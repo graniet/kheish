@@ -1,0 +1,5 @@
+/target
+.env
+logs/*.json
+logs/*.log
+exports/*.md
