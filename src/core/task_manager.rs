@@ -210,18 +210,14 @@ impl TaskManager {
                             }
                             Err(e) => {
                                 error!("Module {} action '{}' failed: {}", module_name, action, e);
+                                let action_availables = module.get_actions().iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
                                 let err_msg = format!(
-                                    "Module {} action '{}' failed: {}",
-                                    module_name, action, e
+                                    "Module {} action '{}' failed: {}\n\
+                                    Available actions: {}",
+                                    module_name, action, e, action_availables
                                 );
                                 self.task.state = TaskState::Failed(err_msg.clone());
-                                format!(
-                                    "Result of module {} action '{} {}':\n{}",
-                                    module_name,
-                                    action,
-                                    params.join(" "),
-                                    e
-                                )
+                                err_msg
                             }
                         };
 
