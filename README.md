@@ -20,6 +20,13 @@
   
 - **Modular and Extensible:** Add new modules or agents without breaking the existing structure. The architecture encourages customization and scaling to new tasks or domains.
 
+## Roadmap
+
+- Add support for more LLM providers.
+- Introduce more sophisticated caching and compression of conversation history.
+- Expand the library of modules (e.g., `git`, `http`).
+- Improve UI/CLI for running and monitoring tasks.
+
 ## Architecture Overview
 
 Kheish orchestrates a **Task Manager** that:
@@ -130,13 +137,6 @@ Run the task, and Kheish will guide the LLM through proposing a security audit, 
   
 - **Module Caching:**  
   Results of module actions are cached. Avoid redundant expensive operations by checking if the result already exists.
-
-## Roadmap
-
-- Add support for more LLM providers.
-- Introduce more sophisticated caching and compression of conversation history.
-- Expand the library of modules (e.g., `git`, `http`).
-- Improve UI/CLI for running and monitoring tasks.
 
 ## Contributing
 
