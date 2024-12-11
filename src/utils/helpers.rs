@@ -127,6 +127,7 @@ pub fn manage_token_count(messages: &mut Vec<ChatMessage>, token_limit: usize) -
                 debug!("Truncated last message to fit token limit");
             }
         }
+        std::thread::sleep(std::time::Duration::from_secs(60));
         return true;
     }
     false
