@@ -4,7 +4,7 @@ version: "1.0"
 
 context:
   - kind: text
-    content: "Find a secret in a file in the filesystem. The secret is actually present in one of the files. Ensure that you do not rely solely on filenames or directory names containing 'flag' or 'secret'. You must confirm by reading the file's content. The file containing the secret will have non-empty content and clearly contain the secret string."
+    content: "Find a secret in a file in the filesystem. The secret is actually present in one of the files. Ensure that you do not rely solely on filenames or directory names containing 'flag' or 'secret'. You must confirm by reading the file's content. The file containing the secret will have non-empty content and clearly contain the secret string. Important: The secret is not a api key or a password, it's a string that is not a secret."
     alias: "task_instructions"
   - kind: text
     content: "base path : /your/base/path"
@@ -88,8 +88,8 @@ workflow:
       condition: "exported"
 
 parameters:
-  llm_model: "gpt-4o"
-  llm_provider: "openai"
+  llm_model: "claude-3-5-sonnet-20240620"
+  llm_provider: "anthropic"
   export_conversation: true
   embedder:
     model: "text-embedding-3-small"

@@ -3,14 +3,14 @@ description: "Perform a thorough security audit of the provided code repository.
 version: "1.0"
 
 context:
-  # - kind: text
-  #   content: "Please perform a thorough security audit of the provided project, focusing on identifying potential vulnerabilities, security risks and best practices violations in **all files** within the directory and its subdirectories. The code is located on base path. Examine every file in this repository, no matter how minor. Pay special attention to SQL injection, XSS, CSRF, file inclusion, command injection, authentication/authorization flaws, data exposure, input validation, error handling, and other security weaknesses. Provide a complete and exhaustive analysis."
-  #   alias: "task_instructions"
+  - kind: text
+    content: "Please perform a thorough security audit of the provided project, focusing on identifying potential vulnerabilities, security risks and best practices violations in **all files** within the directory and its subdirectories. The code is located on base path. Examine every file in this repository, no matter how minor. Pay special attention to SQL injection, XSS, CSRF, file inclusion, command injection, authentication/authorization flaws, data exposure, input validation, error handling, and other security weaknesses. Provide a complete and exhaustive analysis."
+    alias: "task_instructions"
   - kind: text
     content: "base path : /your/base/path"
     alias: "base_path"
-  - kind: user_input
-    alias: "task_instructions"
+  # - kind: user_input
+  #   alias: "task_instructions"
 
 agents:
   proposer:
