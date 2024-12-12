@@ -18,3 +18,8 @@ tracing-subscriber = {version = "0.3.19", features = ["env-filter", "registry"]}
 tracing-appender = "0.2.3"
 dotenvy = "0.15.0"
 chrono = "0.4.39"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
