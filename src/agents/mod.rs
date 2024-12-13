@@ -10,7 +10,7 @@ pub use proposer::*;
 pub use reviewer::*;
 pub use validator::*;
 
-use tracing::info;
+use tracing::debug;
 
 /// Represents the possible outcomes of an agent's execution
 pub enum AgentOutcome {
@@ -65,7 +65,7 @@ pub trait AgentBehavior {
                         vec![]
                     };
 
-                    info!(
+                    debug!(
                         "executing module request: {} {} {:?}",
                         module_name, action, params
                     );
