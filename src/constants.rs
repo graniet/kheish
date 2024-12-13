@@ -1,3 +1,7 @@
+pub const MEMORY_SYSTEM_PROMPT: &str = "You have access to a long-term memory through the memories module. Any information you wish to preserve without repeating it in the prompt can be stored there.
+For example, if you create an intermediate summary of a concept, insert it by using MODULE_REQUEST: memories insert <summary>.
+Later, if you need to retrieve that information, use MODULE_REQUEST: memories recall <keywords or question>";
+
 /// Format reminder for the proposer role - requires starting with 'Proposal:' followed by content
 pub const PROPOSER_FORMAT_REMINDER: &str =
     "Your answer must start with 'Proposal:' followed by the improved summary. \
