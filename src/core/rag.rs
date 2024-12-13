@@ -14,6 +14,8 @@ pub struct DocumentEmbedding {
     pub embedding: Vec<f32>,
     /// Original text content of the document
     pub content: String,
+    /// Metadata about the document
+    pub metadata: Option<String>,
 }
 
 /// Trait defining operations for a vector store
@@ -41,6 +43,22 @@ pub trait VectorStoreProvider: Send + Sync {
         query: &str,
         top_k: usize,
     ) -> Result<Vec<DocumentEmbedding>, Box<dyn Error>>;
+
+    /// Upserts a document with the given ID and content
+    ///
+    /// # Arguments
+    /// * `doc_id` - Unique identifier for the document
+    /// * `content` - Text content of the document
+    /// * `metadata` - Optional metadata about the document
+    ///
+    /// # Returns
+    /// * `Result<(), Box<dyn Error>>` - Success or error
+    async fn upsert_document(
+        &mut self,
+        doc_id: &str,
+        content: &str,
+        metadata: Option<String>,
+    ) -> Result<(), Box<dyn Error>>;
 }
 
 /// In-memory implementation of a vector store
@@ -59,6 +77,9 @@ impl<E: Debug + Embedder + Send + Sync> InMemoryVectorStore<E> {
     ///
     /// # Arguments
     /// * `embedder` - Implementation of the Embedder trait to use
+    ///
+    /// # Returns
+    /// * A new InMemoryVectorStore instance
     pub fn new(embedder: E) -> Self {
         Self {
             documents: Vec::new(),
@@ -97,6 +118,7 @@ impl<E: Debug + Embedder + Send + Sync> VectorStoreProvider for InMemoryVectorSt
             id: doc_id.clone(),
             embedding,
             content: content.to_string(),
+            metadata: None,
         });
         Ok(doc_id)
     }
@@ -121,5 +143,28 @@ impl<E: Debug + Embedder + Send + Sync> VectorStoreProvider for InMemoryVectorSt
             .map(|(_, doc)| (*doc).clone())
             .collect();
         Ok(results)
+    }
+
+    async fn upsert_document(
+        &mut self,
+        doc_id: &str,
+        content: &str,
+        metadata: Option<String>,
+    ) -> Result<(), Box<dyn Error>> {
+        let embedding = self.embedder.embed_text(content).await?;
+
+        if let Some(pos) = self.documents.iter().position(|d| d.id == doc_id) {
+            self.documents[pos].content = content.to_string();
+            self.documents[pos].embedding = embedding;
+            self.documents[pos].metadata = metadata;
+        } else {
+            self.documents.push(DocumentEmbedding {
+                id: doc_id.to_string(),
+                embedding,
+                content: content.to_string(),
+                metadata,
+            });
+        }
+        Ok(())
     }
 }
