@@ -29,6 +29,20 @@ pub trait VectorStoreProvider: Send + Sync {
     /// * `Result<String, Box<dyn Error>>` - ID of the added document or error
     async fn add_document(&mut self, content: &str) -> Result<String, Box<dyn Error>>;
 
+    /// Adds a new document to the store with a specific ID
+    ///
+    /// # Arguments
+    /// * `doc_id` - Unique identifier for the document
+    /// * `content` - Text content of the document to add
+    ///
+    /// # Returns
+    /// * `Result<String, Box<dyn Error>>` - ID of the added document or error
+    async fn add_document_with_id(
+        &mut self,
+        prefix_doc_id: &str,
+        content: &str,
+    ) -> Result<String, Box<dyn Error>>;
+
     /// Searches for similar documents using vector similarity
     ///
     /// # Arguments
@@ -120,6 +134,23 @@ impl<E: Debug + Embedder + Send + Sync> VectorStoreProvider for InMemoryVectorSt
             metadata: None,
         });
         Ok(doc_id)
+    }
+
+    async fn add_document_with_id(
+        &mut self,
+        prefix_doc_id: &str,
+        content: &str,
+    ) -> Result<String, Box<dyn Error>> {
+        let embedding = self.embedder.embed_text(content).await?;
+        self.next_id += 1;
+        let doc_id = format!("{}-{}", prefix_doc_id, self.next_id);
+        self.documents.push(DocumentEmbedding {
+            id: doc_id.to_string(),
+            embedding,
+            content: content.to_string(),
+            metadata: None,
+        });
+        Ok(doc_id.to_string())
     }
 
     async fn search_documents(
