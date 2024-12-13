@@ -14,10 +14,20 @@ impl std::fmt::Debug for MemoriesModule {
 
 #[async_trait::async_trait]
 impl Module for MemoriesModule {
+    /// Returns the name of this module
     fn name(&self) -> &str {
         "memories"
     }
 
+    /// Handles memory operations for storing and retrieving information
+    ///
+    /// # Arguments
+    /// * `vector_store` - Vector store provider for storing embeddings
+    /// * `action` - Action to perform ("insert" or "recall")
+    /// * `params` - Text content or search query
+    ///
+    /// # Returns
+    /// * `Result<String, String>` - Success message or error
     async fn handle_action(
         &self,
         vector_store: &mut dyn VectorStoreProvider,
@@ -72,6 +82,10 @@ impl Module for MemoriesModule {
         }
     }
 
+    /// Returns the list of available actions for this module
+    ///
+    /// # Returns
+    /// * `Vec<ModuleAction>` - List of available actions and their descriptions
     fn get_actions(&self) -> Vec<ModuleAction> {
         vec![
             ModuleAction {
