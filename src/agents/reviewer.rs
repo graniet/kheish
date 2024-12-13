@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use tracing::debug;
 
 /// Agent responsible for reviewing proposals and providing feedback.
-/// 
+///
 /// This agent interacts with the LLM to:
 /// - Review generated proposals against the context
 /// - Approve proposals that meet requirements
@@ -20,10 +20,10 @@ pub struct ReviewerAgent<'a> {
 }
 
 /// Validates that the LLM response is properly formatted.
-/// 
+///
 /// # Arguments
 /// * `resp` - The response string from the LLM
-/// 
+///
 /// # Returns
 /// * `bool` - True if response is "approved", starts with "revise:", or contains "MODULE_REQUEST:"
 fn validate_reviewer_response(resp: &str) -> bool {
@@ -40,7 +40,7 @@ impl<'a> AgentBehavior for ReviewerAgent<'a> {
     /// 2. Builds a prompt including the proposal, context and module execution history
     /// 3. Calls the LLM to review the proposal
     /// 4. Processes the response to determine if the proposal is approved or needs revision
-    /// 
+    ///
     /// # Arguments
     /// * `task` - The task containing the proposal and context to review
     ///
