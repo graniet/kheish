@@ -5,8 +5,6 @@ pub enum TaskState {
     New,
     /// Task is currently being processed
     InProgress,
-    /// Task has finished successfully
-    Completed,
     /// Task failed with an error message
     #[allow(unused)]
     Failed(String),
