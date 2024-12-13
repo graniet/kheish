@@ -1,3 +1,4 @@
+/// Module containing agent-related functionality
 mod agent_manager;
 mod formatter;
 mod proposer;
@@ -11,20 +12,43 @@ pub use validator::*;
 
 use tracing::info;
 
+/// Represents the possible outcomes of an agent's execution
 pub enum AgentOutcome {
+    /// A proposal was successfully generated
     ProposalGenerated,
+    /// A revision was requested
     RevisionRequested,
+    /// The proposal was approved
     Approved,
+    /// The proposal was validated
     Validated,
+    /// The result was exported
     Exported,
+    /// A module request was made with module name, action and parameters
     ModuleRequest(String, String, Vec<String>),
+    /// The execution failed with an error message
     Failed(String),
 }
 
+/// Defines the behavior that all agents must implement
 #[async_trait::async_trait]
 pub trait AgentBehavior {
+    /// Executes a single step of the agent's workflow
+    ///
+    /// # Arguments
+    /// * `task` - The task being processed
+    ///
+    /// # Returns
+    /// The outcome of executing the step
     async fn execute_step(&self, task: &mut crate::core::Task) -> AgentOutcome;
 
+    /// Parses a response string to check for module requests
+    ///
+    /// # Arguments
+    /// * `resp` - The response string to parse
+    ///
+    /// # Returns
+    /// Some(AgentOutcome::ModuleRequest) if a module request is found, None otherwise
     fn parse_module_request(&self, resp: &str) -> Option<AgentOutcome> {
         for line in resp.lines() {
             if line.trim().contains("MODULE_REQUEST:") {
@@ -54,6 +78,10 @@ pub trait AgentBehavior {
 }
 
 impl AgentOutcome {
+    /// Converts the outcome to its string condition representation
+    ///
+    /// # Returns
+    /// A string slice representing the condition for this outcome
     pub fn as_condition(&self) -> &str {
         match self {
             AgentOutcome::ProposalGenerated => "proposal_generated",
