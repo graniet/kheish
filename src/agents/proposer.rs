@@ -3,10 +3,10 @@ use crate::constants::PROPOSER_FORMAT_REMINDER;
 use crate::core::Task;
 use crate::llm::{ChatMessage, LlmClient};
 use async_trait::async_trait;
-use tracing::{debug, info};
+use tracing::debug;
 
 /// Agent responsible for generating and revising proposals.
-/// 
+///
 /// This agent interacts with the LLM to:
 /// - Generate initial content proposals based on context
 /// - Request module executions when needed
@@ -19,10 +19,10 @@ pub struct ProposerAgent<'a> {
 }
 
 /// Validates that the LLM response is properly formatted.
-/// 
+///
 /// # Arguments
 /// * `resp` - The response string from the LLM
-/// 
+///
 /// # Returns
 /// * `bool` - True if response starts with "Proposal:" or contains "MODULE_REQUEST:"
 fn validate_proposer_response(resp: &str) -> bool {
@@ -37,7 +37,7 @@ impl<'a> AgentBehavior for ProposerAgent<'a> {
     /// 1. Builds a prompt from the task context and any previous feedback
     /// 2. Calls the LLM to generate a proposal or module request
     /// 3. Validates and processes the response
-    /// 
+    ///
     /// # Arguments
     /// * `task` - The task containing context and conversation history
     ///
@@ -93,7 +93,7 @@ impl<'a> AgentBehavior for ProposerAgent<'a> {
                     return mr;
                 }
 
-                info!("ProposerAgent: proposal generated: {}", new_proposal);
+                debug!("ProposerAgent: proposal generated: {}", new_proposal);
                 task.add_proposal(new_proposal);
                 AgentOutcome::ProposalGenerated
             }

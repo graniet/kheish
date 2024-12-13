@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use tracing::debug;
 
 /// Agent responsible for validating final proposals.
-/// 
+///
 /// This agent interacts with the LLM to:
 /// - Validate proposals against requirements and context
 /// - Request revisions with specific feedback
@@ -14,15 +14,15 @@ use tracing::debug;
 pub struct ValidatorAgent<'a> {
     /// Client for interacting with the language model
     pub llm_client: &'a LlmClient,
-    /// Custom prompt to guide the agent's behavior 
+    /// Custom prompt to guide the agent's behavior
     pub user_prompt: &'a str,
 }
 
 /// Validates that the LLM response is properly formatted.
-/// 
+///
 /// # Arguments
 /// * `resp` - The response string from the LLM
-/// 
+///
 /// # Returns
 /// * `bool` - True if response is "validated", starts with "not valid:", or contains "MODULE_REQUEST:"
 fn validate_validator_response(resp: &str) -> bool {
@@ -39,7 +39,7 @@ impl<'a> AgentBehavior for ValidatorAgent<'a> {
     /// 2. Builds a prompt including the proposal, context and module execution history
     /// 3. Calls the LLM to validate the proposal
     /// 4. Processes the response to determine if the proposal is valid or needs revision
-    /// 
+    ///
     /// # Arguments
     /// * `task` - The task containing the proposal and context to validate
     ///
@@ -59,7 +59,6 @@ impl<'a> AgentBehavior for ValidatorAgent<'a> {
             return AgentOutcome::Failed("No context available for validation".to_string());
         }
 
-
         let mut prompt = String::new();
         prompt.push_str("Current role: validator\n");
         prompt.push_str("Specific instructions: ");
@@ -68,7 +67,6 @@ impl<'a> AgentBehavior for ValidatorAgent<'a> {
         prompt.push_str(&combined_context);
         prompt.push_str("\n\nFinal proposal:\n");
         prompt.push_str(proposal);
-
 
         prompt.push_str(
             "\n\nPlease respond with 'validated', 'not valid: ...' or 'MODULE_REQUEST:'.",

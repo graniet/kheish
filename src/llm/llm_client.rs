@@ -1,8 +1,8 @@
 use crate::llm::providers::LlmProvider;
 use crate::llm::ChatMessage;
+use crate::utils::manage_token_count;
 use std::error::Error;
 use tracing::{debug, info};
-use crate::utils::manage_token_count;
 
 /// Generic LLM client that delegates work to a concrete provider.
 #[derive(Debug)]
@@ -66,7 +66,7 @@ impl LlmClient {
         F: Fn(&str) -> bool,
     {
         let mut attempts = 0;
-        
+
         manage_token_count(messages, 35000);
 
         loop {

@@ -1,7 +1,7 @@
 use crate::config::AgentsConfig;
 use crate::constants::*;
-use crate::modules::ModulesManager;
 use crate::llm::ChatMessage;
+use crate::modules::ModulesManager;
 
 use tracing::debug;
 
@@ -91,10 +91,8 @@ pub fn generate_system_instructions(
 /// # Returns
 /// * `bool` - True if messages were modified, False otherwise
 pub fn manage_token_count(messages: &mut Vec<ChatMessage>, token_limit: usize) -> bool {
-    let mut total_tokens: usize = messages.iter()
-        .map(|msg| msg.content.chars().count())
-        .sum();
-        
+    let mut total_tokens: usize = messages.iter().map(|msg| msg.content.chars().count()).sum();
+
     if total_tokens >= token_limit {
         if messages.len() > 1 {
             let mut i = 0;
@@ -102,26 +100,34 @@ pub fn manage_token_count(messages: &mut Vec<ChatMessage>, token_limit: usize) -
                 if messages[i].role == "assistant" && messages[i].content.contains("proposal") {
                     total_tokens -= messages[i].content.chars().count();
                     messages.remove(i);
-                    debug!("Removed proposal message to reduce token count. Remaining messages: {}", messages.len());
+                    debug!(
+                        "Removed proposal message to reduce token count. Remaining messages: {}",
+                        messages.len()
+                    );
                 } else {
                     i += 1;
                 }
             }
         }
-        
+
         if total_tokens >= token_limit && messages.len() > 1 {
             while total_tokens >= token_limit && messages.len() > 1 {
                 if let Some(removed_msg) = messages.first() {
                     total_tokens -= removed_msg.content.chars().count();
                 }
                 messages.remove(0);
-                debug!("Removed old message to reduce token count. Remaining messages: {}", messages.len());
+                debug!(
+                    "Removed old message to reduce token count. Remaining messages: {}",
+                    messages.len()
+                );
             }
         }
-        
+
         if total_tokens >= token_limit {
             if let Some(last_msg) = messages.last_mut() {
-                last_msg.content = last_msg.content.chars()
+                last_msg.content = last_msg
+                    .content
+                    .chars()
                     .take(token_limit)
                     .collect::<String>();
                 debug!("Truncated last message to fit token limit");

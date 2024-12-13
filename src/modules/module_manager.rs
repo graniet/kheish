@@ -1,5 +1,5 @@
-use crate::modules::{FileSystemModule, Module, ShModule, VectorStoreModule};
-use tracing::info;
+use crate::modules::{FileSystemModule, Module, ShModule, VectorStoreModule, WebModule};
+use tracing::debug;
 
 /// Manages the loading and access of modules in the system
 #[derive(Debug)]
@@ -22,10 +22,11 @@ impl ModulesManager {
             .filter_map(|mc| match mc.name.as_str() {
                 "fs" => {
                     if let Some(version) = &mc.version {
-                        info!("Loading fs module version {}", version);
+                        debug!("Loading fs module version {}", version);
                     }
                     Some(Box::new(FileSystemModule) as Box<dyn Module>)
                 }
+                "web" => Some(Box::new(WebModule::new()) as Box<dyn Module>),
                 "sh" => mc.config.map(|conf| {
                     let allowed_commands = conf
                         .get("allowed_commands")
@@ -46,7 +47,7 @@ impl ModulesManager {
             })
             .collect();
 
-        info!("Loaded modules: {:?}", modules);
+        debug!("Loaded modules: {:?}", modules);
         ModulesManager { modules }
     }
 

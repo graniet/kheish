@@ -12,9 +12,4 @@ pub struct Cli {
     /// Default: "info"
     #[arg(long, default_value_t = String::from("info"))]
     pub logging_level: String,
-
-    /// Enable writing logs to a daily rotating file in the "logs" directory
-    /// in addition to stdout
-    #[arg(long, default_value_t = false)]
-    pub with_file: bool,
 }

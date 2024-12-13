@@ -8,7 +8,7 @@ pub use parser::load_task_config;
 pub struct TaskConfig {
     /// Name of the task
     pub name: String,
-    /// Optional description of what the task does 
+    /// Optional description of what the task does
     #[serde(default)]
     pub description: Option<String>,
     /// Optional version of the task configuration
@@ -129,6 +129,12 @@ pub struct ParametersConfig {
     /// Embedder configuration
     #[serde(default)]
     pub embedder: Option<EmbedderConfig>,
+    /// Whether to collect feedback after completion
+    #[serde(default)]
+    pub post_completion_feedback: bool,
+    /// Maximum number of retries allowed
+    #[serde(default)]
+    pub max_retries: Option<usize>,
 }
 
 /// Output configuration

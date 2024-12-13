@@ -2,12 +2,14 @@ mod fs_module;
 mod module_manager;
 pub mod rag_module;
 mod sh_module;
+mod web_module;
 
 use crate::core::rag::VectorStoreProvider;
 pub use fs_module::*;
 pub use module_manager::*;
 pub use rag_module::*;
 pub use sh_module::*;
+pub use web_module::*;
 
 pub struct ModuleAction {
     pub name: String,
@@ -17,7 +19,11 @@ pub struct ModuleAction {
 
 impl std::fmt::Display for ModuleAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} ({} args) - {}", self.name, self.arg_count, self.description)
+        write!(
+            f,
+            "{} ({} args) - {}",
+            self.name, self.arg_count, self.description
+        )
     }
 }
 
