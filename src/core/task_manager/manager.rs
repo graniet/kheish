@@ -10,7 +10,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 
 /// Manages the execution of a task by coordinating agents, modules, and workflow.
-/// 
+///
 /// Handles:
 /// - Task state and context management
 /// - Workflow execution and agent coordination
@@ -74,7 +74,7 @@ impl TaskManager {
         spinner.set_style(
             ProgressStyle::default_spinner()
                 .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
-                .template("{spinner} {msg}")
+                .template("{spinner} [{elapsed_precise}] {msg}")
                 .expect("Failed to set spinner template"),
         );
 
