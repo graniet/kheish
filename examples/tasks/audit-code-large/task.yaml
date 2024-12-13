@@ -1,0 +1,138 @@
+name: audit-large-codebase-rag-only
+description: "Perform a thorough security audit of a large code repository using only retrieval-augmented generation (RAG) to extract code, focusing exclusively on critical or high severity vulnerabilities, and providing concrete evidence (code snippets) via RAG."
+version: "1.0"
+
+context:
+  - kind: text
+    content: >
+      Please perform an extremely thorough security audit of the provided project.
+      Recursively explore and index the entire codebase, including all subdirectories:
+      
+      **Do not directly load file contents into the prompt.** Instead:
+      1. Use `fs` to recursively list ALL files in the repository and its subdirectories
+         - Include all file types and hidden files
+         - Maintain the full path structure
+      
+      2. For each discovered file:
+         - Read it in manageable segments
+         - Index each segment into RAG using the `rag` module
+         - Include file path and location metadata with each segment
+         - Ensure no file content is skipped during indexing
+      
+      3. Once complete indexing is verified:
+         - Never use raw file contents again
+         - Use only semantic queries on RAG to retrieve excerpts
+         - Always include file path context with retrieved segments
+      
+      Focus only on critical or high severity vulnerabilities (OWASP top 50, RCE, SQL injection, XSS, CSRF, LFI/RFI, authentication flaws, insufficient authorization, sensitive data exposure, etc.). Identify vulnerabilities where they actually exist and demonstrate how they can be exploited.
+      
+      Take time to deeply analyze data flow between functions, how variables are passed, and particularly how user inputs propagate through the code. Make sure to check if there are validation, filtering or security functions that could mitigate or invalidate the vulnerability. Only report a vulnerability if it is actually exploitable, clearly demonstrating the attack vector.
+
+      Provide tangible evidence for each detected vulnerability, including code excerpts obtained via RAG, and justify how exploitation is made possible (data flow, unvalidated parameters, etc.). If a file is empty or not relevant, explicitly state that no vulnerabilities were found in it.
+
+      The repository is located at the specified base path.
+    alias: "task_instructions"
+
+  - kind: text
+    content: "Base path: /edit/base/path"
+    alias: "base_path"
+
+agents:
+  proposer:
+    strategy: "explorative"
+    system_prompt: |
+      You are a code security audit expert, specialized in complex large repositories and deep data flow analysis.
+      
+      **Key rules**:
+      - Start by using `fs` to list and read all files in small segments.
+      - For each segment, use `rag` to index it.
+      - Once all indexing is complete, never use raw content again. Only query the RAG.
+      - Focus only on critical or high severity vulnerabilities.
+      - For each detected vulnerability, provide:
+        * Severity level (high or critical).
+        * Detailed explanation, with data flow analysis and demonstration of lack of effective security measures.
+        * Relevant code excerpts retrieved via RAG.
+        * Approximate file and line references.
+      - Carefully check if there are security functions, filters, sanitizations already in place, and only report the vulnerability if it remains exploitable.
+      - Review all possible critical vulnerabilities, particularly those mentioned in OWASP top 50 (injections, XSS, CSRF, authentication/authorization flaws, sensitive data exposure, etc.).
+      
+      The final response must start with "Proposal:" on its own line, then list the detected vulnerabilities, or indicate that no vulnerabilities were found, with supporting evidence.
+    user_prompt: |
+      Steps:
+      1. Use `fs` to list all repository files.
+      2. Read them in segments and index each segment in RAG.
+      3. Once indexing is complete, query RAG to search for critical/high vulnerabilities.
+      4. Deeply analyze data flows and user input propagation.
+      5. Provide relevant code excerpts from RAG for each vulnerability.
+      6. Produce the final "Proposal:" response with complete list of vulnerabilities, or indicate none were found.
+  
+  reviewer:
+    strategy: "strict"
+    system_prompt: |
+      You are a strict security audit reviewer.
+      Verify that:
+      - Code was properly indexed in RAG before analysis.
+      - No vulnerability is reported without evidence (RAG excerpts).
+      - Data flows are analyzed correctly.
+      - Only critical/high vulnerabilities are presented.
+    user_prompt: |
+      If the audit is correct and complete, respond "Approved".
+      Otherwise, respond "Revise:" followed by what is missing or incorrect.
+  
+  validator:
+    strategy: "comprehensive"
+    system_prompt: |
+      You are the final validator.
+      If everything is correct, respond only "Validated".
+      Otherwise, respond "Not valid:" followed by an explanation.
+    user_prompt: |
+      Validate the final audit.
+  
+  formatter:
+    system_prompt: |
+      You are a formatting specialist.
+      Convert the validated audit into a Markdown report:
+      - A title
+      - A table of contents
+      - Sections for each vulnerability (severity, explanation, file references, code excerpts)
+    user_prompt: |
+      Produce the final report in Markdown, clearly and comprehensively.
+
+modules:
+  - name: "fs"
+    version: "1.0"
+  - name: "rag"
+    version: "1.0"
+
+workflow:
+  steps:
+    - from: "proposer"
+      to: "reviewer"
+      condition: "proposal_generated"
+    - from: "reviewer"
+      to: "proposer"
+      condition: "revision_requested"
+    - from: "reviewer"
+      to: "validator"
+      condition: "approved"
+    - from: "validator"
+      to: "proposer"
+      condition: "revision_requested"
+    - from: "validator"
+      to: "formatter"
+      condition: "validated"
+    - from: "formatter"
+      to: "completed"
+      condition: "exported"
+
+parameters:
+  llm_model: "claude-3-5-sonnet-20240620"
+  llm_provider: "anthropic"
+  export_conversation: true
+  embedder:
+    model: "text-embedding-3-small"
+  post_completion_feedback: true
+
+output:
+  format: "markdown"
+  file: "exports/audit-large-report.md"
