@@ -20,11 +20,15 @@ pub fn generate_system_instructions(
     agent_config: &AgentsConfig,
     modules: &ModulesManager,
 ) -> String {
-    let proposer_prompt = agent_config
+    let mut proposer_prompt = agent_config
         .proposer
         .system_prompt
         .clone()
         .unwrap_or(PROPOSER_SYSTEM_PROMPT.to_string());
+
+    // Add memory system prompt to proposer prompt
+    proposer_prompt = format!("{}\n\n{}", proposer_prompt, MEMORY_SYSTEM_PROMPT);
+
     let reviewer_prompt = agent_config
         .reviewer
         .system_prompt

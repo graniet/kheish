@@ -1,0 +1,126 @@
+name: hf-secret-finder
+description: "Find secrets in Hugging Face repositories using trufflehog."
+version: "1.0"
+
+context:
+  - kind: text
+    content: >
+      Scan Hugging Face repositories for secrets using trufflehog.  
+      Steps:
+      1. Use `curl` to fetch models from the Hugging Face API (provided URL).  
+      2. Parse the returned JSON to extract repository URLs.  
+      3. For each repository:
+         - Clone it into the specified output directory
+         - Run `trufflehog system` scan on the repository
+      4. Collect findings for each repository:
+         - Repository name and URL
+         - List all secrets and their locations
+         
+      **Memory Usage Instructions**:
+      You have access to a long-term memory via the `memories` module.  
+      - When you retrieve the list of repositories, insert them into memory:
+        ```
+        MODULE_REQUEST: memories insert "Repo 1: <URL>, Repo 2: <URL>, Repo 3: <URL>"
+        ```
+      - Before cloning or scanning, recall them to avoid repeating steps:
+        ```
+        MODULE_REQUEST: memories recall "previously fetched repository URLs"
+        ```
+      - If you find secrets, store them:
+        ```
+        MODULE_REQUEST: memories insert "Discovered secret in Repo X at path Y"
+        ```
+      - Later, if needed, recall these stored secrets to ensure you do not duplicate or miss any.
+        ```
+        MODULE_REQUEST: memories recall "discovered secrets"
+        ```
+        
+      This ensures you do not lose track of which repositories you've already cloned or which secrets you've already found.
+
+    alias: "task_instructions"
+
+  - kind: text
+    content: "models api url : https://huggingface.co/api/models?limit=10"
+    alias: "models_api_url"
+
+  - kind: text
+    content: "OUTPUTDIR: ./outputs_gits"
+    alias: "outputdir"
+
+agents:
+  proposer:
+    strategy: "explorative"
+    system_prompt: |
+      You are an expert in security auditing. Your goal:
+      - Fetch repositories from the Hugging Face API.
+      - Use the `memories` module to store and recall repository info and secrets as you proceed.
+      - Clone each repository into OUTPUTDIR.
+      - Run `trufflehog system` on each cloned repo to find secrets.
+      - If you find secrets, store them in `memories` so you can reference them in your final report.
+      
+      Finally, produce a "Proposal:" section listing each repository, the secrets found, and their locations. Make sure to use the memories module to keep track of progress and avoid repeating steps.
+
+    user_prompt: |
+      Steps:
+      1. Get repositories from Hugging Face API
+      2. Insert their URLs into memories
+      3. Recall them when cloning
+      4. After scanning each with trufflehog, insert discovered secrets into memories
+      5. At the end, recall all discovered secrets and produce the final "Proposal:" with details.
+
+  reviewer:
+    strategy: "strict"
+    system_prompt: |
+      You are a strict security review specialist.
+      Check that:
+      - repositories were retrieved and URLs stored in `memories`.
+      - Repositories were cloned without duplication.
+      - trufflehog scans were run on each repository.
+      - Secrets found were inserted into `memories`.
+      - Final report references `memories` data correctly.
+      
+      If anything is missing or incorrect, request revision.
+    user_prompt: |
+      Verify the workflow thoroughly. Respond 'Approved' if correct, else 'Revise:' plus what’s missing.
+
+  formatter:
+    system_prompt: |
+      You are a formatting specialist.
+      Produce a markdown report with:
+      - A title
+      - A table of contents
+      - A section for each repository: name, URL, discovered secrets with details.
+    user_prompt: |
+      Convert the final, validated "Proposal:" into a well-structured Markdown report.
+
+modules:
+  - name: "memories"
+    version: "1.0"
+  - name: "sh"
+    version: "1.0"
+    config:
+      allowed_commands: ["curl", "git", "trufflehog"]
+
+workflow:
+  steps:
+    - from: "proposer"
+      to: "reviewer"
+      condition: "proposal_generated"
+    - from: "reviewer"
+      to: "proposer" 
+      condition: "revision_requested"
+    - from: "reviewer"
+      to: "formatter"
+      condition: "approved"
+    - from: "formatter"
+      to: "completed"
+      condition: "exported"
+
+parameters:
+  llm_model: "claude-3-5-sonnet-20240620"
+  llm_provider: "anthropic"
+  export_conversation: true
+
+output:
+  format: "markdown"
+  file: "exports/hf-secret-finder.md"
