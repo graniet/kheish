@@ -22,7 +22,7 @@ use tracing::warn;
 async fn main() {
     // Parse command line arguments
     let cli = cli::Cli::try_parse().expect("Failed to parse CLI arguments");
-    utils::init_logging(&cli.logging_level, cli.with_file);
+    utils::init_logging(&cli.logging_level);
 
     // Load environment variables from .env file
     if let Err(e) = dotenvy::dotenv() {
