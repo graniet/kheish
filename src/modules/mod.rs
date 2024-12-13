@@ -1,4 +1,5 @@
 mod fs_module;
+mod mem_module;
 mod module_manager;
 pub mod rag_module;
 mod sh_module;
@@ -6,6 +7,7 @@ mod web_module;
 
 use crate::core::rag::VectorStoreProvider;
 pub use fs_module::*;
+pub use mem_module::*;
 pub use module_manager::*;
 pub use rag_module::*;
 pub use sh_module::*;
