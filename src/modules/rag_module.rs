@@ -91,17 +91,7 @@ impl Module for VectorStoreModule {
             name: "search".to_string(),
             arg_count: 1,
             description: "Performs semantic search in the RAG vector store to find relevant documents. Usage: search <query text>. The query can be a question, keywords, or natural language text. Returns top 5 most semantically similar documents.".to_string(),
-        },
-            ModuleAction {
-                name: "index".to_string(),
-                arg_count: 1,
-                description: "Adds a document to the RAG vector store. Usage: index <file path>. The file path can be a local file or a remote file. The file will be added to the vector store and can be used for semantic search.".to_string(),
-            },
-            ModuleAction {
-                name: "index_multiple".to_string(),
-                arg_count: 1,
-                description: "Adds multiple documents to the RAG vector store. Usage: index_multiple <file paths>. The file paths can be a local file or a remote file. The files will be added to the vector store and can be used for semantic search.".to_string(),
-            },
+        }
         ]
     }
 }
