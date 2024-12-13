@@ -16,8 +16,8 @@ use crate::modules::ModulesManager;
 use crate::utils;
 use std::collections::HashMap;
 use std::fs;
-use tracing::{debug, error, info};
 use std::io::{self, Write};
+use tracing::{debug, error, info, warn};
 
 /// Main manager for task execution and coordination.
 ///
@@ -45,6 +45,10 @@ pub struct TaskManager {
     pub revision_count: usize,
     /// Storage for vector embeddings used in retrieval
     pub vector_store: InMemoryVectorStore<OpenAIEmbedder>,
+    /// Counter tracking the number of retry attempts
+    pub retry_count: usize,
+    /// Maximum number of retries allowed
+    pub max_retries: usize,
 }
 
 impl TaskManager {
@@ -93,6 +97,8 @@ impl TaskManager {
             module_results_cache: HashMap::new(),
             revision_count: 0,
             vector_store,
+            retry_count: 0,
+            max_retries: config.parameters.max_retries.unwrap_or(3),
         }
     }
 
@@ -168,12 +174,33 @@ impl TaskManager {
 
             match agent_outcome {
                 AgentOutcome::Failed(reason) => {
+                    let next_attempt = self.retry_count + 1;
+
+                    if next_attempt <= self.max_retries {
+                        warn!(
+                            "Task will be retried. Attempt {}/{}",
+                            next_attempt, self.max_retries
+                        );
+                        self.retry_count = next_attempt;
+
+                        if let Some(last_success) = self.task.conversation.iter().rposition(|msg| {
+                            msg.role == "assistant" && !msg.content.contains("error")
+                        }) {
+                            self.task.conversation.truncate(last_success + 1);
+                        }
+                        continue;
+                    }
+
                     error!("Task failed at role {} : {}", current_role, reason);
-                    self.task.state = TaskState::Failed(reason);
+                    self.task.state = TaskState::Failed(format!(
+                        "Task failed after {} retries. Last error: {}",
+                        self.max_retries, reason
+                    ));
                     break;
                 }
 
                 AgentOutcome::ModuleRequest(module_name, action, params) => {
+                    self.retry_count = 0;
                     info!("Module request: {} {} {:?}", module_name, action, params);
                     let module_cache_key = (module_name.clone(), action.clone(), params.clone());
                     if self.module_results_cache.contains_key(&module_cache_key) {
@@ -202,15 +229,17 @@ impl TaskManager {
                                         &result[..200]
                                     )
                                 } else {
-                                    format!(
-                                        "{}",
-                                        result
-                                    )
+                                    result.to_string()
                                 }
                             }
                             Err(e) => {
                                 error!("Module {} action '{}' failed: {}", module_name, action, e);
-                                let action_availables = module.get_actions().iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
+                                let action_availables = module
+                                    .get_actions()
+                                    .iter()
+                                    .map(|a| a.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
                                 let err_msg = format!(
                                     "Module {} action '{}' failed: {}\n\
                                     Available actions: {}",
@@ -221,17 +250,25 @@ impl TaskManager {
                             }
                         };
 
-                        self.task.conversation.push(ChatMessage::new("user", &execution_message));
+                        self.task
+                            .conversation
+                            .push(ChatMessage::new("user", &execution_message));
                         continue;
                     } else {
                         let err_msg = format!(
                             "Module {} not found. Available modules and their actions: {}",
-                            module_name, 
+                            module_name,
                             self.modules_manager
                                 .modules
                                 .iter()
-                                .map(|m| format!("{} (actions: {})", m.name(), 
-                                    m.get_actions().iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
+                                .map(|m| format!(
+                                    "{} (actions: {})",
+                                    m.name(),
+                                    m.get_actions()
+                                        .iter()
+                                        .map(|a| a.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
                                 ))
                                 .collect::<Vec<_>>()
                                 .join("; ")
@@ -247,6 +284,7 @@ impl TaskManager {
                 }
 
                 outcome => {
+                    self.retry_count = 0;
                     let condition = outcome.as_condition();
                     match self.workflow.next_role(&current_role, condition) {
                         Some(next_role) => {
@@ -275,6 +313,27 @@ impl TaskManager {
                                         .is_ok()
                                     {
                                         info!("Exported conversation to {}", json_path);
+                                    }
+                                }
+
+                                if self.config.parameters.post_completion_feedback {
+                                    println!("Do you have any additional feedback? Press Enter with no input to skip.");
+                                    print!("Kheish (feedback) |> ");
+                                    io::stdout().flush().expect("Failed to flush stdout");
+
+                                    let mut feedback_input = String::new();
+                                    io::stdin()
+                                        .read_line(&mut feedback_input)
+                                        .expect("Failed to read user input");
+                                    let feedback_input = feedback_input.trim();
+
+                                    if !feedback_input.is_empty() {
+                                        self.task
+                                            .conversation
+                                            .push(ChatMessage::new("user", feedback_input));
+                                        self.revision_count += 1;
+                                        current_role = "proposer".to_string();
+                                        continue;
                                     }
                                 }
 
