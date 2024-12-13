@@ -1,6 +1,8 @@
 use super::manager::TaskManager;
 use super::utils::pause_and_update;
-use crate::agents::{AgentBehavior, AgentOutcome, FormatterAgent, ProposerAgent, ReviewerAgent, ValidatorAgent};
+use crate::agents::{
+    AgentBehavior, AgentOutcome, FormatterAgent, ProposerAgent, ReviewerAgent, ValidatorAgent,
+};
 use crate::constants::*;
 use tracing::debug;
 
@@ -17,8 +19,10 @@ pub async fn execute_role(manager: &mut TaskManager, role: &str) -> AgentOutcome
 
     let human_message = match role {
         "proposer" => "🤔 The proposer is preparing a new proposal to address the task...",
-        "reviewer" => "🔍 The reviewer is examining the proposal to provide feedback...", 
-        "validator" => "✅ The validator is checking the proposal for correctness and completeness...",
+        "reviewer" => "🔍 The reviewer is examining the proposal to provide feedback...",
+        "validator" => {
+            "✅ The validator is checking the proposal for correctness and completeness..."
+        }
         "formatter" => "✨ The formatter is refining the proposal into the final desired output...",
         _ => "❓ An unknown agent is acting...",
     };
