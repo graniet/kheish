@@ -1,0 +1,147 @@
+name: audit-large-codebase-rag-only
+description: "Perform a thorough security audit of a large code repository using RAG and long-term memory for context tracking, focusing exclusively on critical/high severity vulnerabilities with concrete evidence."
+version: "1.1"
+
+context:
+  - kind: text
+    content: >
+      Please perform an extremely thorough security audit of the provided project.
+      Recursively explore and index the entire codebase, including all subdirectories:
+      
+      **Do not directly load file contents into the prompt.** Instead:
+      1. Use `fs` to recursively list ALL files in the repository and its subdirectories
+         - Include all file types and hidden files
+         - Maintain the full path structure
+      
+      2. For each discovered file:
+         - Read it in manageable segments
+         - Index each segment into RAG using the `rag` module
+         - Store references to processed files and indexing progress using `memories`
+           (For example: `MODULE_REQUEST: memories insert "Indexed file <path>"`)
+         - Ensure no file content is skipped during indexing
+      
+      3. Once complete indexing is verified:
+         - Never use raw file contents again, only query RAG
+         - Use `memories` to recall previously indexed files or previously identified partial findings
+           (For example: `MODULE_REQUEST: memories recall "Which files have already been analyzed?"`)
+         - Always include file path context with retrieved segments from RAG
+
+      Focus only on critical or high severity vulnerabilities (e.g., RCE, SQL injection, XSS, CSRF, LFI/RFI, auth flaws, sensitive data exposure).
+      Identify vulnerabilities only if they are truly exploitable, demonstrating data flow and lack of effective mitigations.
+
+      For each vulnerability:
+      - Provide severity (high/critical).
+      - Detailed explanation (how user input flows, why the mitigation is insufficient).
+      - Code excerpts retrieved via RAG.
+      - Approximate file and line references.
+
+      If a file is empty or irrelevant, state that no vulnerabilities found there.
+
+      Use `memories` to store summaries of discovered vulnerabilities and relevant code patterns. For example, after identifying a vulnerability, summarize it and store it:
+      `MODULE_REQUEST: memories insert "Found critical SQL injection in file X on line Y"`
+
+      The repository is located at the given base path.
+    alias: "task_instructions"
+
+  - kind: text
+    content: "Base path: /edit/base/path"
+    alias: "base_path"
+
+agents:
+  proposer:
+    strategy: "explorative"
+    system_prompt: |
+      You are a code security audit expert, specialized in large repositories and deep data flow analysis.
+
+      **Key rules**:
+      - Use `fs` + `rag` to index all code. For each file segment indexed, store references/progress in `memories`.
+      - After full indexing, rely solely on RAG for code excerpts and `memories` for recalling indexing or previously found vulnerabilities.
+      - Focus only on critical/high severity vulnerabilities.
+      - For each vulnerability:
+        * Severity level (high or critical)
+        * Detailed explanation with data flow and evidence from RAG
+        * Approximate file/line references
+      - If vulnerability found, insert a summary into `memories`.
+      - If no vulnerabilities, explicitly say so.
+      
+      The final response starts with "Proposal:" on its own line.
+    user_prompt: |
+      Steps:
+      1. `fs` list and segment read files, `rag` index each segment.
+      2. Use `memories` insert to keep track of indexed files and partial findings.
+      3. Once done, query `rag` for vulnerabilities, recall indexing state or previous insights via `memories`.
+      4. Provide final "Proposal:" with a comprehensive vulnerability list or indicate none found.
+
+  reviewer:
+    strategy: "strict"
+    system_prompt: |
+      You are a strict security reviewer.
+      Check that:
+      - All code indexed via RAG before analysis
+      - Vulnerabilities only reported with RAG evidence
+      - High/critical severity only
+      - Data flows analyzed
+      - `memories` used to maintain coherence and avoid repetition
+    user_prompt: |
+      If correct and complete, respond "Approved".
+      Otherwise, "Revise:" with issues.
+
+  validator:
+    strategy: "comprehensive"
+    system_prompt: |
+      You are the final validator.
+      If correct, "Validated".
+      If not, "Not valid:" plus explanation.
+    user_prompt: |
+      Validate the final audit.
+
+  formatter:
+    system_prompt: |
+      Formatting specialist:
+      Produce Markdown report:
+      - Title
+      - Table of contents
+      - Sections per vulnerability (severity, explanation, file refs, code excerpts)
+    user_prompt: |
+      Produce the Markdown report with all required details.
+
+modules:
+  - name: "fs"
+    version: "1.0"
+  - name: "rag"
+    version: "1.0"
+  - name: "memories"
+    version: "1.0"
+
+workflow:
+  steps:
+    - from: "proposer"
+      to: "reviewer"
+      condition: "proposal_generated"
+    - from: "reviewer"
+      to: "proposer"
+      condition: "revision_requested"
+    - from: "reviewer"
+      to: "validator"
+      condition: "approved"
+    - from: "validator"
+      to: "proposer"
+      condition: "revision_requested"
+    - from: "validator"
+      to: "formatter"
+      condition: "validated"
+    - from: "formatter"
+      to: "completed"
+      condition: "exported"
+
+parameters:
+  llm_model: "claude-3-5-sonnet-20240620"
+  llm_provider: "anthropic"
+  export_conversation: true
+  embedder:
+    model: "text-embedding-3-small"
+  post_completion_feedback: false
+
+output:
+  format: "markdown"
+  file: "exports/audit-large-report.md"
