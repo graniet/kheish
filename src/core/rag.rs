@@ -2,7 +2,6 @@ use crate::llm::Embedder;
 use async_trait::async_trait;
 use std::error::Error;
 use std::fmt::Debug;
-use tracing::info;
 
 /// A document with its embedding vector representation
 #[derive(Clone, Debug)]
@@ -126,10 +125,8 @@ impl<E: Debug + Embedder + Send + Sync> VectorStoreProvider for InMemoryVectorSt
     async fn search_documents(
         &self,
         query: &str,
-        top_k: usize,
+        _top_k: usize,
     ) -> Result<Vec<DocumentEmbedding>, Box<dyn Error>> {
-        info!("Searching for documents with query: {}", query);
-        info!("top_K: {:?}", top_k);
         let query_embedding = self.embedder.embed_text(query).await?;
         let mut scored: Vec<(f32, &DocumentEmbedding)> = Vec::new();
         for doc in &self.documents {
