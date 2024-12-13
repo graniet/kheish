@@ -1,4 +1,6 @@
-use crate::modules::{FileSystemModule, Module, ShModule, VectorStoreModule, WebModule};
+use crate::modules::{
+    FileSystemModule, MemoriesModule, Module, ShModule, VectorStoreModule, WebModule,
+};
 use tracing::debug;
 
 /// Manages the loading and access of modules in the system
@@ -40,6 +42,7 @@ impl ModulesManager {
                     Box::new(ShModule::new(allowed_commands)) as Box<dyn Module>
                 }),
                 "rag" => Some(Box::new(VectorStoreModule) as Box<dyn Module>),
+                "memories" => Some(Box::new(MemoriesModule) as Box<dyn Module>),
                 _ => {
                     eprintln!("Unknown module: {}", mc.name);
                     None
