@@ -1,4 +1,4 @@
-use crate::modules::{FileSystemModule, Module, ShModule, VectorStoreModule};
+use crate::modules::{FileSystemModule, Module, ShModule, VectorStoreModule, WebModule};
 use tracing::info;
 
 /// Manages the loading and access of modules in the system
@@ -26,6 +26,7 @@ impl ModulesManager {
                     }
                     Some(Box::new(FileSystemModule) as Box<dyn Module>)
                 }
+                "web" => Some(Box::new(WebModule::new()) as Box<dyn Module>),
                 "sh" => mc.config.map(|conf| {
                     let allowed_commands = conf
                         .get("allowed_commands")
