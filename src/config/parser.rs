@@ -2,7 +2,7 @@ use super::TaskConfig;
 use std::error::Error;
 use std::fs;
 
-use tracing::info;
+use tracing::debug;
 
 /// Loads and parses a task configuration from a YAML file
 ///
@@ -22,6 +22,6 @@ use tracing::info;
 pub fn load_task_config(file_path: &str) -> Result<TaskConfig, Box<dyn Error>> {
     let yaml_str = fs::read_to_string(file_path)?;
     let task_config: TaskConfig = serde_yaml::from_str(&yaml_str)?;
-    info!("Loaded task configuration: {:?}", task_config.name);
+    debug!("Loaded task configuration: {:?}", task_config.name);
     Ok(task_config)
 }
