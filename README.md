@@ -20,6 +20,16 @@
   
 - **Modular and Extensible:** Add new modules or agents without breaking the existing structure. The architecture encourages customization and scaling to new tasks or domains.
 
+## Example Task
+
+| Task | Description |
+|------|-------------|
+| `audit-code` | Performs a comprehensive security audit of a project with vulnerability detection and detailed reporting |
+| `audit-code-large` | Security audit optimized for large projects using RAG and memory management |
+| `find-in-file` | Searches for a secret string within files in a filesystem using allowed shell commands |
+| `hf-secret-finder` | Scans Hugging Face repositories for potential secrets using trufflehog |
+| `weather-blog-post` | Retrieves weather data and creates a humorous English blog post about Paris weather |
+
 ## Roadmap
 
 - Add support for more LLM providers.
@@ -55,16 +65,6 @@ Kheish orchestrates a **Task Manager** that:
 </p>
 
 The diagram above illustrates how the **TaskManager** orchestrates agents, modules, and the LLM client. The `Workflow` steps guide the transitions between agents, while `ModulesManager` handles on-demand operations (like file reads or vector store queries). The `LlmClient` integrates with vector stores for RAG, ensuring scalable handling of large contexts.
-
-## Example Task
-
-| Task | Description |
-|------|-------------|
-| `audit-code` | Performs a comprehensive security audit of a project with vulnerability detection and detailed reporting |
-| `audit-code-large` | Security audit optimized for large projects using RAG and memory management |
-| `find-in-file` | Searches for a secret string within files in a filesystem using allowed shell commands |
-| `hf-secret-finder` | Scans Hugging Face repositories for potential secrets using trufflehog |
-| `weather-blog-post` | Retrieves weather data and creates a humorous English blog post about Paris weather |
 
 ## Installation & Setup
 
