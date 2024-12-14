@@ -24,11 +24,11 @@
 
 | Task | Description |
 |------|-------------|
-| `audit-code` | Performs a comprehensive security audit of a project with vulnerability detection and detailed reporting |
-| `audit-code-large` | Security audit optimized for large projects using RAG and memory management |
-| `find-in-file` | Searches for a secret string within files in a filesystem using allowed shell commands |
-| `hf-secret-finder` | Scans Hugging Face repositories for potential secrets using trufflehog |
-| `weather-blog-post` | Retrieves weather data and creates a humorous English blog post about Paris weather |
+| [`audit-code`](examples/tasks/audit-code/task.yaml) | Performs a comprehensive security audit of a project with vulnerability detection and detailed reporting |
+| [`audit-code-large`](examples/tasks/audit-code-large/task.yaml) | Security audit optimized for large projects using RAG and memory management |
+| [`find-in-file`](examples/tasks/find-in-file/task.yaml) | Searches for a secret string within files in a filesystem using allowed shell commands |
+| [`hf-secret-finder`](examples/tasks/hf-secret-finder/task.yaml) | Scans Hugging Face repositories for potential secrets using trufflehog |
+| [`weather-blog-post`](examples/tasks/weather-blog-post/task.yaml) | Retrieves weather data and creates a humorous English blog post about Paris weather |
 
 ## Roadmap
 
