@@ -58,29 +58,13 @@ The diagram above illustrates how the **TaskManager** orchestrates agents, modul
 
 ## Example Task
 
-A sample YAML might look like:
-```yaml
-name: audit-code
-description: "Perform a thorough security audit of the provided PHP code."
-context:
-  - kind: text
-    content: "Please audit the code..."
-agents:
-  proposer:
-    system_prompt: "You are a security code auditor..."
-    user_prompt: "Analyze the code..."
-workflow:
-  steps:
-    - from: "proposer" to: "reviewer" condition: "proposal_generated"
-    - from: "reviewer" to: "validator" condition: "approved"
-    - from: "validator" to: "formatter" condition: "validated"
-    - from: "formatter" to: "completed" condition: "exported"
-output:
-  format: "markdown"
-  file: "audit-report.md"
-```
-
-Run the task, and Kheish will guide the LLM through proposing a security audit, receiving feedback, validating, and finally formatting the result.
+| Task | Description |
+|------|-------------|
+| `audit-code` | Performs a comprehensive security audit of a project with vulnerability detection and detailed reporting |
+| `audit-code-large` | Security audit optimized for large projects using RAG and memory management |
+| `find-in-file` | Searches for a secret string within files in a filesystem using allowed shell commands |
+| `hf-secret-finder` | Scans Hugging Face repositories for potential secrets using trufflehog |
+| `weather-blog-post` | Retrieves weather data and creates a humorous English blog post about Paris weather |
 
 ## Installation & Setup
 

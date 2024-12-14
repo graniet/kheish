@@ -1,0 +1,95 @@
+name: weather-blogpost
+description: "Retrieve weather data for Paris and create a humorous English blog post about it."
+version: "1.0"
+
+context:
+  - kind: text
+    content: >
+      You need to: 
+      1. Retrieve the current weather data for Paris using a weather free API like open-meteo.com without any API key (e.g., `curl` a known weather API endpoint).
+      2. Parse the received JSON data to extract key weather details (temperature, conditions, etc.).
+      3. Using this data, write a humorous, lighthearted blog post in English about today's weather in Paris. 
+      4. The blog post should be fun, maybe personify the weather, or poke gentle fun at typical Parisian stereotypes.
+      5. Start your final response with "Proposal:" followed by the blog post text.
+    alias: "task_instructions"
+
+agents:
+  proposer:
+    strategy: "explorative"
+    system_prompt: |
+      You are a creative and humorous content writer who also knows how to make API calls via shell commands using the `sh` module.
+
+      Steps:
+      1. Use `sh run curl <endpoint>` to get the weather data for Paris from the provided weather API URL.
+      2. Parse the JSON output (no direct JSON parsing tools, but you can reason through the text) to find key info: current temperature, weather conditions.
+      3. Write a humorous, English-language blog post about today's Paris weather, making it entertaining and fun. Mention the weather details you found.
+      
+      Your final answer must start with "Proposal:" and then include the blog post. Keep it under a few paragraphs, playful and witty.
+    user_prompt: |
+      Retrieve Paris weather data via the provided API, then create a humorous blog post about today's weather. 
+      Start the final answer with "Proposal:".
+      Example humor: "Parisian weather sipping espresso," "the clouds wearing berets," etc.
+      explain how you got the weather data and how you parsed it.
+
+  reviewer:
+    strategy: "strict"
+    system_prompt: |
+      You are the reviewer. Check that:
+      - The weather data was actually retrieved and used.
+      - The final post is humorous, in English, and mentions weather details.
+      If correct, respond 'Approved'. Otherwise, 'Revise:' plus what to fix.
+    user_prompt: |
+      Verify the proposal. Respond 'Approved' if it meets criteria, otherwise 'Revise:' plus instructions.
+
+  validator:
+    strategy: "comprehensive"
+    system_prompt: |
+      You are the validator. If the final blog post is correct and meets requirements (humorous, uses weather data, etc.), respond 'Validated'. Otherwise 'Not valid:' plus reason.
+    user_prompt: |
+      Validate the final proposal.
+
+  formatter:
+    system_prompt: |
+      You are a formatting specialist.
+      Format the validated blog post into a markdown file:
+      - Title: "Paris Weather Report"
+      - A short introduction
+      - The humorous blog post content in a readable format
+    user_prompt: |
+      Produce the final blog post in Markdown, including a title and a brief intro before the main content.
+
+modules:
+  - name: "sh"
+    version: "1.0"
+    config:
+      allowed_commands: ["curl"]
+
+workflow:
+  steps:
+    - from: "proposer"
+      to: "reviewer"
+      condition: "proposal_generated"
+    - from: "reviewer"
+      to: "proposer"
+      condition: "revision_requested"
+    - from: "reviewer"
+      to: "validator"
+      condition: "approved"
+    - from: "validator"
+      to: "proposer"
+      condition: "revision_requested"
+    - from: "validator"
+      to: "formatter"
+      condition: "validated"
+    - from: "formatter"
+      to: "completed"
+      condition: "exported"
+
+parameters:
+  llm_model: "gpt-4o"
+  llm_provider: "openai"
+  export_conversation: true
+
+output:
+  format: "markdown"
+  file: "exports/paris-weather-blogpost.md"
