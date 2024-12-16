@@ -3,7 +3,7 @@ use crate::constants::SYSTEM_PROMPT_TASK_CONFIG;
 use crate::llm::{ChatMessage, LlmClient};
 use chrono::Local;
 use colored::*;
-use dialoguer::{Input, theme::ColorfulTheme};
+use dialoguer::{theme::ColorfulTheme, Input};
 use serde_yaml;
 use std::fs;
 use std::path::Path;
@@ -78,7 +78,7 @@ pub async fn generate_task_config_from_user(
 
     loop {
         println!("{}", "⏳ Generating configuration...".cyan().italic());
-        
+
         let mut response = llm_client
             .call_llm_api(messages.clone())
             .await
@@ -106,22 +106,29 @@ pub async fn generate_task_config_from_user(
                 match serde_yaml::from_str::<TaskConfig>(&yaml_content) {
                     Ok(config) => {
                         display_header("✅ Configuration Validated");
-                        
+
                         match save_task_config(&yaml_content) {
-                            Ok(filename) => println!("{} Configuration saved to {}", 
-                                "✓".green(), filename.bold()),
-                            Err(e) => println!("{} Error saving configuration: {}", 
-                                "✗".red(), e),
+                            Ok(filename) => println!(
+                                "{} Configuration saved to {}",
+                                "✓".green(),
+                                filename.bold()
+                            ),
+                            Err(e) => println!("{} Error saving configuration: {}", "✗".red(), e),
                         }
 
                         println!("{}", SEPARATOR);
                         return config;
                     }
                     Err(e) => {
-                        println!("\n{} YAML validation error:\n{}", 
-                            "⚠️".red().bold(), e.to_string().red());
-                        messages.push(ChatMessage::new("user", 
-                            "The YAML is invalid. Please provide a valid configuration."));
+                        println!(
+                            "\n{} YAML validation error:\n{}",
+                            "⚠️".red().bold(),
+                            e.to_string().red()
+                        );
+                        messages.push(ChatMessage::new(
+                            "user",
+                            "The YAML is invalid. Please provide a valid configuration.",
+                        ));
                         continue;
                     }
                 }
@@ -129,8 +136,10 @@ pub async fn generate_task_config_from_user(
         }
 
         println!("{} Invalid format, retrying...", "⚠️".yellow());
-        messages.push(ChatMessage::new("user", 
-            "Please provide the YAML in a proper ```yaml ... ``` code block."));
+        messages.push(ChatMessage::new(
+            "user",
+            "Please provide the YAML in a proper ```yaml ... ``` code block.",
+        ));
     }
 }
 
@@ -147,7 +156,7 @@ pub async fn generate_task_config_from_user(
 fn extract_and_validate_yaml(response: &str) -> Option<(String, bool)> {
     let yaml_start = response.find("```")?;
     let yaml_end = response[yaml_start + 3..].find("```")?;
-    
+
     let yaml_content = response[yaml_start + 3..yaml_start + 3 + yaml_end]
         .trim()
         .replace("yaml", "")
