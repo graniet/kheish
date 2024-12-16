@@ -31,8 +31,8 @@ async fn main() {
     let mut task_manager = match cli.task_config {
         None => TaskManager::new_without_task().await,
         Some(task_path) => {
-            let config = config::load_task_config(&task_path)
-                .expect("Failed to parse task configuration");
+            let config =
+                config::load_task_config(&task_path).expect("Failed to parse task configuration");
             TaskManager::new(&config)
         }
     };
