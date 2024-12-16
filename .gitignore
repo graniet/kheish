@@ -4,3 +4,4 @@ logs/*.json
 logs/*.log
 exports/*.md
 rec/*
+tasks/*.yaml

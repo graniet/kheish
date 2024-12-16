@@ -29,6 +29,7 @@
 | [`find-in-file`](examples/tasks/find-in-file/task.yaml) | Searches for a secret string within files in a filesystem using allowed shell commands |
 | [`hf-secret-finder`](examples/tasks/hf-secret-finder/task.yaml) | Scans Hugging Face repositories for potential secrets using trufflehog |
 | [`weather-blog-post`](examples/tasks/weather-blog-post/task.yaml) | Retrieves weather data and creates a humorous English blog post about Paris weather |
+| [`find-and-send-secret`](examples/tasks/find-and-send-secret/task.yaml) | Searches for a secret string within files in a filesystem using allowed shell commands and sends it to a webhook |
 
 ## Roadmap
 

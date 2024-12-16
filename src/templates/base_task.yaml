@@ -1,0 +1,119 @@
+name: base-task
+description: "Base task for all tasks."
+version: "1.0"
+
+# exemple of context definition
+context:
+  # if you need to provide a text, you can define a text context
+  - kind: text
+    content: "Find a secret in a file in the filesystem. The secret is actually present in one of the files. Ensure that you do not rely solely on filenames or directory names containing 'flag' or 'secret'. You must confirm by reading the file's content. The file containing the secret will have non-empty content and clearly contain the secret string. Important: The secret is not a api key or a password, it's a string that is not a secret."
+    alias: "task_instructions"
+  # if you need to provide a file, you can define a file context
+  - kind: file
+    content: "/your/base/path/file.txt"
+    alias: "base_path"
+  # if you need to provide a text, you can define a text context
+  - kind: text
+    content: "base path : /your/base/path"
+    alias: "base_path"
+  # if you need to ask the user for input, you can define a user_input context
+  - kind: user_input
+    content: "Enter the base path"
+    alias: "base_path_input"
+
+# exemple of agent definition
+# follow the pattern to define your own agents, do not change the name of the agent
+agents:
+  proposer:
+    strategy: "explorative"
+    system_prompt: |
+      You are an expert in filesystem navigation. You must absolutely find the file containing the secret. 
+      - Before announcing the final file, you must clearly show the `cat` output and prove it contains the secret.
+      - Do not invent content. If you don't find it, keep searching. The secret is guaranteed to be present in a single, non-empty file and clearly identifiable.
+    user_prompt: |
+      Find the file that actually contains the secret. 
+      Return:
+      1. Its absolute path
+      2. Its full contents
+      Make sure the file you choose is not empty and the secret is truly inside it. 
+      Avoid false positives.
+
+  reviewer:
+    strategy: "strict"
+    system_prompt: |
+      You are a strict reviewer verifying the correctness of the found file and its contents.
+      Check that:
+      - The provided path is absolute and correct.
+      - The file is not empty and indeed contains the secret (not just a misleading filename).
+      - The proposer used only allowed commands and actually read the file (via 'cat') to confirm the secret.
+      If correct, respond 'Approved'. If not, 'Revise:' plus what is wrong.
+    user_prompt: |
+      Verify that the chosen file is actually correct and contains the secret in its content.
+      If correct, respond 'Approved'. Otherwise 'Revise:' plus what needs correction.
+
+  validator:
+    strategy: "comprehensive"
+    system_prompt: |
+      You are a final validator. Confirm that the final chosen file is indeed correct, absolute, and that its contents show the secret clearly. 
+      If correct, respond 'Validated'. If not, 'Not valid:' plus why.
+    user_prompt: |
+      Confirm the final file is correct and contains the secret. If yes, respond only with 'Validated'. If no, 'Not valid:' plus explanation.
+
+  formatter:
+    system_prompt: |
+      You are a formatting specialist. Present the final path and the file's contents in markdown code blocks. 
+      The first code block: the full absolute path.
+      The second code block: the full file contents.
+    user_prompt: |
+      Format the validated result as two markdown code blocks:
+      1. The absolute file path
+      2. The full file contents
+
+# exemple of module definition
+# available modules are : fs, rag, sh, ssh
+modules:
+  - name: fs
+    version: "1.0"
+  - name: "rag"
+    version: "1.0"
+  - name: "sh"
+    version: "1.0"
+    config:
+      allowed_commands: ["ls", "cat", "echo", "pwd"]
+
+# exemple of workflow definition
+# follow the pattern to define your own workflow, do not change the name of the workflow
+# do not change the name of the steps, they are used by the task manager to know the order of the steps
+workflow:
+  steps:
+    - from: "proposer"
+      to: "reviewer"
+      condition: "proposal_generated"
+    - from: "reviewer"
+      to: "proposer"
+      condition: "revision_requested"
+    - from: "reviewer"
+      to: "validator"
+      condition: "approved"
+    - from: "validator"
+      to: "proposer"
+      condition: "revision_requested"
+    - from: "validator"
+      to: "formatter"
+      condition: "validated"
+    - from: "formatter"
+      to: "completed"
+      condition: "exported"
+
+# exemple of parameters definition
+parameters:
+  llm_model: "claude-3-5-sonnet-20240620"
+  llm_provider: "anthropic"
+  export_conversation: true
+  embedder:
+    model: "text-embedding-3-small"
+
+# exemple of output definition
+output:
+  format: "markdown"
+  file: "exports/find-in-file.md"

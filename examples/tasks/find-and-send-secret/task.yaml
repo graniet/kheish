@@ -1,0 +1,83 @@
+name: find-and-send-secret-task
+description: "Task to find a secret string in a directory and send it to a webhook."
+version: "1.0"
+
+context:
+  - kind: text
+    content: "Find a secret string located inside this repositories or sub directory. and set it to webhook url."
+    alias: "task_instructions"
+  - kind: text
+    content: "/your/path/to/search"
+    alias: "base_path"
+  - kind: text
+    content: "http://awesome/"
+    alias: "webhook_url"
+
+agents:
+  proposer:
+    strategy: "explorative"
+    system_prompt: |
+      You are an expert in filesystem navigation. You must find the file containing the secret and send it to the specified webhook URL. 
+      - Before announcing the final file, you must clearly show the `cat` output and prove it contains the secret.
+      - Use the 'http' module to send a POST request to the webhook URL with the secret as the body.
+      - Do not invent content. If you don't find it, keep searching. The secret is guaranteed to be present in a single, non-empty file and clearly identifiable.
+    user_prompt: |
+      Find the file that contains the secret. 
+      Send the secret to the specified webhook URL.
+
+  reviewer:
+    strategy: "strict"
+    system_prompt: |
+      You are a strict reviewer verifying the correctness of the found file and its contents.
+      Check that:
+      - The provided path is absolute and correct.
+      - The file is not empty and indeed contains the secret (not just a misleading filename).
+      - The proposer used only allowed commands and actually read the file (via 'cat') to confirm the secret.
+      - A POST request was made to the correct webhook URL with the secret as the body.
+      If correct, respond 'Approved'. If not, 'Revise:' plus what is wrong.
+    user_prompt: |
+      Verify that the chosen file is correct, contains the secret, and that the secret was sent to the correct webhook URL.
+
+  validator:
+    strategy: "comprehensive"
+    system_prompt: |
+      You are a final validator. Confirm that the final chosen file is indeed correct, absolute, and that its contents show the secret clearly. 
+      Confirm that the secret was sent to the correct webhook URL.
+      If correct, respond 'Validated'. If not, 'Not valid:' plus why.
+    user_prompt: |
+      Confirm the final file is correct, contains the secret, and that the secret was successfully sent to the webhook URL.
+
+modules:
+  - name: fs
+    version: "1.0"
+  - name: "sh"
+    version: "1.0"
+    config:
+      allowed_commands: ["ls", "cat", "grep", "find"]
+  - name: "http"
+    version: "1.0"
+
+workflow:
+  steps:
+    - from: "proposer"
+      to: "reviewer"
+      condition: "proposal_generated"
+    - from: "reviewer"
+      to: "proposer"
+      condition: "revision_requested"
+    - from: "reviewer"
+      to: "validator"
+      condition: "approved"
+    - from: "validator"
+      to: "proposer"
+      condition: "revision_requested"
+    - from: "validator"
+      to: "completed"
+      condition: "validated"
+
+parameters:
+  llm_model: "claude-3-5-sonnet-20240620"
+  llm_provider: "anthropic"
+  export_conversation: true
+  embedder:
+    model: "text-embedding-3-small"

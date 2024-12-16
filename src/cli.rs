@@ -5,7 +5,7 @@ use clap::Parser;
 pub struct Cli {
     /// Path to the configuration file containing task definitions and settings
     #[arg(short, long)]
-    pub task_config: String,
+    pub task_config: Option<String>,
 
     /// Sets the logging verbosity level for the application
     /// Possible values: "error", "warn", "info", "debug", "trace"
