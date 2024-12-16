@@ -4,7 +4,6 @@ use crate::llm::{ChatMessage, LlmClient};
 use chrono::Local;
 use colored::*;
 use dialoguer::{theme::ColorfulTheme, Input};
-use serde_yaml;
 use std::fs;
 use std::path::Path;
 
