@@ -2,11 +2,14 @@ use super::context::process_task_context;
 use crate::config::TaskConfig;
 use crate::core::rag::InMemoryVectorStore;
 use crate::core::task::Task;
+use crate::core::task_generation::generate_task_config_from_user;
 use crate::core::workflow::Workflow;
 use crate::llm::{ChatMessage, LlmClient, OpenAIEmbedder};
 use crate::modules::ModulesManager;
 use crate::utils;
-use indicatif::{ProgressBar, ProgressStyle};
+use colored::*;
+use dialoguer::Input;
+use indicatif::ProgressBar;
 use std::collections::HashMap;
 
 /// Manages the execution of a task by coordinating agents, modules, and workflow.
@@ -33,6 +36,31 @@ pub struct TaskManager {
 }
 
 impl TaskManager {
+    pub async fn new_without_task() -> Self {
+        println!("{}", "No task configuration provided, please enter a short description of what you want to do.".yellow());
+
+        let user_request: String = Input::new()
+            .with_prompt("Kheish")
+            .interact_text()
+            .expect("Failed to read user input");
+
+        print!("\x1B[2J\x1B[1;1H");
+
+        println!(
+            "{}",
+            "Great! I'll try to begin a task that matches your description.".green()
+        );
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        print!("\x1B[2J\x1B[1;1H");
+
+        let llm_client = LlmClient::new("openai", "gpt-4o").expect("Failed to create LLM client");
+        let config: TaskConfig = generate_task_config_from_user(&user_request, &llm_client).await;
+
+        Self::from_config(&config)
+    }
+
     /// Creates a new TaskManager instance with the provided configuration.
     ///
     /// # Arguments
@@ -41,6 +69,11 @@ impl TaskManager {
     /// # Returns
     /// * `Self` - Configured TaskManager instance ready for task execution
     pub fn new(config: &TaskConfig) -> Self {
+        Self::from_config(config)
+    }
+
+    /// Internal helper function to avoid code duplication in `new` and `new_without_task`.
+    fn from_config(config: &TaskConfig) -> Self {
         let llm_provider = config
             .parameters
             .llm_provider
@@ -70,15 +103,7 @@ impl TaskManager {
             .push(ChatMessage::new("system", &system_instructions));
 
         let spinner = ProgressBar::new_spinner();
-        spinner.enable_steady_tick(std::time::Duration::from_millis(120));
-        spinner.set_style(
-            ProgressStyle::default_spinner()
-                .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
-                .template("{spinner} [{elapsed_precise}] {msg}")
-                .expect("Failed to set spinner template"),
-        );
-
-        Self {
+        let mut manager = Self {
             task,
             workflow,
             modules_manager,
@@ -90,6 +115,8 @@ impl TaskManager {
             retry_count: 0,
             max_retries: config.parameters.max_retries.unwrap_or(3),
             spinner,
-        }
+        };
+        manager.init_spinner();
+        manager
     }
 }
