@@ -56,6 +56,10 @@ Kheish orchestrates a **Task Manager** that:
    - `fs`: read/list files
    - `sh`: run allowed shell commands
    - `vector_store`: semantic search
+   - `http`: send a request to a host
+   - `memories`: store and retrieve information
+   - `ssh`: run allowed ssh commands
+   
    
    Results are cached to avoid redundant operations.
 
