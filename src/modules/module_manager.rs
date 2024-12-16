@@ -1,5 +1,5 @@
 use crate::modules::{
-    FileSystemModule, MemoriesModule, Module, ShModule, SshModule, VectorStoreModule, WebModule,
+    FileSystemModule, HttpModule, MemoriesModule, Module, ShModule, SshModule, VectorStoreModule,
 };
 use tracing::debug;
 
@@ -29,7 +29,7 @@ impl ModulesManager {
                     Some(Box::new(FileSystemModule) as Box<dyn Module>)
                 }
                 "ssh" => Some(Box::new(SshModule) as Box<dyn Module>),
-                "web" => Some(Box::new(WebModule::new()) as Box<dyn Module>),
+                "http" => Some(Box::new(HttpModule::new()) as Box<dyn Module>),
                 "sh" => mc.config.map(|conf| {
                     let allowed_commands = conf
                         .get("allowed_commands")
