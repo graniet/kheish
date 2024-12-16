@@ -1,25 +1,22 @@
 use super::context::process_task_context;
-use crate::config::TaskConfig;
-use crate::core::rag::InMemoryVectorStore;
-use crate::core::task::Task;
-use crate::core::task_generation::generate_task_config_from_user;
-use crate::core::workflow::Workflow;
-use crate::llm::{ChatMessage, LlmClient, OpenAIEmbedder};
-use crate::modules::ModulesManager;
-use crate::utils;
+use crate::{
+    config::TaskConfig,
+    core::{
+        rag::InMemoryVectorStore, task::Task, task_generation::generate_task_config_from_user,
+        workflow::Workflow,
+    },
+    llm::{ChatMessage, LlmClient, OpenAIEmbedder},
+    modules::ModulesManager,
+    utils,
+};
 use colored::*;
-use dialoguer::Input;
+use dialoguer::{theme::ColorfulTheme, Input};
 use indicatif::ProgressBar;
 use std::collections::HashMap;
 
-/// Manages the execution of a task by coordinating agents, modules, and workflow.
-///
-/// Handles:
-/// - Task state and context management
-/// - Workflow execution and agent coordination
-/// - Module request handling and caching
-/// - LLM client interactions
-/// - Progress display and user feedback
+const DEFAULT_MAX_RETRIES: usize = 3;
+const DEFAULT_EMBEDDER_MODEL: &str = "text-embedding-3-small";
+
 #[derive(Debug)]
 pub struct TaskManager {
     pub task: Task,
@@ -37,43 +34,78 @@ pub struct TaskManager {
 
 impl TaskManager {
     pub async fn new_without_task() -> Self {
-        println!("{}", "No task configuration provided, please enter a short description of what you want to do.".yellow());
+        Self::display_welcome_message();
 
-        let user_request: String = Input::new()
-            .with_prompt("Kheish")
-            .interact_text()
-            .expect("Failed to read user input");
+        let user_input = Self::get_user_input();
+        Self::clear_screen();
 
-        print!("\x1B[2J\x1B[1;1H");
-
-        println!(
-            "{}",
-            "Great! I'll try to begin a task that matches your description.".green()
-        );
-
+        Self::display_processing_message();
         std::thread::sleep(std::time::Duration::from_secs(1));
+        Self::clear_screen();
 
-        print!("\x1B[2J\x1B[1;1H");
+        let llm_client = LlmClient::new("openai", "gpt-4").expect("Failed to create LLM client");
 
-        let llm_client = LlmClient::new("openai", "gpt-4o").expect("Failed to create LLM client");
-        let config: TaskConfig = generate_task_config_from_user(&user_request, &llm_client).await;
-
+        let config = generate_task_config_from_user(&user_input, &llm_client).await;
         Self::from_config(&config)
     }
 
-    /// Creates a new TaskManager instance with the provided configuration.
-    ///
-    /// # Arguments
-    /// * `config` - Task configuration containing parameters, workflow steps, and module settings
-    ///
-    /// # Returns
-    /// * `Self` - Configured TaskManager instance ready for task execution
+    fn display_welcome_message() {
+        println!("{}", "\n🤖 Welcome to the Task Manager!".bold().cyan());
+        println!(
+            "{}",
+            "Please briefly describe what you would like to do.".yellow()
+        );
+    }
+
+    fn get_user_input() -> String {
+        Input::with_theme(&ColorfulTheme::default())
+            .with_prompt("📝 Your task")
+            .interact_text()
+            .expect("Failed to read input")
+    }
+
+    fn clear_screen() {
+        print!("\x1B[2J\x1B[1;1H");
+    }
+
+    fn display_processing_message() {
+        println!(
+            "{}",
+            "✨ Excellent! Starting to analyze your request...".green()
+        );
+    }
+
     pub fn new(config: &TaskConfig) -> Self {
         Self::from_config(config)
     }
 
-    /// Internal helper function to avoid code duplication in `new` and `new_without_task`.
     fn from_config(config: &TaskConfig) -> Self {
+        let (llm_provider, llm_model) = Self::extract_llm_config(config);
+        let vector_store = Self::initialize_vector_store(config);
+        let llm_client = Self::create_llm_client(llm_provider, llm_model);
+
+        let task = Self::create_task(config);
+        let modules_manager = ModulesManager::new(config.modules.clone());
+
+        let mut manager = Self {
+            task,
+            workflow: Workflow::new(config.workflow.steps.clone()),
+            modules_manager,
+            config: config.clone(),
+            llm_client,
+            module_results_cache: HashMap::new(),
+            revision_count: 0,
+            vector_store,
+            retry_count: 0,
+            max_retries: config.parameters.max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
+            spinner: ProgressBar::new_spinner(),
+        };
+
+        manager.init_spinner();
+        manager
+    }
+
+    fn extract_llm_config(config: &TaskConfig) -> (&str, &str) {
         let llm_provider = config
             .parameters
             .llm_provider
@@ -84,39 +116,32 @@ impl TaskManager {
             .llm_model
             .as_deref()
             .expect("LLM model is required");
+        (llm_provider, llm_model)
+    }
 
-        let context = process_task_context(config);
-        let workflow = Workflow::new(config.workflow.steps.clone());
-        let modules_manager = ModulesManager::new(config.modules.clone());
+    fn initialize_vector_store(config: &TaskConfig) -> InMemoryVectorStore<OpenAIEmbedder> {
         let embedder_config = config.parameters.embedder.clone().unwrap_or_default();
         let embedder_model = embedder_config
             .model
-            .unwrap_or("text-embedding-3-small".to_string());
-        let vector_store = InMemoryVectorStore::new(OpenAIEmbedder::new(&embedder_model).unwrap());
-        let llm_client =
-            LlmClient::new(llm_provider, llm_model).expect("Failed to create LLM client");
+            .unwrap_or(DEFAULT_EMBEDDER_MODEL.to_string());
+        InMemoryVectorStore::new(OpenAIEmbedder::new(&embedder_model).unwrap())
+    }
 
+    fn create_llm_client(provider: &str, model: &str) -> LlmClient {
+        LlmClient::new(provider, model).expect("Failed to create LLM client")
+    }
+
+    fn create_task(config: &TaskConfig) -> Task {
+        let context = process_task_context(config);
         let mut task = Task::new(config.name.clone(), context);
-        let system_instructions =
-            utils::generate_system_instructions(&config.agents, &modules_manager);
+
+        let system_instructions = utils::generate_system_instructions(
+            &config.agents,
+            &ModulesManager::new(config.modules.clone()),
+        );
         task.conversation
             .push(ChatMessage::new("system", &system_instructions));
 
-        let spinner = ProgressBar::new_spinner();
-        let mut manager = Self {
-            task,
-            workflow,
-            modules_manager,
-            config: config.clone(),
-            llm_client,
-            module_results_cache: HashMap::new(),
-            revision_count: 0,
-            vector_store,
-            retry_count: 0,
-            max_retries: config.parameters.max_retries.unwrap_or(3),
-            spinner,
-        };
-        manager.init_spinner();
-        manager
+        task
     }
 }
