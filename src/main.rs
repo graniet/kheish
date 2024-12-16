@@ -15,25 +15,27 @@ mod modules;
 mod utils;
 
 use clap::Parser;
+use core::TaskManager;
 use tracing::warn;
 
 /// Main entry point that initializes and runs the application
 #[tokio::main]
 async fn main() {
-    // Parse command line arguments
     let cli = cli::Cli::try_parse().expect("Failed to parse CLI arguments");
     utils::init_logging(&cli.logging_level);
 
-    // Load environment variables from .env file
     if let Err(e) = dotenvy::dotenv() {
         warn!("Failed to load .env file: {}", e);
     }
 
-    // Load task configuration
-    let config =
-        config::load_task_config(&cli.task_config).expect("Failed to parse task configuration");
+    let mut task_manager = match cli.task_config {
+        None => TaskManager::new_without_task().await,
+        Some(task_path) => {
+            let config = config::load_task_config(&task_path)
+                .expect("Failed to parse task configuration");
+            TaskManager::new(&config)
+        }
+    };
 
-    // Initialize and run task manager
-    let mut task_manager = core::TaskManager::new(&config);
     task_manager.run().await;
 }
