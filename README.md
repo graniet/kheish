@@ -1,7 +1,7 @@
 # Kheish
 
 <p align="center">
-  <img src="docs/logo.png" alt="Kheish Logo" width="200">
+  <img src="docs/logo.png" alt="Kheish Logo" width="250">
 </p>
 
 **Kheish** is an open-source, pluggable multi-agent orchestration platform designed to tackle complex tasks using Large Language Models (LLMs). By leveraging multiple specialized "agents" and a flexible workflow, Kheish coordinates a variety of steps—proposal generation, reviewing, validation, formatting—to produce reliable, high-quality results. It seamlessly integrates external modules such as filesystem access, shell commands, or vector stores to enrich context and handle large codebases or documents with Retrieval-Augmented Generation (RAG).
