@@ -23,7 +23,6 @@
 /// ```
 use crate::core::rag::VectorStoreProvider;
 use crate::modules::{Module, ModuleAction};
-use dialoguer::{Confirm, Password};
 use dirs::home_dir;
 use once_cell::sync::Lazy;
 use std::process::{Command, Stdio};
@@ -72,7 +71,7 @@ fn check_key_passphrase_needed(key_path: &str) -> bool {
 
     if let Ok(out) = output {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        if stderr.to_lowercase().contains("enter passphrase") {
+        if stderr.to_lowercase().contains("passphrase") {
             return true;
         }
     }
@@ -107,47 +106,14 @@ fn run_ssh_command(base_cmd: &str, args: &[&str], session: &SshSession) -> Resul
         cmd.arg(a);
     }
 
-    if let Some(pass) = &session.passphrase {
-        if Command::new("sshpass").arg("-V").output().is_ok() {
-            let mut sshpass_cmd = Command::new("sshpass");
-            sshpass_cmd.arg("-p").arg(pass).arg(base_cmd);
-            if let Some(k) = &session.key {
-                sshpass_cmd.arg("-i").arg(k);
-            }
-            if base_cmd == "ssh" {
-                let full_target = format!(
-                    "{}@{}",
-                    session.user.as_ref().unwrap(),
-                    session.host.as_ref().unwrap()
-                );
-                sshpass_cmd.arg(full_target);
-            }
-            for a in args {
-                sshpass_cmd.arg(a);
-            }
+    let out = cmd.output().map_err(|e| e.to_string())?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
 
-            let out = sshpass_cmd.output().map_err(|e| e.to_string())?;
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-
-            if !stderr.trim().is_empty() {
-                Ok(format!("STDOUT:\n{}\n\nSTDERR:\n{}", stdout, stderr))
-            } else {
-                Ok(stdout.trim().to_string())
-            }
-        } else {
-            Err("Key requires a passphrase, but 'sshpass' is not installed. Please install it or provide a key without a passphrase.".into())
-        }
+    if !stderr.trim().is_empty() {
+        Ok(format!("STDOUT:\n{}\n\nSTDERR:\n{}", stdout, stderr))
     } else {
-        let out = cmd.output().map_err(|e| e.to_string())?;
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-
-        if !stderr.trim().is_empty() {
-            Ok(format!("STDOUT:\n{}\n\nSTDERR:\n{}", stdout, stderr))
-        } else {
-            Ok(stdout.trim().to_string())
-        }
+        Ok(stdout.trim().to_string())
     }
 }
 
@@ -203,26 +169,10 @@ impl Module for SshModule {
 
                 if let Some(k) = &session.key {
                     if check_key_passphrase_needed(k) {
-                        session.passphrase_required = true;
-                        println!("\nThe chosen key is passphrase-protected.");
-
-                        let confirmed = Confirm::new()
-                            .with_prompt("Do you want to provide the passphrase now?")
-                            .default(true)
-                            .interact()
-                            .map_err(|e| e.to_string())?;
-                        if confirmed {
-                            let pass = Password::new()
-                                .with_prompt("Enter your key passphrase")
-                                .interact()
-                                .map_err(|e| e.to_string())?;
-                            session.passphrase = Some(pass);
-                        } else {
-                            return Err(
-                                "Key requires a passphrase and none was provided. Cannot connect."
-                                    .into(),
-                            );
-                        }
+                        return Err(
+                            "Key requires a passphrase. Please use a key without a passphrase."
+                                .into(),
+                        );
                     }
                 }
 
