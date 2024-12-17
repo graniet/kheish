@@ -13,6 +13,7 @@ pub use validator::*;
 use tracing::debug;
 
 /// Represents the possible outcomes of an agent's execution
+#[derive(Debug, Clone)]
 pub enum AgentOutcome {
     /// A proposal was successfully generated
     ProposalGenerated,
@@ -40,7 +41,7 @@ pub trait AgentBehavior {
     ///
     /// # Returns
     /// The outcome of executing the step
-    async fn execute_step(&self, task: &mut crate::core::Task) -> AgentOutcome;
+    async fn execute_step(&self, mut task: crate::core::Task) -> (AgentOutcome, crate::core::Task);
 
     /// Parses a response string to check for module requests
     ///
