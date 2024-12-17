@@ -10,6 +10,7 @@ mod cli;
 mod config;
 mod constants;
 mod core;
+mod event;
 mod llm;
 mod modules;
 mod utils;
