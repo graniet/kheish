@@ -16,6 +16,7 @@ use uuid::Uuid;
 #[derive(Deserialize)]
 pub struct CreateTaskRequest {
     pub prompt: String,
+    pub interval: Option<String>,
 }
 
 /// Represents the response payload after successfully creating a task
@@ -63,6 +64,8 @@ pub async fn create_task(
 
     let logical_task_id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
+    let interval = payload.interval.unwrap_or_default();
+    let last_run_at = None;
 
     let db_id = repo
         .insert_task(
@@ -76,11 +79,13 @@ pub async fn create_task(
             None,
             None,
             None,
+            last_run_at,
+            Some(interval),
         )
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 
     Ok(Json(CreateTaskResponse {
-        status: "new".to_string(),
+        status: "New".to_string(),
         task_id: db_id,
         created_at: now,
     }))
