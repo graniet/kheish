@@ -67,6 +67,9 @@ pub struct AgentConfig {
     /// Optional user prompt for the agent
     #[serde(default)]
     pub user_prompt: Option<String>,
+    /// Optional schema for the agent
+    #[serde(default)]
+    pub schema: Option<String>,
 }
 
 /// Represents a single context item providing input data
