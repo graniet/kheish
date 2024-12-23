@@ -42,6 +42,7 @@ pub const FORMATTER_USER_PROMPT: &str = "You have access to the final solution a
 /// Maximum number of feedback iterations allowed for the proposer
 pub const MAX_PROPOSER_FEEDBACK_COUNT: usize = 50;
 
+/// System prompt for the task configuration module
 pub const SYSTEM_PROMPT_TASK_CONFIG: &str = concat!(
     "You are a friendly and helpful configuration expert for the Kheish framework. ",
     "Your goal is to produce a fully detailed TaskConfig in YAML form based on the user's request and a given template. ",
