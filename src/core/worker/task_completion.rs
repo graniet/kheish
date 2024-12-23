@@ -66,7 +66,11 @@ impl TaskWorker {
             // }
         }
 
-        task.state = TaskState::Completed;
+        if self.task.interval.is_some() {
+            task.state = TaskState::WaitingWakeUp;
+        } else {
+            task.state = TaskState::Completed;
+        }
 
         if let Some(manager_tx) = self.get_manager_tx() {
             let _ = manager_tx.send(Event::TaskStateUpdated(self.task_id.clone(), task.state));
