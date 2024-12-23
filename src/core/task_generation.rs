@@ -1,5 +1,6 @@
 use crate::config::TaskConfig;
 use crate::constants::SYSTEM_PROMPT_TASK_CONFIG;
+use crate::db::Task;
 use crate::llm::{ChatMessage, LlmClient};
 use chrono::Local;
 use colored::*;
@@ -163,4 +164,71 @@ fn extract_and_validate_yaml(response: &str) -> Option<(String, bool)> {
         .to_string();
 
     Some((yaml_content, true))
+}
+
+/// Generates a task configuration from a task model without user interaction
+///
+/// # Arguments
+/// * `task_model` - The task model to generate configuration from
+/// * `llm_client` - The LLM client used for generation
+///
+/// # Returns
+/// * `Result<TaskConfig, String>` - The validated task configuration or error message
+pub async fn generate_task_config_from_task(
+    task_model: &Task,
+    llm_client: &LlmClient,
+) -> Result<TaskConfig, String> {
+    let messages = vec![
+        ChatMessage::new("system", SYSTEM_PROMPT_TASK_CONFIG),
+        ChatMessage::new(
+            "user", 
+            &format!(
+                "You must generate a valid YAML task configuration based on the template below. \
+                Follow the exact structure and only modify the values. \
+                The configuration must include all required fields.\n\
+                Template:\n```\n{}\n```",
+                BASE_TEMPLATE
+            ),
+        ),
+        ChatMessage::new(
+            "user",
+            &format!(
+                "Using the task model details below, generate a complete and valid task configuration. \
+                Ensure all values are appropriate for the task requirements:\n{}",
+                task_model.description.clone().unwrap_or_default()
+            ),
+        ),
+    ];
+
+    let mut retries = 0;
+    let response = loop {
+        match llm_client.call_llm_api(messages.clone()).await {
+            Ok(response) => break response,
+            Err(e) => {
+                if retries >= 3 {
+                    panic!("LLM API call failed after 3 retries: {}", e);
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                retries += 1;
+            }
+        }
+    };
+
+    if let Some((yaml_content, is_valid)) = extract_and_validate_yaml(&response) {
+        if is_valid {
+            match serde_yaml::from_str::<TaskConfig>(&yaml_content) {
+                Ok(config) => {
+                    if let Err(e) = save_task_config(&yaml_content) {
+                        eprintln!("Error saving configuration: {}", e);
+                    }
+                    return Ok(config);
+                }
+                Err(e) => {
+                    return Err(format!("Invalid YAML configuration: {}", e));
+                }
+            }
+        }
+    }
+
+    Err("No valid YAML configuration was generated.".to_string())
 }
