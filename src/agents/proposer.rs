@@ -63,8 +63,8 @@ impl ProposerAgent {
                 if let Event::NewRequest(role, task) = event {
                     if role == "proposer" {
                         let (outcome, task) = self.execute_step(task).await;
-                            let _ = worker_tx.send(Event::AgentResponse(role, outcome, task));
-                        }
+                        let _ = worker_tx.send(Event::AgentResponse(role, outcome, task));
+                    }
                 }
             }
         }
