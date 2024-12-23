@@ -130,6 +130,30 @@ impl<'a> TaskRepository<'a> {
         Ok(found_tasks)
     }
 
+    /// Retrieves all tasks matching any of the specified TaskStates
+    ///
+    /// # Arguments
+    ///
+    /// * `filter_states` - Array of TaskState values to filter by
+    ///
+    /// # Returns
+    ///
+    /// A vector of tasks matching any of the specified states
+    ///
+    /// # Errors
+    ///
+    /// Returns an Error if database operations fail
+    pub fn get_tasks_by_states(&mut self, filter_states: &[TaskState]) -> Result<Vec<Task>, Error> {
+        use crate::schema::tasks::dsl::*;
+        let filter_states_str = filter_states.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+
+        let found_tasks = tasks
+            .filter(state.eq_any(filter_states_str))
+            .load::<Task>(self.conn)?;
+
+        Ok(found_tasks)
+    }
+
     /// Updates the last run at timestamp of a task by logical `task_id`
     ///
     /// # Arguments
