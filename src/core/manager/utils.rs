@@ -1,8 +1,7 @@
 use crate::core::TaskManager;
 use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
-use tokio::time::{sleep, Duration};
-
+use tracing::info;
 /// Updates the spinner message and pauses execution for 500ms
 ///
 /// This function updates the message displayed by the progress spinner and introduces
@@ -20,8 +19,8 @@ use tokio::time::{sleep, Duration};
 /// pause_and_update(&spinner, "Processing...").await;
 /// ```
 pub async fn pause_and_update(spinner: &ProgressBar, message: &str) {
+    info!("{}", message);
     spinner.set_message(message.to_string());
-    sleep(Duration::from_millis(500)).await;
 }
 
 impl TaskManager {
@@ -39,6 +38,10 @@ impl TaskManager {
     /// task_manager.init_spinner();
     /// ```
     pub fn init_spinner(&mut self) {
+        if self.without_task {
+            return;
+        }
+
         self.spinner
             .enable_steady_tick(std::time::Duration::from_millis(120));
         self.spinner.set_style(

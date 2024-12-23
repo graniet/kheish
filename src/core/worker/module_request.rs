@@ -1,40 +1,26 @@
-use crate::core::task_manager::utils::pause_and_update;
 use crate::core::task_state::TaskState;
 use crate::core::Task;
-use crate::core::TaskManager;
+use crate::core::TaskWorker;
+use crate::event::Event;
 use crate::llm::ChatMessage;
 use tracing::error;
 
-impl TaskManager {
-    /// Handles module requests from agents during task execution
+impl TaskWorker {
+    /// Handles a module request from an agent by executing the requested module action
     ///
-    /// This function processes module requests by:
-    /// - Checking the module cache for previous results
-    /// - Executing the requested module action with parameters
-    /// - Handling success/failure cases and updating task state
-    /// - Managing large results and error messages
-    /// - Continuing task execution with the current role
+    /// This function:
+    /// 1. Checks if the result is already cached
+    /// 2. Executes the module action if not cached
+    /// 3. Handles success/failure cases
+    /// 4. Updates the task conversation with the result
+    /// 5. Continues task execution
     ///
     /// # Arguments
-    ///
     /// * `module_name` - Name of the module to execute
-    /// * `action` - Action to perform within the module
+    /// * `action` - Action to perform on the module
     /// * `params` - Parameters for the module action
-    /// * `current_role` - Current agent role making the request
-    /// * `task` - Current task state and context
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// let mut task_manager = TaskManager::new();
-    /// task_manager.handle_module_request(
-    ///     "git".to_string(),
-    ///     "status".to_string(),
-    ///     vec![],
-    ///     "proposer",
-    ///     task
-    /// ).await;
-    /// ```
+    /// * `current_role` - Current role executing the task
+    /// * `task` - Task being processed
     pub async fn handle_module_request(
         &mut self,
         module_name: String,
@@ -43,38 +29,40 @@ impl TaskManager {
         current_role: &str,
         mut task: Task,
     ) {
-        pause_and_update(
-            &self.spinner,
-            &format!(
-                "🔌 The agent requests the '{}' module to assist...",
-                module_name
-            ),
-        )
-        .await;
+        if let Some(manager_tx) = self.get_manager_tx() {
+            let _ = manager_tx.send(Event::NewMessage(
+                self.task_id.clone(),
+                format!(
+                    "🔌 The agent requests the '{}' module to assist...",
+                    module_name
+                ),
+            ));
+        }
 
         self.retry_count = 0;
         let module_cache_key = (module_name.clone(), action.clone(), params.clone());
         if self.module_results_cache.contains_key(&module_cache_key) {
-            pause_and_update(
-                &self.spinner,
-                "♻️ Module result already known, proceeding...",
-            )
-            .await;
+            let message = "♻️ Module result already known, proceeding...";
+            if let Some(manager_tx) = self.get_manager_tx() {
+                let _ =
+                    manager_tx.send(Event::NewMessage(self.task_id.clone(), message.to_string()));
+            }
             self.execute_role(current_role, task.clone()).await;
             return;
         }
 
         if let Some(module) = self.modules_manager.get_module(&module_name) {
-            pause_and_update(
-                &self.spinner,
-                &format!(
-                    "⚡ Executing module '{}' with action '{}' and params: {}",
-                    module_name,
-                    action,
-                    params.join(" ")
-                ),
-            )
-            .await;
+            let message = format!(
+                "⚡ Executing module '{}' with action '{}' and params: {}",
+                module_name,
+                action,
+                params.join(" ")
+            );
+
+            if let Some(manager_tx) = self.get_manager_tx() {
+                let _ =
+                    manager_tx.send(Event::NewMessage(self.task_id.clone(), message.to_string()));
+            }
 
             let action_result = module
                 .handle_action(&mut self.vector_store, &action, &params)
@@ -97,14 +85,14 @@ impl TaskManager {
                     }
                 }
                 Err(e) => {
-                    pause_and_update(
-                        &self.spinner,
-                        &format!(
-                            "Module '{}' action '{}' failed. Stopping task.",
-                            module_name, action
-                        ),
-                    )
-                    .await;
+                    let message = format!(
+                        "Module '{}' action '{}' failed. Stopping task.",
+                        module_name, action
+                    );
+                    if let Some(manager_tx) = self.get_manager_tx() {
+                        let _ = manager_tx
+                            .send(Event::NewMessage(self.task_id.clone(), message.to_string()));
+                    }
 
                     error!("Module {} action '{}' failed: {}", module_name, action, e);
                     let action_availables = module
@@ -126,21 +114,22 @@ Available actions: {}",
             task.conversation
                 .push(ChatMessage::new("user", &execution_message));
 
-            pause_and_update(
-                &self.spinner,
-                "⚙️ Module execution finished. Returning to the agent...",
-            )
-            .await;
+            let message = "⚙️ Module execution finished. Returning to the agent...";
+            if let Some(manager_tx) = self.get_manager_tx() {
+                let _ =
+                    manager_tx.send(Event::NewMessage(self.task_id.clone(), message.to_string()));
+            }
             self.execute_role(current_role, task.clone()).await;
         } else {
-            pause_and_update(
-                &self.spinner,
-                &format!(
-                    "The agent tried to use a non-existent module '{}'.",
-                    module_name
-                ),
-            )
-            .await;
+            let message = format!(
+                "The agent tried to use a non-existent module '{}'.",
+                module_name
+            );
+            if let Some(manager_tx) = self.get_manager_tx() {
+                let _ =
+                    manager_tx.send(Event::NewMessage(self.task_id.clone(), message.to_string()));
+            }
+            task.state = TaskState::Failed(format!("Module {} not found", module_name));
 
             let err_msg = format!(
                 "Module {} not found. Available modules and their actions: {}",
