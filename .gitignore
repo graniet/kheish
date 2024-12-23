@@ -5,3 +5,4 @@ logs/*.log
 exports/*.md
 rec/*
 tasks/*.yaml
+kheish.db
