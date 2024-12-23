@@ -40,10 +40,12 @@
 
 ## Example Tasks
 
-- **`audit-code`**: A thorough security audit of a codebase, identifying potential vulnerabilities via multi-step agent roles.  
-- **`hf-secret-finder`**: Requests the Hugging Face API, clones the repositories, and uses `trufflehog` (via the `sh` module) to detect secrets.  
-- **`find-in-file`**: Searches for a secret across multiple files, chunk-reading them with `fs`.  
-- **`weather-blog-post`**: Fetches live weather data (via `web` or a custom module) and writes a humorous blog post about it.
+| Task Name | Description |
+|-----------|-------------|
+| `audit-code` | A thorough security audit of a codebase, identifying potential vulnerabilities via multi-step agent roles. |
+| `hf-secret-finder` | Requests the Hugging Face API, clones the repositories, and uses `trufflehog` (via the `sh` module) to detect secrets. |
+| `find-in-file` | Searches for a secret across multiple files, chunk-reading them with `fs`. |
+| `weather-blog-post` | Fetches live weather data (via `web` or a custom module) and writes a humorous blog post about it. |
 
 ## How Kheish Works
 
@@ -60,7 +62,13 @@
    - Formats the final result (`Formatter`).
 4. **Optional RAG Integration**  
    If large data is encountered, the agent chunk-indexes it into a vector store, retrieving relevant pieces via semantic queries.
-5. **Output**  
+5. **API Integration**
+   Kheish provides a REST API that allows:
+   - Task submission and monitoring
+   - Real-time status updates
+   - Result retrieval
+   - Module execution control
+6. **Output**  
    Once validated, Kheish saves or exports the final solution. If further feedback is provided, it can loop back into revision mode automatically.
 
 ## Installation & Usage
