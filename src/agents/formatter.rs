@@ -140,6 +140,8 @@ impl AgentBehavior for FormatterAgent {
                         "FormatterAgent: result written to file {}",
                         self.output_file
                     );
+
+                    let response = response.replace("```json", "").replace("```", "").trim().to_string();
                     task.final_output = Some(serde_json::from_str(&response).unwrap_or_default());
                     (AgentOutcome::Exported, task)
                 } else {
