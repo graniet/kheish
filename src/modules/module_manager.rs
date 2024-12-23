@@ -55,6 +55,22 @@ impl ModulesManager {
         ModulesManager { modules }
     }
 
+    /// Creates a new ModulesManager instance with all available modules loaded
+    ///
+    /// # Returns
+    /// * `ModulesManager` - New manager instance containing all supported modules
+    pub fn new_with_all_modules() -> Self {
+        let modules = vec![
+            Box::new(FileSystemModule) as Box<dyn Module>,
+            Box::new(SshModule) as Box<dyn Module>,
+            Box::new(HttpModule::new()) as Box<dyn Module>,
+            Box::new(ShModule::new(vec![])) as Box<dyn Module>,
+            Box::new(VectorStoreModule) as Box<dyn Module>,
+            Box::new(MemoriesModule) as Box<dyn Module>,
+        ];
+        ModulesManager { modules }
+    }
+
     /// Retrieves a reference to a loaded module by its name
     ///
     /// # Arguments
