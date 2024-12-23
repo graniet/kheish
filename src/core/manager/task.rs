@@ -143,7 +143,7 @@ impl TaskManager {
         let mut conn = self.database.get_conn();
         let mut task_repo: TaskRepository<'_> = TaskRepository::new(&mut conn);
 
-        let tasks = task_repo.get_tasks_by_state(&TaskState::Ready)?;
+        let tasks = task_repo.get_tasks_by_states(&[TaskState::Ready, TaskState::WaitingWakeUp])?;
 
         let _handles: Vec<_> = tasks
             .into_iter()
@@ -193,4 +193,5 @@ impl TaskManager {
 
         Ok(())
     }
+
 }
