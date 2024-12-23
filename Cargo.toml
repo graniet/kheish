@@ -30,6 +30,7 @@ uuid = { version = "1.4.1", features = ["v4"] }
 r2d2 = "0.8"
 r2d2-diesel = "1.0"
 humantime = "2.1.0"
+jsonschema = "0.27.0"
 
 [profile.release]
 lto = true
