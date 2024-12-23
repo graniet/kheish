@@ -63,6 +63,8 @@ impl<'a> TaskRepository<'a> {
         feedback_history: Option<String>,
         module_execution_history: Option<String>,
         conversation: Option<String>,
+        last_run_at: Option<chrono::NaiveDateTime>,
+        interval: Option<String>,
     ) -> Result<String, Error> {
         use crate::schema::tasks;
 
@@ -93,6 +95,8 @@ impl<'a> TaskRepository<'a> {
             created_at: now.clone(),
             updated_at: now,
             config: None,
+            interval,
+            last_run_at,
         };
 
         diesel::insert_into(tasks::table)
@@ -124,6 +128,30 @@ impl<'a> TaskRepository<'a> {
             .load::<Task>(self.conn)?;
 
         Ok(found_tasks)
+    }
+
+    /// Updates the last run at timestamp of a task by logical `task_id`
+    ///
+    /// # Arguments
+    ///
+    /// * `the_task_id` - The task ID to update
+    /// * `last_run_at` - The new last run at timestamp
+    ///
+    /// # Returns
+    ///
+    /// Unit type if successful
+    ///
+    /// # Errors
+    ///
+    /// Returns an Error if database operations fail
+    pub fn update_task_last_run_at(&mut self, the_task_id: &str) -> Result<(), Error> {
+        use crate::schema::tasks;
+        let now = Utc::now().to_rfc3339();
+
+        diesel::update(tasks::table.filter(tasks::task_id.eq(the_task_id)))
+            .set((tasks::last_run_at.eq(&now), tasks::updated_at.eq(&now)))
+            .execute(self.conn)?;
+        Ok(())
     }
 
     /// Updates the configuration of a task by logical `task_id`
@@ -328,9 +356,9 @@ impl<'a> TaskRepository<'a> {
     ///
     /// Returns a DieselError if database operations fail
     pub fn get_task_by_task_id(&mut self, the_task_id: &str) -> Result<Task, DieselError> {
-        use crate::schema::tasks::dsl::*;
-        let found = tasks
-            .filter(task_id.eq(the_task_id))
+        use crate::schema::tasks;
+        let found = tasks::table
+            .filter(tasks::task_id.eq(the_task_id))
             .first::<Task>(self.conn)?;
         Ok(found)
     }
