@@ -4,132 +4,88 @@
   <img src="docs/logo.png" alt="Kheish Logo" width="250">
 </p>
 
-**Kheish** is an open-source, pluggable multi-agent orchestration platform designed to tackle complex tasks using Large Language Models (LLMs). By leveraging multiple specialized "agents" and a flexible workflow, Kheish coordinates a variety of steps—proposal generation, reviewing, validation, formatting—to produce reliable, high-quality results. It seamlessly integrates external modules such as filesystem access, shell commands, or vector stores to enrich context and handle large codebases or documents with Retrieval-Augmented Generation (RAG).
+**Kheish** is an open-source, multi-role **agent** designed for complex tasks that require structured, step-by-step collaboration with Large Language Models (LLMs). Rather than a simple orchestrator, Kheish itself acts as an **intelligent agent** that can request modules on demand, integrate user feedback, switch between specialized roles (Proposer, Reviewer, Validator, Formatter, etc.), and ultimately deliver a refined result. By harnessing multiple “sub-agents” (roles) within one framework, Kheish tackles tasks like security audits, file searches, RAG-based exploration, and more.
 
-## Key Features
+## Highlights of Kheish as an **Agent**
 
-- **Multi-Agent Workflow:** Kheish defines a sequence of roles—**Proposer**, **Reviewer**, **Validator**, **Formatter**—and executes them in order, as defined by a YAML-based workflow configuration.
-  
-- **Flexible Modules Integration:** Extend capabilities with modules like `fs` (filesystem), `sh` (shell commands), or `vector_store` (RAG). Agents can request modules to fetch additional data, read files, or perform semantic searches.
-  
-- **Chat-Style Prompts:** Interactions with LLMs are structured as conversation-like exchanges with `system`, `user`, and `assistant` roles, making it easy to maintain context and clarify instructions.
-  
-- **Feedback and Revision Loops:** The workflow supports iterative feedback: if the Reviewer or Validator detects issues, it can request revisions until the solution meets the criteria.
-  
-- **RAG and Embeddings:** Easily integrate a vector store (e.g., `OpenAIEmbedder` + `InMemoryVectorStore`) to handle large documents. The model can fetch relevant snippets without overloading the prompt.
-  
-- **Modular and Extensible:** Add new modules or agents without breaking the existing structure. The architecture encourages customization and scaling to new tasks or domains.
+- **Adaptive Role Switching**  
+  Kheish functions as a single agent with multiple internal roles:
+  - **Proposer**: Generates or updates proposals based on user input and context.  
+  - **Reviewer**: Critically evaluates proposals, identifying flaws or requesting improvements.  
+  - **Validator**: Final gatekeeper ensuring correctness and completeness.  
+  - **Formatter**: Takes a validated solution and converts it into a final presentation format (Markdown, etc.).  
+  These roles can be enabled or disabled depending on the task definition in your YAML file.
 
-## Example Task
+- **On-Demand Module Requests**  
+  As an agent, Kheish can spontaneously invoke modules if it needs more information or functionality. Modules include:  
+  - **Filesystem (`fs`)**: Reading files chunk by chunk, indexing them in RAG.  
+  - **Shell (`sh`)**: Running limited shell commands with sandboxed allowances.  
+  - **RAG (`rag`)**: Storing and retrieving large amounts of text via embeddings, enabling chunk-based queries.  
+  - **SSH (`ssh`)**: Secure remote commands.  
+  - **Memories (`memories`)**: Storing or recalling data outside the immediate LLM context (long-term memory).
 
-| Task | Description |
-|------|-------------|
-| [`audit-code`](examples/tasks/audit-code/task.yaml) | Performs a comprehensive security audit of a project with vulnerability detection and detailed reporting |
-| [`audit-code-large`](examples/tasks/audit-code-large/task.yaml) | Security audit optimized for large projects using RAG and memory management |
-| [`find-in-file`](examples/tasks/find-in-file/task.yaml) | Searches for a secret string within files in a filesystem using allowed shell commands |
-| [`hf-secret-finder`](examples/tasks/hf-secret-finder/task.yaml) | Scans Hugging Face repositories for potential secrets using trufflehog |
-| [`weather-blog-post`](examples/tasks/weather-blog-post/task.yaml) | Retrieves weather data and creates a humorous English blog post about Paris weather |
-| [`find-and-send-secret`](examples/tasks/find-and-send-secret/task.yaml) | Searches for a secret string within files in a filesystem using allowed shell commands and sends it to a webhook |
+- **Feedback & Iteration**  
+  In many tasks, Kheish re-checks and revises its own proposals. For example:
+  1. **Proposer** suggests a solution.
+  2. **Reviewer** critiques and possibly requests changes.
+  3. **Proposer** refines based on feedback.
+  4. **Validator** delivers final approval or requests more fixes.  
+  This iterative approach provides an agent that grows the solution’s quality step by step.
 
-## Roadmap
+- **Retrieval-Augmented Generation (RAG)**  
+  For large codebases or multi-file contexts, Kheish indexes data in a vector store. It can retrieve relevant snippets later without stuffing the entire text into a single LLM prompt. This agent-based RAG integration reduces token usage and scales to bigger projects.
 
-- Add support for more LLM providers.
-- Introduce more sophisticated caching and compression of conversation history.
-- Expand the library of modules (e.g., `git`, `http`).
-- Improve UI/CLI for running and monitoring tasks.
+- **Single Agent, Many Tasks**  
+  Kheish can handle parallel or serial tasks by defining separate YAML configurations or combining them into a single multi-step scenario. Each role or module request is orchestrated **internally** by Kheish’s logic—no external orchestrator needed.
 
-## Architecture Overview
+## Example Tasks
 
-Kheish orchestrates a **Task Manager** that:
+- **`audit-code`**: A thorough security audit of a codebase, identifying potential vulnerabilities via multi-step agent roles.  
+- **`hf-secret-finder`**: Requests the Hugging Face API, clones the repositories, and uses `trufflehog` (via the `sh` module) to detect secrets.  
+- **`find-in-file`**: Searches for a secret across multiple files, chunk-reading them with `fs`.  
+- **`weather-blog-post`**: Fetches live weather data (via `web` or a custom module) and writes a humorous blog post about it.
 
-1. **Loads a Task Configuration (YAML)**: Declares the task name, description, context, agents, modules, workflow steps, and output format.
-  
-2. **Processes Context**: Reads initial files or text, prepares a `TaskContext`.
-  
-3. **Runs the Workflow**:  
-   - **Proposer** agent generates an initial solution (or performs a subtask).
-   - **Reviewer** agent checks the proposal’s quality and requests revisions if needed.
-   - **Validator** agent ensures final correctness before finalizing.
-   - **Formatter** agent outputs the validated result in the requested format.
-   
-4. **Integrates Modules on Demand**: Agents can issue `MODULE_REQUEST` calls:
-   - `fs`: read/list files
-   - `sh`: run allowed shell commands
-   - `vector_store`: semantic search
-   - `http`: send a request to a host
-   - `memories`: store and retrieve information
-   - `ssh`: run allowed ssh commands
-   
-   Results are cached to avoid redundant operations.
+## How Kheish Works
 
-### Architecture Diagram
+1. **Reads a YAML Configuration**  
+   Includes the agent roles, modules, the workflow of steps, and final output instructions.
+2. **Builds an Agent**  
+   Kheish loads the roles (Proposer, Reviewer, etc.) and hooks in the modules for possible requests.  
+3. **Executes Steps Internally**  
+   The agent:
+   - Gathers context (files, text).
+   - Generates or refines a solution (`Proposer`).
+   - Seeks feedback (`Reviewer`) if needed.
+   - Validates correctness (`Validator`).
+   - Formats the final result (`Formatter`).
+4. **Optional RAG Integration**  
+   If large data is encountered, the agent chunk-indexes it into a vector store, retrieving relevant pieces via semantic queries.
+5. **Output**  
+   Once validated, Kheish saves or exports the final solution. If further feedback is provided, it can loop back into revision mode automatically.
 
-<p align="center">
-  <img src="docs/arch.png" alt="Kheish Architecture" width="600">
-</p>
+## Installation & Usage
 
-The diagram above illustrates how the **TaskManager** orchestrates agents, modules, and the LLM client. The `Workflow` steps guide the transitions between agents, while `ModulesManager` handles on-demand operations (like file reads or vector store queries). The `LlmClient` integrates with vector stores for RAG, ensuring scalable handling of large contexts.
-
-## Installation & Setup
-
-1. **Clone the Repository:**
+1. **Clone the Repository**  
    ```bash
    git clone https://github.com/yourusername/kheish.git
    cd kheish
    ```
-
-2. **Install Dependencies:**
-   - Rust toolchain: [Install Rust](https://www.rust-lang.org/tools/install)
-   - Set `OPENAI_API_KEY` or other provider keys as environment variables.
-   
-3. **Build:**
+2. **Install Dependencies**  
+   - Rust toolchain (latest stable).  
+   - `OPENAI_API_KEY` or other relevant environment variables for your chosen LLM provider.
+3. **Build**  
    ```bash
    cargo build --release
    ```
-
-4. **Run a Task:**
+4. **Run a Task**  
    ```bash
    ./target/release/kheish --task-config examples/tasks/audit-code.yaml
    ```
 
-## Configuration
-
-- **LLM Provider & Model:**  
-  Set `llm_provider` and `llm_model` in the YAML, and corresponding environment variable keys.  
-  Example:
-  ```yaml
-  parameters:
-    llm_provider: "openai"
-    llm_model: "gpt-4"
-  ```
-  
-- **Modules & Allowed Commands:**  
-  Add modules in the YAML:
-  ```yaml
-  modules:
-    - name: "fs"
-      version: "1.0"
-    - name: "sh"
-      version: "1.0"
-      config:
-        allowed_commands: ["ls","cat"]
-  ```
-
-## Recommended Best Practices
-
-- **Use RAG Efficiently:**  
-  For large codebases or documents, store chunks and use `vector_store` to retrieve only relevant snippets. Don’t dump entire files into the prompt.
-  
-- **Summarize Iterations:**  
-  If the conversation grows large, periodically summarize the history or rely on the vector store to shorten prompts.
-  
-- **Module Caching:**  
-  Results of module actions are cached. Avoid redundant expensive operations by checking if the result already exists.
-
 ## Contributing
 
-Contributions are welcome! Please open issues or submit pull requests on [GitHub](https://github.com/graniet/kheish).
+Contributions to Kheish are welcome! Feel free to open issues or submit pull requests on [GitHub](https://github.com/graniet/kheish).
 
 ## License
 
-This project is licensed under the Apache License 2.0. See [LICENSE](LICENSE) for details.
+Licensed under [Apache 2.0](LICENSE).
