@@ -9,6 +9,7 @@ use serde_json::Value;
 use std::str::FromStr;
 
 /// Represents a task with its associated state and context
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Task {
     /// ID of the task
@@ -33,6 +34,10 @@ pub struct Task {
     pub module_execution_history: Vec<String>,
     /// Conversation history
     pub conversation: Vec<ChatMessage>,
+    /// Interval for the task
+    pub interval: Option<String>,
+    /// Timestamp when the task was last run
+    pub last_run_at: Option<chrono::NaiveDateTime>,
 }
 
 impl Task {
@@ -42,7 +47,13 @@ impl Task {
     ///
     /// * `name` - Name of the task
     /// * `context` - Initial task context
-    pub fn new(task_id: String, name: String, description: String, context: TaskContext) -> Self {
+    pub fn new(
+        task_id: String,
+        name: String,
+        description: String,
+        context: TaskContext,
+        interval: Option<String>,
+    ) -> Self {
         Self {
             task_id,
             name,
@@ -55,6 +66,8 @@ impl Task {
             feedback_history: Vec::new(),
             module_execution_history: Vec::new(),
             conversation: Vec::new(),
+            interval,
+            last_run_at: None,
         }
     }
 
@@ -123,6 +136,8 @@ impl From<DbTask> for Task {
             feedback_history: Vec::new(),
             module_execution_history: Vec::new(),
             conversation: Vec::new(),
+            interval: db_task.interval,
+            last_run_at: db_task.last_run_at,
         }
     }
 }
@@ -142,6 +157,8 @@ impl From<(DbTask, TaskConfig)> for Task {
             feedback_history: Vec::new(),
             module_execution_history: Vec::new(),
             conversation: Vec::new(),
+            interval: db_task.interval,
+            last_run_at: db_task.last_run_at,
         }
     }
 }
