@@ -1,10 +1,10 @@
 mod parser;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub use parser::load_task_config;
 
 /// Main configuration structure for a task
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TaskConfig {
     /// Name of the task
     pub name: String,
@@ -35,7 +35,7 @@ pub struct TaskConfig {
 }
 
 /// Configuration for the different agent roles
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Default, Clone, Serialize)]
 pub struct AgentsConfig {
     /// Configuration for proposer agents
     #[serde(default)]
@@ -52,7 +52,7 @@ pub struct AgentsConfig {
 }
 
 /// Configuration for a specific agent role
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Default, Clone, Serialize)]
 pub struct AgentConfig {
     /// Optional strategy name for agent behavior
     #[allow(unused)]
@@ -67,7 +67,7 @@ pub struct AgentConfig {
 }
 
 /// Represents a single context item providing input data
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 pub struct ContextItem {
     /// Type of the context item
     pub kind: String,
@@ -83,7 +83,7 @@ pub struct ContextItem {
 }
 
 /// Configuration for a module
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 pub struct ModuleConfig {
     /// Name of the module
     pub name: String,
@@ -96,7 +96,7 @@ pub struct ModuleConfig {
 }
 
 /// Configuration for the workflow execution
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Default, Clone, Serialize)]
 pub struct WorkflowConfig {
     /// List of workflow steps
     #[serde(default)]
@@ -104,7 +104,7 @@ pub struct WorkflowConfig {
 }
 
 /// Represents a single step in the workflow
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 pub struct WorkflowStep {
     /// Source state
     pub from: String,
@@ -115,7 +115,7 @@ pub struct WorkflowStep {
 }
 
 /// Global parameters for task execution
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Default, Clone, Serialize)]
 pub struct ParametersConfig {
     /// Name/identifier of the LLM model to use
     #[serde(default)]
@@ -138,7 +138,7 @@ pub struct ParametersConfig {
 }
 
 /// Output configuration
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Default, Clone, Serialize)]
 pub struct OutputConfig {
     /// Format of the output
     pub format: String,
@@ -147,7 +147,7 @@ pub struct OutputConfig {
 }
 
 /// Embedder configuration
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone, Default, Serialize)]
 pub struct EmbedderConfig {
     /// Name/identifier of the embedder
     pub model: Option<String>,
