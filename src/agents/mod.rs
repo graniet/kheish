@@ -13,7 +13,7 @@ pub use validator::*;
 use tracing::debug;
 
 /// Represents the possible outcomes of an agent's execution
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentOutcome {
     /// A proposal was successfully generated
     ProposalGenerated,
@@ -28,7 +28,7 @@ pub enum AgentOutcome {
     /// A module request was made with module name, action and parameters
     ModuleRequest(String, String, Vec<String>),
     /// The execution failed with an error message
-    Failed(String),
+    Failed(String), // error message
 }
 
 /// Defines the behavior that all agents must implement
