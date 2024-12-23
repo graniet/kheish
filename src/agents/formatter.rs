@@ -4,6 +4,7 @@ use crate::constants::FORMATTER_USER_PROMPT;
 use crate::core::Task;
 use crate::event::Event;
 use crate::llm::{ChatMessage, LlmClient};
+use crate::llm::{build_validator, validate_response};
 use async_trait::async_trait;
 use std::fs;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -21,6 +22,8 @@ pub struct FormatterAgent {
     pub output_file: String,
     /// Channel receiver for incoming events
     pub self_rx: UnboundedReceiver<Event>,
+    /// Schema for the output
+    pub schema: Option<String>,
 }
 
 impl FormatterAgent {
@@ -43,8 +46,18 @@ impl FormatterAgent {
         output_file: String,
     ) -> (Self, UnboundedSender<Event>) {
         let (self_tx, self_rx) = tokio::sync::mpsc::unbounded_channel();
+        let content_schema = match config.schema.clone() {
+            Some(schema) => {
+                if let Some(stripped) = schema.strip_prefix("file://") {
+                    std::fs::read_to_string(stripped).ok()
+                } else {
+                    Some(schema)
+                }
+            }
+            None => None
+        };
 
-        (
+        (   
             Self {
                 llm_client: LlmClient::new(llm_provider, llm_model)
                     .expect("Failed to create LLM client"),
@@ -56,6 +69,7 @@ impl FormatterAgent {
                 output_format,
                 output_file,
                 self_rx,
+                schema: content_schema,
             },
             self_tx,
         )
@@ -90,6 +104,21 @@ fn validate_final_output(resp: &str) -> bool {
     !resp.trim().is_empty()
 }
 
+/// Validates a response string against a JSON schema
+///
+/// # Arguments
+/// * `schema` - The JSON schema string to validate against
+/// * `resp` - The response string to validate
+///
+/// # Returns
+/// * `bool` - True if validation succeeds, false if validation fails or there's an error
+fn validate_schema(schema: &str, resp: &str) -> bool {
+    build_validator(schema)
+        .ok()
+        .and_then(|validator| validate_response(&validator, resp).ok())
+        .unwrap_or(false)
+}
+
 #[async_trait]
 impl AgentBehavior for FormatterAgent {
     /// Executes the formatting step on the provided task
@@ -120,6 +149,11 @@ impl AgentBehavior for FormatterAgent {
         prompt.push_str(&self.output_format);
         prompt.push_str(" and only output the final formatted result, without comments.");
 
+        if let Some(schema) = &self.schema {
+            prompt.push_str("\n\nSchema:\n");
+            prompt.push_str(schema);
+        }
+
         task.conversation.push(ChatMessage::new("user", &prompt));
 
         match self
@@ -129,27 +163,35 @@ impl AgentBehavior for FormatterAgent {
         {
             Ok(response) => {
                 debug!("FormatterAgent: raw formatted output received.");
-                if validate_final_output(&response) {
-                    if let Err(e) = fs::write(&self.output_file, response.as_bytes()) {
+                if !validate_final_output(&response) {
+                    return (
+                        AgentOutcome::Failed("Formatted output is invalid or empty.".to_string()),
+                        task,
+                    );
+                }
+
+                if let Some(schema) = &self.schema {
+                    if !validate_schema(schema, &response) {
                         return (
-                            AgentOutcome::Failed(format!("Failed to write output file: {}", e)),
+                            AgentOutcome::Failed("Output does not match schema".to_string()),
                             task,
                         );
                     }
-                    info!(
-                        "FormatterAgent: result written to file {}",
-                        self.output_file
-                    );
-
-                    let response = response.replace("```json", "").replace("```", "").trim().to_string();
-                    task.final_output = Some(serde_json::from_str(&response).unwrap_or_default());
-                    (AgentOutcome::Exported, task)
-                } else {
-                    (
-                        AgentOutcome::Failed("Formatted output is invalid or empty.".to_string()),
-                        task,
-                    )
                 }
+
+                if let Err(e) = fs::write(&self.output_file, response.as_bytes()) {
+                    return (
+                        AgentOutcome::Failed(format!("Failed to write output file: {}", e)),
+                        task,
+                    );
+                }
+
+                info!("FormatterAgent: result written to file {}", self.output_file);
+
+                let cleaned_response = response.replace("```json", "").replace("```", "").trim().to_string();
+                task.final_output = Some(serde_json::from_str(&cleaned_response).unwrap_or_default());
+                
+                (AgentOutcome::Exported, task)
             }
             Err(e) => (
                 AgentOutcome::Failed(format!("LLM error in Formatter: {}", e)),
