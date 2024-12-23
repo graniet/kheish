@@ -32,6 +32,9 @@ pub struct TaskConfig {
     /// Output configuration
     #[serde(default)]
     pub output: OutputConfig,
+    /// Optional interval for the task
+    #[serde(default)]
+    pub interval: Option<String>,
 }
 
 /// Configuration for the different agent roles
