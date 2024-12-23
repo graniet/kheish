@@ -12,5 +12,7 @@ CREATE TABLE tasks (
     conversation TEXT NULL,
     config TEXT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    last_run_at DATETIME NULL,
+    interval TEXT NULL
 );
