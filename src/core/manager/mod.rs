@@ -211,6 +211,7 @@ impl TaskManager {
             config.name.clone(),
             config.description.clone().unwrap_or("".to_string()),
             context,
+            config.interval.clone(),
         );
 
         let system_instructions = generate_system_instructions(
