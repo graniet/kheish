@@ -56,17 +56,14 @@ impl ValidatorAgent {
         )
     }
 
-    pub async fn run_loop(mut self, manager_tx: UnboundedSender<Event>) {
+    pub async fn run_loop(mut self, worker_tx: UnboundedSender<Event>) {
         loop {
             while let Some(event) = self.self_rx.recv().await {
-                match event {
-                    Event::NewRequest(role, task) => {
-                        if role == "validator" {
-                            let (outcome, task) = self.execute_step(task).await;
-                            let _ = manager_tx.send(Event::AgentResponse(role, outcome, task));
-                        }
+                if let Event::NewRequest(role, task) = event {
+                    if role == "validator" {
+                        let (outcome, task) = self.execute_step(task).await;
+                        let _ = worker_tx.send(Event::AgentResponse(role, outcome, task));
                     }
-                    _ => {}
                 }
             }
         }
