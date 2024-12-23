@@ -36,6 +36,10 @@ pub struct Task {
     pub created_at: String,
     /// Timestamp when the task was last updated
     pub updated_at: String,
+    /// Timestamp when the task was last run
+    pub last_run_at: Option<chrono::NaiveDateTime>,
+    /// Optional interval for the task
+    pub interval: Option<String>,
 }
 
 /// Represents the output of a task in the database
