@@ -1,4 +1,5 @@
 use super::TaskManager;
+use crate::core::manager::utils;
 use crate::core::task_generation::generate_task_config_from_task;
 use crate::core::TaskState;
 use crate::core::{Task, TaskWorker, Workflow};
@@ -47,6 +48,8 @@ impl TaskManager {
         let task_id = task.task_id.clone();
         let name = task.name.clone();
 
+        let last_run_at = None;
+
         let db_task_id = task_repo.insert_task(
             task_id.clone(),
             Some(name.clone()),
@@ -58,6 +61,8 @@ impl TaskManager {
             Some(feedback_history),
             Some(module_execution_history),
             Some(conversation),
+            last_run_at,
+            task.interval,
         )?;
 
         let message = format!("Task {} created with id {}", name, db_task_id);
@@ -144,6 +149,23 @@ impl TaskManager {
             .into_iter()
             .filter_map(|task| {
                 let task_id = task.task_id.clone();
+                let last_run_at = task.last_run_at;
+                let interval = task.interval.clone();
+
+                if let Some(interval) = interval {
+                    if let Some(last_run_at) = last_run_at {
+                        if !utils::check_should_execute_now(&interval, last_run_at) {
+                            return None;
+                        }
+                    }
+                }
+
+                if let Err(e) = task_repo.update_task_last_run_at(&task_id) {
+                    error!("Error updating task last run at: {}", e);
+                } else {
+                    info!("Task {} last run at updated", task_id);
+                }
+
                 match task_repo.get_task_config(&task.task_id) {
                     Ok(task_config) => {
                         let vector_store = Self::initialize_vector_store(&task_config);
