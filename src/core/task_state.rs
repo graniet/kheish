@@ -16,6 +16,8 @@ pub enum TaskState {
     Completed,
     /// State when the task is actively being executed
     InProgress,
+    /// State when the task is waiting for a specific interval to pass
+    WaitingWakeUp,
 }
 
 #[allow(clippy::to_string_trait_impl)]
@@ -29,6 +31,7 @@ impl ToString for TaskState {
             TaskState::InProgress => "In Progress".to_string(),
             TaskState::Ready => "Ready".to_string(),
             TaskState::Configuring => "Configuring".to_string(),
+            TaskState::WaitingWakeUp => "WaitingWakeUp".to_string(),
         }
     }
 }
