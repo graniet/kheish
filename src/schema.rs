@@ -38,6 +38,8 @@ diesel::table! {
         config -> Nullable<Text>,
         created_at -> Text,
         updated_at -> Text,
+        last_run_at -> Nullable<Timestamp>,
+        interval -> Nullable<Text>,
     }
 }
 
