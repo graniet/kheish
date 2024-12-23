@@ -9,11 +9,17 @@ use std::fs;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::{debug, info};
 
+/// Agent responsible for formatting the final solution into the desired output format
 pub struct FormatterAgent {
+    /// LLM client for interacting with the language model
     pub llm_client: LlmClient,
+    /// Custom prompt to guide the formatting behavior
     pub user_prompt: String,
+    /// Target format for the output (e.g. "markdown", "html")
     pub output_format: String,
+    /// File path where the formatted output will be written
     pub output_file: String,
+    /// Channel receiver for incoming events
     pub self_rx: UnboundedReceiver<Event>,
 }
 
@@ -55,29 +61,44 @@ impl FormatterAgent {
         )
     }
 
-    pub async fn run_loop(mut self, manager_tx: UnboundedSender<Event>) {
+    /// Main event loop that processes incoming events
+    ///
+    /// # Arguments
+    /// * `worker_tx` - Channel sender to communicate back to the worker
+    pub async fn run_loop(mut self, worker_tx: UnboundedSender<Event>) {
         loop {
             while let Some(event) = self.self_rx.recv().await {
-                match event {
-                    Event::NewRequest(role, task) => {
-                        if role == "formatter" {
-                            let (outcome, task) = self.execute_step(task).await;
-                            let _ = manager_tx.send(Event::AgentResponse(role, outcome, task));
-                        }
+                if let Event::NewRequest(role, task) = event {
+                    if role == "formatter" {
+                        let (outcome, task) = self.execute_step(task).await;
+                        let _ = worker_tx.send(Event::AgentResponse(role, outcome, task));
                     }
-                    _ => {}
                 }
             }
         }
     }
 }
 
+/// Validates that the formatted output is not empty
+///
+/// # Arguments
+/// * `resp` - The formatted response string to validate
+///
+/// # Returns
+/// * `bool` - True if the response is non-empty after trimming whitespace
 fn validate_final_output(resp: &str) -> bool {
     !resp.trim().is_empty()
 }
 
 #[async_trait]
 impl AgentBehavior for FormatterAgent {
+    /// Executes the formatting step on the provided task
+    ///
+    /// # Arguments
+    /// * `task` - The task containing the solution to format
+    ///
+    /// # Returns
+    /// * `(AgentOutcome, Task)` - The outcome of the formatting and the updated task
     async fn execute_step(&self, mut task: Task) -> (AgentOutcome, Task) {
         debug!("FormatterAgent: formatting final proposal...");
         let proposal = if let Some(sol) = &task.current_proposal {
@@ -119,7 +140,7 @@ impl AgentBehavior for FormatterAgent {
                         "FormatterAgent: result written to file {}",
                         self.output_file
                     );
-                    task.final_output = Some(response);
+                    task.final_output = Some(serde_json::from_str(&response).unwrap_or_default());
                     (AgentOutcome::Exported, task)
                 } else {
                     (
