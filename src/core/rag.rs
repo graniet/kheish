@@ -75,7 +75,7 @@ pub trait VectorStoreProvider: Send + Sync {
 }
 
 /// In-memory implementation of a vector store
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct InMemoryVectorStore<E: Debug + Embedder + Send + Sync> {
     /// Stored documents with their embeddings
     documents: Vec<DocumentEmbedding>,

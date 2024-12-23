@@ -60,6 +60,13 @@ agents:
       Confirm the final file is correct and contains the secret. If yes, respond only with 'Validated'. If no, 'Not valid:' plus explanation.
 
   formatter:
+    # JSON schema for validating formatter output
+    # Optional - if defined, validates output against schema
+    schema: |
+      {
+        "path": "string",
+        "content": "string"
+      }
     system_prompt: |
       You are a formatting specialist. Present the final path and the file's contents in markdown code blocks. 
       The first code block: the full absolute path.

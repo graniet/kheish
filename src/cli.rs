@@ -12,4 +12,24 @@ pub struct Cli {
     /// Default: "info"
     #[arg(long, default_value_t = String::from("info"))]
     pub logging_level: String,
+
+    /// Sets the port for the API server
+    #[arg(long, default_value_t = 3000)]
+    pub api_port: u16,
+
+    /// Enables the API server
+    #[arg(long, default_value_t = false)]
+    pub api_enabled: bool,
+
+    /// Creates a new task
+    #[arg(long, default_value_t = false)]
+    pub new_task: bool,
+
+    /// LLM provider (e.g openai)
+    #[arg(long)]
+    pub llm_provider: Option<String>,
+
+    /// LLM model (e.g gpt-4)
+    #[arg(long)]
+    pub llm_model: Option<String>,
 }

@@ -39,11 +39,26 @@ pub fn generate_system_instructions(
         .system_prompt
         .clone()
         .unwrap_or(VALIDATOR_SYSTEM_PROMPT.to_string());
-    let formatter_prompt = agent_config
+    let mut formatter_prompt = agent_config
         .formatter
         .system_prompt
         .clone()
         .unwrap_or(FORMATTER_SYSTEM_PROMPT.to_string());
+
+    if let Some(schema) = &agent_config.formatter.schema {
+        if let Some(stripped) = schema.strip_prefix("file://") {
+            let content_schema = std::fs::read_to_string(stripped).unwrap_or(schema.to_string());
+            formatter_prompt.push_str("\n\n");
+            formatter_prompt.push_str(FORMATTER_SCHEMA_VALIDATOR);
+            formatter_prompt.push_str("\n\n");
+            formatter_prompt.push_str(&content_schema);
+        } else {
+            formatter_prompt.push_str("\n\n");
+            formatter_prompt.push_str(FORMATTER_SCHEMA_VALIDATOR);
+            formatter_prompt.push_str("\n\n");
+            formatter_prompt.push_str(schema);
+        }
+    }
 
     let mut system_instructions = String::from(
         "Global rules:\n\

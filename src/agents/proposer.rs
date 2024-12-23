@@ -1,8 +1,13 @@
 use super::{AgentBehavior, AgentOutcome};
+use crate::config::AgentConfig;
 use crate::constants::PROPOSER_FORMAT_REMINDER;
+use crate::constants::PROPOSER_USER_PROMPT;
 use crate::core::Task;
+use crate::event::Event;
 use crate::llm::{ChatMessage, LlmClient};
 use async_trait::async_trait;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::debug;
 
 /// Agent responsible for generating and revising proposals.
@@ -11,11 +16,59 @@ use tracing::debug;
 /// - Generate initial content proposals based on context
 /// - Request module executions when needed
 /// - Revise proposals based on feedback
-pub struct ProposerAgent<'a> {
+pub struct ProposerAgent {
     /// Client for interacting with the language model
-    pub llm_client: &'a LlmClient,
+    pub llm_client: LlmClient,
     /// Custom prompt to guide the agent's behavior
-    pub user_prompt: &'a str,
+    pub user_prompt: String,
+    /// Receiver for events from the task manager
+    pub self_rx: UnboundedReceiver<Event>,
+}
+
+impl ProposerAgent {
+    /// Creates a new ProposerAgent instance
+    ///
+    /// # Arguments
+    /// * `config` - Configuration for the agent
+    /// * `llm_provider` - The LLM provider to use (e.g. "openai")
+    /// * `llm_model` - The specific model to use (e.g. "gpt-4")
+    ///
+    /// # Returns
+    /// * `(Self, UnboundedSender<Event>)` - The agent instance and a channel sender for events
+    pub fn new(
+        config: AgentConfig,
+        llm_provider: &str,
+        llm_model: &str,
+    ) -> (Self, UnboundedSender<Event>) {
+        let (self_tx, self_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        (
+            Self {
+                llm_client: LlmClient::new(llm_provider, llm_model)
+                    .expect("Failed to create LLM client"),
+                user_prompt: config
+                    .user_prompt
+                    .as_deref()
+                    .unwrap_or(PROPOSER_USER_PROMPT)
+                    .to_string(),
+                self_rx,
+            },
+            self_tx,
+        )
+    }
+
+    pub async fn run_loop(mut self, worker_tx: UnboundedSender<Event>) {
+        loop {
+            while let Some(event) = self.self_rx.recv().await {
+                if let Event::NewRequest(role, task) = event {
+                    if role == "proposer" {
+                        let (outcome, task) = self.execute_step(task).await;
+                        let _ = worker_tx.send(Event::AgentResponse(role, outcome, task));
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Validates that the LLM response is properly formatted.
@@ -30,7 +83,7 @@ fn validate_proposer_response(resp: &str) -> bool {
 }
 
 #[async_trait]
-impl<'a> AgentBehavior for ProposerAgent<'a> {
+impl AgentBehavior for ProposerAgent {
     /// Executes a single step of the proposal generation process.
     ///
     /// This method:
@@ -43,13 +96,14 @@ impl<'a> AgentBehavior for ProposerAgent<'a> {
     ///
     /// # Returns
     /// * `AgentOutcome` - The result of the execution step
-    async fn execute_step(&self, task: &mut Task) -> AgentOutcome {
+    async fn execute_step(&self, mut task: Task) -> (AgentOutcome, Task) {
         debug!("ProposerAgent: generating initial proposal...");
 
         let source_text = task.context.combined_context();
         if source_text.trim().is_empty() {
-            return AgentOutcome::Failed(
-                "No source text available for proposing content".to_string(),
+            return (
+                AgentOutcome::Failed("No source text available for proposing content".to_string()),
+                task,
             );
         }
 
@@ -58,7 +112,7 @@ impl<'a> AgentBehavior for ProposerAgent<'a> {
         let mut prompt = String::new();
         prompt.push_str("Current role: proposer\n");
         prompt.push_str("Specific instructions: ");
-        prompt.push_str(self.user_prompt);
+        prompt.push_str(&self.user_prompt);
         prompt.push_str("\n\nContext:\n");
         prompt.push_str(&source_text);
 
@@ -90,14 +144,17 @@ impl<'a> AgentBehavior for ProposerAgent<'a> {
                 task.conversation
                     .push(ChatMessage::new("assistant", &new_proposal));
                 if let Some(mr) = self.parse_module_request(&new_proposal) {
-                    return mr;
+                    return (mr, task);
                 }
 
                 debug!("ProposerAgent: proposal generated: {}", new_proposal);
                 task.add_proposal(new_proposal);
-                AgentOutcome::ProposalGenerated
+                (AgentOutcome::ProposalGenerated, task)
             }
-            Err(e) => AgentOutcome::Failed(format!("LLM error in Proposer: {}", e)),
+            Err(e) => (
+                AgentOutcome::Failed(format!("LLM error in Proposer: {}", e)),
+                task,
+            ),
         }
     }
 }

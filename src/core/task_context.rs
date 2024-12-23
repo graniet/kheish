@@ -1,5 +1,7 @@
+use serde::{Deserialize, Serialize};
+
 /// Represents the context for a task, containing both file-based and text-based content
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskContext {
     /// Vector of tuples containing file names and their content
     pub files: Vec<(String, String)>,
@@ -11,8 +13,7 @@ impl TaskContext {
     /// Creates a new empty TaskContext
     ///
     /// # Returns
-    ///
-    /// A new TaskContext instance with empty files and text
+    /// * A new TaskContext instance with empty files and text
     pub fn new() -> Self {
         Self {
             files: vec![],
@@ -22,12 +23,12 @@ impl TaskContext {
 
     /// Combines all context sources into a single formatted string
     ///
+    /// # Description
     /// Merges both text content and file contents into a formatted string,
     /// with clear section headers for each type of content.
     ///
     /// # Returns
-    ///
-    /// A String containing the combined context, or empty string if no content exists
+    /// * A String containing the combined context, or empty string if no content exists
     pub fn combined_context(&self) -> String {
         if self.text.trim().is_empty() && self.files.is_empty() {
             return String::new();

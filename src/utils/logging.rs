@@ -17,7 +17,7 @@ use tracing_subscriber::EnvFilter;
 /// ```
 /// init_logging("info");
 /// ```
-pub fn init_logging(log_level: &str) {
+pub fn init_logging(log_level: &str, api_enabled: bool) {
     let filter = match EnvFilter::try_new(log_level) {
         Ok(f) => f,
         Err(_) => {
@@ -26,14 +26,16 @@ pub fn init_logging(log_level: &str) {
         }
     };
 
-    let file_appender = RollingFileAppender::new(Rotation::DAILY, "logs", "kheish.log");
+    let registry = tracing_subscriber::registry().with(filter);
 
-    let file_layer = fmt::layer()
-        .with_line_number(true)
-        .with_writer(file_appender);
-
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(file_layer)
-        .init();
+    if api_enabled {
+        let console_layer = fmt::layer().with_line_number(true).with_target(false);
+        registry.with(console_layer).init();
+    } else {
+        let file_appender = RollingFileAppender::new(Rotation::DAILY, "logs", "kheish.log");
+        let file_layer = fmt::layer()
+            .with_line_number(true)
+            .with_writer(file_appender);
+        registry.with(file_layer).init();
+    }
 }
