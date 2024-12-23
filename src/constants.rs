@@ -27,6 +27,8 @@ pub const VALIDATOR_SYSTEM_PROMPT: &str = "You are a final validator, responsibl
 /// System prompt defining the formatter role for converting audits to markdown
 pub const FORMATTER_SYSTEM_PROMPT: &str = "You are a formatting assistant... You have access to the final security audit and the original code. Your role is to convert the audit into a markdown file.";
 
+pub const FORMATTER_SCHEMA_VALIDATOR: &str = "You are a formatting specialist. Your output must strictly match the provided JSON schema. No extra text or code fences. Only valid JSON.";
+
 /// User prompt template for the proposer to generate initial solutions
 pub const PROPOSER_USER_PROMPT: &str = "You have context and instructions describing a problem, task or content request. Based on this information, provide an initial proposal that is concise, coherent and useful. If a specific format is required, follow it scrupulously. If previous feedback is available, incorporate it. Start your response with 'Proposal:' followed directly by the requested solution or content, without additional comments.";
 
