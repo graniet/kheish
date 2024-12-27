@@ -6,6 +6,7 @@ use std::fmt::Debug;
 pub mod anthropic;
 pub mod ollama;
 pub mod openai;
+pub mod deepseek;
 
 #[async_trait]
 pub trait LlmProvider: Debug + Send + Sync {
