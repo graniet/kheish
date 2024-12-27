@@ -25,6 +25,7 @@ impl LlmClient {
             "anthropic" => Box::new(crate::llm::providers::anthropic::AnthropicProvider::new(
                 model,
             )?),
+            "deepseek" => Box::new(crate::llm::providers::deepseek::DeepSeekProvider::new(model)?),
             "ollama" => Box::new(crate::llm::providers::ollama::OllamaProvider::new(model)?),
             _ => return Err(format!("Unknown provider '{}'", provider_name).into()),
         };
