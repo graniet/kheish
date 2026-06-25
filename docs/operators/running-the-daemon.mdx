@@ -1,0 +1,331 @@
+---
+title: Running the daemon
+description: Building, starting, and operating a Kheish daemon safely.
+---
+
+# Running the daemon
+
+This page covers the operational basics for running a Kheish daemon instance.
+
+## Build
+
+```bash
+cargo build -p kheish-daemon
+```
+
+The daemon binary is:
+
+```bash
+target/debug/kheish-daemon
+```
+
+## Start an isolated daemon
+
+The recommended startup path is:
+
+1. choose one named-routes file
+2. populate its referenced `auth_ref` slots
+3. start the daemon with an explicit state root and workspace root
+
+For a dual-route baseline, use the shipped [routes.default.toml](../../routes.default.toml) from the repository root. It expects the secret refs `anthropic.prod` and `openai.prod`.
+
+```bash
+export KHEISH_AUTH_STORE_MASTER_KEY="$(./target/debug/kheish-daemon secrets generate)"
+
+mkdir -p .kheish-daemon-data .kheish-workspace
+
+./target/debug/kheish-daemon secrets set anthropic.prod \
+  --offline \
+  --state-root .kheish-daemon-data \
+  --provider anthropic \
+  --from-env ANTHROPIC_API_KEY
+
+./target/debug/kheish-daemon secrets set openai.prod \
+  --offline \
+  --state-root .kheish-daemon-data \
+  --provider openai \
+  --from-env OPENAI_API_KEY
+```
+
+Generate this key once for `.kheish-daemon-data` and keep reusing it. If you replace it later, the daemon can no longer decrypt the existing auth store for that state root.
+
+If you run in Docker, Kubernetes, or another secret-file-oriented platform, use `KHEISH_AUTH_STORE_MASTER_KEY_FILE` instead of the inline environment variable.
+
+The daemon also generates and persists an Ed25519 signing key for the external-action audit under `state_root/audit-signing.key` unless you set `KHEISH_EXTERNAL_ACTION_AUDIT_SIGNING_KEY` or `KHEISH_EXTERNAL_ACTION_AUDIT_SIGNING_KEY_FILE`. Back up that key with the same state root if you want signed audit continuity after migration or restore.
+
+```bash
+./target/debug/kheish-daemon serve \
+  --bind 127.0.0.1:4000 \
+  --state-root .kheish-daemon-data \
+  --workspace-root .kheish-workspace \
+  --routes-file ./routes.default.toml
+```
+
+If you want a smaller single-provider daemon, create one minimal routes file:
+
+```bash
+cat > routes.toml <<'TOML'
+version = 1
+default_route = "openai"
+
+[routes.openai]
+driver = "openai"
+default_model = "gpt-5.4"
+auth_ref = "openai.prod"
+TOML
+```
+
+```bash
+./target/debug/kheish-daemon secrets set openai.prod \
+  --offline \
+  --state-root .kheish-daemon-data \
+  --provider openai \
+  --from-env OPENAI_API_KEY
+```
+
+For OpenRouter, use a first-class OpenRouter route:
+
+```bash
+cat > openrouter-routes.toml <<'TOML'
+version = 1
+default_route = "openrouter"
+
+[routes.openrouter]
+driver = "openrouter"
+default_model = "openai/gpt-5.4-mini"
+model_support = "any"
+auth_ref = "openrouter.prod"
+TOML
+```
+
+```bash
+./target/debug/kheish-daemon secrets set openrouter.prod \
+  --offline \
+  --state-root .kheish-daemon-data \
+  --provider openrouter \
+  --from-env OPENROUTER_API_KEY
+
+./target/debug/kheish-daemon serve \
+  --bind 127.0.0.1:4000 \
+  --state-root .kheish-daemon-data \
+  --workspace-root .kheish-workspace \
+  --routes-file ./openrouter-routes.toml
+```
+
+For OpenRouter, `model_support = "any"` is usually the right setting because route-aware selectors commonly target vendor-prefixed model identifiers such as `openrouter/openai/gpt-5.4-mini`.
+
+## Route inventory flags
+
+The main route-related startup flags are:
+
+- `--routes-file`
+- `--default-route`
+
+`--routes-file` is the recommended operator path because it gives the daemon a stable inventory of named routes such as `openai`, `anthropic`, `research`, or `openrouter`, each with its own `auth_ref`.
+
+The older single-route startup flags still exist, including `--provider openrouter`, but `--routes-file` is the recommended production path because it keeps route ids, auth refs, and capability overrides explicit.
+
+If the file defines multiple routes, set `default_route = "..."` inside the file. `serve --default-route ...` can override that file value, but it does not currently replace a missing `default_route` in a multi-route file.
+
+When a daemon starts from `--routes-file`, it records non-secret route inventory metadata in the state root as `route-inventory.json`, including the canonical route-file path and loaded SHA-256. `kheish-daemon doctor routes` compares that loaded hash with the current file on disk and warns with `route_file_drift` if an operator edited the file without restarting or performing a controlled reload. The running daemon keeps using the inventory it loaded at startup until restarted.
+
+## Additional startup flags
+
+The most important startup parameters are:
+
+- `--bind`
+- `--state-root`
+- `--workspace-root`
+- `--mcp-discovery`
+- `--mcp-config`
+- `--mcp-credentials`
+- `--mcp-profile`
+- `--connectors-config`
+- `--http-auth-mode`
+- `--http-admin-token` or `--http-admin-token-file`
+- `--http-readonly-token` or `--http-readonly-token-file`
+- `--http-cors-allow-origin`
+- `--skill-root`
+
+Leave `--http-cors-allow-origin` unset for the default local-development policy, which accepts loopback browser origins. Set it one or more times, or use comma-delimited `KHEISH_HTTP_CORS_ALLOW_ORIGINS`, when the browser UI should be limited to exact local origins such as `http://localhost:5173`.
+
+Use `--mcp-profile` to enable a built-in MCP catalog profile without writing a Codex-compatible MCP config file:
+
+```bash
+./target/debug/kheish-daemon serve --mcp-profile docs
+```
+
+The catalog is opt-in. `serve` does not start every built-in MCP server by default. See [MCP catalog](./mcp-catalog) for profiles, credential variables, and validation steps.
+
+For container deployments, also read [Docker and containers](./docker-and-containers). That page covers the official image defaults, `/healthz` and `/readyz`, file-backed secrets, and the recommended daemon-plus-remote-connectors topology.
+
+For production backup/restore, TLS proxying, key rotation, incident response, and SLO smoke checks, read [Production runbooks](./production-runbooks).
+
+## Sanity checks
+
+After startup, validate the daemon with:
+
+```bash
+./target/debug/kheish-daemon status
+./target/debug/kheish-daemon runtime get
+```
+
+`status` is the daemon-side operator snapshot: readiness, runtime route, run queues, schedules, agents, mailboxes, storage write health, provider readiness, and live background shell tasks. Use `doctor` when you also want the CLI to probe `/readyz`, verify that the SSE stream delivers a heartbeat/event frame, preserve actionable health-warning fixes, and diagnose auth/CORS/routes/hooks. Use `doctor --cors-origin <origin>` to test the browser preflight path, including `POST` with `Authorization` and `Content-Type` headers.
+
+The daemon also exposes unauthenticated probe endpoints:
+
+```bash
+curl http://127.0.0.1:4000/healthz
+curl http://127.0.0.1:4000/readyz
+```
+
+`/readyz` returns `503` while the daemon is draining during shutdown.
+
+`runtime get` is the authoritative operator view for the active route id, current model, and full route inventory known to the daemon.
+It also shows the resolved MCP snapshot, including selected built-in profiles and per-server source metadata when MCP is enabled.
+Use `secrets list` and `secrets get <secret_ref>` for the corresponding secret metadata. Those commands return slot status only, not raw secret values.
+Use `runtime auth subject <subject_id>` and `runtime auth lease <lease_id>` when you need to inspect delegated runtime auth, and `runs external-actions <run_id>` when you need the signed per-run external audit trail.
+
+## Evidence note
+
+- Code verified: `crates/kheish-daemon/src/cli/serve.rs`, `crates/kheish-daemon/src/config.rs`, `crates/kheish-daemon/src/builders.rs`.
+- CLI verified: `serve --mcp-profile` and `KHEISH_MCP_PROFILES`.
+- Daemon live tested: yes, with a fresh `--state-root`, fresh `--workspace-root`, and `--mcp-profile docs`.
+- Provider-specific tested: no provider-specific model route is required for daemon startup flag validation.
+
+## Working model
+
+The recommended operational loop is:
+
+1. create a fresh session
+2. submit one input
+3. watch the run or session stream
+4. inspect approvals, questions, or tasks if the run blocks
+5. read the final output from the daemon rather than inferring from prompt text alone
+
+## Project coordination smoke check
+
+If you want to validate the daemon-owned project layer against a real daemon, one compact operator flow is:
+
+```bash
+./target/debug/kheish-daemon sessions create implementer
+./target/debug/kheish-daemon channels create --channel-id release-room "Release room"
+
+./target/debug/kheish-daemon projects create \
+  --project-id release-2026-q2 \
+  "Release 2026 Q2"
+
+./target/debug/kheish-daemon projects members upsert \
+  release-2026-q2 \
+  implementer \
+  "Implementer" \
+  --member-kind session \
+  --session-id implementer \
+  --role implementation \
+  --expertise-tag rust
+
+./target/debug/kheish-daemon projects channels link \
+  release-2026-q2 \
+  release-room \
+  --default-for-new-tasks true \
+  --mirror-members true
+
+./target/debug/kheish-daemon projects tasks create \
+  release-2026-q2 \
+  "Review route inventory" \
+  --project-task-id review-routes \
+  --description "Inspect routes.default.toml and post project-visible updates." \
+  --assignee-member-id implementer
+
+./target/debug/kheish-daemon projects tasks start \
+  release-2026-q2 \
+  review-routes \
+  --wait
+```
+
+This validates the current production path:
+
+- daemon-owned project creation
+- session-backed project membership
+- linked project channels
+- mirrored project members in channels
+- project-task creation and assignment
+- project-task start through a real daemon run
+- optional creation of a public kickoff thread in the linked default channel
+
+Read [Projects and project tasks](../concepts/projects-and-project-tasks) for the model and [Projects API](../reference/projects-api) for the HTTP surface behind these commands.
+
+## Manual capability-scope smoke check
+
+After startup, you can validate persona and session capability scoping against the real daemon with one short flow:
+
+```bash
+./target/debug/kheish-daemon personas create "Restricted reviewer" \
+  --persona-id restricted-reviewer \
+  --soul "Review changes and cite the relevant files." \
+  --capability-scope-json '{"mcp_server_allow":["openaiDeveloperDocs"]}'
+
+./target/debug/kheish-daemon sessions create review-demo \
+  --persona-id restricted-reviewer
+
+./target/debug/kheish-daemon sessions set-capability-scope review-demo \
+  --capability-scope-json '{"skill_deny":["live-inline-marker"]}'
+
+./target/debug/kheish-daemon sessions get review-demo
+```
+
+Inspect the returned session view for:
+
+- the bound `persona`
+- the persisted `capability_scope`
+- the derived `effective_capability_scope`
+
+By default, a session with no persona baseline and no session scope starts from the daemon-global MCP inventory. The final surfaced MCP tools can still be narrower if the active runtime surface explicitly removes executable MCP entries.
+
+## State-root discipline
+
+Always be explicit about the active state root. Many apparent bugs are caused by talking to the wrong daemon instance or reusing stale state from another run or schema version.
+
+Use a dedicated workspace root for production daemons. Pointing the daemon at a source checkout or a broadly writable filesystem tree expands the blast radius of tool execution and file mutation.
+
+The state root also stores daemon-owned assets, derived document text, derived preview images, run state, channel records, channel event logs, channel lease snapshots, debug artifacts, recovered run-memory files under `run-memories/`, durable learnings, promoted procedural skills, and live runtime configuration in `runtime-config.json`. The learning automation policy is part of that runtime-config revision stream; `learning-policy.json` is treated only as legacy migration input when present. Size and back up the state root accordingly when you enable document-heavy, DXF-heavy, image-heavy, channel-heavy, or learning-heavy workflows.
+
+The same state root also stores daemon-managed persona records and the compact persona index used for listing and validation. Session-bound persona snapshots, session capability scopes, and session-local inline-skill state live in session metadata, so keep the full state root together when backing up or migrating a daemon.
+
+The same state root also stores daemon-managed connectors and the runtime connector cache. Session reply-target defaults live in session metadata, so a durable migration or backup must keep the connector store, auth store, and session journal together.
+
+## Manual connector and reply-target smoke check
+
+You can also validate the runtime connector control plane and session reply-target defaults against the real daemon:
+
+```bash
+./target/debug/kheish-daemon connectors put-http smoke-hook \
+  --json '{
+    "actor_id": "smoke-http",
+    "default_reply_targets": [
+      { "plugin": "http", "address": "https://example.invalid/reply" }
+    ]
+  }'
+
+./target/debug/kheish-daemon sessions set-reply-targets review-demo \
+  --reply-targets-json '{
+    "reply_targets": [
+      {
+        "type": "http",
+        "url": "https://example.invalid/reply",
+        "headers": {
+          "x-kheish-test": "1"
+        }
+      }
+    ]
+  }'
+
+./target/debug/kheish-daemon sessions get review-demo
+./target/debug/kheish-daemon connectors list
+```
+
+Inspect:
+
+- the session `reply_targets`
+- the connector inventory returned by `connectors list`
+- the redacted secret metadata when you use a secret-backed connector

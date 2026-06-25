@@ -1,0 +1,109 @@
+---
+title: Permissions
+description: Permission modes, rule scopes, approval behavior, and auditability for tool execution.
+---
+
+# Permissions
+
+Permissions control whether a tool call can run immediately, must be denied, or must wait for approval.
+
+## Modes
+
+The runtime exposes five global permission modes:
+
+- `default`
+- `acceptEdits`
+- `bypassPermissions`
+- `plan`
+- `dontAsk`
+
+These modes change the approval behavior for sensitive operations without rewriting tool or agent logic.
+
+The JSON and runtime identifiers use the forms shown above. The CLI exposes the same modes with kebab-case flags such as `accept-edits`, `bypass-permissions`, and `dont-ask`.
+
+`bypassPermissions` converts approval prompts into allows but still preserves explicit deny rules. `acceptEdits` auto-allows edit approvals for `write_file`, `edit_file`, and `apply_patch`, but also preserves explicit deny rules. `plan` preserves explicit deny rules before applying its read-only/coordination allowlist.
+
+Mode matrix for the default sensitive-rule set:
+
+| Tool class | default | acceptEdits | bypassPermissions | plan | dontAsk |
+| --- | --- | --- | --- | --- | --- |
+| Explicit deny rule | deny | deny | deny | deny | deny |
+| `bash` | ask | ask | allow | deny | deny |
+| `write_file`, `edit_file`, `apply_patch` | ask | allow | allow | deny | deny |
+| `mcp__*` tools | ask | ask | allow | deny | deny |
+| `list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource` | ask | ask | allow | ask | deny |
+| Read-only file/search/list tools and schedule/goal inspection | allow | allow | allow | allow | allow |
+| `exit_plan_mode` | ask | ask | allow | ask | deny |
+| Other tools not matched by a sensitive rule | allow | allow | allow | deny unless whitelisted as read-only/coordination | allow |
+
+## Rule scopes
+
+Permission rules can be owned at three scopes:
+
+- user
+- project
+- session
+
+This lets operators apply broad defaults while still narrowing or relaxing behavior for a specific deployment or session.
+
+Precedence is deterministic and is applied in this order:
+
+1. Merge durable session-scoped hook updates with the static session rules. Hook updates are evaluated before static session rules, so they win same-pattern specificity ties.
+2. Match session rules before project rules before user rules.
+3. Within the winning scope, exact tool names win over prefix wildcards such as `mcp__linear__*`, longer prefix wildcards win over shorter prefix wildcards such as `mcp__*`, prefix wildcards win over `*`, and the earliest inserted rule wins ties among equally specific rules.
+4. Apply the effective permission mode. Modes can transform an `ask` into `allow` or `deny`, and `plan` can also deny a base `allow` for tools outside its read-only/coordination allowlist.
+5. If the resulting decision is `ask`, run `permission_request` hooks.
+6. If the final decision is `deny`, run `permission_denied` hooks.
+7. Persist the final permission audit data for the tool call.
+
+The default daemon adds a final session `*` allow rule after the sensitive-tool rules. That makes otherwise-unmatched tools explicit in dry-run explanations instead of relying on an implicit allow.
+
+## Approval behavior
+
+When a tool call requires approval:
+
+1. the run pauses
+2. an approval request is persisted
+3. the caller or another client resolves the request
+4. the original run resumes with the approved or denied outcome
+
+## Auditability
+
+Permission decisions are written into the session record stream as audit data. This gives operators a durable account of how a sensitive tool call was evaluated and resolved. The durable audit is updated after permission hooks run, so a hook-approved request is audited as `allow`, a hook-blocked request is audited as `deny`, and a still-pending approval remains `ask`.
+
+Each permission audit includes the final `decision`, the `base_decision` before permission mode transformations, the `effective_mode`, the `mode_effect` when a mode changed the result, the `matched_rule_pattern` when a rule matched, and `matched_rule_origin` (`static` or `hook_update`) when the selected rule came from a known source. These fields make hook-approved, hook-denied, mode-denied, and approval-pending cases inspectable without inferring from free-form reasons.
+
+`GET /v1/sessions/{session_id}/permission-audits` exposes the ordered durable audit records for a session.
+
+Operator approval resolution is recorded separately as approval events on the run. For a complete audit trail of an approval-gated tool call, inspect both the permission audit data and the approval resolution events.
+
+## Hooks and permissions
+
+Hooks can update permissions dynamically. This is powerful, but it should be treated as part of the operational security model rather than as a convenience feature. Hook-emitted permission updates are accepted only at `session` scope because that is the durable scope restored after daemon restart. Broader `user` and `project` changes must go through runtime configuration instead of hook output.
+
+Agent hooks are isolated ephemeral agents. When `tool_surface` is omitted, they receive no tools. If an agent hook needs tools, configure an explicit allowlist; denylist-only surfaces are rejected because they otherwise expose every future tool by default.
+
+`POST /v1/runtime/permissions/check` and `kheish-daemon runtime permissions check` are dry-run explainers. They do not execute hooks, create approval requests, run tools, or persist audit records. Their response includes `hooks_evaluated=false` and `hook_policy=not_executed_in_dry_run` so operators can distinguish static rule/mode explanation from a real run. If a `session_id` is provided, it must name an existing session so session-scoped hook permission updates can be applied deliberately. The request also accepts `mode_override`, and the CLI exposes it as `--mode`, to explain another mode without mutating runtime configuration or consuming approval ids.
+
+`POST /v1/runtime/permissions/matrix` and `kheish-daemon runtime permissions matrix` explain every registered tool under every permission mode without mutating runtime configuration. Use this before production changes to confirm the active daemon surface, including dynamically registered MCP tools and control tools, matches the expected matrix.
+
+The dry-run response also includes the matched static rule and mode transformation details:
+
+- `matched_rule`: the selected rule after scope and pattern precedence, when one matched.
+- `matched_rule_origin`: `static` or `hook_update`, when the selected rule source is known.
+- `base_decision`: the rule decision before applying the effective mode.
+- `mode_applied`: whether the mode changed the rule semantics. This field may be absent when a newer CLI is reading an older daemon response.
+- `mode_effect`: the named mode transformation, such as `accept_edits_auto_allowed_edit_approval` or `plan_mode_denied_non_whitelisted_tool`.
+
+## Playbooks and flows
+
+Playbooks and Flows do not bypass permissions. A Flow starts a normal session run, so tool calls still use the active permission mode, permission rules, approvals, hooks, and session credential boundary.
+
+Sidechain children cannot widen the parent session permission mode. If a parent is in `default`, the child cannot request `acceptEdits` or `bypassPermissions`; if a parent is in `plan`, the child remains in `plan`. Omitted child modes are pinned to the parent's effective mode at spawn time, and session-scoped permission updates are copied to the child session.
+
+## Evidence Note
+
+- Code verified: `crates/kheish-runtime/src/permissions.rs`, `crates/kheish-core/src/engine.rs`, `crates/kheish-daemon/src/state/subagent_spawn.rs`, `crates/kheish-daemon/src/state/session_state.rs`, `crates/kheish-daemon/src/control_tools.rs`.
+- CLI/API verified: sidechain permission-mode fields checked against `SpawnSidechainRequest` and `spawn_agent` descriptor.
+- Daemon tested for this note: deterministic daemon tests cover permission check dry-runs, HTTP API shape, invalid session rejection, actual mode enforcement on tool execution, hook allow/deny final audit replacement, mode widening rejection, explicit default pinning, stale reuse reset, and parent session permission update inheritance.
+- Provider-specific tested for this note: OpenAI live hook/write smoke for the permissions path; detailed permission evaluation and audit assertions remain daemon-local.

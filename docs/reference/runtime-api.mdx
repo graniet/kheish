@@ -1,0 +1,1036 @@
+---
+title: Runtime API
+description: Daemon-wide capabilities, routing, secrets, connectors, hooks, permission mode, debug level, and live events.
+---
+
+# Runtime API
+
+These endpoints expose or mutate daemon-wide runtime state. They are operational controls, not per-run settings.
+
+## Endpoint inventory
+
+Inspection:
+
+- `GET /v1/status`
+- `GET /v1/capabilities`
+- `GET /v1/runtime`
+- `GET /v1/runtime/learning-policy`
+- `GET /v1/runtime/run-memory-policy`
+- `GET /v1/runtime/tool-limits`
+- `GET /v1/runtime/secrets`
+- `GET /v1/runtime/secrets/{secret_ref}`
+- `GET /v1/runtime/auth/accounts`
+- `GET /v1/runtime/auth/accounts/{slot_id}`
+- `GET /v1/runtime/auth/subjects/{subject_id}`
+- `GET /v1/runtime/auth/leases/{lease_id}`
+- `GET /v1/runtime/connectors`
+- `GET /v1/runtime/connectors/external/metrics`
+- `GET /v1/runtime/connectors/{kind}/{name}`
+- `GET /v1/runtime/hooks`
+- `GET /v1/runtime/revisions`
+- `GET /v1/skills`
+- `GET /v1/skills/{skill_name}`
+
+Mutation:
+
+- `POST /v1/runtime/model`
+- `POST /v1/runtime/learning-policy`
+- `POST /v1/runtime/run-memory-policy`
+- `POST /v1/runtime/tool-limits`
+- `POST /v1/runtime/secrets`
+- `POST /v1/runtime/auth/accounts`
+- `POST /v1/runtime/auth/accounts/mcp-oauth`
+- `POST /v1/runtime/auth/accounts/{slot_id}/refresh`
+- `POST /v1/runtime/auth/accounts/{slot_id}/revoke`
+- `POST /v1/runtime/auth/subjects/{subject_id}/revoke`
+- `POST /v1/runtime/auth/leases/{lease_id}/revoke`
+- `DELETE /v1/runtime/auth/accounts/{slot_id}`
+- `DELETE /v1/runtime/secrets/{secret_ref}`
+- `POST /v1/runtime/permission-mode`
+- `POST /v1/runtime/permissions/check`
+- `POST /v1/runtime/system-prompt`
+- `POST /v1/runtime/hooks`
+- `POST /v1/runtime/debug-level`
+- `POST /v1/runtime/rollback`
+- `PUT /v1/runtime/connectors/{kind}/{name}`
+- `DELETE /v1/runtime/connectors/{kind}/{name}`
+
+Streaming:
+
+- `GET /v1/events/stream`
+
+When control-plane bearer auth is enabled, the subject and lease inspection endpoints require an admin token. Raw hook settings, hook dead-letter records, and runtime revision history also require an admin token because they can reveal executor bodies, integration endpoints, or historical policy details. `GET /v1/status` and `GET /v1/runtime` keep hook shape but redact executor secrets on read-only surfaces.
+
+## `POST /v1/runtime/permissions/check`
+
+Dry-runs one permission decision without running hooks, creating approvals, executing a tool, or persisting audit records.
+
+Request body:
+
+```json
+{
+  "tool_name": "bash",
+  "tool_call_id": "optional-call-id",
+  "session_id": "optional-session-id",
+  "input": { "command": "echo hello" }
+}
+```
+
+The response is a `PermissionExplanation` with the effective mode, `decision` (`allow`, `ask`, or `deny`), optional `base_decision`, optional `mode_applied`, optional `mode_effect`, optional `matched_rule`, `approval_required`, `scope`, optional `reason`, `audit_preview`, `hooks_evaluated=false`, and `hook_policy=not_executed_in_dry_run`. `base_decision` is the static rule decision before permission mode transformations, and `matched_rule` is selected before mode application. `base_decision` and `mode_applied` are optional for mixed-version CLI/daemon compatibility; current daemons include them. If `session_id` is supplied and no such session exists, the endpoint returns `404 session_not_found`.
+
+## `GET /v1/status`
+
+This is the daemon-owned operator snapshot used by `kheish-daemon status` and `kheish-daemon doctor`.
+
+The response preserves the original top-level readiness contract:
+
+- `status`: `ready` or `draining`
+- `ready`: boolean readiness flag
+- `capabilities`: the same feature advertisement returned by `/v1/capabilities`
+
+It also includes cheap summaries that avoid walking every live session runtime:
+
+- `runtime`: current route, model, permission mode, redacted hook settings, MCP, skills, tool runtime limits, and debug level
+- `run_memory`: recovered run-memory policy, indexed counts, stale indexed count, and monotonic counters
+- `session_memory`: prompt-visible learned-context counters, including final runtime prompt-budget omissions
+- `sessions.total`
+- `runs`: lifecycle counts, pending approval/question counts, max queue depth, oldest queued-run lag, oldest non-terminal run age, oldest non-terminal idle time, and a bounded sample of runs idle past the stale threshold
+- `schedules`: lifecycle counts, due/backoff counts, queued fire count, in-flight count, and next due time
+- `delivery`: output delivery queue counts, target circuit/backpressure counts, next retry timing, worker heartbeat, `worker_lag_ms`, plus `status_error_count` and `status_error` when persisted delivery ledgers or the derived status summary need operator attention
+- `agents`: status counts, live runtime count, sidechain count, closed count, terminal snapshot count, and mailbox message count
+- `tasks`: live background shell task count plus durable task counts for `pending`, `in_progress`, `blocked`, `completed`, `failed`, and `cancelled`
+- `storage`: write-health probes for the daemon state root and workspace root
+- `provider_readiness`: per-route provider/account readiness derived from route config and referenced auth slots
+- `control_plane`: bind/auth/CORS posture, including effective admin/read-only token availability and redacted token-file load errors
+- `events`: SSE replay-buffer capacity, retained count, oldest/newest/next event ids, subscriber count, replay cursor gap count, live stream lag count, and retained per-session/per-run eviction metadata counts
+- `health`: aggregate route counts, scheduler lag, snapshot build duration, and operator warnings with stable `severity`, `code`, `message`, optional `related_id`, and optional `action`; inline provider credentials are reported as an `info` warning so supported inline-key route files remain healthy
+
+`storage.probes[]` performs a bounded create/write/sync/delete probe off the async runtime. Each probe has a timeout; a failed or timed-out probe sets `storage.ok=false`, increments `storage.write_error_count`, and emits a `storage_write_probe_failed` health warning with an action that points at the affected startup flag.
+
+`storage.state_root_lock` reports the daemon lock file, whether the current daemon owns it, and the platform mechanism such as `flock`. On older daemons this field can be absent, so Doctor treats absence as compatibility rather than a hard failure.
+
+`provider_readiness.routes[]` reports each route id, provider, model, capability matrix, whether it is the active route, the auth reference, and readiness state:
+
+- `ok`: the route has inline startup credentials, a matching healthy auth slot, or it is a non-authenticated internal/scripted provider
+- `warning`: credentials are usable but close to expiry or the last refresh outcome was not successful
+- `error`: the route references a missing slot, a mismatched provider, an expired credential, or an unreadable auth status
+
+`health.warnings[]` includes `queued_run_lag` when the oldest queued run exceeds the status threshold, `stale_non_terminal_runs` when active/waiting work has been idle past the stale threshold, `provider_active_route_not_ready` when the active route is not usable even if the route inventory did not emit a more specific provider-readiness error, `event_stream_lagged` when live SSE consumers skipped broadcast events, `delivery_status_unavailable` when delivery ledgers cannot be summarized, and control-plane auth warnings for missing effective admin tokens, unavailable token files, or duplicate effective tokens.
+
+The default run-warning thresholds are 30 minutes. Operators can tune them with `KHEISH_QUEUED_RUN_LAG_WARNING_THRESHOLD_MS` and `KHEISH_STALE_NON_TERMINAL_RUN_THRESHOLD_MS`; the effective values are echoed in `status.runs.queued_run_lag_threshold_ms` and `status.runs.stale_non_terminal_run_threshold_ms`.
+
+Delivery terminal counts are served from a derived summary keyed by append-only ledger byte offsets, so `/v1/status` does not re-scan historical delivery ledgers. If those offsets fall behind the ledgers, `delivery.status_error_count` and `delivery.status_error` flag the summary as stale until the daemon repairs it on the next terminal delivery mutation or restart.
+
+Status collection also expires due structured questions before counting pending user questions, so the snapshot matches the question detail endpoints instead of reporting stale waits.
+
+## `kheish-daemon doctor`
+
+`doctor` is the CLI-side diagnostic wrapper around `/v1/status`. It prints the status payload plus structured checks for:
+
+- `/readyz`
+- `/v1/events/stream`, including a parseable SSE heartbeat/event frame
+- event replay counters from `status.events`, including lagged live SSE consumers and replay cursor gaps
+- control-plane auth posture, including effective token-file availability and duplicate effective tokens
+- CORS policy, and an actual browser-style preflight for `POST` plus `Authorization`/`Content-Type` when `--cors-origin <origin>` is provided
+- route inventory and provider readiness
+- storage probes and state-root lock ownership
+- static hook configuration problems plus HTTP hook DNS target checks for private/local address resolution
+- server-side `health.warnings`, preserving each warning `action` and `related_id`
+
+Exit codes follow the normal CLI contract: `0` when no error-severity check is present, `1` when Doctor found daemon health errors, `2` for invalid requests or oversized payloads (`400`/`413`), `3` when the daemon cannot be reached, `4` for auth failures (`401`/`403`), `5` for missing resources (`404`), `6` for conflicts (`409`), `7` for retryable transport/status failures such as timeouts, `429`, or `503`, and `8` for status schema mismatch.
+
+`doctor routes --routes-file <path>` validates a route file without starting the daemon. It reports inline-key warnings, missing `api_key_env`, missing explicit OpenAI/Anthropic auth files, invalid `base_url` values, unsupported capability overrides, unknown fields, and default-route problems. OpenAI Codex account-auth routes that try to re-enable image/audio/transcription capabilities are rejected here, matching `serve`.
+
+Use `doctor routes --routes-file <path> --default-route <route_id>` when you want the diagnostic to mirror a planned `serve --routes-file <path> --default-route <route_id>` command. The override must name an existing route, and multi-route files still need a valid file-level `default_route`.
+
+`doctor routes --check-auth` additionally checks referenced daemon auth slots against the running daemon, including missing slots, provider mismatches, expired credentials, and refresh warnings. For route files, it also checks implicit account-auth slots such as `route.<route_id>` for `openai_auth_source = "codex"` and `anthropic_auth_source = "claude_code"`, or verifies that a source credentials file is available for startup import.
+
+`doctor routes --check-references` checks the running daemon for persisted route references that no longer exist in the runtime route inventory. It currently inspects session route policies, non-terminal schedules, and non-terminal runs, and reports `stale_session_route_policy`, `stale_schedule_route`, or `stale_run_route` diagnostics with the missing route id. The option requires a running daemon and is rejected with `--routes-file`.
+
+`doctor routes --canary` submits a tiny real run against the selected running route inventory, using the normal session/run path with the route id and model pinned on the run. It is opt-in because it reaches the provider and may spend tokens. Use `--route <route_id>` to limit the check, and `--canary-timeout-ms <ms>` to bound each run. Canary rows report `passed`, `failed`, or `timeout`; failures include the canary session/run ids so operators can inspect the exact run. Canary mode is rejected with `--routes-file` because static TOML validation cannot prove that the currently running daemon can reach a provider/model/base URL.
+
+Run submission also checks the selected route readiness after route/model resolution and before persisting the run. If the effective route is already in an error state, such as a missing, mismatched, or expired `auth_ref`, the daemon rejects the request with `application/problem+json`, domain `routes`, code `route_not_ready`, and does not enqueue provider work. Scheduled dispatch uses the same guard, and persisted schedules pointing at a route removed after restart fail before a run is persisted. The daemon rechecks the pinned route immediately before run execution as well, so queued or waiting runs restored after restart fail on the missing pinned route instead of drifting to the active route. Warning states, such as credentials expiring soon, remain allowed.
+
+## `GET /v1/capabilities`
+
+This is the coarse daemon feature advertisement.
+
+Current fields include:
+
+- `control_plane_version`
+- `approvals`
+- `sidechains`
+- `mailboxes`
+- `session_events`
+- `restart_restore`
+- `live_events`
+- `api_revision`
+- `route_capability_matrix_version`
+- `sse_replay`
+- `typed_sse_heartbeat`
+- `openapi`
+- `problem_details`
+- `cursor_pagination`
+- `paginated_lists`
+- `domain_errors`
+- `agent_supervisor_audit`
+- `spawn_policies`
+
+Example:
+
+```json
+{
+  "control_plane_version": "0.1.0",
+  "api_revision": 3,
+  "route_capability_matrix_version": 2,
+  "approvals": true,
+  "sidechains": true,
+  "mailboxes": true,
+  "session_events": true,
+  "restart_restore": true,
+  "live_events": true,
+  "sse_replay": true,
+  "typed_sse_heartbeat": true,
+  "openapi": true,
+  "problem_details": true,
+  "cursor_pagination": true,
+  "paginated_lists": true,
+  "domain_errors": true,
+  "agent_supervisor_audit": true,
+  "spawn_policies": true
+}
+```
+
+## OpenAPI and Error Contract
+
+`GET /v1/openapi.json` returns the daemon HTTP contract as OpenAPI 3.1. The spec covers the control-plane routes, connector ingress routes, observation ingress routes, and health probes, including path/query/header parameters, security scheme selection, SSE content type, pagination controls, and the shared `ProblemDetails` response. Connector ingress security is documented by mechanism, including replay-protection timestamp headers for HMAC-style signatures; individual connector configs can explicitly enable unauthenticated ingress, but the OpenAPI contract does not advertise unauthenticated access as the default.
+
+Daemon HTTP surfaces normalize non-success API errors to `application/problem+json` with stable `code` and optional `domain`. Control-plane errors use feature domains such as `sessions`, `runs`, `runtime`, `assets`, or `pagination`; observation upload and capture heartbeat ingress errors use `observation_ingress`; connector ingress errors use `connector_ingress` with connector-specific codes for rate-limit responses. Connector-specific success acknowledgements, such as Slack ignores or external-protocol per-item rejections inside a `200` batch response, keep their protocol JSON shape.
+
+Cursor pagination is opt-in with `page=true` or `cursor`. Supplying only `limit` preserves the legacy JSON array shape while applying the bounded limit and the same `limit=0` validation. `limit` values above the daemon maximum are clamped to the advertised maximum.
+The CLI mirrors this contract: `--limit` alone prints the legacy array shape, while `--page` or `--cursor` prints the paginated envelope.
+
+## `GET /v1/runtime`
+
+This is the main operator snapshot for a live daemon.
+
+Important fields:
+
+- `default_route`: the daemon-wide fallback route when no session or run override applies
+- `route_id`: the active default route identifier
+- `provider` and `model`: compatibility fields derived from the active default route
+- `routes`: the full daemon route inventory
+- `learning_policy`
+- `run_memory_policy`
+- `permission_mode`
+- `system_prompt`
+- `hooks`
+- `debug_level`
+- `debug_capture`: effective capture policy loaded from environment, including TTL/GC intervals,
+  artifact/run/store budgets, encryption status/key id, and redaction token source status
+- `mcp`
+- `skills`
+- `config`: durable runtime-config metadata (`revision`, `updated_at_ms`, `persisted`, `history_len`, `history_limit`, `store_path`)
+
+Each route entry exposes its resolved `route_id`, `auth_ref`, and capability flags:
+
+- `matrix_version`
+- `multimodal_input`
+- `native_web_search`
+- `image_generation`
+- `image_edit`
+- `audio_generation`
+- `transcription`
+
+`matrix_version` is currently `2` and should match `/v1/capabilities.route_capability_matrix_version` for current daemons. A legacy route payload without this field deserializes as version `0`.
+
+### Durable runtime config
+
+The daemon serializes live mutations for the default route/model, permission mode, system prompt, hooks, debug level, learning policy, run-memory policy, and tool runtime limits into `runtime-config.json` under the daemon state root. Successful writes append a monotonic revision and publish `runtime_updated`.
+
+Runtime transactions gate runtime reads and route pinning while the commit phase applies and persists the new revision. New runs should pin either the previous durable route or the next durable route, never a partially applied mutation.
+
+Mutation payloads for `/model`, `/permission-mode`, `/system-prompt`, `/debug-level`, `/learning-policy`, `/run-memory-policy`, and `/tool-limits` accept optional `expected_revision`. If the current revision differs, the daemon returns `409 application/problem+json` with:
+
+```json
+{
+  "domain": "runtime",
+  "code": "runtime_revision_conflict"
+}
+```
+
+`GET /v1/runtime/revisions` returns the current revision plus retained history in descending revision order. Revision reads use the same runtime-config visibility gate as `GET /v1/runtime`, so operators do not observe revision history while a mutation is in its apply/persist window.
+
+The daemon retains at most `config.history_limit` historical revisions plus the current revision. Older historical revisions are pruned when the limit is exceeded, so rollback targets must be present in `GET /v1/runtime/revisions`.
+
+`POST /v1/runtime/rollback` accepts:
+
+```json
+{
+  "target_revision": 7,
+  "expected_revision": 12,
+  "skip_hooks": false
+}
+```
+
+`target_revision` is optional; when omitted, the daemon restores the previous retained revision. Rollback appends a new revision with `setting: "rollback"` and `rollback_of_revision` set to the restored revision.
+
+`skip_hooks` defaults to `false`. Set it to `true` only for operator recovery when a persisted `config_change` hook blocks normal runtime remediation. Forced rollback still appends a normal runtime-config revision and records `source: "runtime_api_force"`.
+
+If a `config_change` hook blocks a mutation, no runtime-config revision is appended and the daemon returns `409` with `runtime/runtime_change_blocked`.
+
+Rollback to an unknown retained revision returns `404` with `runtime/runtime_revision_not_found`.
+
+Hook definitions inside `GET /v1/runtime` and `GET /v1/runtime/revisions` are redacted because these are runtime summary surfaces. Use the admin-only `GET /v1/runtime/hooks` endpoint to inspect the current raw hook settings before making hook changes.
+
+### MCP snapshot
+
+When MCP is enabled, `mcp` includes:
+
+- `config_path`: Codex-compatible MCP config path when one was loaded.
+- `selected_profiles`: built-in MCP catalog profiles selected through `--mcp-profile` or `KHEISH_MCP_PROFILES`.
+- `servers`: per-server snapshots.
+- `tool_names`: daemon-global MCP helper and qualified MCP tool names before session/persona filtering.
+
+Each server snapshot can include:
+
+- `server`
+- `source`: `codex_config` or `built_in_catalog`
+- `profiles`: built-in profile names that selected the server when it came from the catalog
+- `catalog_entry_id`: built-in catalog entry id when applicable
+- `transport`
+- `uses_credentials`
+- `credential_secret_refs`: daemon auth-store refs used by the server, without secret values
+- `connected`
+- `tools`
+- `error`
+- `instructions`: truncated, warning-wrapped server-provided advisory text. Treat it as untrusted data, not an operator instruction.
+
+The runtime snapshot reports daemon inventory. A session or persona can still narrow MCP visibility with capability scope, and child agents can further narrow credential inheritance. The snapshot is not a live transport health probe; operators should validate suspicious MCP liveness through a real tool/resource call and daemon logs.
+
+## Learning automation policy
+
+`GET /v1/runtime/learning-policy` returns the daemon-owned `LearningAutomationPolicyConfig`.
+
+`POST /v1/runtime/learning-policy` replaces the full learning automation policy, appends a durable runtime-config revision, and accepts optional `expected_revision`.
+
+Wrapped payload:
+
+```json
+{
+  "policy": {
+    "mode": "shadow"
+  },
+  "expected_revision": 12
+}
+```
+
+For compatibility, the daemon also accepts the legacy flat policy object with `expected_revision` at the top level. A payload containing only `expected_revision` is rejected; use the wrapped `policy` object for an explicit reset.
+
+Current top-level fields:
+
+- `mode`
+- `capture`
+- `publication`
+- `judge`
+
+Current mode values:
+
+- `manual_only`
+- `shadow`
+- `enabled`
+
+Current defaults:
+
+- `mode` defaults to `shadow`
+- `capture.run_summary_candidates` defaults to `true`
+- `capture.semantic_candidates.enabled` defaults to `false`
+- `capture.semantic_candidates.max_candidates_per_run` defaults to `2`
+- `publication.default_action` defaults to `manual_review`
+- `publication.allow_api_origin_active_publication` defaults to `false`
+- `judge.enabled` defaults to `false`
+
+## Evidence note
+
+- Code verified: `crates/kheish-mcp/src/manager.rs`, `crates/kheish-daemon/src/state.rs`, `crates/kheish-daemon/src/api/types.rs`, `crates/kheish-daemon/src/api/handlers.rs`, `crates/kheish-auth/src/types.rs`, `crates/kheish-auth/src/backends/mcp_oauth.rs`.
+- CLI verified: `runtime get`, `runtime auth accounts list/get/refresh/revoke`, and `mcp oauth status/login/refresh/logout`.
+- Daemon live tested: yes, using a fresh daemon with `--mcp-profile docs` and the generic MCP OAuth true-binary protocol harness.
+- Provider-specific tested: no provider-specific model behavior is required for this control-plane snapshot.
+
+Important update rule:
+
+- `POST /v1/runtime/learning-policy` replaces the full policy
+- send `mode` explicitly when mutating policy, because omitting that field is not the same thing as applying the effective runtime default
+
+Current capture fields:
+
+- `run_summary_candidates`
+- `semantic_candidates`
+
+`semantic_candidates` currently contains:
+
+- `enabled`
+- `model`
+- `timeout_ms`
+- `max_candidates_per_run`
+
+Current semantic-capture validation:
+
+- `timeout_ms` must be greater than zero when provided
+- `max_candidates_per_run` must be between `1` and `8`
+- semantic capture rejects secret-like `fact`, `preference`, and `decision` content before candidate persistence
+
+Current publication fields:
+
+- `default_action`
+- `allow_api_origin_active_publication`
+- `quarantined_rule_names`
+- `rules`
+
+Current publication rule fields:
+
+- `name`
+- `scope_kind`
+- `scope_id`
+- `kind`
+- `sensitivity`
+- `min_confidence`
+- `require_evidence`
+- `require_source_run`
+- `require_source_session`
+- `action`
+- `expires_after_ms`
+
+Current action values:
+
+- `manual_review`
+- `reject`
+- `publish_provisional`
+- `publish_active`
+
+Important validation rules:
+
+- `publication.default_action` cannot be `publish_active`
+- a `publish_active` rule must declare an explicit `kind`
+- `publish_active` is not supported for `procedure` learnings
+- automatic active publication escalates to `manual_review` when the candidate conflicts with an active same-scope, same-kind learning with the same obvious subject
+- duplicate same-scope, same-kind prompt-visible learnings are reused instead of republished under a new learning id
+- `quarantined_rule_names` must be non-empty and unique
+
+Important runtime rule:
+
+- `require_evidence`, `require_source_run`, and `require_source_session` only count as trusted rule inputs for daemon-owned candidates
+- this trusted-input rule only affects rule matching; API-created candidates can still auto-publish when another rule matches, but automatic `active` publication is still subject to `allow_api_origin_active_publication` and daemon-owned verification
+
+Important automatic-`active` rule:
+
+- API-origin candidates are downgraded from automatic `publish_active` to `publish_provisional` unless `allow_api_origin_active_publication=true`
+- `publish_active` still requires daemon-owned verification before prompt visibility
+
+Current judge fields:
+
+- `enabled`
+- `model`
+- `timeout_ms`
+
+The judge is model-backed and daemon-owned. It runs after deterministic policy evaluation, can only choose actions inside the policy envelope, and fails closed to `manual_review` in `enabled` mode when execution fails.
+
+Example:
+
+```json
+{
+  "mode": "enabled",
+  "capture": {
+    "run_summary_candidates": false,
+    "semantic_candidates": {
+      "enabled": true,
+      "model": {
+        "provider": "openai",
+        "generation": {
+          "model": "gpt-5.4-mini"
+        }
+      },
+      "timeout_ms": 15000,
+      "max_candidates_per_run": 2
+    }
+  },
+  "publication": {
+    "default_action": "manual_review",
+    "allow_api_origin_active_publication": false,
+    "quarantined_rule_names": [],
+    "rules": [
+      {
+        "name": "session-fact-autopublish",
+        "scope_kind": "session",
+        "kind": "fact",
+        "sensitivity": "scoped",
+        "min_confidence": 95,
+        "require_evidence": false,
+        "require_source_run": false,
+        "require_source_session": false,
+        "action": "publish_provisional"
+      }
+    ]
+  },
+  "judge": {
+    "enabled": true,
+    "model": {
+      "provider": "anthropic",
+      "generation": {
+        "model": "claude-sonnet-4-5"
+      }
+    },
+    "timeout_ms": 15000
+  }
+}
+```
+
+## Run memory policy
+
+`GET /v1/runtime/run-memory-policy` returns the daemon-owned recovered run-memory policy.
+
+`POST /v1/runtime/run-memory-policy` replaces the full recovered run-memory policy. The policy is persisted through the runtime-config revision stream, restored on daemon restart, and immediately reapplies retention/overflow pruning to persisted run-memory records.
+
+New clients should send a wrapped payload with an optional compare-and-swap guard:
+
+```json
+{
+  "policy": {
+    "enabled": true,
+    "retention_ms": 604800000,
+    "max_tracked_per_session": 16,
+    "max_prompt_entries": 4,
+    "redact_pii": true,
+    "search_visibility": "session_only"
+  },
+  "expected_revision": 12
+}
+```
+
+For compatibility, the daemon also accepts the legacy flat policy object with `expected_revision` at the top level. Empty payloads, unknown-only payloads, and payloads containing only `expected_revision` are rejected instead of resetting the policy to defaults.
+
+Invalid policy limits return `400` with `runtime/invalid_run_memory_policy`.
+
+The runtime-config revision commit is authoritative. If follow-up pruning or index maintenance fails after a successful commit, the endpoint still returns the committed runtime snapshot and records the maintenance failure under `/v1/status.run_memory.maintenance`.
+
+Current fields:
+
+- `enabled`
+- `retention_ms`
+- `max_tracked_per_session`
+- `max_prompt_entries`
+- `redact_pii`
+- `search_visibility`
+
+Current defaults:
+
+- `enabled=true`
+- `retention_ms=2592000000`
+- `max_tracked_per_session=32`
+- `max_prompt_entries=3`
+- `redact_pii=true`
+- `search_visibility=session_only`
+
+Validation rules:
+
+- when `enabled=true`, `retention_ms`, `max_tracked_per_session`, and `max_prompt_entries` must be greater than zero
+- `max_prompt_entries` must not exceed `max_tracked_per_session`
+
+Operational effects:
+
+- disabled policy prevents new run-memory records from being stored and removes existing records as runs complete
+- `retention_ms` is enforced during boot rebuild, policy changes, storage, memory-context projection, memory-search, and prompt recovery
+- `max_tracked_per_session` controls durable per-session overflow pruning
+- `max_prompt_entries` controls the candidate set considered for prompt injection before final model-budget packing
+- `search_visibility=session_only` limits recovered-run `memory-search` results to the requested session
+- `search_visibility=learning_scopes` opts recovered-run `memory-search` into the session's visible learning scopes
+- `/v1/status.run_memory.metrics.prompt_limit_omitted_total` includes both daemon-side `max_prompt_entries` omissions and final runtime prompt-budget omissions
+- `/v1/status.run_memory.metrics.injected_total` counts recovered-memory entries kept after final runtime prompt packing, not merely candidate entries attached to run metadata
+- `/v1/status.run_memory.maintenance` exposes the last bounded startup or runtime-policy maintenance report, including prune counts, scan/prune error counts, and bounded diagnostics
+- `redact_pii=true` scrubs common PII and secret/token shapes before run-memory records are persisted
+
+CLI examples:
+
+```bash
+kheish-daemon runtime run-memory-policy get
+kheish-daemon runtime run-memory-policy set --file run-memory-policy.json
+cat run-memory-policy.json | kheish-daemon runtime run-memory-policy set --stdin
+kheish-daemon runtime run-memory-policy set --reset
+kheish-daemon runtime run-memory-policy set --file run-memory-policy.json --expected-revision 12
+```
+
+Example payload:
+
+```json
+{
+  "enabled": true,
+  "retention_ms": 604800000,
+  "max_tracked_per_session": 16,
+  "max_prompt_entries": 4,
+  "redact_pii": true,
+  "search_visibility": "session_only"
+}
+```
+
+## Change the default route
+
+`POST /v1/runtime/model` changes the daemon default route. It does not rewrite session route policies, queued runs, active runs, or already suspended runs.
+
+Request body:
+
+- `provider`: optional route identifier such as `openai`, `anthropic`, or `openrouter`
+- `model`: required backend model string
+
+Example:
+
+```json
+{
+  "provider": "openrouter",
+  "model": "openai/gpt-5.4-mini"
+}
+```
+
+Named-route note:
+
+- On a named-route daemon, `provider` is the daemon route id.
+- The concrete model stays in `model`.
+
+Terminology note:
+
+- request `provider` selects a configured route id
+- secret-slot `provider` names the underlying auth/backend family
+
+## Secret slots
+
+The runtime secret surface stores daemon-managed auth material. Read endpoints return `AuthSlotStatus`, not raw secret values.
+
+`AuthSlotStatus` fields:
+
+- `slot_id`
+- `provider`
+- `mode`
+- `summary`
+- `updated_at_ms`
+- `details`: backend-specific redacted metadata, such as expiry, source, issuer, resource, scopes, or last refresh outcome
+
+### `POST /v1/runtime/secrets`
+
+This endpoint accepts a full `AuthSlotRecord`:
+
+- `slot_id`
+- `provider`
+- `mode`
+- `state`
+- `updated_at_ms`
+
+### Generic opaque secret example
+
+Useful for connector secret references and MCP token slots such as `mcp.linear.LINEAR_API_KEY`.
+
+```json
+{
+  "slot_id": "connectors.http.inbox.bearer_token",
+  "provider": "generic",
+  "mode": "opaque_secret",
+  "state": {
+    "value": "super-secret-token"
+  },
+  "updated_at_ms": 1760000000000
+}
+```
+
+Runtime secret writes persist only when the daemon was started with `KHEISH_AUTH_STORE_MASTER_KEY` or `KHEISH_AUTH_STORE_MASTER_KEY_FILE`. MCP and connector token slots should use `provider: "generic"` with `mode: "opaque_secret"` unless you are writing a provider route key such as OpenAI or Anthropic.
+
+For MCP, a stored secret is useful only when a loaded built-in catalog entry or explicit MCP config references that `mcp.*` slot. Built-in catalog slots can be inspected with `mcp auth slots <entry-id>`, and explicit MCP config can reference slots through `bearer_token_secret_ref`, `http_header_secret_refs`, or `env_secret_refs`.
+
+MCP inventory is loaded at daemon startup. After writing or rotating a secret used by an MCP server, restart the daemon so that server reconnects with the new value.
+
+### OpenAI API key example
+
+```json
+{
+  "slot_id": "openai.primary",
+  "provider": "open_ai",
+  "mode": "api_key",
+  "state": {
+    "kind": "api_key",
+    "api_key": "sk-...",
+    "organization": "org_123",
+    "project": "proj_123"
+  },
+  "updated_at_ms": 1760000000000
+}
+```
+
+Other provider API-key states are also explicit in the auth backends:
+
+- Anthropic: `{"kind":"api_key","api_key":"..."}`
+- Google: `{"kind":"api_key","api_key":"..."}`
+- OpenRouter: `{"kind":"api_key","api_key":"..."}`
+- xAI: `{"kind":"api_key","api_key":"..."}`
+
+For account-backed OAuth records, prefer the CLI import or account flows when possible because the stored `state` is backend-specific and more verbose than simple API-key records.
+
+### OAuth account endpoints
+
+These endpoints expose redacted account status and write-only MCP OAuth import. They never return tokens.
+
+- `GET /v1/runtime/auth/accounts`: lists only slots where `mode` is `oauth_account`.
+- `GET /v1/runtime/auth/accounts/{slot_id}`: returns one OAuth account status and rejects non-OAuth slots.
+- `POST /v1/runtime/auth/accounts/{slot_id}/refresh`: forces one backend refresh and returns redacted status. The endpoint rejects non-OAuth slots.
+- `POST /v1/runtime/auth/accounts/{slot_id}/revoke` and `DELETE /v1/runtime/auth/accounts/{slot_id}`: delete the local OAuth account after normal dependency checks.
+- `POST /v1/runtime/auth/accounts/mcp-oauth`: stores one completed MCP OAuth authorization-code login. This is the endpoint used by `kheish-daemon mcp oauth login`.
+- `POST /v1/runtime/auth/accounts`: compatibility alias for the same MCP OAuth import body. Prefer `/v1/runtime/auth/accounts/mcp-oauth` in new clients.
+
+MCP OAuth import body:
+
+```json
+{
+  "slot_id": "mcp.oauth.acme",
+  "server_name": "acme",
+  "resource": "https://mcp.acme.example/mcp",
+  "issuer": "https://auth.acme.example",
+  "authorization_endpoint": "https://auth.acme.example/oauth/authorize",
+  "token_endpoint": "https://auth.acme.example/oauth/token",
+  "client_id": "client_123",
+  "client_secret": null,
+  "access_token": "write-only",
+  "refresh_token": "write-only",
+  "expires_at_ms": 1760000000000,
+  "scopes": ["read", "search"]
+}
+```
+
+The API validates MCP OAuth account records before storage:
+
+- slot ids must use the `mcp.` namespace
+- resource, issuer, authorization endpoint, and token endpoint must use `https`, except loopback `http` test URLs
+- empty core fields are rejected
+- refresh responses cannot add scopes that were not already approved
+
+Deletion:
+
+- `DELETE /v1/runtime/secrets/{secret_ref}` returns `{"accepted": true}` when the slot was removed.
+- Deletion returns `409 Conflict` when a runtime connector or loaded MCP server still references that slot.
+
+## Brokered runtime auth
+
+Kheish exposes operator-facing inspection for the broker that resolves auth-backed route and connector access at execution time.
+
+### Subject endpoints
+
+- `GET /v1/runtime/auth/subjects/{subject_id}`
+- `POST /v1/runtime/auth/subjects/{subject_id}/revoke`
+
+`AuthSubjectStatus` fields:
+
+- `subject_id`
+- `current_epoch`
+- `revoked`
+- `active_connector_lease_ids`
+- `active_route_lease_ids`
+- `active_mcp_lease_ids`
+
+Common subject ids are derived from the execution principal, typically:
+
+- `session:{session_id}`
+- `agent:{agent_id}`
+- `connector:{connector_name}`
+- `daemon`
+
+Revoking a subject immediately prevents future auth resolution for that subject and revokes its still-active leases.
+
+### Lease endpoints
+
+- `GET /v1/runtime/auth/leases/{lease_id}`
+- `POST /v1/runtime/auth/leases/{lease_id}/revoke`
+- `POST /v1/runtime/auth/slots/{slot_id}/revoke`
+
+`CredentialLeaseStatus` fields:
+
+- `lease`
+- `revoked`
+- `active`
+
+The nested `lease` payload includes:
+
+- `id`
+- `grant_id`
+- `subject_id`
+- `subject_epoch`
+- `audience`
+- `issued_at_ms`
+- `expires_at_ms`
+
+The HTTP and CLI operator view intentionally omits the broker's internal `token_digest`; it remains only in broker state for validation.
+
+Current lease audiences are:
+
+- `{"type":"route","route_id":"openai","slot_id":"openai.prod"}`
+- `{"type":"connector","connector":"slack-prod","env_keys":["BOT_TOKEN"]}`
+- `{"type":"mcp_server","server":"acme","slot_id":"mcp.oauth.acme","scopes_hash":"..."}`
+
+These endpoints are useful when you need to confirm whether one run or sidecar is still operating on a live delegated lease before rotating credentials or revoking delegated access.
+
+Matching CLI commands:
+
+```bash
+./target/debug/kheish-daemon runtime auth subject session:demo
+./target/debug/kheish-daemon runtime auth revoke-subject session:demo
+./target/debug/kheish-daemon runtime auth lease route-lease-abc123
+./target/debug/kheish-daemon runtime auth revoke-lease route-lease-abc123
+./target/debug/kheish-daemon runtime auth revoke-slot openai.prod
+```
+
+## Permission mode
+
+`POST /v1/runtime/permission-mode` replaces the daemon-wide permission mode.
+
+Request body:
+
+```json
+{
+  "mode": "acceptEdits"
+}
+```
+
+Supported values:
+
+- `default`
+- `acceptEdits`
+- `bypassPermissions`
+- `plan`
+- `dontAsk`
+
+## System prompt settings
+
+`POST /v1/runtime/system-prompt` replaces the current `SystemPromptSettings`.
+
+Fields:
+
+- `override_prompt`
+- `custom_prompt`
+- `append_prompt`
+- `language`
+- `output_style`
+
+Example:
+
+```json
+{
+  "settings": {
+    "append_prompt": "When a tool can perform the next step directly, use it instead of narrating intent.",
+    "language": "English",
+    "output_style": "Concise, operator-facing responses."
+  }
+}
+```
+
+## Hooks
+
+`GET /v1/runtime/hooks` returns the current raw `HookSettings`. When bearer auth is enabled, this endpoint requires an admin token. Use `GET /v1/runtime` or `GET /v1/status` for read-only runtime summaries with hook executor bodies redacted.
+
+`POST /v1/runtime/hooks` replaces the full hook map and appends a durable runtime-config revision. The endpoint accepts either a legacy bare `HookSettings` object or a wrapped request:
+
+```json
+{
+  "settings": {
+    "hooks": {}
+  },
+  "expected_revision": 12,
+  "skip_hooks": false
+}
+```
+
+`expected_revision` is optional. `skip_hooks` defaults to `false` and is intended only for operator recovery from a bad `config_change` hook revision.
+
+A payload containing only `expected_revision` or `skip_hooks` is rejected; use the wrapped `settings` object for an explicit hook reset.
+
+Hook settings are validated before persistence. Invalid hook names, empty executor inputs, zero or excessive timeouts, excessive retries, unsafe HTTP targets, and invalid agent turn limits return `application/problem+json` with `domain: "runtime"` and `code: "invalid_hook_settings"`. Rejected hook updates do not change the active runtime revision.
+
+Minimal example:
+
+```json
+{
+  "hooks": {
+    "session_start": [
+      {
+        "name": "announce-start",
+        "executor": {
+          "type": "command",
+          "command": "echo session-started",
+          "timeout_ms": 1000
+        }
+      }
+    ]
+  }
+}
+```
+
+For the full hook schema, event names, and executor variants, read [Hook reference](./hook-reference).
+
+`GET /v1/runtime/hooks/dead-letter` returns the latest redacted hook dead-letter records for operator inspection. When bearer auth is enabled, this endpoint requires an admin token. The underlying store is pruned by count and bytes. `POST /v1/runtime/hooks/dead-letter/{id}/resolve` accepts a JSON body such as `{"reason":"investigated"}`, appends a redacted operator-resolution ledger entry, and returns the resolved record view. The same subsystem is summarized under `GET /v1/status` as `status.hooks`, including configured count, historical and unresolved dead-letter counts, last unresolved hook, retry/failure counters, and dead-letter persistence failures.
+
+## Tool runtime limits
+
+`GET /v1/runtime/tool-limits` returns the current `ToolRuntimeLimits`.
+
+`POST /v1/runtime/tool-limits` replaces the full tool-limit object and appends a durable runtime-config revision. The mutation affects future tool batches; an already running batch keeps the snapshot it started with.
+
+Example:
+
+```json
+{
+  "limits": {
+    "max_input_bytes": 16777216,
+    "max_output_bytes": 16777216,
+    "max_result_envelope_bytes": 25165824,
+    "max_timeout_ms": 180000,
+    "max_parallel_tools": 16,
+    "max_calls_per_turn": 256,
+    "max_cumulative_output_bytes": 67108864,
+    "max_cumulative_result_envelope_bytes": 100663296,
+    "max_sandbox": "network_enabled"
+  },
+  "expected_revision": 12
+}
+```
+
+Every numeric limit must be greater than zero. Invalid requests return `400` with `runtime/invalid_tool_runtime_limits`.
+
+## Debug capture
+
+`POST /v1/runtime/debug-level` replaces the daemon-wide debug capture level.
+
+Example:
+
+```json
+{
+  "level": "redacted"
+}
+```
+
+Supported values:
+
+- `off`
+- `on`
+- `redacted`
+- `full`
+
+`full` is daemon-global and should only be enabled on isolated instances.
+At `redacted`, audio transcription attachment blocks inside model/provider debug payloads are
+replaced with digest/size summaries instead of raw transcript text.
+
+Debug artifacts are persisted under the daemon state root and are protected by the debug store:
+
+- retained artifact summaries expose plaintext byte counts and SHA-256 checksums
+- artifacts are truncated when they exceed `KHEISH_DEBUG_MAX_ARTIFACT_BYTES`
+- run artifact bodies are bounded by `KHEISH_DEBUG_MAX_RUN_BYTES` and
+  `KHEISH_DEBUG_MAX_ARTIFACTS_PER_RUN`
+- `KHEISH_DEBUG_MAX_STORE_BYTES` can cap the whole debug store by pruning the oldest terminal or
+  orphaned bundles
+- `KHEISH_DEBUG_TTL_MS` applies automatic retention to stale terminal and orphaned debug bundles;
+  known non-terminal runs are protected so resumable runs keep their evidence
+- `KHEISH_DEBUG_GC_INTERVAL_MS` controls the periodic retention worker interval
+- artifact bodies and manifests are synced through atomic temp-file replacement before they become
+  visible to the debug API
+
+Set `KHEISH_DEBUG_CAPTURE_KEY` or `KHEISH_DEBUG_CAPTURE_KEY_FILE` to a 32-byte key to encrypt
+debug artifact bodies at rest. The debug API and CLI decrypt artifacts when the same key is
+available. The two key environment variables are mutually exclusive. Encrypted artifacts include a
+non-secret key id so operators can identify key mismatches. If a configured key is invalid, enabling
+any non-`off` debug level is rejected with `400 application/problem+json` and code
+`debug_capture_key_invalid` so the daemon does not silently lose evidence.
+
+Set `KHEISH_DEBUG_REDACT_TOKENS` or `KHEISH_DEBUG_REDACT_TOKENS_FILE` for comma/newline-separated
+literal tokens that should be scrubbed from debug artifacts in addition to the built-in credential
+redaction rules. If the token file cannot be read, `redacted`/`full` capture enablement is rejected;
+if the file disappears while capture is already enabled, affected text payloads fail closed to a
+redaction marker instead of being persisted raw.
+
+Some media/debug providers can emit repeated artifacts without a turn/attempt number. In that case
+the first artifact keeps the base id and later artifacts receive stable timestamp suffixes; discover
+the full list from `GET /v1/runs/{run_id}/debug` before fetching artifact bodies.
+
+## Runtime connectors
+
+Detailed connector payloads and ingress behavior are documented in [Connectors API](./connectors-api). The important runtime behavior is:
+
+- `GET /v1/runtime/connectors` returns the full connector inventory
+- `GET /v1/runtime/connectors/{kind}/{name}` returns one projected connector view
+- `PUT /v1/runtime/connectors/{kind}/{name}` creates or updates one daemon-managed connector
+- `DELETE /v1/runtime/connectors/{kind}/{name}` removes one daemon-managed connector after dependency checks
+
+Supported kinds:
+
+- `external`
+- `telegram`
+- `slack`
+- `http`
+
+Important upsert rule:
+
+- The connector `PUT` surface behaves like a field-aware upsert.
+- Fields present in the JSON payload are applied.
+- Fields omitted from the payload keep their current stored value.
+
+This matters because `PUT` here is not a blind full-record replacement.
+
+External connector runtime metrics are exposed at `GET /v1/runtime/connectors/external/metrics`.
+
+## Daemon-wide event stream
+
+`GET /v1/events/stream` exposes the daemon-wide SSE stream used by control-plane observers.
+
+```bash
+curl -N http://127.0.0.1:4000/v1/events/stream
+```
+
+Each data-bearing daemon SSE event has a monotone decimal-string `id`; typed heartbeat keepalives
+are id-less and do not advance the reconnect cursor. Reconnect with the standard `Last-Event-ID`
+header or `?cursor=<event_id>` to replay buffered events with larger ids.
+When both are supplied, the daemon parses both as event ids and uses the larger cursor so an older query string cannot
+rewind a browser-managed reconnect. Event ids are seeded from a state-root epoch on startup,
+so a reconnect cursor from before a daemon restart cannot mask fresh post-restart events.
+The in-memory replay window is bounded; if a cursor is older than retained history or a slow
+consumer falls behind the bounded live channel, the stream emits a typed `stream_gap` event with
+`skipped`, `reason`, `scope`, `skipped_is_estimate`, and optional `resume_after_id` fields.
+`resume_after_id` is present only when the daemon can provide a safe replay cursor; the gap frame
+uses the same value as its SSE `id` only when doing so would advance the current stream cursor.
+After a daemon restart, a cursor from a previous event-id epoch also receives `stream_gap` because
+replay history is process-local; in that case `skipped` is a conservative id-range count and
+clients should reconcile through the list/get endpoints before resuming from `resume_after_id`.
+Keepalive frames are typed `heartbeat` events with JSON payload `{ "type": "heartbeat" }`. The
+daemon retains bounded scoped-loss metadata for filtered streams; if a filtered client falls
+behind beyond that metadata window, it receives a conservative `stream_gap` instead of a silent
+miss. `/v1/status.events` exposes the current replay window, cursor-gap count, live stream lag
+count, event ids serialized as decimal strings, and `tail_event_id_cursor` as the safe current-tail
+cursor for clients that want to connect from the status snapshot point. Tune the replay/live buffer
+with `--event-history-capacity` or `KHEISH_EVENT_HISTORY_CAPACITY`; the daemon clamps unsafe zero or
+excessive capacities to the supported `1..=262144` event range. The CLI streaming commands cap
+individual SSE frames at 1 MiB to avoid unbounded buffering; use list/get endpoints when
+reconciling very large outputs.
+
+The global stream accepts optional `session_id` and `run_id` query filters. Session and run
+stream endpoints are filtered views over the same daemon event bus:
+
+```bash
+curl -N 'http://127.0.0.1:4000/v1/events/stream?session_id=demo'
+curl -N http://127.0.0.1:4000/v1/sessions/demo/stream
+curl -N http://127.0.0.1:4000/v1/runs/run-1/stream
+```
+
+The current SSE event names emitted by the daemon bus include:
+
+- `trace`
+- `session_state_changed`
+- `session_snapshot`
+- `output`
+- `run_updated`
+- `session_goal_updated`
+- `interrupted`
+- `runtime_updated`
+- `heartbeat`
+- `stream_gap`
+
+Read [Connectors API](./connectors-api), [Skills API](./skills-api), and [Hook reference](./hook-reference) for the linked subsystems surfaced by `GET /v1/runtime`.

@@ -1,0 +1,192 @@
+---
+title: Docker and containers
+description: Running the Kheish daemon in Docker or container orchestration without weakening the runtime boundary.
+---
+
+# Docker and containers
+
+Kheish can run cleanly in containers, but the production shape should stay explicit:
+
+- one daemon container per instance
+- one persistent state volume
+- one dedicated workspace volume or bind mount
+- one explicit routes file
+- one explicit control-plane auth boundary
+- one explicit auth-store master key
+
+The official container path is the daemon itself. Do not assume Python sidecar connectors are bundled into the same image.
+
+## Supported production topology
+
+The recommended production topology is:
+
+- one `kheish-daemon` container
+- model routes defined through `--routes-file`
+- daemon-managed route secrets stored under the persistent `state_root`
+- external connectors run as separate services and talk to the daemon through `remote_http`
+
+This keeps the daemon image focused on the durable control plane and avoids coupling platform-specific sidecar runtimes into the core container.
+
+## What the official image includes
+
+The daemon image is built for the actual runtime surface the daemon expects today:
+
+- the `kheish-daemon` binary
+- `bash` for shell execution
+- `ripgrep` for search tools
+- `procps` for MCP child-process management
+- `git` for common code workflows
+- `ca-certificates` for outbound HTTPS
+- `tini` for init and signal forwarding
+
+The image runs as a non-root user and defaults to:
+
+- `KHEISH_BIND=0.0.0.0:4000`
+- `KHEISH_STATE_ROOT=/var/lib/kheish/state`
+- `KHEISH_WORKSPACE_ROOT=/workspace`
+- `KHEISH_HTTP_AUTH_MODE=bearer`
+- `KHEISH_MCP_DISCOVERY=disabled`
+
+## Why MCP discovery defaults to disabled
+
+Container workloads should not implicitly import developer-local MCP config from `$HOME/.codex`.
+
+The image therefore defaults to:
+
+```bash
+KHEISH_MCP_DISCOVERY=disabled
+```
+
+If you want MCP inside containers, pass explicit config paths with:
+
+- `--mcp-config`
+- `--mcp-credentials`
+
+or set:
+
+- `KHEISH_MCP_CONFIG`
+- `KHEISH_MCP_CREDENTIALS`
+
+The stock image does not bundle arbitrary Node, Python, or platform-specific binaries for external MCP servers or `child_process` connectors. If your MCP config points at those runtimes, build a custom image or run them as separate services.
+
+## Secret files
+
+In container environments, prefer file-backed secrets over inline environment variables.
+
+The key file inputs are:
+
+- `KHEISH_DAEMON_ADMIN_TOKEN_FILE`
+- `KHEISH_DAEMON_READONLY_TOKEN_FILE`
+- `KHEISH_AUTH_STORE_MASTER_KEY_FILE`
+
+The auth-store master key file is the container-friendly equivalent of `KHEISH_AUTH_STORE_MASTER_KEY`. The daemon and any offline `secrets set --offline` writes that touch the same `state_root` must use the same key.
+
+The shipped Compose example uses Docker-managed secrets mounted under `/run/secrets/...` instead of bind-mounting the host secret directory. That keeps host-side `0600` permissions compatible with the non-root container user.
+
+## Probes
+
+The daemon now exposes unauthenticated liveness and readiness endpoints outside the control-plane auth middleware:
+
+- `GET /healthz`
+- `GET /readyz`
+
+`/readyz` returns `503 Service Unavailable` once daemon shutdown begins. Use those endpoints for Docker health checks, Kubernetes probes, or external monitoring. Do not reuse authenticated `/v1/*` endpoints for liveness.
+
+## Example compose workflow
+
+The repository includes:
+
+- [Dockerfile](../../Dockerfile)
+- [docker/compose.yaml](../../docker/compose.yaml)
+- [docker/routes.example.toml](../../docker/routes.example.toml)
+
+The shipped Compose file uses named volumes for both the daemon state and the workspace. That is the safer production default because it avoids host UID and permission mismatches from a fixed non-root container user.
+
+Build the image first:
+
+```bash
+docker compose -f docker/compose.yaml build daemon
+```
+
+Prepare secrets next:
+
+```bash
+mkdir -p docker/secrets
+docker run --rm \
+  --entrypoint /usr/local/bin/kheish-daemon \
+  kheish-daemon:local \
+  secrets generate > docker/secrets/auth-store-master-key.txt
+
+docker run --rm \
+  --entrypoint /bin/sh \
+  kheish-daemon:local \
+  -lc 'tr -dc "A-Za-z0-9" < /dev/urandom | head -c 48' \
+  > docker/secrets/admin-token.txt
+
+chmod 600 docker/secrets/auth-store-master-key.txt docker/secrets/admin-token.txt
+```
+
+Those files stay on the host with restrictive permissions. Docker Compose reads them and mounts container-readable secret files under `/run/secrets/`.
+
+Bootstrap the route secret into the daemon-owned auth store before the long-running container starts:
+
+```bash
+docker compose -f docker/compose.yaml run --rm \
+  -e OPENAI_API_KEY="$OPENAI_API_KEY" \
+  daemon \
+  secrets set openai.prod \
+    --offline \
+    --state-root /var/lib/kheish/state \
+    --provider openai \
+    --from-env OPENAI_API_KEY
+```
+
+Then start the daemon:
+
+```bash
+docker compose -f docker/compose.yaml up -d
+```
+
+Inspect it with:
+
+```bash
+curl http://127.0.0.1:4000/healthz
+curl -H "Authorization: Bearer $(cat docker/secrets/admin-token.txt)" \
+  http://127.0.0.1:4000/v1/runtime
+```
+
+If you intentionally want the workspace on a host bind mount for local development, override the Compose file or run the container with a UID and GID that match your host user. Otherwise files created under `/workspace` will be owned by the container user and can become awkward to edit from the host.
+
+## Entrypoint guardrails
+
+The official image entrypoint rejects obvious misconfiguration early. In particular, it refuses:
+
+- relative `state_root` or `workspace_root`
+- identical `state_root` and `workspace_root`
+- non-loopback binds without bearer auth, unless you explicitly opt into insecure local testing
+- unreadable token or master-key files
+- conflicting inline and file-backed secret inputs for the same setting
+
+This is meant to catch broken production container specs before the daemon starts with unsafe defaults.
+
+## Shutdown behavior
+
+Container runtimes send `SIGTERM`, not Ctrl+C.
+
+The daemon now treats both `SIGTERM` and `SIGINT` as graceful shutdown signals, so:
+
+- ingress tasks receive the normal shutdown signal
+- MCP shutdown still runs
+- the process exits cleanly under normal orchestrator termination
+
+## Connector guidance in containers
+
+The recommended production boundary is:
+
+- daemon container
+- connector containers or services
+- `remote_http` external connector mode between them
+
+Do not default to running all external connector sidecars as `child_process` inside the daemon container. That makes dependency management and blast radius worse for no operational gain.
+
+Use `child_process` inside containers only when you intentionally build a custom image for a tightly controlled environment.

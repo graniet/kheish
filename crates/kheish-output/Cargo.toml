@@ -1,0 +1,15 @@
+[package]
+name = "kheish-output"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dependencies.kheish-types]
+path = "../kheish-types"

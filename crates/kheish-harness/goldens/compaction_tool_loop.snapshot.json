@@ -1,0 +1,158 @@
+{
+  "run_meta": {
+    "session_id": "fixture-session-1",
+    "thread_id": "fixture-thread-1",
+    "input_source_plugin": "memory",
+    "input_source_kind": "test",
+    "input_event_offset": 0,
+    "completion_follow_up_count": 0,
+    "max_output_tokens_recovery_count": 0,
+    "autocompact": {
+      "consecutive_failures": 0,
+      "last_compacted_turn": 2,
+      "turn_counter": 2
+    },
+    "policy": {
+      "max_turns": 4,
+      "keep_last_messages": 2,
+      "snip_token_budget": 120000,
+      "snip_keep_minimum_messages": 10,
+      "microcompact_keep_recent": 5,
+      "microcompact_idle_timeout_ms": 900000,
+      "autocompact_threshold_tokens": 20,
+      "autocompact_buffer_tokens": 13000,
+      "session_memory_min_tokens": 10000,
+      "session_memory_max_tokens": 40000
+    },
+    "engine_version": "0.1.0"
+  },
+  "turns": [
+    {
+      "turn": 1,
+      "prompt": {
+        "checkpoint_offset_used": null,
+        "summary_digest": null,
+        "summary_text": null,
+        "system_sections": [],
+        "messages": [
+          {
+            "id": "user-0",
+            "role": "user",
+            "digest": "20c7865711a205ea80826b5647da42d37860be0aa975d5c494b3062fb8526b6d",
+            "content_digest": "d31462774ae49fba40911c233cf9529ffa9aec86bdfb245274e93392d9d086ca"
+          }
+        ],
+        "open_tool_call_ids": []
+      },
+      "assistant_message_id": "assistant-1",
+      "assistant_message_digest": "57ca23e7dc1ea6eea25f3be4377dde1735d6c9d4c08655e3bf6a386b05696052",
+      "stop_reason": "tool_calls",
+      "tool_calls": [
+        {
+          "call_id": "call-1",
+          "tool_name": "lookup_context",
+          "input_digest": "cbb8bcd2dcfe078515ae682588100c2f665579cde716b52dfaf42b078c701fd0",
+          "input_canonical_json": {
+            "query": "important state"
+          }
+        }
+      ],
+      "tool_results": [
+        {
+          "call_id": "call-1",
+          "decision": {
+            "type": "allow"
+          },
+          "result_is_error": false,
+          "result_digest": "7a0340cca30a901e83c18ed44068186e54ce3d085b28bfc48c0ea234e955ba20",
+          "result_canonical_json": {
+            "state": "resolved"
+          }
+        }
+      ]
+    },
+    {
+      "turn": 2,
+      "prompt": {
+        "checkpoint_offset_used": 1,
+        "summary_digest": "92e8b05974bf0bc8a0f92b3908301d4cc6a8c6376f34bbb5154c357f77afa806",
+        "summary_text": "Summary:\n1. Primary Request and Intent\n- The user wants the task completed.\n2. Current Work\n- Waiting to continue after the tool result.",
+        "system_sections": [],
+        "messages": [
+          {
+            "id": "assistant-1",
+            "role": "assistant",
+            "digest": "fcf2345b327633c6b18c5f0a74d7a3b7c0ea4ad24e23fb29793d7ec3d1574bba",
+            "content_digest": "3327608819533ff516f034cb093408dac0ec4750cb9807b74c2a860f78345964"
+          },
+          {
+            "id": "tool-message-call-1",
+            "role": "tool",
+            "digest": "12ba626ad66e1133df2194e43f6d37bd6212c170d09ae3e662cc1fef568efada",
+            "content_digest": "7a0340cca30a901e83c18ed44068186e54ce3d085b28bfc48c0ea234e955ba20"
+          }
+        ],
+        "open_tool_call_ids": []
+      },
+      "assistant_message_id": "assistant-2",
+      "assistant_message_digest": "33dc2effeccfa8a98a85f054214ca7fdad4566526126740c97b6db7e7f22d68f",
+      "stop_reason": "completed",
+      "tool_calls": [],
+      "tool_results": []
+    }
+  ],
+  "checkpoints": [
+    {
+      "compacted_until_offset": 1,
+      "journal_digest": "b1eaffb457a8d2ed2bacec6c3bfafaf77d4a12bb14e4d89c85a24c89a02a3bb1",
+      "summary_digest": "92e8b05974bf0bc8a0f92b3908301d4cc6a8c6376f34bbb5154c357f77afa806",
+      "summary_text": "Summary:\n1. Primary Request and Intent\n- The user wants the task completed.\n2. Current Work\n- Waiting to continue after the tool result.",
+      "canonical_state_digest": "b0e411a2f7aa34bff1b080829f81fb97e98b39b1ce4cdb3730f3678a898636c3"
+    }
+  ],
+  "final_state": {
+    "messages": [
+      {
+        "id": "user-0",
+        "role": "user",
+        "digest": "20c7865711a205ea80826b5647da42d37860be0aa975d5c494b3062fb8526b6d",
+        "content_digest": "d31462774ae49fba40911c233cf9529ffa9aec86bdfb245274e93392d9d086ca"
+      },
+      {
+        "id": "assistant-1",
+        "role": "assistant",
+        "digest": "fcf2345b327633c6b18c5f0a74d7a3b7c0ea4ad24e23fb29793d7ec3d1574bba",
+        "content_digest": "3327608819533ff516f034cb093408dac0ec4750cb9807b74c2a860f78345964"
+      },
+      {
+        "id": "tool-message-call-1",
+        "role": "tool",
+        "digest": "12ba626ad66e1133df2194e43f6d37bd6212c170d09ae3e662cc1fef568efada",
+        "content_digest": "7a0340cca30a901e83c18ed44068186e54ce3d085b28bfc48c0ea234e955ba20"
+      },
+      {
+        "id": "assistant-2",
+        "role": "assistant",
+        "digest": "af7777347fd58d0b61d3174b43a39be52ec3a8abaf974cecdd827ecf710c493f",
+        "content_digest": "931128f72d030dd38db1065915a071ddfc73f879f1c67b5f3fdc1f4cde9f559e"
+      }
+    ],
+    "message_digests": [
+      "20c7865711a205ea80826b5647da42d37860be0aa975d5c494b3062fb8526b6d",
+      "fcf2345b327633c6b18c5f0a74d7a3b7c0ea4ad24e23fb29793d7ec3d1574bba",
+      "12ba626ad66e1133df2194e43f6d37bd6212c170d09ae3e662cc1fef568efada",
+      "af7777347fd58d0b61d3174b43a39be52ec3a8abaf974cecdd827ecf710c493f"
+    ],
+    "message_roles": [
+      "user",
+      "assistant",
+      "tool",
+      "assistant"
+    ],
+    "completed_tool_result_digests": [
+      "a8d61f9ad0146db965848511b8e9521f40af5ee96af5023e2df9b87937512b62"
+    ],
+    "open_tool_call_ids": [],
+    "canonical_state_digest": "05d46b90c2baa4d77bffc4affbafc4146e08dc9564e16e0237090532ece7cb5b"
+  }
+}

@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kheish-external-connectors"
+version = "0.1.0"
+description = "Python sidecars for Kheish external connectors"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+discord = ["discord.py>=2.4,<3"]
+all = ["discord.py>=2.4,<3"]
+
+[tool.setuptools]
+py-modules = ["common", "platforms", "run_connector"]

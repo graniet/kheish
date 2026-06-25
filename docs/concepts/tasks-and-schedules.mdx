@@ -1,0 +1,80 @@
+---
+title: Tasks and schedules
+description: Structured work tracking, background shell tasks, and scheduled execution inside the daemon.
+---
+
+# Tasks and schedules
+
+Kheish includes first-class primitives for structured work tracking and delayed or recurring execution.
+
+## Tasks
+
+Tasks are session-scoped records that represent units of work with ownership and status. They support:
+
+- titles and descriptions
+- owner assignment
+- progress and status updates
+- dependency tracking through blocked-by relationships
+
+Tasks are useful when a coordinator or operator needs visibility into work decomposition instead of relying on free-form transcript text.
+
+These session tasks are not the same thing as daemon-owned **project tasks**.
+
+Current distinction:
+
+- session tasks live inside one session control state
+- project tasks live in the daemon project store and can point at one assigned session, one public discussion thread, and one latest run
+- Flow projections expose the underlying run correlation; inspect session tasks through the normal task API
+
+Use session tasks when:
+
+- one session needs local decomposition, status tracking, or scheduling hints during execution
+
+Use project tasks when:
+
+- work ownership, dependencies, or public discussion must stay durable across multiple sessions
+
+Read [Projects and project tasks](./projects-and-project-tasks) for the project-scoped model.
+
+## Background shell tasks
+
+Shell execution is not treated as an opaque side effect. Background shell tasks are persisted daemon tasks with:
+
+- task identifiers
+- output capture
+- stop controls
+- watchdog handling and truncation limits
+- bounded output rotation metadata, including retained bytes, total bytes observed, and rotation count
+
+This matters operationally because interrupted or long-running shell work can still be inspected after the original run has moved on.
+
+After a daemon restart, an active daemon-managed shell task is settled fail-closed:
+
+- `pending` or `in_progress` shell tasks become `failed`
+- metadata includes `terminal_reason: "daemon_restarted"` and `recovered_on_boot: true`
+- captured partial output remains readable with `tasks output`
+- retained output rotation markers are recovered from disk so `output_rotated`, `output_total_bytes`, and `output_rotation_count` remain meaningful after restart
+- the daemon does not restart or re-attach the shell command
+- `cancelled` remains reserved for explicit operator or agent stop requests
+
+For shell tasks, `tasks output` reports output retrieval, not command success. A `retrieval_status` of `success` means Kheish read the persisted output view. The command itself is successful only when the task record has `status: "completed"` and shell metadata has `exit_code: 0`.
+
+## Schedules
+
+Schedules let the daemon create future runs without an external scheduler. They support:
+
+- one-shot execution
+- recurring execution
+- pause, resume, cancel, and trigger-now operations
+- overlap and misfire policies
+
+## Why schedules belong in the daemon
+
+Putting schedules inside the daemon keeps them close to the state they act on. A schedule can target an existing session, preserve the same control-plane behavior as manual input, and survive daemon restarts through persisted scheduler state.
+
+## Evidence Note
+
+- Code verified: `crates/kheish-daemon/src/shell_tasks.rs`, `crates/kheish-daemon/src/services/task.rs`, `crates/kheish-daemon/src/state/task_workflow.rs`, `crates/kheish-daemon/src/control_tools/tasks.rs`.
+- CLI/API verified: `tasks list`, `tasks get`, `tasks output`, `tasks stop` command surfaces checked against `crates/kheish-daemon/src/main.rs` and `crates/kheish-daemon/src/api/handlers.rs`.
+- Daemon live tested for this note: no; deterministic daemon/service tests cover the documented recovery semantics.
+- Provider-specific tested for this note: no; shell task recovery is daemon-local and provider-neutral.

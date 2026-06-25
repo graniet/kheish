@@ -1,0 +1,63 @@
+{
+  "name": "permission_denied",
+  "policy": {
+    "max_turns": 4,
+    "compact_after_chars": 4096,
+    "keep_last_messages": 3
+  },
+  "input": {
+    "source": {
+      "plugin": "memory",
+      "kind": "test"
+    },
+    "conversation": {
+      "session_id": "fixture-session-2",
+      "thread_id": null
+    },
+    "actor": {
+      "id": "user-1",
+      "display_name": null
+    },
+    "payload": {
+      "type": "text",
+      "content": "start"
+    },
+    "attachments": [],
+    "metadata": null,
+    "reply": null
+  },
+  "scripted_turns": [
+    {
+      "assistant_message_id": "assistant-deny",
+      "assistant_content": "Je tente un tool qui sera refuse.",
+      "tool_calls": [
+        {
+          "id": "call-denied",
+          "name": "delete_everything",
+          "input": {
+            "scope": "all"
+          }
+        }
+      ]
+    },
+    {
+      "assistant_message_id": "assistant-recovery",
+      "assistant_content": "Le tool a ete refuse, je termine proprement.",
+      "tool_calls": []
+    }
+  ],
+  "denied_tools": [
+    {
+      "tool_name": "delete_everything",
+      "reason": "destructive tool"
+    }
+  ],
+  "expect": {
+    "final_message_id": "assistant-recovery",
+    "turns": 2,
+    "min_checkpoints": 0,
+    "summary_turns": [],
+    "tool_result_errors": 1,
+    "denied_calls": ["call-denied"]
+  }
+}

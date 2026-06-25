@@ -1,0 +1,96 @@
+---
+title: Agents and sidechains
+description: Agent hierarchy, sidechains, mailboxes, and profile-constrained execution.
+---
+
+# Agents and sidechains
+
+Kheish models execution as a tree of managed agents rather than a single monolithic worker.
+
+## Managed agents
+
+Every session is mapped to a primary managed agent. Additional agents can be spawned as sidechains to isolate work, split responsibilities, or run with different tool and model constraints. A session-scoped agent is not always the root of the global agent tree, because sidechain execution can itself be attached to a distinct session.
+
+Agents have:
+
+- an identifier and conversation context
+- a status and retention policy
+- an optional parent relationship
+- a mailbox for typed inter-agent communication
+- a tool surface and prompt configuration
+
+## Sidechains
+
+A sidechain is a child execution context launched from another agent or from the control plane. Sidechains are useful when a task should run:
+
+- with a narrower tool surface
+- with a different configured route or model
+- with an alternate workspace root or worktree
+- in the background while the parent continues
+
+Child sessions inherit the parent session's current bound persona snapshot. This is a spawn-time copy, not a live link to the parent's future persona changes.
+
+Child sessions also inherit the parent session's current capability scope override. In practice, the child starts from the same effective capability boundary that the parent had at spawn time.
+
+Child sessions also inherit the parent session's current credential scope. If the spawn request does not carry an explicit child credential scope, delegated children keep route access but do not automatically inherit connector credentials or credentialed MCP access.
+
+Child sessions also inherit the parent session's effective permission mode and session-scoped permission updates at spawn time. A child can request a narrower mode such as `dontAsk` or `plan`, but the daemon rejects a request that would widen the parent boundary, such as `bypassPermissions` from a `default` parent.
+
+Child subtasks can start from:
+
+- compatibility `content` plus attachments
+- one simpler text prompt plus existing asset identifiers
+- fully ordered multimodal `input_items`
+
+Use the richer multimodal shape when the child must review or transform daemon-owned images or documents in a specific order.
+
+## Agent profiles
+
+Kheish uses profile-constrained execution surfaces for common roles such as default work, planning, coordination, and verification. The exact tool surface is enforced by the daemon rather than left to prompt convention alone.
+
+That profile-constrained tool surface is still narrowed by the child session's effective capability scope. Auth-backed resources are also gated by the child session's effective credential scope. A child can therefore see fewer tools than its nominal profile would otherwise expose and still be unable to resolve some credentials even when a tool remains visible.
+
+## Mailboxes
+
+Agents coordinate through mailbox messages. This is the control-plane primitive used for:
+
+- inter-agent coordination
+- parent-child signaling
+- deferred delivery of background work
+- follow-up execution when a sidechain or hook needs to hand control back
+
+Mailbox-driven execution is part of the persisted runtime model, not a best-effort in-memory shortcut.
+
+Raw mailbox posts remain typed structured payloads. The agent-facing orchestration tools can still normalize one text-plus-assets payload or one ordered multimodal message into that daemon-owned mailbox envelope. When a child needs one initial multimodal task definition, prefer a sidechain subtask over hand-building mailbox JSON.
+
+Mailboxes are private coordination primitives. Public multi-member discussion belongs in channels, not in mailbox traffic. One session can receive a public `ChannelDelivery` turn, inspect the thread, react, and publish through the channel while still using mailbox traffic privately for side coordination.
+
+## Retention and visibility
+
+Children can be configured with `close_on_settle` retention. Once a child is closed:
+
+- the agent snapshot still exists for direct inspection if you already know the identifier
+- `GET /v1/sessions` hides that closed child session to keep the session list focused on root and active work
+
+## Operational guidance
+
+Use sidechains when you want isolation, explicit routing, or parallelism. Keep work on the root agent when continuity of context matters more than execution isolation.
+
+For Playbook review workflows, sidechains remain the review mechanism. A Playbook can describe reviewer roles and evidence expectations, but it does not make all tools available to all reviewers. The daemon-enforced profile, capability scope, and credential scope still decide the actual surface.
+
+When debugging a child that is missing a skill or MCP tool, inspect:
+
+- the child session persona summary
+- the child session `capability_scope`
+- the child session `effective_capability_scope`
+- the child session `credential_scope`
+- the child session `effective_credential_scope`
+
+before assuming the profile itself is wrong.
+
+## Evidence Note
+
+- Code verified: `crates/kheish-agent/src/types.rs`, `crates/kheish-agent/src/supervisor.rs`, `crates/kheish-daemon/src/state/subagent_spawn.rs`, `crates/kheish-daemon/src/state/session_state.rs`, `crates/kheish-daemon/src/control_tools.rs`.
+- CLI/API verified: sidechain request and agent snapshot fields checked against daemon API handlers and `spawn_agent` tool schema.
+- Daemon live tested for this note: no; deterministic daemon tests cover sidechain mode inheritance and non-widening behavior.
+- Provider-specific tested for this note: no; sidechain permission and scope projection are daemon-local.

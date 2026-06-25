@@ -1,0 +1,494 @@
+---
+title: Connectors API
+description: Runtime connector CRUD, ingress payloads, auth behavior, session materialization, and reply-target defaults.
+---
+
+# Connectors API
+
+Kheish exposes connectors through two different HTTP surfaces:
+
+- runtime CRUD for operators
+- ingress routes for external systems
+
+They are related, but they do not serve the same purpose.
+
+## Runtime CRUD endpoints
+
+- `GET /v1/runtime/connectors`
+- `GET /v1/runtime/connectors/{kind}/{name}`
+- `PUT /v1/runtime/connectors/{kind}/{name}`
+- `DELETE /v1/runtime/connectors/{kind}/{name}`
+
+Supported kinds:
+
+- `telegram`
+- `slack`
+- `http`
+- `external`
+
+`GET` returns projected connector views with:
+
+- `source`: `file` or `daemon`
+- non-secret transport settings
+- redacted secret metadata such as `configured`, `source`, `secret_ref`, or `env`
+
+Deletion rules:
+
+- file-backed connectors are readable but not mutable through the daemon control plane
+- deletion is rejected when the connector is still referenced by dependent config such as schedules or reply-target relationships
+
+## Runtime upsert semantics
+
+`PUT /v1/runtime/connectors/{kind}/{name}` behaves like a field-aware upsert.
+
+- If the connector does not exist, the daemon creates it.
+- If the connector already exists, only fields present in the JSON payload are updated.
+- Fields omitted from the payload keep their stored value.
+
+This is important because the endpoint uses `PUT`, but it is not a naive full-record replacement.
+
+## Shared helper shapes
+
+### `ConnectorSecretInput`
+
+Secret-bearing runtime fields such as `bot_token`, `signing_secret`, `secret_token`, and `bearer_token` use the same write-only helper shape:
+
+```json
+{
+  "secret_ref": "connectors.http.inbox.bearer_token",
+  "value": "super-secret-token"
+}
+```
+
+Supported fields:
+
+- `value`: store or rotate a daemon-managed generic secret slot
+- `secret_ref`: point at an existing daemon-managed generic secret slot
+- `env`: read the secret from an environment variable
+
+Rule:
+
+- `env` cannot be combined with `value` or `secret_ref`
+
+### `ReplyHandle`
+
+Connector reply-target fields use raw `ReplyHandle` objects:
+
+```json
+{
+  "plugin": "http",
+  "address": "{\"url\":\"https://example.com/replies\",\"headers\":{\"X-Delivery-Topic\":\"triage\"}}"
+}
+```
+
+This same wire shape is used by:
+
+- HTTP connector `default_reply_targets`
+- Slack connector `additional_reply_targets`
+- Telegram connector `additional_reply_targets`
+- HTTP ingress `reply_targets`
+
+It is different from the structured `SessionReplyTargetRequest` surface used by `/v1/sessions/{session_id}/reply-targets`.
+
+Plugin-specific address payloads commonly encode:
+
+- `http`: a raw URL string or serialized `HttpReplyRoute` (`url`, optional `headers`, optional `allow_private_network` for trusted local sidecars)
+- `slack`: serialized `SlackReplyRoute`
+- `telegram`: serialized `TelegramReplyRoute`
+- `external`: serialized `ExternalReplyRoute`
+
+### `session_policy`
+
+Connectors can optionally bootstrap sessions for inbound traffic:
+
+```json
+{
+  "session_policy": {
+    "create_if_missing": true,
+    "persona_id": "support-bot",
+    "capability_scope": {
+      "skill_deny": ["dangerous-inline-tool"]
+    },
+    "credential_scope": {
+      "route_allow": ["openai"],
+      "mcp_server_deny": ["github"]
+    }
+  }
+}
+```
+
+Fields:
+
+- `create_if_missing`
+- `persona_id`
+- `capability_scope`
+- `credential_scope`
+
+This policy is applied when the connector needs to materialize a session for inbound traffic. `persona_id` is validated against existing daemon persona records.
+
+## HTTP connectors
+
+### Runtime payload
+
+`PUT /v1/runtime/connectors/http/{name}` accepts:
+
+- `actor_id`
+- `fixed_session_id`
+- `bearer_token`
+- `hmac_secret`
+- `allow_unauthenticated_ingress`
+- `require_hmac_signature`
+- `signature_max_age_secs`
+- `require_idempotency_key`
+- `ingress_events_per_second`
+- `allow_payload_reply_targets`
+- `default_reply_targets`
+- `default_binding_keys`
+- `session_policy`
+
+Example:
+
+```json
+{
+  "actor_id": "webhook-user",
+  "bearer_token": {
+    "value": "inbox-token"
+  },
+  "default_binding_keys": ["team:docs"],
+  "default_reply_targets": [
+    {
+      "plugin": "http",
+      "address": "{\"url\":\"https://example.com/replies\",\"headers\":{\"X-Delivery-Topic\":\"triage\"}}"
+    }
+  ],
+  "session_policy": {
+    "create_if_missing": true,
+    "persona_id": "triage"
+  }
+}
+```
+
+Validation rule:
+
+- if no bearer token source is configured, configure `require_hmac_signature=true` with an HMAC secret or set `allow_unauthenticated_ingress=true`
+- if `require_hmac_signature=true`, configure `hmac_secret` and keep `require_idempotency_key=true`
+- `signature_max_age_secs` must be between `1` and `3600`
+- empty bearer and HMAC secrets are rejected
+- HTTP reply-route headers must be syntactically valid and cannot include `Authorization`, `Connection`, `Content-Length`, `Content-Type`, `Cookie`, `Forwarded`, `Host`, `Idempotency-Key`, `Proxy-Authorization`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, `X-Api-Key`, or `X-Forwarded-*`
+- ingress payload fields `reply_targets`, `reply_plugin`, and `reply_address` are accepted only when the request is authenticated and `allow_payload_reply_targets` is `true`; otherwise the connector uses only its configured defaults
+- unauthenticated ingress rejects payload `session_id`, payload `binding_keys`, and asset/board payloads; use bearer or HMAC auth for those capabilities
+- daemon-configured `default_binding_keys` remain allowed for public connectors because the caller cannot choose them
+- payload `metadata` cannot set daemon-owned ingress keys such as `connector_ingress_key` or `http_ingress_*`
+- accepted idempotent receipts persist a payload fingerprint in the connector-ingress shard as well as `http_ingress_fingerprint` in run metadata
+
+### Ingress endpoint
+
+- `POST /v1/connectors/http/{name}`
+
+Payload fields:
+
+- `session_id`
+- `binding_keys`
+- `actor_id`
+- `content`
+- `input_items`
+- `attachments`
+- `metadata`
+- `reply_targets`
+- `reply_plugin`
+- `reply_address`
+- `idempotency_key`
+
+Example:
+
+```json
+{
+  "binding_keys": ["customer:acme", "channel:ticket-123"],
+  "content": "Summarize the latest ticket state.",
+  "metadata": {
+    "ticket_id": "123"
+  },
+  "idempotency_key": "ticket-123-update-9"
+}
+```
+
+HTTP ingress session resolution order:
+
+1. connector `fixed_session_id`
+2. payload `session_id`
+3. session already bound to the provided `binding_keys`
+4. connector-derived fallback session id based on the first binding key
+
+If none of those can resolve a session, the request is rejected.
+
+HTTP ingress auth:
+
+- uses the `Authorization: Bearer ...` header when a connector bearer token is configured
+- otherwise requires `allow_unauthenticated_ingress=true`
+- when `require_hmac_signature=true`, also requires `X-Kheish-Timestamp` and `X-Kheish-Signature`; `X-Kheish-Timestamp` is a Unix timestamp in seconds
+- signatures use HMAC-SHA256 over `v1:POST:<path-and-query>:<timestamp>:<raw-body>` and the signature header must be exactly `v1=<64 lowercase or uppercase hex chars>`; duplicate timestamp/signature headers are rejected
+- accepted payloads require `idempotency_key` by default; reusing the same key with a different payload is rejected with `409`
+- run metadata records hashed `connector_ingress_key` / `http_ingress_key`, `http_ingress_key_sha256`, and `http_ingress_fingerprint` for restart recovery and duplicate-payload conflict checks without persisting the raw idempotency key
+- ingress is rate-limited per connector and returns `429` with `Retry-After` when the token bucket is exhausted
+
+Fixed HMAC vector:
+
+```text
+secret: hmac-test-secret
+canonical: v1:POST:/v1/connectors/http/orders?source=a%2Fb&attempt=1:1710000000:{"content":"hello","idempotency_key":"order-123","metadata":{"k":"v"}}
+signature: f13a4b8c5099a2ffc6b8a913e0998d6765d61a693c27f594ca34ede2e0d4e557
+header: X-Kheish-Signature: v1=f13a4b8c5099a2ffc6b8a913e0998d6765d61a693c27f594ca34ede2e0d4e557
+```
+
+HTTP output:
+
+- sends `Idempotency-Key: kheish:<delivery_id>` when delivering queued daemon output
+- owns the `Content-Type` and `Idempotency-Key` headers for the JSON delivery request
+- honors numeric and HTTP-date target `429 Retry-After` headers for durable retry scheduling
+- treats non-429 `4xx` target responses as terminal delivery failures
+- resolves hostname reply targets before delivery, rejects private/local IP results, pins the resolved addresses for the request, and ignores proxy environment variables
+- reports delivery request failures with a redacted target instead of the raw URL
+
+## Slack connectors
+
+### Runtime payload
+
+`PUT /v1/runtime/connectors/slack/{name}` accepts:
+
+- `bot_token`
+- `signing_secret`
+- `allow_unauthenticated_ingress`
+- `api_base_url`
+- `fixed_session_id`
+- `include_self_output`
+- `additional_reply_targets`
+- `additional_binding_keys`
+- `session_policy`
+- `ingress_events_per_second`
+- `allowed_api_app_ids`
+- `allowed_enterprise_ids`
+- `allowed_team_ids`
+- `allowed_channel_ids`
+- `allowed_file_hosts`
+- `team_bot_tokens`
+
+Example:
+
+```json
+{
+  "bot_token": {
+    "secret_ref": "slack.prod.bot_token"
+  },
+  "signing_secret": {
+    "secret_ref": "slack.prod.signing_secret"
+  },
+  "include_self_output": true,
+  "ingress_events_per_second": 60,
+  "allowed_team_ids": ["T012345"],
+  "allowed_channel_ids": ["C012345"],
+  "additional_binding_keys": ["team:support"],
+  "team_bot_tokens": [
+    {
+      "team_id": "T012345",
+      "bot_token": {
+        "secret_ref": "slack.prod.team_T012345.bot_token"
+      }
+    }
+  ],
+  "session_policy": {
+    "create_if_missing": true
+  }
+}
+```
+
+Validation rule:
+
+- if no signing secret source is configured, `allow_unauthenticated_ingress` must be `true`
+
+### Ingress endpoint
+
+- `POST /v1/connectors/slack/{name}`
+
+Behavior:
+
+- verifies the Slack signature when a signing secret is configured
+- rejects stale or far-future signed requests
+- answers `url_verification` with the Slack `challenge`
+- enforces configured app, enterprise, team, and channel allowlists before run creation
+- validates every Slack `authorizations[]` enterprise/team entry against the configured allowlists
+- derives Enterprise Grid session IDs and reply routes from enterprise/team/channel/thread scope
+- ignores bot-authored events
+- derives one durable session from channel plus root thread timestamp when `fixed_session_id` is not configured
+- automatically downloads inbound files when a matching bot token is configured
+- blocks Slack file downloads from non-allowlisted hosts and does not follow connector media redirects
+
+Slack ingress idempotency:
+
+- prefers Slack `event_id`
+- includes enterprise/team scope in the durable ingress key when Slack sends those fields
+
+Slack output delivery:
+
+- posts text through `chat.postMessage`
+- sends deterministic `client_msg_id` values for queued text steps
+- uploads attachments through Slack external upload APIs
+- persists per-delivery Slack output progress for posted text timestamps and upload `file_id`/uploaded/completed steps so retries can skip already completed downstream steps
+- does not persist Slack external upload URLs in progress state
+- validates persisted Slack reply targets against enterprise/team/channel allowlists before they can be stored on a session
+- honors HTTP `429 Retry-After` and Slack JSON `ratelimited` responses for queued delivery retries
+- treats permanent Slack API errors such as invalid auth or channel-not-found as terminal delivery failures
+
+## External connectors
+
+### Runtime payload
+
+`PUT /v1/runtime/connectors/external/{name}` accepts:
+
+- `platform`
+- `mode`
+- `base_url`
+- `allow_private_network`
+- `shared_token`
+- `allow_unauthenticated_ingress`
+- `fixed_session_id`
+- `include_self_output`
+- `additional_reply_targets`
+- `additional_binding_keys`
+- `session_policy`
+- `ingress_events_per_second`
+- `child_process`
+
+External connector reads return:
+
+- non-secret transport config
+- whether private-network remote targets are explicitly allowed
+- `child_process.env_keys`
+- `child_process.credential_env_keys`
+- redacted secret metadata for the shared token
+
+When `child_process.credential_slots` is configured, the daemon does not inject those platform secrets into the child environment directly. Each referenced slot must already exist as a non-empty generic secret when the connector config is resolved. The daemon starts the sidecar with one short-lived opaque credential token and the list of allowed env keys, and the sidecar fetches each concrete secret from the daemon on demand.
+
+### Ingress endpoints
+
+- `POST /v1/connectors/external/{name}/events`
+- `POST /v1/connectors/external/{name}/events/batch`
+
+External ingress is documented in detail in [External connectors protocol](./external-connectors-protocol).
+
+The short version:
+
+- single-event ingress returns `accepted`, `duplicate`, or `rejected`
+- single-event rate limiting is HTTP `429` with `Retry-After`; new events are throttled before a durable ingress receipt is reserved, while duplicate/pending event ids use the existing receipt path
+- batch ingress is ordered, non-atomic, and returns per-item statuses, including structured `retry_after_ms` for rate-limited items
+- session derivation can use `thread.path`, `routing_key`, or `fixed_session_id`
+- sidecar runtime endpoints stay on protocol `1`, while ingress semantics now default to protocol `2`
+- duplicate and conflicting idempotency replays return the original run/session identifiers
+- receipt shards store hashed event ids and payload fingerprints; raw event ids stay out of connector-ingress receipt files
+- daemon-to-sidecar delivery is at-least-once; sidecars must deduplicate repeated `delivery_id` values
+
+Reply targets:
+
+- when `include_self_output=true`, replies default back to the sidecar-provided `reply_route`
+- `additional_reply_targets` are appended after that default self-target
+
+## Telegram connectors
+
+### Runtime payload
+
+`PUT /v1/runtime/connectors/telegram/{name}` accepts:
+
+- `bot_token`
+- `secret_token`
+- `allow_unauthenticated_ingress`
+- `api_base_url`
+- `ingress_mode`
+- `polling_timeout_seconds`
+- `ingress_events_per_second`
+- `allowed_chat_ids`
+- `fixed_session_id`
+- `include_self_output`
+- `additional_reply_targets`
+- `additional_binding_keys`
+- `session_policy`
+
+Example:
+
+```json
+{
+  "bot_token": {
+    "secret_ref": "telegram.prod.bot_token"
+  },
+  "secret_token": {
+    "secret_ref": "telegram.prod.secret_token"
+  },
+  "ingress_mode": "webhook",
+  "ingress_events_per_second": 100,
+  "allowed_chat_ids": [123456789],
+  "include_self_output": true,
+  "session_policy": {
+    "create_if_missing": true,
+    "persona_id": "chat-operator"
+  }
+}
+```
+
+Validation rules:
+
+- `ingress_mode=polling` requires a bot token
+- `ingress_mode=webhook` requires either a secret token source or `allow_unauthenticated_ingress=true`
+- empty bot tokens and secret tokens are rejected
+- `api_base_url` must be an absolute `http://` or `https://` URL and must not include userinfo, query, or fragment
+- `ingress_events_per_second` is normalized to at least `1`
+- when `allowed_chat_ids` is non-empty, ingress and output are restricted to those chat ids
+
+### Ingress endpoint
+
+- `POST /v1/connectors/telegram/{name}`
+
+Behavior:
+
+- accepts requests only for connectors configured with `ingress_mode=webhook`
+- requires Telegram `update_id` on webhook requests
+- verifies `x-telegram-bot-api-secret-token` when a secret token is configured
+- derives one durable session from chat id plus topic thread id when `fixed_session_id` is not configured
+- downloads inbound photos and documents through the Telegram Bot API when a bot token is available
+- accepts `message`, `edited_message`, and `callback_query` updates
+- acknowledges authenticated unsupported webhook update types as skipped instead of returning a retryable daemon error
+- validates and deduplicates callback queries before answering them; duplicate callback `update_id` submissions return the existing run without another Bot API acknowledgement
+- rate-limits only new Telegram updates after `update_id` dedupe; rate-limited webhooks return `429` with `Retry-After` and `retry_after_ms`, and are rejected before Bot API file metadata or media download calls
+- polling mode requests `message`, `edited_message`, and `callback_query` updates
+- polling mode honors capped Telegram `parameters.retry_after` and HTTP `Retry-After` flood-wait responses, including HTTP-date headers
+- Telegram Bot API and media clients ignore proxy environment variables and do not follow redirects
+
+Telegram ingress idempotency:
+
+- keyed by Telegram `update_id`
+- run metadata records `connector_ingress_key` so crash recovery can reconnect pending receipts to created runs
+- run metadata records `telegram_ingress_fingerprint`; duplicate `update_id` submissions with a different payload return `409`
+
+Reply targets:
+
+- when `include_self_output=true`, replies default back to the same chat or topic
+- `additional_reply_targets` are appended after the self-target
+- reply targets outside `allowed_chat_ids` are rejected when the allowlist is configured
+
+Telegram output delivery:
+
+- splits text outputs into Telegram-safe chunks of at most 4096 Unicode scalar values
+- sends attachments through `sendPhoto`, `sendAudio`, or `sendDocument`
+- honors capped Telegram `429` / `parameters.retry_after` and HTTP `Retry-After` flood-wait responses through the durable delivery queue
+- persists per-delivery step progress under `telegram-delivery-progress.d` and skips already persisted chunks/attachments on retry
+- treats permanent auth/chat errors as terminal delivery failures
+- remains at-least-once for a Telegram side effect that succeeds immediately before the daemon can persist step progress, because Telegram Bot API does not expose an idempotency key for these send methods
+
+## Output expectations
+
+Connector ingress and output routing are separate concerns:
+
+- ingress routes submit work into Kheish
+- reply targets determine where finalized output is delivered
+- output delivery can stay daemon-local or flow through output plugins
+- queued output can be inspected with `GET /v1/deliveries`, `GET /v1/deliveries/dead-letter`, `GET /v1/deliveries/{delivery_id}`, and replayed from DLQ with `POST /v1/deliveries/{delivery_id}/replay`
+- `RunView.deliveries` shows redacted delivery state for the run
+
+Read [Connectors and reply targets](../concepts/connectors-and-reply-targets), [Connector configuration](./connector-configuration), and [Output routing](../integrations/output-routing) for the broader model.

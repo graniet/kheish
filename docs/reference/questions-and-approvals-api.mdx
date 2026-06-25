@@ -1,0 +1,241 @@
+---
+title: Questions and approvals API
+description: Resume suspended runs after permission approvals or structured user questions.
+---
+
+# Questions and approvals API
+
+Kheish exposes approvals and structured user questions as first-class suspended-run states. These endpoints do not create unrelated work. They resume runs that are waiting.
+
+## Endpoint inventory
+
+List pending user questions:
+
+- `GET /v1/questions`
+- `GET /v1/sessions/{session_id}/questions`
+
+Resume from a session context:
+
+- `POST /v1/sessions/{session_id}/approvals`
+- `POST /v1/sessions/{session_id}/questions`
+- `POST /v1/sessions/{session_id}/approval-runs`
+
+Resume from a run handle:
+
+- `POST /v1/runs/{run_id}/approvals`
+- `POST /v1/runs/{run_id}/questions`
+- `POST /v1/runs/{run_id}/questions/{request_id}/cancel`
+
+## Which endpoint should you use?
+
+Use the session-scoped endpoints when you already operate in a session workflow and want the result projected back onto the session surface.
+
+Use the run-scoped endpoints when you already have a concrete suspended `run_id` and want a detached resume handle.
+
+Behavior difference:
+
+- `POST /v1/sessions/{session_id}/approvals`
+  - returns an updated `SessionView`
+- `POST /v1/sessions/{session_id}/questions`
+  - returns an updated `SessionView`
+- `POST /v1/sessions/{session_id}/approval-runs`
+  - returns `202 Accepted` plus a detached `RunView`
+- `POST /v1/runs/{run_id}/approvals`
+  - returns `202 Accepted` plus a detached `RunView`
+- `POST /v1/runs/{run_id}/questions`
+  - returns `202 Accepted` plus a detached `RunView`
+- `POST /v1/runs/{run_id}/questions/{request_id}/cancel`
+  - validates that `request_id` is pending on `run_id`, then returns the cancelled or declined `RunView`
+
+## List pending user questions
+
+`GET /v1/questions` supports:
+
+- `session_id`
+
+`GET /v1/sessions/{session_id}/questions` is the session-scoped equivalent.
+
+The response is a list of `PendingQuestionView` objects:
+
+- `session_id`
+- `agent_id`
+- `run_id`
+- `run_kind`
+- `requester_agent_id`
+- `requester_session_id`
+- `requester_run_id`
+- `requester_tool_call_id`
+- `requester_project_ids`
+- `requester_channel_ids`
+- `parent_project_ids`
+- `parent_channel_ids`
+- `request`
+
+The requester and project/channel fields are populated for `parent_clarification` runs. They let operators see which child run is blocked, where the question came from, and which project or channel contexts were active when the child escalated the clarification.
+
+`request` is a `UserQuestionRequest`:
+
+- `id`
+- `tool_call_id`
+- `questions`
+- `created_at_ms`
+- `expires_at_ms`
+
+Each structured question contains:
+
+- `id`
+- `header`
+- `question`
+- `options`
+- `multi_select`
+
+## Resolve approvals
+
+Approval endpoints accept:
+
+```json
+{
+  "idempotency_key": "optional-client-retry-key",
+  "resolutions": [
+    {
+      "request_id": "approval-bash-1",
+      "behavior": "allow",
+      "justification": "approved by operator"
+    }
+  ]
+}
+```
+
+Each `ApprovalResolution` supports:
+
+- `request_id`
+- `behavior`
+  - `allow`
+  - `deny`
+- `updated_input`
+- `justification`
+- `reason`
+
+Use `updated_input` when the approver wants to modify the pending tool input before allowing it.
+
+Clients can also send the idempotency key through the `Idempotency-Key` header. Reusing the same key with an identical payload returns the same resumed run; reusing it with a different payload is rejected.
+
+## Resolve structured user questions
+
+Question endpoints accept:
+
+```json
+{
+  "idempotency_key": "optional-client-retry-key",
+  "resolution": {
+    "request_id": "question-1",
+    "answers": [
+      {
+        "question_id": "routing",
+        "selected_option_ids": ["openai"]
+      },
+      {
+        "question_id": "notes",
+        "freeform_answer": "Use the fast path unless cost exceeds budget."
+      }
+    ],
+    "declined": false,
+    "justification": "Answered by operator"
+  }
+}
+```
+
+`UserQuestionResolution` fields:
+
+- `request_id`
+- `answers`
+- `declined`
+- `justification`
+
+Each answer supports:
+
+- `question_id`
+- `selected_option_ids`
+- `freeform_answer`
+
+For declined questions, set `declined` to `true` and leave `answers` empty.
+
+Clients can also send the idempotency key through the `Idempotency-Key` header. This is recommended for CLI and UI retries because question answers resume the original suspended run.
+
+## Cancel structured user questions
+
+Cancel a specific pending question through the run-scoped cancel endpoint:
+
+```json
+{
+  "idempotency_key": "optional retry key",
+  "justification": "optional operator note"
+}
+```
+
+For normal user questions, `POST /v1/runs/{run_id}/questions/{request_id}/cancel` cancels the waiting run only when the request id still matches a pending question on that run. A stale or mistyped `request_id` is rejected and the run remains waiting.
+
+For parent-clarification questions, the same endpoint records a declined clarification and delivers that declined answer back to the requesting child. The optional `justification` is included in the declined clarification payload.
+
+`questions cancel` uses this request-scoped endpoint. The older run-level `POST /v1/runs/{run_id}/cancel` still cancels a run directly, but clients that are acting on a question should prefer the request-scoped question cancel endpoint.
+
+Clients can also send the cancel idempotency key through the `Idempotency-Key` header. This is recommended when retrying a request-scoped cancel after network loss or double-submit. CLI retries with `questions cancel --idempotency-key` require `--run-id`, because a completed cancel removes the pending question from session-scoped discovery.
+
+## Question errors
+
+Question endpoints return `application/problem+json` with stable `domain` and `code` fields. Common codes:
+
+| Status | Domain | Code | Meaning |
+|---|---|---|---|
+| `400` | `questions` | `question_request_mismatch` | The resolution or cancel request does not match the pending question request. |
+| `400` | `questions` | `question_option_not_found` | An answer selected an option id that is not part of the question. |
+| `400` | `questions` | `question_answer_missing` | A required structured question was not answered. |
+| `400` | `questions` | `question_duplicate_answer` | The payload answered the same question more than once. |
+| `400` | `questions` | `question_duplicate_option` | The payload selected the same option more than once. |
+| `400` | `questions` | `question_declined_with_answers` | A declined resolution also supplied answers. |
+| `400` | `questions` | `question_single_select_violation` | A single-select question received multiple selected options. |
+| `400` | `questions` | `question_answer_empty` | An answer supplied neither selected options nor freeform text. |
+| `400` | `questions` | `question_unknown_answer` | The payload included answers for questions not present in the request. |
+| `409` | `questions` | `question_state_conflict` | The run is not waiting for a user question. |
+| `409` | `questions` | `question_expired` | The question expired before the answer or cancel request arrived. |
+| `409` | `questions` | `question_resolution_conflict` | A parent-clarification retry supplied a different answer after the first resolution was already durably claimed. |
+| `409` | `idempotency` | `idempotency_conflict` | The idempotency key was reused with a different payload. |
+
+## Run states
+
+These endpoints are relevant when a run enters one of these states:
+
+- `waiting_for_approval`
+- `waiting_for_user_question`
+
+You can inspect those states through [Sessions and runs API](./sessions-and-runs-api) using:
+
+- `GET /v1/sessions/{session_id}`
+- `GET /v1/runs/{run_id}`
+
+Relevant fields on `RunView`:
+
+- `pending_approval_ids`
+- `pending_approvals`
+- `pending_question_ids`
+- `pending_questions`
+
+Question-producing tools may set:
+
+- `expires_at_ms` for an absolute Unix timestamp in milliseconds
+- `expires_after_ms` for a relative timeout from question creation
+
+Expired normal user questions cancel the waiting run. Expired parent-clarification questions are delivered back to the requesting child as a declined clarification.
+
+Parent-clarification resolution is durable and idempotent. If the daemon restarts after an answer is captured but before every side effect finishes, startup replays the missing mailbox/output/audit work once. Parent interrupts and parent question cancellation are delivered to the child as declined clarifications. If the child has already been closed, the parent run still completes and the answer is moved to the child's mailbox dead-letter queue.
+
+`GET /v1/runs/{run_id}/events` and `GET /v1/sessions/{session_id}/events` include a structured `parent_clarification_resolved` event for parent-clarification answers.
+
+## Operational notes
+
+- Approval resolution is batch-based: send every decision you want to resolve in the current request.
+- Approval batches are atomic per run: invalid, duplicate, or stale request IDs reject the batch without resolving any approval in that run.
+- `approvals allow-all` and `approvals deny-all` group work by run and submit one atomic batch per run; they are not one global transaction across multiple sessions or runs.
+- Session-scoped resume endpoints operate on the active waiting state for that session.
+- Run-scoped resume endpoints are safer when multiple suspended runs could exist over time and the client wants to target one exact waiting run.
+- CLI operators can answer with `questions answer --interactive`, decline with `questions answer --declined`, and cancel with `questions cancel`.

@@ -1,0 +1,61 @@
+---
+title: Hooks
+description: Lifecycle interception, policy enforcement, and runtime augmentation through daemon-configured hooks.
+---
+
+# Hooks
+
+Hooks are daemon-configured lifecycle interceptors that can observe and influence runtime behavior.
+
+## What hooks can do
+
+Depending on the event and executor, hooks can:
+
+- block or approve execution
+- update permission rules
+- modify tool input or output
+- inject additional context into the agent transcript
+- suggest an initial session message
+- register watch paths
+- emit retry instructions after failures
+
+## Where hooks apply
+
+Hooks cover a broad set of runtime events, including:
+
+- tool execution
+- permission requests and denials
+- session start and end
+- compaction
+- task lifecycle
+- subagent lifecycle
+- file and working-directory changes
+- notification and configuration events
+
+## Executor model
+
+Kheish supports several hook executors:
+
+- shell command executors
+- HTTP executors
+- lightweight model prompt executors
+- isolated ephemeral agent executors
+- in-process callback executors
+
+Use prompt or agent executors when hook logic is model-driven. Use command or HTTP executors when the logic must integrate with external systems or local scripts.
+
+## Reliability and safety
+
+Hook settings are validated before runtime mutation, so invalid definitions do not become active revisions. Command and HTTP executors receive a wire payload with `contract_version: 1` and a stable invocation key; prompt and agent templates can include the same payload with `{{invocation_json}}`. In-process callback executors receive the typed daemon `HookInvocation` directly. HTTP hooks also receive an `Idempotency-Key` header.
+
+Hook failures support bounded retries and `open` or `closed` failure modes. HTTP hooks retry transport/timeouts plus retryable statuses such as `429` and `5xx`, honor capped `Retry-After`, and treat redirects, schema/parse errors, and ordinary `4xx` responses as terminal. Exhausted failures, including internal hook task panics, are persisted to a pruned hook dead-letter store with redacted errors and safe targets. `/v1/status` exposes hook counters and unresolved dead-letter health without exposing raw hook executor bodies. Admin-only `GET /v1/runtime/hooks/dead-letter` lists redacted records, and `POST /v1/runtime/hooks/dead-letter/{id}/resolve` marks a record operator-resolved without deleting the audit evidence.
+
+HTTP hooks reject local/private/special targets, pin DNS resolutions, disable proxies and redirects, cap response bodies, and run under a bounded total timeout.
+
+## Operational guidance
+
+Treat hooks as production runtime policy. Validate them on a real daemon, because they can alter permissions, mutate execution flow, and interact with stateful components like tasks and outputs.
+
+## Playbooks and flows
+
+A Flow starts a normal session run, so hook behavior remains run and tool scoped. The Flow projection can help correlate evidence, but hooks still observe the underlying daemon events and runtime actions rather than a separate Flow executor.

@@ -1,0 +1,161 @@
+---
+title: Send One Webhook Event Into Kheish
+description: Create one webhook connector, bind it to a fixed session, and verify that one external event becomes one daemon run.
+---
+
+# Send One Webhook Event Into Kheish
+
+This is the shortest user-ready path from a working daemon to one real external ingress event.
+
+It uses the `webhook` connector from the sibling `kheish-connectors` repository because that path has the strongest real-daemon smoke coverage today.
+
+If the daemon is not already working, start with [Run Kheish](../introduction/quickstart) first.
+
+## What you need first
+
+- one running `kheish-daemon`
+- Python with `pip`
+- the `kheish-connectors` CLI
+- one session identifier that will own the incoming work
+
+Install the connector CLI and its SDK dependency:
+
+```bash
+pip install kheish-sdk kheish-connectors
+```
+
+If you are working from sibling repos instead of published packages:
+
+```bash
+pip install -e ../kheish-sdks/python
+pip install -e ../kheish-connectors
+```
+
+If your daemon requires bearer auth, export the token before using the connector CLI:
+
+```bash
+export KHEISH_TOKEN="<admin token>"
+```
+
+If you followed the Docker quickstart from this repository, one valid example is:
+
+```bash
+export KHEISH_TOKEN="$(cat docker/secrets/admin-token.txt)"
+```
+
+## 1. Create one fixed target session
+
+If you built the daemon binary on the host:
+
+```bash
+./target/debug/kheish-daemon sessions create webhook-demo
+```
+
+If you are using the Docker quickstart instead:
+
+```bash
+docker compose -f docker/compose.yaml exec daemon \
+  kheish-daemon sessions create webhook-demo
+```
+
+Using `fixed_session_id` keeps the first success obvious: every accepted event lands in the same durable session.
+
+## 2. Generate one webhook connector manifest
+
+```bash
+kheish-connectors init webhook webhook-demo \
+  --output ./webhook-demo.toml \
+  --daemon-url http://127.0.0.1:4000 \
+  --fixed-session-id webhook-demo
+```
+
+This writes one manifest plus one local `.env` file beside it.
+
+## 3. Register the connector in the daemon
+
+```bash
+kheish-connectors apply ./webhook-demo.toml
+```
+
+## 4. Inspect the connector state
+
+```bash
+kheish-connectors status ./webhook-demo.toml --json
+```
+
+`status` combines:
+
+- the desired connector runtime from the manifest
+- the daemon runtime view for that connector
+- the sidecar `/manifest` and `/health` endpoints
+- filtered daemon metrics when available
+
+Repeat `status` until the sidecar health reports `ready` or `degraded`, then trigger the ingress probe.
+
+## 5. Trigger one real ingress probe
+
+```bash
+kheish-connectors test ./webhook-demo.toml
+```
+
+For `webhook`, `test` is not a fake stub. It sends a real ingress probe through the connector route and verifies that the daemon accepts it. The output also includes a `probe.run_id` when the daemon materializes one run from the event.
+
+## 6. Verify that the event became daemon work
+
+If you built the daemon binary on the host:
+
+```bash
+./target/debug/kheish-daemon runs list --session-id webhook-demo
+./target/debug/kheish-daemon sessions events webhook-demo
+```
+
+If you are using the Docker quickstart instead:
+
+```bash
+docker compose -f docker/compose.yaml exec daemon \
+  kheish-daemon runs list --session-id webhook-demo
+docker compose -f docker/compose.yaml exec daemon \
+  kheish-daemon sessions events webhook-demo
+```
+
+After the test, you should see one or more new run and input events tied to `webhook-demo`.
+
+If the `test` output includes `probe.run_id`, wait for that run explicitly:
+
+```bash
+./target/debug/kheish-daemon runs wait <run_id>
+```
+
+or, for the Docker quickstart:
+
+```bash
+docker compose -f docker/compose.yaml exec daemon \
+  kheish-daemon runs wait <run_id>
+```
+
+## Important local-only note
+
+The generated `webhook` route is intentionally easy to bring up locally. It is not a safe internet-facing default until you set `WEBHOOK_HMAC_SECRET` in the generated env file.
+
+So for this first quickstart:
+
+- use it on localhost
+- prove the ingress path works
+- then harden it before exposing it anywhere else
+
+## What this quickstart proves
+
+You are proving that:
+
+- an external producer can reach Kheish through a connector sidecar
+- the daemon still owns session resolution and run creation
+- `fixed_session_id` can collapse repeated ingress into one durable session
+
+## Next steps
+
+Once the first webhook event works, continue with:
+
+- [Connectors](./connectors) for the transport model
+- [Multiple input connectors in one session](./multi-input-sessions) for fan-in patterns
+- [Connector configuration](../reference/connector-configuration) for file-backed and runtime-backed models
+- [External connectors protocol](../reference/external-connectors-protocol) for sidecar contract details

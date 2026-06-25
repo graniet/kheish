@@ -1,0 +1,216 @@
+---
+title: Control plane API
+description: Base conventions, auth boundaries, and the reference map for the daemon HTTP API.
+---
+
+# Control plane API
+
+Kheish serves its operator-facing HTTP API under `/v1/`.
+
+Most endpoints return JSON. Three categories are intentionally different:
+
+- SSE streams:
+  - `GET /v1/events/stream`
+  - `GET /v1/sessions/{session_id}/stream`
+  - `GET /v1/runs/{run_id}/stream`
+  - `GET /v1/flows/{flow_id}/stream`
+- Raw bytes:
+  - `GET /v1/assets/{asset_id}/raw`
+- Raw UTF-8 text:
+  - `GET /v1/runs/{run_id}/debug/artifacts/{artifact_id}`
+
+## Auth boundaries
+
+Kheish has three distinct HTTP trust zones:
+
+1. Control plane
+   - Playbook, Flow, project, channel, session, run, output-delivery, runtime, task, schedule, agent, asset, persona, skill, observation-management, and derivation endpoints.
+   - Protected by the daemon's control-plane auth middleware when HTTP auth is enabled.
+   - Browser CORS is loopback-only by default and can be narrowed with `--http-cors-allow-origin` or `KHEISH_HTTP_CORS_ALLOW_ORIGINS`.
+   - Sensitive read paths such as raw asset bytes, run debug artifacts, and brokered runtime-auth subject or lease details require an admin token when auth is enabled.
+
+2. Connector ingress
+   - `POST /v1/connectors/http/{name}`
+   - `POST /v1/connectors/slack/{name}`
+   - `POST /v1/connectors/telegram/{name}`
+   - `POST /v1/connectors/external/{name}/events`
+   - `POST /v1/connectors/external/{name}/events/batch`
+   - `GET /v1/connectors/external/{name}/credentials/{env_key}`
+   - Auth is connector-specific and separate from control-plane auth. The external connector credential route returns one raw secret value only when the caller presents a valid brokered lease token.
+
+3. Observation upload ingress
+   - `POST /v1/observation-sources/{source_id}/observations`
+   - Uses one source-scoped bearer token, not the admin control-plane token.
+
+## Common response patterns
+
+The API does not wrap every result in a generic envelope. Most routes return the concrete view directly.
+
+Typical status codes:
+
+- `200 OK` for reads and in-place mutations
+- `201 Created` for resource creation such as personas, sessions, and schedules
+- `202 Accepted` for detached run submissions and mailbox posts
+- `400 Bad Request` for invalid payloads, malformed multimodal input, invalid route combinations, or invalid selection criteria
+- `404 Not Found` for unknown sessions, runs, personas, assets, observations, derivations, skills, or connectors
+- `409 Conflict` for runtime state conflicts such as persona/capability/credential rebinding while a session is not idle, connector mutation of file-backed config, or duplicate persona identifiers
+
+## Streaming surfaces
+
+Use SSE when you need a live operator view instead of polling.
+
+```bash
+curl -N http://127.0.0.1:4000/v1/events/stream
+curl -N http://127.0.0.1:4000/v1/sessions/demo/stream
+curl -N http://127.0.0.1:4000/v1/runs/run-1/stream
+curl -N http://127.0.0.1:4000/v1/flows/flow-1/stream
+```
+
+Data SSE events carry monotone decimal-string ids; typed `heartbeat` keepalives are id-less and
+do not advance the reconnect cursor. Reconnect with `Last-Event-ID` or
+`?cursor=<event_id>`; when both are present, the larger numeric cursor wins. The daemon emits typed
+`heartbeat` keepalives and typed `stream_gap` notices when a cursor is older than the bounded
+replay window, predates the current daemon event-id epoch after restart, or a slow consumer falls
+behind. Gap payloads include `skipped`, `reason`, `scope`, `skipped_is_estimate`, and optional
+`resume_after_id` when the daemon can provide a safe replay cursor. Gap frames carry an SSE `id`
+only when that safe resume cursor exists and would advance the stream cursor. Filtered streams
+report scoped losses when retained metadata can prove one and emit a conservative gap if the
+client falls behind beyond that metadata window. The global stream can also be filtered with
+`session_id` and `run_id`. The replay/live buffer defaults to 2048 events and can be tuned with
+`--event-history-capacity` or `KHEISH_EVENT_HISTORY_CAPACITY`; the daemon clamps unsafe zero or
+excessive capacities to the supported `1..=262144` event range. The CLI streaming commands abort
+if one SSE frame exceeds 1 MiB; use list/get endpoints for bulk output reconciliation.
+
+Current SSE event names on the daemon bus include:
+
+- `trace`
+- `session_state_changed`
+- `session_snapshot`
+- `output`
+- `run_updated`
+- `session_goal_updated`
+- `interrupted`
+- `runtime_updated`
+- `heartbeat`
+- `stream_gap`
+
+The session, run, and Flow stream endpoints are filtered views over that shared daemon event bus. Flow streaming is a proxy over the referenced root run stream; it does not create a second Flow event bus.
+
+## Reference map
+
+Use the dedicated reference pages below instead of treating this page as the full API spec:
+
+- [Runtime API](./runtime-api) for:
+  - `/v1/status`
+  - `/v1/capabilities`
+  - `/v1/runtime`
+  - `/v1/runtime/learning-policy`
+  - `/v1/runtime/secrets`
+  - `/v1/runtime/auth/subjects/{subject_id}`
+  - `/v1/runtime/auth/leases/{lease_id}`
+  - `/v1/runtime/hooks`
+  - `/v1/runtime/debug-level`
+  - `/v1/runtime/connectors/external/metrics`
+  - `/v1/events/stream`
+- [Channels API](./channels-api) for:
+  - `/v1/channels`
+  - channel members
+  - public messages
+  - reactions
+  - public turn leases
+  - channel stimuli
+  - canonical thread-work state
+- [Projects API](./projects-api) for:
+  - `/v1/projects`
+  - project members
+  - linked channels
+  - project tasks
+  - project-task start
+- [Playbooks and flows API](./playbooks-and-flows-api) for:
+  - `/v1/playbooks`
+  - `/v1/playbooks/validate`
+  - `/v1/playbooks/{playbook_id}/publish`
+  - `/v1/playbooks/{playbook_id}/revoke`
+  - `/v1/flows`
+  - `/v1/flows/{flow_id}`
+  - `/v1/flows/{flow_id}/cancel`
+  - `/v1/flows/{flow_id}/evidence`
+  - `/v1/flows/{flow_id}/verify/product-view`
+  - `/v1/flows/{flow_id}/stream`
+- [Sessions and runs API](./sessions-and-runs-api) for:
+  - `/v1/sessions`
+  - `/v1/runs`
+  - session input, route policy, capability scope, credential scope, reply targets, memory context, memory search, run external actions, and run debug
+- [Learnings API](./learnings-api) for:
+  - `/v1/learning-candidates`
+  - `/v1/learnings`
+  - `/v1/learnings/revoke-matching`
+  - `/v1/learning-skills`
+  - promoted procedural skills
+- [Questions and approvals API](./questions-and-approvals-api) for:
+  - `/v1/questions`
+  - `/v1/sessions/{session_id}/approvals`
+  - `/v1/sessions/{session_id}/questions`
+  - `/v1/sessions/{session_id}/approval-runs`
+  - `/v1/runs/{run_id}/approvals`
+  - `/v1/runs/{run_id}/questions`
+- [Tasks, schedules, and agents API](./tasks-schedules-agents-api) for:
+  - `/v1/sessions/{session_id}/tasks`
+  - `/v1/schedules`
+  - `/v1/agents`
+  - `/v1/mailboxes`
+- [Observations and derivations API](./observations-and-derivations-api) for:
+  - `/v1/observation-sources`
+  - `/v1/observations`
+  - `/v1/observation-materializations`
+  - `/v1/derivations`
+- [Connectors API](./connectors-api) for:
+  - `/v1/runtime/connectors`
+  - `/v1/connectors/http/{name}`
+  - `/v1/connectors/slack/{name}`
+  - `/v1/connectors/telegram/{name}`
+  - `/v1/connectors/external/{name}`
+- [Assets API](./assets-api) for:
+  - `/v1/assets`
+- [Boards API](./boards-api) for:
+  - `/v1/boards`
+  - `/v1/boards/{board_id}/revisions`
+- [Personas API](./personas-api) for:
+  - `/v1/personas`
+  - session persona binding endpoints
+- [Skills API](./skills-api) for:
+  - `/v1/skills`
+
+## Route groups at a glance
+
+The actual control-plane router currently exposes these groups:
+
+- capabilities and runtime
+- runtime secrets
+- runtime auth subjects and leases
+- runtime connectors
+- learning candidates, learnings, and promoted learning skills
+- assets
+- observation sources, observations, and observation materializations
+- derivations
+- skills
+- personas
+- channels
+- projects
+- playbooks and flows
+- sessions
+- runs
+- tasks
+- questions and approvals
+- schedules
+- agents and mailboxes
+- daemon-wide, session-scoped, and run-scoped event streams
+
+Connector ingress and observation upload ingress are mounted separately and intentionally sit outside the operator control-plane auth middleware.
+
+## Evidence Note
+
+- Code verified: `crates/kheish-daemon/src/api/handlers.rs`, `crates/kheish-daemon/src/cli/commands/playbooks.rs`, `crates/kheish-daemon/src/playbooks.rs`.
+- CLI/API verified: Playbook/Flow route names and Flow stream behavior checked against the current router and CLI.
+- Daemon live tested for this note: no; this page is a route map.
+- Provider-specific tested for this note: no; these control-plane routes are provider-neutral.

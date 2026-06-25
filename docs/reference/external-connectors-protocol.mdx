@@ -1,0 +1,382 @@
+---
+title: External connectors protocol
+description: Runtime-managed sidecar configuration, current ingress semantics, batch submission, and delivery compatibility for external connectors.
+---
+
+# External connectors protocol
+
+External connectors let Kheish talk to user-authored sidecars without rebuilding the daemon.
+
+They are intended for:
+
+- chat transports such as Discord, Matrix, Signal, WhatsApp, or email
+- generic webhook bridges
+- domain events that still need to materialize durable Kheish sessions
+
+The protocol is deliberately split into two layers:
+
+- one stable **runtime sidecar contract** for `manifest`, `health`, and `deliver`
+- one additive **ingress contract** for daemon-owned event submission
+
+## Versioning
+
+There are currently two version numbers in play:
+
+- runtime sidecar contract: `protocol_version = 1`
+- ingress contract: `protocol_version = 2`, while the daemon still accepts ingress `1`
+
+This split is intentional.
+
+The sidecar runtime contract did not need a breaking migration to add ingress semantics such as `intent`, `relation`, `routing_key`, or batch submission.
+
+Current compatibility rules:
+
+- `GET /manifest` and `GET /health` must return runtime `protocol_version = 1`
+- child-process readiness requires `GET /health` to report the same `instance_id` as `GET /manifest`
+- `POST /deliver` currently receives runtime `protocol_version = 1`
+- `POST /events` and `POST /events/batch` accept ingress `protocol_version = 1` or `2`
+- the bundled Python sidecar helpers now submit ingress `protocol_version = 2` by default and automatically fall back to ingress `1` when talking to an older daemon
+
+Protocol additions should be additive within the accepted ingress range. Breaking runtime-contract changes require a new runtime protocol version and an explicit daemon compatibility update.
+
+## Runtime-managed external connectors
+
+Runtime CRUD uses the normal connector surface:
+
+- `GET /v1/runtime/connectors`
+- `GET /v1/runtime/connectors/external/{name}`
+- `PUT /v1/runtime/connectors/external/{name}`
+- `DELETE /v1/runtime/connectors/external/{name}`
+
+External connector runtime payloads accept:
+
+- `platform`
+- `mode`: `remote_http` or `child_process`
+- `base_url`
+- `allow_private_network`
+- `shared_token`
+- `allow_unauthenticated_ingress`
+- `fixed_session_id`
+- `include_self_output`
+- `additional_reply_targets`
+- `additional_binding_keys`
+- `session_policy`
+- `ingress_events_per_second`
+- `child_process`
+
+`base_url` must use `http://` or `https://` and must not include URL userinfo. `remote_http` connectors reject loopback, private, link-local, and metadata-network targets by default; set `allow_private_network=true` only for trusted local sidecars. Runtime manifest fetches and delivery re-resolve hostnames, reject any private/special address in the answer set, pin the validated addresses for the request, and never follow redirects. `child_process` connectors must use a loopback `base_url` without a path, query, or fragment. Empty `shared_token` values are rejected; if no shared token is configured, `allow_unauthenticated_ingress=true` must be explicit.
+
+Daemon HTTP clients for sidecar runtime checks and delivery use bounded timeouts, ignore proxy environment variables, and do not follow redirects. Runtime manifests are cached briefly and then revalidated so a sidecar at a stable URL cannot keep an old capability contract indefinitely.
+
+`child_process` accepts:
+
+- `command`
+- `args`
+- `env`
+- `credential_slots`
+- `working_dir`
+
+## Sidecar runtime endpoints
+
+One external sidecar exposes:
+
+- `GET /manifest`
+- `GET /health`
+- `POST /deliver`
+
+Optional local test-only endpoint used by bundled sidecars:
+
+- `POST /__test/inject`
+
+`/__test/inject` is disabled by default and only turns on when all of these are true:
+
+- `KHEISH_EXTERNAL_CONNECTOR_ENABLE_TEST_API=true`
+- `KHEISH_EXTERNAL_CONNECTOR_TEST_MODE=true`
+- the sidecar `base_url` is loopback-only
+- the sidecar has a configured shared token
+
+## Ingress endpoints
+
+The daemon-owned external ingress surface is:
+
+- `POST /v1/connectors/external/{name}/events`
+- `POST /v1/connectors/external/{name}/events/batch`
+
+Both endpoints authenticate with the connector `shared_token` unless:
+
+- `allow_unauthenticated_ingress=true`
+
+Both endpoints also enforce:
+
+- per-connector rate limiting through `ingress_events_per_second`
+- request body limits
+- per-event `content`, `input_items`, `attachments`, and inline-asset limits
+- a deterministic input shape: `input_items` cannot be combined with legacy `content` or `attachments`
+- idempotency by `event_id`
+- payload-fingerprint mismatch rejection for reused `event_id`
+- durable connector-ingress receipts with hashed event ids and payload fingerprints, so restart recovery does not depend only on run metadata
+
+For single-event overload, the daemon returns HTTP `429` with `Retry-After`. For batch overload, the affected item returns `rate_limited` with `retry_after_ms`.
+
+## Child-process credential bootstrap
+
+`shared_token` is the normal transport credential for ingress and delivery. It is not the same thing as the child-process credential lease used for `credential_slots`.
+
+When an external connector runs in `child_process` mode and declares `credential_slots`, the daemon starts the sidecar with:
+
+- `KHEISH_EXTERNAL_CONNECTOR_CREDENTIAL_TOKEN`
+- `KHEISH_EXTERNAL_CONNECTOR_CREDENTIAL_KEYS_JSON`
+
+The token is an opaque short-lived lease scoped to that connector name and only the listed env keys. The sidecar can then fetch one concrete secret at a time from:
+
+- `GET /v1/connectors/external/{name}/credentials/{env_key}`
+
+using `Authorization: Bearer $KHEISH_EXTERNAL_CONNECTOR_CREDENTIAL_TOKEN`.
+
+Successful responses return:
+
+- `value`
+- `lease_id`
+- `grant_id`
+- `expires_at_ms`
+
+Operationally this means:
+
+- the sidecar never receives the daemon's long-lived root secrets directly in its startup environment
+- restarting or shutting down the child revokes the active credential lease
+- rotating the root secret slot does not require changing the sidecar bootstrap contract
+
+Child-process sidecars run with daemon provider credentials removed from the inherited environment. The daemon does not inherit the sidecar's stdin/stdout/stderr streams, retries spawn/readiness/exit failures with bounded backoff, and on Unix starts the sidecar in its own process group so shutdown can signal descendants that remain in that group.
+
+## Single-event ingress
+
+`POST /events` accepts:
+
+```json
+{
+  "protocol_version": 2,
+  "instance_id": "discord-main",
+  "event_id": "discord-123",
+  "fingerprint": "discord-123",
+  "occurred_at_ms": 1730000000000,
+  "actor_id": "user-42",
+  "source_kind": "discord",
+  "intent": "message",
+  "relation": {
+    "kind": "reply_to",
+    "target_event_id": "discord-122"
+  },
+  "thread": {
+    "path": ["guild-1", "channel-2", "thread-3"]
+  },
+  "routing_key": "ignored-when-thread-is-present",
+  "content": "Summarize this thread.",
+  "input_items": [],
+  "attachments": [],
+  "reply_route": "{\"channel_id\":\"2\",\"thread_id\":\"3\"}",
+  "metadata": {
+    "message_id": "123"
+  }
+}
+```
+
+### Fields
+
+- `instance_id`: opaque sidecar instance identifier; child-process ingress is validated against the sidecar manifest
+- `event_id`: durable idempotency key inside one connector
+- `fingerprint`: optional extra hash or upstream event revision used to reject conflicting replays
+- `occurred_at_ms`: optional source timestamp
+- `actor_id`: optional upstream actor identifier
+- `source_kind`: free-form source family such as `discord`, `email`, `webhook`, `grafana_alert`
+- `intent`: optional free-form semantic hint such as `message` or `domain_event`
+- `relation`: optional typed relation with:
+  - `kind`
+  - `target_event_id`
+- `thread.path`: hierarchical conversation identity
+- `routing_key`: optional non-thread conversation key for threadless events
+- `content`: canonical human-readable summary of the event
+- `input_items`: multimodal prompt items
+- `attachments`: durable inbound files
+- `reply_route`: opaque connector-defined reply handle payload
+- `metadata`: opaque JSON bag preserved into run input metadata
+
+### Session resolution
+
+External ingress materializes or resolves one session in this order:
+
+1. connector `fixed_session_id`
+2. session already bound to the derived external binding keys
+3. natural session id derived from `thread.path`
+4. natural session id derived from `routing_key`
+
+Important rule:
+
+- if `thread.path` is present, it drives session identity
+- `routing_key` is only used for session identity when `thread.path` is empty
+- `routing_key` is still persisted into metadata when supplied
+
+If none of these can resolve a session, the event is rejected.
+
+### Typed semantics
+
+`intent`, `relation`, and `routing_key` are accepted and preserved by the daemon.
+
+They are currently projected into reserved run input metadata fields:
+
+- `external_protocol_version`
+- `external_event_key_sha256`
+- `external_event_fingerprint`
+- `external_intent`
+- `external_relation`
+- `external_routing_key`
+
+They are not yet used by the daemon to alter prompt construction, delivery, or permissions.
+
+### Content, input items, and attachments
+
+Use one input shape per event:
+
+- `content`: compatibility text-only input
+- `content` plus `attachments`: compatibility text plus appended durable assets
+- `input_items`: ordered multimodal input that should enter the prompt surface directly
+
+Recommended rule:
+
+- for text-only events, send `content`
+- for legacy text-plus-files events, send `content` and `attachments`
+- for ordered multimodal events, put every prompt-visible text and asset in `input_items`
+
+Do not send `content` or `attachments` together with `input_items`. The daemon rejects mixed legacy and ordered input shapes so provider prompt construction stays deterministic.
+
+## Batch ingress
+
+`POST /events/batch` accepts one shared `protocol_version` and an ordered `events` array:
+
+```json
+{
+  "protocol_version": 2,
+  "events": [
+    {
+      "instance_id": "mail-importer",
+      "event_id": "email-1",
+      "source_kind": "email",
+      "intent": "message",
+      "routing_key": "mailbox:ops",
+      "content": "Email 1"
+    },
+    {
+      "instance_id": "mail-importer",
+      "event_id": "email-2",
+      "source_kind": "email",
+      "intent": "message",
+      "routing_key": "mailbox:ops",
+      "content": "Email 2"
+    }
+  ]
+}
+```
+
+Batch semantics:
+
+- request order is preserved in the response
+- there is no atomicity
+- each event consumes rate limit independently
+- each event goes through the same validation, idempotency, and session-resolution pipeline as `/events`
+- oversized batches are rejected at the HTTP layer
+
+Batch item result statuses are:
+
+- `accepted`
+- `duplicate`
+- `rejected`
+- `rate_limited`
+- `error`
+
+Use batch for:
+
+- backfills
+- imports
+- low-latency round-trip reduction when events are already buffered
+
+Do not use batch as a replacement for a telemetry firehose. The connector ingress pipeline still materializes Kheish sessions and runs.
+
+## Single-event responses
+
+`POST /events` returns:
+
+```json
+{
+  "event_id": "discord-123",
+  "status": "accepted",
+  "session_id": "external:discord-main:deadbeefcafebabe",
+  "run_id": "run_123"
+}
+```
+
+Possible `status` values:
+
+- `accepted`
+- `duplicate`
+- `rejected`
+
+Important difference from batch:
+
+- rate limiting on `POST /events` is still an HTTP `429`
+- rate limiting inside `POST /events/batch` is item-scoped and returns `rate_limited`
+
+Duplicate and conflicting `event_id` responses return the original run and session identifiers, even if connector routing configuration has changed since the first accepted event. The daemon persists a hashed `connector_ingress_key` plus `external_event_key_sha256` and the payload fingerprint in run metadata; the raw `event_id` remains part of the protocol response and external metadata contract.
+
+## Delivery
+
+Daemon-to-sidecar delivery is unchanged by the current ingress semantics.
+
+`POST /deliver` still sends runtime `protocol_version = 1` with:
+
+- `delivery_id`
+- `attempt`
+- `reply_route`
+- `conversation`
+- `content`
+- `parts`
+- `artifacts`
+- `metadata`
+
+That keeps older sidecars compatible while ingress semantics evolve independently.
+
+Delivery requests also include:
+
+- `Idempotency-Key: kheish:<delivery_id>`
+- `X-Kheish-External-Protocol-Version: 1`
+
+Delivery is at-least-once. A daemon crash after the sidecar commits but before the local delivery ledger is settled can replay the same `delivery_id`, so production sidecars must deduplicate by `delivery_id` or the `Idempotency-Key` header. If the sidecar returns HTTP `429` with a numeric or HTTP-date `Retry-After` header, the daemon schedules the durable retry from that delay.
+
+`Retry-After` may be numeric seconds or an HTTP-date; the daemon caps downstream retry delay at one hour. A sidecar `committed` delivery response is only accepted on a 2xx HTTP response. Non-2xx responses with an invalid or missing JSON body are mapped to retryable or terminal delivery failures by HTTP status class. Delivery response bodies are capped at 64 KiB.
+
+When a delivery includes attachments, each asset descriptor contains a `download_path`:
+
+```text
+/v1/connectors/external/{name}/deliveries/{delivery_id}/assets/{asset_id}/raw
+```
+
+The sidecar downloads that path from the daemon with `Authorization: Bearer <shared_token>`. The daemon only serves assets referenced by the pending external delivery, so a wrong delivery id, connector name, or asset id returns not found.
+
+## Bundled Python helper surface
+
+The Python sidecar helper in [connectors/python/common.py](../../connectors/python/common.py) exposes:
+
+- `submit_event(payload)`
+- `submit_events_batch(payloads)`
+
+Both automatically include:
+
+- the ingress protocol version
+- the sidecar `instance_id`
+- connector auth headers when configured
+
+## Recommended sidecar patterns
+
+- For chat transports, use `thread.path` and `reply_route`.
+- For threadless sources, prefer `routing_key` over fake thread coordinates.
+- For edits, replies, or reactions, fill `relation`.
+- Keep `content` human-readable even when the authoritative source data lives in `metadata`.
+- If one source can emit both chat-like and domain-like events, keep `source_kind` stable and vary `intent`.

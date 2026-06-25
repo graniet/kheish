@@ -1,0 +1,69 @@
+---
+title: Architecture overview
+description: The main subsystems that make up Kheish and how requests flow through them.
+---
+
+# Architecture overview
+
+Kheish is organized as a Rust workspace centered around four operational layers:
+
+- a daemon control plane that exposes HTTP/SSE APIs, CLI workflows, and daemon-managed ingress routes
+- a provider-agnostic runtime that assembles prompts, tools, permissions, hooks, skills, and model drivers
+- a daemon auth layer that stores provider accounts, MCP OAuth accounts, route keys, connector secrets, and broker revocation state behind redacted status APIs
+- an orchestration layer that manages agents, sidechains, mailboxes, channel turn arbitration, project coordination, and task coordination
+- a Playbook/Flow projection layer that versions procedures and correlates them with normal sessions, runs, approvals, agents, and evidence
+- a persistence layer that stores session journals, Playbook catalogs, Flow records, project records, project-task state, channel logs, persona records, run state, daemon-managed secret slots, debug artifacts, and queued deliveries
+
+## Request flow
+
+At a high level, a request flows through the system like this:
+
+1. An input arrives through the control plane or an ingress connector.
+2. The daemon validates request metadata, route selection, `auth_ref` resolution, and reply targets, then creates or queues a run.
+3. The runtime executes the run against the current session state, with hooks, permissions, tools, and provider routing applied.
+4. The run either completes, pauses for approval or user input, or spawns additional work such as sidechains or background shell tasks.
+5. The daemon persists output locally and optionally routes it through reply targets and output plugins.
+
+## Persistence model
+
+Kheish persists long-lived state rather than treating the daemon as an in-memory orchestrator:
+
+- **session journals** store messages, tool activity, checkpoints, metadata, permission audits, and output records
+- **channel storage** keeps daemon-owned channel records, public message logs, reactions, and turn leases
+- **project storage** keeps daemon-owned projects, members, linked channels, and project tasks
+- **Playbook and Flow storage** keeps immutable Playbook versions, mutable release metadata, and Flow correlation records
+- **persona storage** keeps mutable daemon-owned persona records plus a compact persona index under the state root
+- **asset storage** keeps daemon-owned raw files plus derived text for supported document formats
+- **observation storage** keeps daemon-owned observation sources plus captured records with retention and materialization metadata
+- **run state** tracks lifecycle, status, errors, pending approvals, and pending questions
+- **route and auth state** keeps daemon-owned route bindings, encrypted secret slots, account-auth records, MCP OAuth records, broker leases, and revocation state outside run payloads
+- **connector state** keeps daemon-managed transport definitions and their bindings to secret-store slots
+- **delivery queues** store outbound responses that must be retried against external systems
+- **debug artifacts** capture model and provider traces when debug capture is enabled
+
+## Integration model
+
+The runtime supports several extension points without changing the control-plane contract:
+
+- model providers and provider routing
+- built-in tools and daemon control tools
+- lifecycle hooks
+- reusable skills
+- MCP-backed tools and instructions, including secret-store-backed bearer config and scoped OAuth account records for HTTP MCP servers
+- daemon-managed ingress connectors
+- daemon-managed observation ingest and materialization
+- daemon-managed channels and public thread arbitration
+- daemon-managed projects and project-task coordination over existing sessions and channels
+- daemon-managed Playbooks and Flow projections over existing runs
+- generic output plugins and queued delivery
+
+## Operational boundary
+
+The daemon is the operational entry point for the system. It is the source of truth for sessions, runs, approvals, route inventory, secret-slot bindings, runtime configuration, and integration state. When debugging or validating behavior, prefer the daemon CLI and HTTP API over direct inspection of state files.
+
+## Evidence note
+
+- Code verified: `crates/kheish-daemon/src/state.rs`, `crates/kheish-daemon/src/builders.rs`, `crates/kheish-auth/src/manager.rs`, `crates/kheish-auth/src/broker.rs`, `crates/kheish-mcp/src/manager.rs`.
+- CLI verified: `runtime get`, `runtime auth accounts`, `secrets`, and `mcp oauth` surfaces correspond to the architecture described here.
+- Daemon live tested: yes for MCP catalog/secret-store/OAuth protocol true-binary harnesses.
+- Provider-specific tested: no architecture claim here depends on provider-specific model output.

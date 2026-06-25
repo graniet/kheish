@@ -1,0 +1,205 @@
+---
+title: Personas
+description: Mutable persona records, immutable session bindings, sidechain inheritance, and the prompt semantics that make personas durable.
+---
+
+# Personas
+
+Personas are the durable identity layer that sits above individual sessions.
+
+Kheish separates:
+
+- a mutable **persona record** owned by the daemon
+- an immutable **session persona binding** copied into each session that binds it
+
+That split is what makes personas production-safe in a daemon that supports restart recovery, queued runs, and sidechains.
+
+## What a persona is
+
+A persona record is a reusable instruction template stored under the daemon state root. It carries:
+
+- a stable `persona_id`
+- a user-visible `display_name`
+- one `soul` text body
+- a monotonically increasing version
+- an optional `capability_scope` baseline
+- optional `default_skills` assignments for inline skills
+- optional metadata
+
+The `soul` is the exact instruction body that future sessions can bind. The capability baseline and default inline skills are also part of what future sessions inherit from that persona.
+
+Use personas when you want one reusable identity such as:
+
+- reviewer
+- researcher
+- planner
+- customer-support style responder
+
+Do not treat personas as a replacement for one-off run input. Session input and run input are still the right place for task-specific instructions.
+
+## The two-layer model
+
+The critical design rule is:
+
+- persona records are mutable
+- session bindings are immutable snapshots
+
+When a session binds a persona, Kheish copies the current persona state into session metadata. The session then keeps:
+
+- `persona_id`
+- `persona_version`
+- `display_name`
+- the captured `soul`
+- the captured persona `capability_scope`
+- the resolved `default_inline_skills` snapshot
+- a digest of the captured instructions
+- the bind timestamp
+
+This means:
+
+- updating a persona record does not rewrite existing sessions
+- future sessions see the latest persona version
+- existing sessions keep the persona snapshot they already bound
+- default inline skills are frozen into the binding that each session captured
+- capability restrictions are also frozen into that binding
+
+## Capability baseline and defaults
+
+Personas do more than carry prompt text.
+
+A persona can define:
+
+- a `capability_scope` baseline that restricts which skills and MCP surfaces future bound sessions can see
+- `default_skills` assignments that resolve into inline skill snapshots when the persona is bound
+
+Those two pieces are intentionally different:
+
+- the capability scope is a visibility and authorization boundary
+- the default skills are the inline skill activations that start enabled for new bound sessions
+
+If a persona does not define a capability scope, a newly created session starts from the daemon-global skill and MCP inventory.
+
+If a persona does define one, that baseline is intersected with any session-local capability scope override. The effective scope is:
+
+- persona binding baseline
+- restricted by the session capability scope
+
+This is why `sessions get` exposes both the persisted session `capability_scope` and the derived `effective_capability_scope`.
+
+## Binding flow
+
+Typical lifecycle:
+
+1. Create or import a persona record.
+2. Bind it when you create a session, or later with `sessions set-persona`.
+3. Run work inside that session.
+4. Update the persona record when you want future sessions to use a new version.
+
+Example:
+
+```bash
+kheish-daemon personas import ./reviewer.md --persona-id reviewer
+kheish-daemon sessions create review-root --persona-id reviewer
+```
+
+Later:
+
+```bash
+kheish-daemon personas update reviewer --soul-file ./reviewer-v2.md
+```
+
+`review-root` keeps the old snapshot. A newly created session binds the new one.
+
+## Markdown import
+
+The CLI supports importing personas directly from Markdown:
+
+```bash
+kheish-daemon personas import ./reviewer.md --persona-id reviewer
+```
+
+Rules:
+
+- import accepts `.md` and `.markdown` files
+- the full file content becomes the persona `soul`
+- `--display-name` overrides the derived name
+- otherwise the first Markdown heading becomes the display name
+- if the file has no heading, the file stem is used
+- `--metadata-json` and `--metadata-file` can attach metadata to the imported persona
+
+Import is a CLI authoring workflow. The daemon HTTP API still exposes persona creation and update through `/v1/personas`.
+
+## Session mutation rules
+
+Binding or clearing a session persona is stricter than normal input submission.
+
+Kheish only allows persona changes while the session is idle for topology mutation. In practice, mutation is blocked when the session still has:
+
+- an active or queued run
+- pending approvals or questions
+- mailbox backlog
+- waiting agent state
+- live descendant work
+
+This keeps persona changes from rewriting the identity of already queued or suspended execution.
+
+## Sidechains
+
+Sidechains inherit the parent session's current persona snapshot at spawn time.
+
+That inheritance is:
+
+- snapshot-based
+- local to the new child session
+- independent from later persona updates on the parent or on the source persona record
+
+This is intentionally different from route policy inheritance. Child sessions do not auto-inherit the parent session route policy, but they do inherit the current persona snapshot.
+
+They also inherit the parent's current session capability scope, so the child starts from the same effective capability boundary as the parent session at spawn time.
+
+## Prompt semantics
+
+When a session has a bound persona snapshot, the runtime injects it as a dedicated `persona` section in the system prompt.
+
+Two details matter:
+
+- the session persona is restored after daemon restart because the binding lives in session metadata
+- a daemon-level `override_prompt` suppresses the persona section, because that override replaces the normal base prompt assembly
+
+The persona binding also feeds the runtime's default inline skills and capability baseline. Those restored values survive restart for the same reason: the binding lives in session metadata, not only in the mutable persona record.
+
+## Recovery and operations
+
+Persona durability is split across two stores:
+
+- mutable persona records live under the state root
+- bound session persona snapshots live inside session metadata
+
+Operationally, that gives you:
+
+- stable restart behavior for existing sessions
+- repairable persona indexes from on-disk persona records
+- session recovery that does not depend on the persona record remaining unchanged
+- recovery of persona capability baselines and resolved default inline skills from the session binding itself
+
+If prompt identity looks wrong during debugging, inspect both the session and the persona record:
+
+```bash
+kheish-daemon sessions get <session_id>
+kheish-daemon personas get <persona_id>
+```
+
+Those views can differ legitimately when the session bound an older snapshot.
+
+If capability visibility looks wrong, inspect the same session view for:
+
+- `persona`
+- `capability_scope`
+- `effective_capability_scope`
+
+## Related surfaces
+
+- Read [Sessions and runs](./sessions-and-runs) for queueing and waiting semantics.
+- Read [Agents and sidechains](./agents-and-sidechains) for child-session behavior.
+- Read [State and recovery](./state-and-recovery) for restore semantics.
+- Read [Personas API](../reference/personas-api) for the concrete HTTP and CLI surface.

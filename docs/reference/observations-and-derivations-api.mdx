@@ -1,0 +1,545 @@
+---
+title: Observations and derivations API
+description: Observation sources, source-scoped uploads, materialization into runs, and deterministic asset derivations.
+---
+
+# Observations and derivations API
+
+Kheish exposes a dedicated observation plane for durable captured media and a derivation plane for deterministic secondary artifacts such as canonical text or visual previews.
+
+## Endpoint inventory
+
+Observation source management:
+
+- `GET /v1/observation-sources`
+- `POST /v1/observation-sources`
+- `GET /v1/observation-sources/{source_id}`
+- `POST /v1/observation-sources/{source_id}/rotate-token`
+- `POST /v1/observation-sources/{source_id}/revoke-token`
+- `GET /v1/observation-audit`
+
+Capture-agent provisioning and operations:
+
+- `POST /v1/capture-agent-provisions`
+- `GET /v1/capture-agents`
+- `GET /v1/capture-agents/{machine_id}`
+- `POST /v1/capture-agents/{machine_id}/heartbeat`
+- `POST /v1/capture-agents/{machine_id}/revoke`
+- `GET /v1/capture-alerts`
+
+Observation upload and listing:
+
+- `POST /v1/observation-sources/{source_id}/observations`
+- `GET /v1/observations`
+- `GET /v1/observations/{observation_id}`
+
+Observation materialization:
+
+- `POST /v1/observation-materializations`
+
+Derivations:
+
+- `GET /v1/derivations`
+- `POST /v1/derivations`
+- `GET /v1/derivations/{derivation_id}`
+
+## Observation sources
+
+`POST /v1/observation-sources` accepts:
+
+- `source_id`
+- `display_name`
+- `kind`
+- `upload_token`
+- `sensitivity`
+- `retention_seconds`
+- `max_active_observations`
+- `max_active_bytes`
+- `ingest_rate_limit_window_ms`
+- `ingest_rate_limit_burst`
+- `purge_raw_on_retention`
+- `allow_materialization`
+- `allow_output_delivery`
+
+Defaults:
+
+- `sensitivity`: `sensitive`
+- `retention_seconds`: 7 days
+- `max_active_observations`: 512
+- `max_active_bytes`: 512 MiB
+- `ingest_rate_limit_window_ms`: `60000`
+- `ingest_rate_limit_burst`: `120`
+- `purge_raw_on_retention`: `false`
+- `allow_materialization`: `true`
+- `allow_output_delivery`: `false`
+
+`source_id` is optional:
+
+- when you provide it, the daemon uses it as the stable source identifier
+- when you omit it, the daemon generates one server-side
+- explicit source identifiers are path-safe: ASCII letters, digits, dots, underscores, and dashes only, up to 128 bytes
+
+Example:
+
+```json
+{
+  "source_id": "screen-main",
+  "display_name": "Main screen snapshots",
+  "kind": "screen_snapshot",
+  "upload_token": "screen-upload-token",
+  "sensitivity": "sensitive",
+  "retention_seconds": 86400,
+  "max_active_observations": 100,
+  "max_active_bytes": 104857600,
+  "ingest_rate_limit_window_ms": 60000,
+  "ingest_rate_limit_burst": 120,
+  "purge_raw_on_retention": true,
+  "allow_materialization": true,
+  "allow_output_delivery": false
+}
+```
+
+Important note:
+
+- the returned `ObservationSourceView` does not expose the upload token
+- callers must keep the token client-side after source creation or rotation
+- `POST /v1/observation-sources/{source_id}/rotate-token` accepts `upload_token` and optional `grace_period_ms`; while the grace window is active, the previous token can still authenticate uploads
+- `POST /v1/observation-sources/{source_id}/revoke-token` revokes the current source upload token and any grace-window tokens without disabling historical observations; source-token revoke audit reasons are sanitized and secret-looking free text is recorded as `operator_reason_redacted`
+- recreating an existing source with a new `upload_token` increments `upload_token_version` immediately without a grace window; use `rotate-token` when clients need a bounded handoff window
+- source creates, explicit token rotations/revocations, successful uploads, rejected uploads, rate limits, and retention asset purges are appended to the daemon observation audit log without bearer tokens, raw bytes, base64, or literal idempotency keys
+
+`GET /v1/observation-audit` supports:
+
+- `source_id`: exact source filter
+- `event`: exact audit event filter
+- `limit`: newest records returned, default `100`, capped by the daemon
+
+Supported source kinds and accepted media types:
+
+- `screen_snapshot`
+  - `image/png`
+  - `image/jpeg`
+- `webcam_snapshot`
+  - `image/png`
+  - `image/jpeg`
+- `microphone_segment`
+  - `audio/wav`
+  - `audio/webm`
+
+`GET /v1/observation-sources` supports:
+
+- `query`: substring filter over source id or display name
+
+## Capture-agent provisioning
+
+`POST /v1/capture-agent-provisions` creates or rotates a batch of host-local capture agents.
+The response is the only API response that contains raw upload tokens; durable agent, source, audit, and list views store or expose only token metadata and digests.
+
+Request fields:
+
+- `batch_id`
+- `daemon_base_url`
+- `os_profile`: `macos`, `linux`, or `windows`; defaults to `macos`
+- `agents`: machine targets with `machine_id`, optional per-agent `os_profile`, camera selection, and microphone selection
+- `sources`: booleans for `screen`, `camera`, `system_audio`, and `microphone`
+- `interval_ms`, `max_runs`, `duration_ms`
+- `retention_seconds`, `max_active_observations`, `max_active_bytes`
+- `token_ttl_ms`
+- `heartbeat_interval_ms`
+- `heartbeat_grace_ms`
+
+The daemon renders one config TOML per agent, creates the required observation sources, and stores one durable capture-agent record with:
+
+- `status`
+- `os_profile`
+- `source_ids`
+- sanitized source lease views with `lease_id`, `issued_at_ms`, `expires_at_ms`, token version, and revocation/supersession state
+- `heartbeat_token_version`
+- `last_heartbeat_at_ms`
+- `heartbeat_deadline_ms`
+- `heartbeat_state`
+- last heartbeat diagnostics: `last_heartbeat_agent_version`, `last_heartbeat_observed_source_ids`, `last_heartbeat_unobserved_source_ids`
+- `heartbeat_missing_since_ms` when a missing-heartbeat alert has been materialized
+
+Re-provisioning the same `machine_id` and source ids with a new `batch_id` rotates source upload tokens and the per-agent heartbeat token. Old leases are marked revoked and superseded, old upload tokens fail immediately, the old heartbeat token fails immediately, and the new config contains the replacement tokens.
+Reusing an already-applied `batch_id` returns `409` instead of rotating again. Raw tokens are intentionally not replayable from daemon state.
+Capture-owned observation sources are managed by capture provisioning and capture-agent revocation; the generic source `rotate-token` and `revoke-token` endpoints reject those sources with `409` so source leases and agent records cannot drift.
+Capture-owned observation sources also fail closed if the capture-agent record is absent or quarantined on restart; the source upload endpoint will not fall back to the generic source token path.
+
+The macOS profile supports screen, webcam, system-audio, and microphone provisioning. The portable Linux and Windows profiles currently support microphone provisioning and reject unsupported screen/camera/system-audio requests with `400`.
+
+## Capture-agent heartbeat and revoke
+
+`POST /v1/capture-agents/{machine_id}/heartbeat` is intentionally outside normal admin auth, like observation ingest.
+It requires `Authorization: Bearer <active heartbeat_token>` from the provisioned agent config. Source upload tokens cannot authenticate heartbeats. The endpoint accepts:
+
+```json
+{
+  "observed_source_ids": ["macos-laptop-01-screen"],
+  "agent_version": "kheish-capture-agent/dev"
+}
+```
+
+The daemon validates that `observed_source_ids` are owned by that agent, stores the sanitized `agent_version`, records any owned sources not observed in that heartbeat, updates `last_heartbeat_at_ms`, extends `heartbeat_deadline_ms`, clears `heartbeat_missing_since_ms`, and changes `heartbeat_state` to `healthy`.
+If an active agent passes its deadline, `GET /v1/capture-agents` and `GET /v1/capture-alerts` materialize one `missing_heartbeat` alert and audit the transition once. A later valid heartbeat records a recovery transition.
+
+`POST /v1/capture-agents/{machine_id}/revoke` accepts:
+
+```json
+{
+  "reason": "host retired"
+}
+```
+
+Revocation is idempotent. It marks the capture agent `revoked`, revokes all active leases, disables every owned observation source, and blocks future uploads and heartbeats using those tokens. Secret-looking revoke reasons are sanitized before they are stored or appended to the observation audit log.
+
+## Upload an observation
+
+The upload route is intentionally outside normal admin auth:
+
+- `POST /v1/observation-sources/{source_id}/observations`
+
+Authentication:
+
+- send `Authorization: Bearer <upload_token>`
+- the token is validated against the source-scoped upload secret
+- successful non-replay uploads are rate-limited per source using `ingest_rate_limit_window_ms` and `ingest_rate_limit_burst`
+- when the rate limit is exceeded, the route returns `429 application/problem+json` with `code: "rate_limited"` and a `retry_after_ms` value in `detail`
+
+Example:
+
+```bash
+curl -X POST http://127.0.0.1:4000/v1/observation-sources/screen-main/observations \
+  -H 'Authorization: Bearer screen-upload-token' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "upload": {
+      "file_name": "frame-001.png",
+      "media_type": "image/png",
+      "content_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB..."
+    },
+    "idempotency_key": "screen-main:frame-001",
+    "captured_at_ms": 1760000000000,
+    "stream_id": "call-7",
+    "seq_no": 1,
+    "canonical_text": "OCR text captured from the screen",
+    "metadata": {
+      "window": "editor"
+    }
+  }'
+```
+
+Fields:
+
+- `upload.file_name`
+- `upload.media_type`
+- `upload.content_base64`
+- `idempotency_key`
+- `captured_at_ms`
+- `stream_id`
+- `seq_no`
+- `canonical_text`
+- `metadata`
+
+`stream_id`, when provided, is source-scoped and path/query-safe: ASCII letters, digits, dots, underscores, dashes, and colons only, up to 128 bytes.
+
+Idempotency behavior:
+
+- the stable key is `(source_id, idempotency_key)`
+- if the same request fingerprint is replayed, the daemon returns the existing observation
+- if the same key is reused with different payload content, the request is rejected
+
+Retention behavior:
+
+- retention always marks expired or over-budget records as `purged`
+- time-based retention is measured from the daemon receive timestamp, not from uploader-controlled `captured_at_ms`
+- when the source sets `purge_raw_on_retention: true`, the daemon also removes raw/canonical daemon-owned assets that are no longer referenced by active observations
+- a purged observation remains listable with `include_purged=true`, but it cannot be materialized or used as a derivation subject
+
+## Observation listing
+
+`GET /v1/observations` supports:
+
+- `source_id`
+- `stream_id`
+- `after_ms`
+- `before_ms`
+- `include_purged`
+
+Filter behavior:
+
+- `stream_id` requires `source_id`
+- combining `source_id` and `stream_id` narrows the result set to one source stream
+
+`ObservationView` includes:
+
+- `observation_id`
+- `source_id`
+- `kind`
+- `sensitivity`
+- `retention_state`
+- `asset_id`
+- `canonical_text_asset_id`
+- `media_type`
+- `sha256`
+- `byte_length`
+- `captured_at_ms`
+- `received_at_ms`
+- `stream_id`
+- `seq_no`
+- `idempotency_key`
+- `request_fingerprint`
+- `metadata`
+
+## Materialize observations into a run
+
+`POST /v1/observation-materializations` submits a normal daemon run after augmenting an input request with one observation selection.
+
+Request fields:
+
+- `target_session_id`
+- `selection`
+- `request`
+- `include_raw_assets`
+- `raw_asset_policy`
+- `fail_when_empty`
+
+Important note:
+
+- `request` is a full `SubmitInputRequest`
+- when that nested request uses only `input_items`, `content` can be omitted
+
+Defaults and validation:
+
+- `include_raw_assets` defaults to `true`
+- `fail_when_empty` defaults to `true`
+- `latest_from_source` and `latest_from_stream` default `max_observations` to `3`
+- `observation_ids` must contain at least one identifier
+- `max_observations` must be greater than zero
+
+### Selection variants
+
+By ids:
+
+```json
+{
+  "type": "observation_ids",
+  "observation_ids": ["observation-1", "observation-2"]
+}
+```
+
+Latest from a source:
+
+```json
+{
+  "type": "latest_from_source",
+  "source_id": "screen-main",
+  "max_observations": 3,
+  "lookback_seconds": 600
+}
+```
+
+Latest from a stream:
+
+```json
+{
+  "type": "latest_from_stream",
+  "source_id": "screen-main",
+  "stream_id": "call-7",
+  "max_observations": 3,
+  "lookback_seconds": 600
+}
+```
+
+Observation group:
+
+```json
+{
+  "type": "observation_group",
+  "capture_group_id": "call-context-1",
+  "max_observations": 10,
+  "lookback_seconds": 600
+}
+```
+
+Example request:
+
+```json
+{
+  "target_session_id": "incident-review",
+  "selection": {
+    "type": "latest_from_stream",
+    "source_id": "screen-main",
+    "stream_id": "call-7",
+    "max_observations": 2,
+    "lookback_seconds": 300
+  },
+  "request": {
+    "content": "Analyze the latest observations and summarize what changed.",
+    "generation": {
+      "model": "gpt-5.4",
+      "tool_choice": "auto",
+      "allow_parallel_tool_calls": true,
+      "response_format": {
+        "type": "text"
+      }
+    }
+  },
+  "raw_asset_policy": "auto",
+  "fail_when_empty": true
+}
+```
+
+Raw asset behavior:
+
+- `include_raw_assets` is a legacy boolean fallback
+- `raw_asset_policy` is the preferred explicit control:
+  - `auto`
+  - `never`
+  - `always`
+
+Prompt-injection guard:
+
+- materialized observation screenshots, transcripts, OCR, and metadata are framed as untrusted observed data
+- canonical text is wrapped with explicit begin/end markers instructing the model to treat it as evidence, not as commands or policy
+
+## Derivations
+
+Derivations are deterministic daemon-owned transforms over assets, observations, or persisted session input.
+
+`GET /v1/derivations` supports:
+
+- `query`: substring match over derivation id, profile, subject, or result asset id
+- `query` also matches source fingerprints, status, and persisted error text
+
+### Create a derivation
+
+`POST /v1/derivations` accepts:
+
+- `profile`
+- `subject`
+- optional `transcription` controls for audio-backed `canonical_text` derivations:
+  - `prompt`: trimmed provider prompt, capped at 2,000 characters
+  - `language`: trimmed short ASCII language hint
+  - `timestamp_granularities`: unique `word` and/or `segment`; currently requires the OpenAI `whisper-1` transcription backend and persists a timestamp JSON asset
+
+Query parameters:
+
+- `force_refresh=true`: recompute even when a terminal cache entry already exists
+- `retry_failed=true`: recompute only when the current cache entry is failed
+
+Supported profiles:
+
+- `canonical_text`
+- `visual_preview`
+
+Derivation records are durable terminal attempts. Successful records return:
+
+- `status: "completed"`
+- `profile_version`, the deterministic implementation version included in the cache key
+- `source_fingerprint`, the source hash/fingerprint used for invalidation
+- `result_asset_id`
+- `reused_subject_asset`
+- `backend`, when the derivation used an external backend such as transcription; current fields are `kind`, `route_id`, `provider`, `model`, `pipeline_version`, `stitching_strategy`, `part_count`, and optional `timestamp_asset_id`
+- `cache_status`, only on `POST /v1/derivations` responses, as `miss` when the request created a new durable record or `hit` when it reused an existing record
+
+If the subject resolves but execution fails, the daemon persists one failed record with:
+
+- `status: "failed"`
+- `profile_version`
+- `source_fingerprint`
+- `error`
+
+Failed records are returned by `GET /v1/derivations`, `GET /v1/derivations/{derivation_id}`,
+and repeated `POST /v1/derivations` calls for the same versioned cache key. Validation errors
+such as unknown subjects, unsupported visual previews, inactive observations, or blocked
+observation sources are rejected without creating a failed derivation record. Retryable provider
+failures and audio preflight validation failures are also left unpersisted so a later request can
+retry instead of replaying a cached terminal failure.
+
+Use `POST /v1/derivations?retry_failed=true` to retry a persisted failed cache entry. Use
+`force_refresh=true` when a completed record should be recomputed; if the forced recompute
+completes, it becomes the preferred cache entry for later normal calls.
+
+On daemon startup, completed records whose result asset is no longer available are repaired into
+durable failed records instead of continuing to advertise a missing artifact.
+
+The cache key includes `profile`, `profile_version`, the stable subject key, and the resolved
+source fingerprint. A profile implementation version bump therefore recomputes instead of
+silently reusing older derived assets. Asset source fingerprints also include attached canonical
+text when `text_uri` exists, so an older placeholder canonical-text derivation is not reused after
+the asset gains a real transcript.
+
+When explicit transcription `prompt`, `language`, or `timestamp_granularities` options are supplied, the source fingerprint
+also includes a non-secret digest of the normalized options plus the planned transcription route,
+provider, and model. Option-specific transcription derivations do not replace the asset or
+observation's default canonical text pointer; repeated calls with the same normalized options
+return a `cache_status: "hit"`, while changing the options creates a separate cache key.
+
+Concurrent `POST /v1/derivations` calls for the same cache key are single-flighted and return the
+same durable record. Calls for unrelated cache keys are not serialized behind the same lock.
+Completed derivations also attach their `derivation_id` to the result asset's `derivation_ids`
+provenance list; daemon startup backfills this list for older completed records.
+
+Audio notes:
+
+- `canonical_text` on microphone observations reuses uploader-supplied canonical text when it already exists
+- otherwise, when the daemon was started with a transcription backend, `canonical_text` performs daemon-owned speech-to-text and stores the result as one daemon-owned `text/plain` asset
+- explicit `transcription.prompt`, `transcription.language`, and supported timestamp granularities are forwarded to the transcription backend for manual derivation requests
+- session input and observation materialization paths that trigger speech-to-text also create the same durable `canonical_text` derivation records exposed by this API
+- built-in transcription backends currently include OpenAI and OpenRouter
+- canonical-text derivation depends on the configured transcription backend, not only on the selected run route
+- current transcription provenance uses `pipeline_version: 1`, `stitching_strategy: "single_part"`, and `part_count: 1`; these fields are included in derivation backend provenance and timestamp JSON assets so future chunking or stitching changes can be audited and cache-invalidation behavior can stay explicit
+- observation-source uploads remain limited to `audio/wav` and `audio/webm`, but imported daemon assets and normal session attachments can also derive text from supported formats such as `audio/mpeg`, `audio/mpga`, `audio/mp4`, and `audio/m4a`
+- before uploading to a transcription backend, the daemon revalidates supported audio containers and rejects malformed WAV/WebM/MP3 payloads, WebM without a supported audio track or media block, MP4/M4A containers without an audio handler, unsupported runtime media types, and transcription payloads above 25 MiB
+
+Supported subjects:
+
+- asset:
+
+```json
+{
+  "type": "asset",
+  "asset_id": "asset-1"
+}
+```
+
+- observation:
+
+```json
+{
+  "type": "observation",
+  "observation_id": "observation-1"
+}
+```
+
+- session input:
+
+```json
+{
+  "type": "session_input",
+  "session_id": "demo",
+  "offset": 42
+}
+```
+
+Example:
+
+```json
+{
+  "profile": "visual_preview",
+  "subject": {
+    "type": "asset",
+    "asset_id": "asset-dxf-1"
+  }
+}
+```
+
+The returned `DerivationView` contains:
+
+- `derivation_id`
+- `profile`
+- `subject`
+- `result_asset_id`
+- `reused_subject_asset`
+- `created_at_ms`

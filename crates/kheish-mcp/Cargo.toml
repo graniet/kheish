@@ -1,0 +1,37 @@
+[package]
+name = "kheish-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+rmcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sse-stream = "0.2"
+tokio.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
+tracing.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dependencies.kheish-codec]
+path = "../kheish-codec"
+
+[dependencies.kheish-auth]
+path = "../kheish-auth"
+
+[dependencies.kheish-runtime]
+path = "../kheish-runtime"
+
+[dependencies.kheish-types]
+path = "../kheish-types"
+
+[dev-dependencies]
+tempfile.workspace = true

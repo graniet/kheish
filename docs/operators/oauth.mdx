@@ -1,0 +1,181 @@
+---
+title: OAuth
+description: Connect daemon-managed account auth and MCP OAuth accounts without exposing tokens to agents.
+---
+
+# OAuth
+
+Kheish has one daemon auth store for provider account auth, MCP OAuth accounts, connector secrets, and route secrets. Operators connect accounts into that store; runs and child agents receive only brokered, scoped leases.
+
+OAuth in Kheish is not the control-plane bearer token. The HTTP daemon API still uses its own admin/read-only auth model.
+
+## Provider account auth
+
+OpenAI Codex account auth and Anthropic Claude account auth are imported into normal auth slots. Use these when you want a route to resolve account-backed material instead of a static API key.
+
+```bash
+export KHEISH_AUTH_STORE_MASTER_KEY="$(./target/debug/kheish-daemon secrets generate)"
+
+./target/debug/kheish-daemon secrets import-codex openai.prod \
+  --offline \
+  --state-root .kheish-daemon-prod
+
+./target/debug/kheish-daemon secrets import-claude-code anthropic.prod \
+  --offline \
+  --state-root .kheish-daemon-prod
+```
+
+Bind those slots from a routes file:
+
+```toml
+version = 1
+default_route = "openai"
+
+[routes.openai]
+driver = "openai"
+default_model = "gpt-5.4"
+auth_ref = "openai.prod"
+
+[routes.anthropic]
+driver = "anthropic"
+default_model = "claude-opus-4-6"
+auth_ref = "anthropic.prod"
+```
+
+After the daemon is running, inspect and refresh redacted account status:
+
+```bash
+./target/debug/kheish-daemon runtime auth accounts list
+./target/debug/kheish-daemon runtime auth accounts get openai.prod
+./target/debug/kheish-daemon runtime auth accounts refresh openai.prod
+./target/debug/kheish-daemon runtime auth accounts revoke openai.prod
+```
+
+These commands return metadata such as provider, mode, expiry, source, and last refresh outcome. They do not return access tokens, refresh tokens, API keys, or bearer headers.
+
+If a route uses an OAuth account `auth_ref` and the account token is already expired when work is submitted, the daemon attempts one slot refresh before rejecting the run as `route_not_ready`. The run only proceeds if the refreshed slot makes the route readiness recover.
+
+Google, OpenRouter, and xAI are API-key-only at this layer until a real account-auth backend is added for them.
+
+## MCP OAuth accounts
+
+MCP OAuth is for HTTP MCP servers that implement the MCP Authorization model with protected resource metadata, authorization server metadata or OIDC discovery, authorization-code flow, PKCE S256, `resource`, and bearer tokens.
+
+Kheish supports the account layer and operator login flow:
+
+- local loopback callback
+- PKCE S256
+- `state` verification
+- dynamic client registration when the authorization server advertises it
+- write-only import into the encrypted auth store
+- forced refresh with refresh-token rotation
+- redacted status only
+- no silent scope escalation on refresh
+- loopback `http` only for local protocol tests; production resources must use `https`
+
+Login to a spec-compliant custom HTTP MCP server:
+
+```bash
+export KHEISH_AUTH_STORE_MASTER_KEY="$(./target/debug/kheish-daemon secrets generate)"
+
+./target/debug/kheish-daemon serve \
+  --bind 127.0.0.1:4025 \
+  --state-root .kheish-daemon-oauth \
+  --workspace-root .kheish-workspace-oauth
+```
+
+In another terminal, point the CLI at that daemon:
+
+```bash
+./target/debug/kheish-daemon --base-url http://127.0.0.1:4025 mcp oauth login acme \
+  --url https://mcp.acme.example/mcp \
+  --scopes read,search
+```
+
+The daemon process must have `KHEISH_AUTH_STORE_MASTER_KEY` or `KHEISH_AUTH_STORE_MASTER_KEY_FILE` set. The CLI writes the completed account through the daemon API; it does not perform an offline auth-store write.
+
+For SSH or headless machines, use `--no-open`. The CLI prints a JSON object containing `authorization_url`, `redirect_uri`, and `slot_id`; open `authorization_url` in a browser that can reach the callback host.
+
+```bash
+./target/debug/kheish-daemon --base-url http://127.0.0.1:4025 mcp oauth login acme \
+  --url https://mcp.acme.example/mcp \
+  --scopes read,search \
+  --no-open
+```
+
+The callback binds to `127.0.0.1` on the machine running the CLI. For SSH, either run the browser on that same machine or choose a fixed callback port and forward it:
+
+```bash
+ssh -L 18765:127.0.0.1:18765 user@host
+
+./target/debug/kheish-daemon --base-url http://127.0.0.1:4025 mcp oauth login acme \
+  --url https://mcp.acme.example/mcp \
+  --scopes read,search \
+  --callback-port 18765 \
+  --no-open
+```
+
+If the server does not advertise dynamic client registration, pass a pre-registered client:
+
+```bash
+./target/debug/kheish-daemon --base-url http://127.0.0.1:4025 mcp oauth login acme \
+  --url https://mcp.acme.example/mcp \
+  --client-id "$ACME_MCP_CLIENT_ID" \
+  --client-secret-env ACME_MCP_CLIENT_SECRET \
+  --scopes read,search
+```
+
+For pre-registered clients, configure the vendor app redirect URI to the exact loopback callback you use, such as `http://127.0.0.1:18765/callback`.
+
+Check, refresh, or remove the local account:
+
+```bash
+./target/debug/kheish-daemon --base-url http://127.0.0.1:4025 mcp oauth status acme
+./target/debug/kheish-daemon --base-url http://127.0.0.1:4025 mcp oauth refresh acme
+./target/debug/kheish-daemon --base-url http://127.0.0.1:4025 mcp oauth logout acme
+```
+
+The default slot is `mcp.oauth.<id>`. You can override it with `--slot`.
+
+## Custom MCP config
+
+Reference the stored OAuth account from Codex-compatible MCP config:
+
+```toml
+[mcp_servers.acme]
+url = "https://mcp.acme.example/mcp"
+oauth_slot_ref = "mcp.oauth.acme"
+oauth_resource = "https://mcp.acme.example/mcp"
+oauth_scopes = ["read", "search"]
+```
+
+`oauth_slot_ref` names the daemon auth slot. `oauth_resource` must match the resource used during login. `oauth_scopes` must be a subset of the scopes originally approved by the user.
+
+Current runtime behavior is scoped and fail-closed: Kheish can store, inspect, refresh, and validate MCP OAuth accounts, and HTTP MCP servers that require OAuth are not initialized with daemon-global credentials at bootstrap. If a server requires OAuth material during bootstrap, the runtime snapshot reports:
+
+```json
+{
+  "connected": false,
+  "error": "oauth_requires_scoped_runtime_initialization"
+}
+```
+
+That behavior prevents the daemon from sending OAuth tokens outside a session/agent credential scope. Explicit resource helper calls can initialize such a server on demand inside the current credential scope, and the client re-authorizes before each HTTP MCP call. Direct discovered tool registration still depends on startup-discoverable tools; built-in OAuth catalog entries remain `catalog_only` until a vendor-specific true-binary E2E proves discovery, login, refresh, retry, scope behavior, and tool/resource use.
+
+Linear-specific boundary: Linear's hosted MCP server supports Streamable HTTP and an interactive OAuth flow upstream. The checked Linear OAuth path reached authorization URL generation only; do not copy that login target into `oauth_resource` unless it exactly matches the resource used by the authorization server. To use Linear tools today, use the built-in `planning` profile with `mcp.linear.LINEAR_API_KEY` stored in the daemon secret store.
+
+## Troubleshooting
+
+- `authorization server does not advertise dynamic registration`: pass `--client-id`, and `--client-secret` only when the upstream client type requires it.
+- `callback state did not match`: retry the login. Kheish rejects mismatched callbacks instead of importing the account.
+- `requires https resource URLs`: use `https` for production. `--allow-http-for-loopback` is only for local fixture tests on `127.0.0.1`, `localhost`, or `::1`.
+- `attempted to add unapproved scope`: re-run `mcp oauth login` with the broader scopes. Agents cannot silently consent to scope escalation.
+- `secret is still referenced by one or more MCP servers`: stop or restart the daemon without that MCP config before deleting the account.
+
+## Evidence note
+
+- Code verified: `crates/kheish-auth/src/oauth.rs`, `crates/kheish-auth/src/backends/mcp_oauth.rs`, `crates/kheish-auth/src/manager.rs`, `crates/kheish-auth/src/broker.rs`, `crates/kheish-daemon/src/api/handlers.rs`, `crates/kheish-daemon/src/cli/commands/mcp.rs`, `crates/kheish-daemon/src/cli/commands/runtime.rs`, `crates/kheish-mcp/src/config.rs`, `crates/kheish-mcp/src/manager.rs`.
+- CLI verified: `mcp oauth status/login/refresh/logout` and `runtime auth accounts list/get/refresh/revoke` are implemented in the daemon CLI.
+- Daemon live tested: yes for the generic MCP OAuth account protocol path with `scripts/e2e/mcp_oauth_protocol_true_binary.sh`; scoped OAuth-backed HTTP MCP authorization is unit-tested at the client/broker boundary, while vendor-specific OAuth tool catalogs still require their own true-binary E2E before being promoted from `catalog_only`.
+- Vendor OAuth checked: Linear `mcp oauth login` reached authorization URL generation only, but this did not complete account import and did not promote Linear OAuth-backed tool use in Kheish runtime. The supported Linear runtime path remains bearer/API-key auth through `mcp.linear.LINEAR_API_KEY`.
+- Provider-specific tested: OpenAI and Anthropic account backends have deterministic coverage; run manual daemon validation with your real Codex/Claude credentials before production rollout.

@@ -1,0 +1,130 @@
+---
+title: Boards API
+description: Durable board records and immutable rendered board revisions.
+---
+
+# Boards API
+
+Boards are daemon-owned visual or structured work surfaces. Revisions are immutable and can be referenced from `SubmitInputRequest.input_items` with `board_reference`.
+
+## Boards
+
+`GET /v1/boards` returns `BoardView[]`.
+
+Query parameters:
+
+- `query`, filtering by board id or display name substring
+- `owner_session_id`, restricting results to one owning session
+
+`POST /v1/boards` creates a board:
+
+```json
+{
+  "board_id": "board-demo",
+  "display_name": "Demo board",
+  "owner_session_id": "demo",
+  "metadata": {}
+}
+```
+
+`GET /v1/boards/{board_id}` returns one board.
+
+`PUT /v1/boards/{board_id}` updates mutable board fields:
+
+```json
+{
+  "display_name": "Updated board",
+  "metadata": {
+    "source": "operator"
+  }
+}
+```
+
+## Revisions
+
+`GET /v1/boards/{board_id}/revisions` returns immutable `BoardRevisionView[]`.
+
+`POST /v1/boards/{board_id}/revisions` creates one revision:
+
+```json
+{
+  "previous_revision_id": "board-revision-1",
+  "client_revision_id": "canvas-save-42",
+  "render_asset_id": "asset-render-1",
+  "state_asset_id": "asset-state-1",
+  "note": "Initial layout",
+  "source_session_id": "demo",
+  "source_run_id": "run-1",
+  "metadata": {}
+}
+```
+
+`render_asset_id` must reference a readable daemon asset whose media type is an image.
+`state_asset_id`, when present, must reference a readable `application/json` asset using the
+versioned board-state envelope:
+
+```json
+{
+  "schema_version": 1,
+  "board_id": "board-demo",
+  "previous_revision_id": "board-revision-1",
+  "canvas": { "width": 1280, "height": 720 },
+  "strokes": [],
+  "elements": []
+}
+```
+
+Supported `schema_version` values are `1`, `"1"`, and `"kheish.board_state.v1"`.
+`board_id` and `previous_revision_id` are optional, but when supplied they must match the
+target board and submitted parent revision. Content fields such as `canvas`, `elements`,
+`strokes`, `layers`, `assets`, `metadata`, `payload`, or `note` keep empty or placeholder
+states from being accepted as valid board state.
+
+When `assets` contains daemon asset ids such as `"asset-42"` or nested objects with asset-id
+values, those ids are validated as readable daemon assets when the revision is created and
+again during startup repair. The same protection applies to known asset reference fields embedded
+anywhere in the state JSON, such as `asset_id`, `asset_ids`, `image_asset_id`, and
+`image_asset_ids`. They are exposed by `GET /v1/assets/{asset_id}/references` as hard
+`boards/state_embedded_asset` references, so asset delete/GC and observation retention cannot
+remove assets still embedded in a board state.
+
+Revision creation is linear and uses `previous_revision_id` as the compare-and-swap base.
+Concurrent writers from the same parent produce one successful revision and one `409`
+problem response with `domain: "boards"` and `code: "board_revision_conflict"`.
+`client_revision_id` is optional and scoped to the target board. Repeating the same
+`client_revision_id` with the same payload returns the original immutable revision, including after
+restart; reusing it with a different payload returns `domain: "boards"` and
+`code: "board_revision_idempotency_conflict"`.
+Invalid state assets return `domain: "boards"` and `code: "board_state_invalid"`.
+Unreadable render assets return `domain: "boards"` and `code: "board_asset_missing"`.
+
+`GET /v1/boards/{board_id}/revisions/{revision_id}` returns one revision.
+
+At startup the daemon revalidates persisted board revisions before exposing them. The repair path
+requires the render asset to still be a readable image, rechecks raw asset integrity, replays the
+same versioned board-state validation used at revision creation, and verifies the parent chain.
+Invalid revisions are quarantined and board summaries are rebuilt from the remaining valid history.
+The current durable repair contract is strictly linear: persisted histories with multiple roots,
+forked children, cycles, or unreachable nodes are quarantined as invalid topology, and board
+summaries use the single reachable chain tip rather than timestamp order.
+
+## Input Reference
+
+Use the latest board revision:
+
+```json
+{
+  "type": "board_reference",
+  "board_id": "board-demo"
+}
+```
+
+Use a specific immutable revision:
+
+```json
+{
+  "type": "board_reference",
+  "board_id": "board-demo",
+  "revision_id": "board-revision-1"
+}
+```

@@ -1,0 +1,24 @@
+[package]
+name = "kheish-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+hex.workspace = true
+libc = "0.2"
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+
+[dependencies.kheish-codec]
+path = "../kheish-codec"
+
+[dependencies.kheish-core]
+path = "../kheish-core"
+
+[dependencies.kheish-types]
+path = "../kheish-types"

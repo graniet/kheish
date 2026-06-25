@@ -1,0 +1,7 @@
+version = 1
+default_route = "openai"
+
+[routes.openai]
+driver = "openai"
+default_model = "gpt-5.4"
+auth_ref = "openai.prod"

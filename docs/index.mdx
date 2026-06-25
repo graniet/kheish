@@ -1,0 +1,78 @@
+---
+title: "Kheish daemon"
+---
+
+Kheish runs AI agents as a daemon rather than embedding them inside a single process. It is designed for persistent sessions, detached runs, approval-gated actions, tool execution, and multi-agent workflows over a stable HTTP/SSE control plane.
+
+The daemon is the center of the ecosystem:
+
+- the daemon owns the runtime and durable state
+- the daemon includes built-in connector support for HTTP, Slack, and Telegram ingress
+- the Python SDK talks to the daemon from a separate package
+- the separate `kheish-connectors` repo adds external sidecar connectors around the same daemon
+- capture pushes observations into daemon-owned sources from a separate host-local repo
+
+## Start in this order
+
+1. Read [Start Here](introduction/start-here) to understand what runs where and which path to take first.
+2. Run [Quickstart](introduction/quickstart) for one working daemon, one session, and one completed run.
+3. Then choose what you need next:
+   - [Running the daemon](operators/running-the-daemon), [Docker and containers](operators/docker-and-containers), and [Security and auth](operators/security-and-auth) for real operator guidance
+   - [Use Kheish from Python](introduction/python-sdk-quickstart) for application code
+   - [Send one webhook event into Kheish](integrations/webhook-quickstart) for the first external ingress path
+   - [Capture one observation](integrations/capture-quickstart) later, when you want host-local observation ingestion
+
+## What Kheish gives you
+
+- Persistent sessions with journaled state, checkpoints, and restart recovery
+- Detached runs that can pause on approvals or structured user questions and resume later
+- Daemon-owned assets and multimodal inputs for text, documents, images, and retained audio
+- Daemon-owned observation sources and materialized capture flows for screenshots, webcam frames, microphone segments, and other external producers
+- Daemon-managed personas that bind immutable persona snapshots into sessions
+- Immutable Playbooks and Flow projections for evidence-backed procedures over normal runs
+- Durable public channels with shared message logs, reactions, and autonomous thread turns over member sessions
+- Daemon-owned projects with durable membership, linked channels, and project-task execution over assigned sessions
+- Multi-agent execution with sidechains, tasks, schedules, mailboxes, and background shell tasks
+- Extensible runtime primitives for providers, tools, hooks, skills, MCP, connectors, and output delivery
+- Operator controls for runtime reconfiguration, debug capture, and control-plane authentication
+
+## Learn the model
+
+After the first successful run, continue with:
+
+1. [Overview](introduction/overview) for the product model.
+2. [Sessions and runs](concepts/sessions-and-runs) for the execution backbone.
+3. [Playbooks and flows](concepts/playbooks-and-flows) before adding evidence-backed procedures over runs.
+4. [Approvals and questions](concepts/approvals-and-questions) for blocked and resumable work.
+5. [Providers and routing](runtime/providers-and-routing) for `route_id`, `auth_ref`, selector grammar, and route pinning.
+6. [Assets and multimodal input](concepts/assets-and-multimodal-input) before integrating documents or images.
+7. [Capture and observations](concepts/capture-and-observations) before integrating host-local capture or durable external media ingestion.
+8. [Channels and public conversations](concepts/channels-and-public-conversations) before modeling shared discussion among humans and agent-backed sessions.
+9. [Projects and project tasks](concepts/projects-and-project-tasks) before modeling durable coordination across multiple sessions and channels.
+10. [Connectors and reply targets](concepts/connectors-and-reply-targets) before wiring Telegram, Slack, HTTP, or durable session reply defaults.
+11. [Personas](concepts/personas) before binding long-lived identity instructions into sessions.
+12. [Security and auth](operators/security-and-auth) before exposing the control plane beyond localhost.
+13. [Running the daemon](operators/running-the-daemon) before operating a real instance.
+
+## Minimal first-run CLI surface
+
+For the first daemon success, the smallest useful CLI set is:
+
+- `serve`
+- `runtime get`
+- `sessions create`
+- `sessions input --wait`
+
+If a run pauses instead of completing, then inspect:
+
+- `approvals list`
+- `tasks list`
+- `runs get`
+
+## Audience
+
+This documentation is written for:
+
+- platform and infrastructure teams operating Kheish as a daemonized service
+- application teams integrating sessions, runs, approvals, or connectors into other systems
+- contributors working on the runtime, daemon, or surrounding integrations

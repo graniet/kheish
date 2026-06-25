@@ -1,0 +1,129 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Kheish daemon",
+  "description": "Persistent agent runtime and control plane for long-lived, tool-using AI workflows.",
+  "colors": {
+    "primary": "#E73331",
+    "light": "#F26863",
+    "dark": "#7A1F28"
+  },
+  "logo": {
+    "light": "/logo.png",
+    "dark": "/logo.png"
+  },
+  "favicon": "/logo.png",
+  "navigation": {
+    "groups": [
+      {
+        "group": "Home",
+        "pages": [
+          "index"
+        ]
+      },
+      {
+        "group": "Get started",
+        "pages": [
+          "introduction/start-here",
+          "introduction/quickstart",
+          "operators/running-the-daemon",
+          "operators/docker-and-containers",
+          "operators/security-and-auth",
+          "introduction/python-sdk-quickstart",
+          "introduction/web-sdk-quickstart",
+          "integrations/webhook-quickstart",
+          "introduction/overview",
+          "introduction/architecture-overview"
+        ]
+      },
+      {
+        "group": "Concepts",
+        "pages": [
+          "concepts/sessions-and-runs",
+          "concepts/playbooks-and-flows",
+          "concepts/projects-and-project-tasks",
+          "concepts/channels-and-public-conversations",
+          "concepts/connectors-and-reply-targets",
+          "concepts/personas",
+          "concepts/recovered-run-memory",
+          "concepts/semantic-learning-and-procedural-skills",
+          "concepts/assets-and-multimodal-input",
+          "concepts/capture-and-observations",
+          "concepts/agents-and-sidechains",
+          "concepts/tasks-and-schedules",
+          "concepts/approvals-and-questions",
+          "concepts/state-and-recovery"
+        ]
+      },
+      {
+        "group": "Runtime",
+        "pages": [
+          "runtime/providers-and-routing",
+          "runtime/openrouter",
+          "runtime/tools",
+          "runtime/permissions",
+          "runtime/hooks",
+          "runtime/skills",
+          "runtime/mcp"
+        ]
+      },
+      {
+        "group": "Integrations",
+        "pages": [
+          "integrations/connectors",
+          "integrations/multi-input-sessions",
+          "integrations/output-routing",
+          "integrations/capture-quickstart"
+        ]
+      },
+      {
+        "group": "Operations",
+        "pages": [
+          "operators/runtime-configuration",
+          "operators/production-runbooks",
+          "operators/mcp-catalog",
+          "operators/oauth",
+          "operators/playbooks-and-flows",
+          "operators/deployment-and-hardening",
+          "operators/debugging-and-recovery"
+        ]
+      },
+      {
+        "group": "API",
+        "pages": [
+          "reference/control-plane-api",
+          "reference/playbooks-and-flows-api",
+          "reference/projects-api",
+          "reference/channels-api",
+          "reference/personas-api",
+          "reference/assets-api",
+          "reference/boards-api",
+          "reference/observations-and-derivations-api",
+          "reference/connectors-api",
+          "reference/external-connectors-protocol",
+          "reference/runtime-api",
+          "reference/sessions-and-runs-api",
+          "reference/questions-and-approvals-api",
+          "reference/tasks-schedules-agents-api",
+          "reference/learnings-api",
+          "reference/skills-api"
+        ]
+      },
+      {
+        "group": "Operational reference",
+        "pages": [
+          "reference/connector-configuration",
+          "reference/skill-format",
+          "reference/hook-reference",
+          "reference/built-in-tools"
+        ]
+      },
+      {
+        "group": "Contributing",
+        "pages": [
+          "contributing/development"
+        ]
+      }
+    ]
+  }
+}

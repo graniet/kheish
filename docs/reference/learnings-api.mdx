@@ -1,0 +1,661 @@
+---
+title: Learnings API
+description: Candidate review, automatic capture and publication, durable learning records, and promoted procedural-skill endpoints.
+---
+
+# Learnings API
+
+Kheish exposes the daemon-owned learning plane through three related HTTP surfaces:
+
+- learning candidates
+- published learnings
+- promoted procedural skills
+
+The CLI mirrors this under `kheish-daemon learnings ...`.
+
+## Resource model
+
+The normal flow is:
+
+1. create or capture a learning candidate
+2. review it manually or through daemon automation
+3. publish it into a durable learning record, or reject it
+4. later revoke or supersede the learning
+5. optionally promote one reviewed `procedure` learning into a daemon-owned skill
+
+## Scope rules
+
+Every candidate and learning belongs to one scope:
+
+- `session`
+- `persona`
+- `project`
+- `workspace`
+
+For `workspace`, the stable scope id is always `default`.
+
+If you pass `scope_kind=workspace` without `scope_id`, the HTTP API normalizes that to `default`.
+
+For query filters:
+
+- `scope_id` without `scope_kind` is rejected
+- `scope_kind` without `scope_id` is rejected for `session`, `persona`, and `project`
+- only `workspace` may omit `scope_id`
+
+## Learning candidates
+
+### Endpoints
+
+- `GET /v1/learning-candidates`
+- `POST /v1/learning-candidates`
+- `GET /v1/learning-candidates/{candidate_id}`
+- `POST /v1/learning-candidates/{candidate_id}/publish`
+- `POST /v1/learning-candidates/{candidate_id}/reject`
+
+### List filters
+
+`GET /v1/learning-candidates` supports:
+
+- `query`
+- `scope_kind`
+- `scope_id`
+- `kind`
+- `state`
+
+### Create payload
+
+`POST /v1/learning-candidates` accepts:
+
+- `scope`
+- `kind`
+- `sensitivity`
+- `content`
+- `confidence`
+- `source`
+- `evidence_refs`
+- `expires_at_ms`
+
+Current validation notes:
+
+- `content` is required
+- `content` is capped at `1600` characters
+- `confidence` must stay in `0..=100`
+- `sensitivity` defaults to `scoped`
+- `confidence` defaults to `80`
+- `source` defaults to an empty source object
+- public attempts to create `run_summary` candidates are rejected because `run_summary` capture is daemon-owned
+
+Example:
+
+```json
+{
+  "scope": {
+    "kind": "workspace",
+    "id": "default"
+  },
+  "kind": "procedure",
+  "sensitivity": "scoped",
+  "content": "Use the verification child profile when checking scheduler regressions.",
+  "confidence": 92,
+  "source": {
+    "session_id": "ops-review"
+  }
+}
+```
+
+### Candidate origins
+
+Returned candidates retain one ingress origin:
+
+- `api`
+- `daemon`
+
+This matters for automation:
+
+- daemon automation only treats `source` and `evidence_refs` as trusted policy inputs for daemon-origin candidates
+- API-origin candidates may still auto-publish through other matching rules, but they do not satisfy the `require_*` trusted-input gates
+
+### Candidate states and automation review
+
+Returned candidates expose:
+
+- `origin`
+- `state`
+- `automation_review`
+- `published_learning_id`
+
+Current candidate states are:
+
+- `pending`
+- `escalated`
+- `published`
+- `rejected`
+
+`automation_review` is the daemon-owned audit record written by the automation worker. It includes:
+
+- `mode`
+- `action`
+- `reviewed_at_ms`
+- `matched_rule_name`
+- `judge`
+- `reason`
+
+When present, `automation_review.judge` includes:
+
+- `action`
+- `judged_at_ms`
+- `reason`
+
+### Publish payload
+
+`POST /v1/learning-candidates/{candidate_id}/publish` accepts optional overrides:
+
+- `scope`
+- `kind`
+- `sensitivity`
+- `content`
+- `confidence`
+- `expires_at_ms`
+- `publish_tier`
+- `evidence_refs`
+- `supersedes`
+
+If omitted, Kheish publishes the candidate as-is.
+
+Current operator-path behavior:
+
+- the daemon normalizes `policy_decision` to `manual`
+- the daemon normalizes `policy_actor` to `operator`
+- `publish_tier` defaults to `active` when omitted
+- `publish_tier=provisional` produces a durable learning with `status=provisional`
+- `publish_tier=active` produces a durable learning with `status=active`
+- `supersedes` is only accepted when the published record uses `publish_tier=active`
+
+### Reject behavior
+
+`POST /v1/learning-candidates/{candidate_id}/reject` marks the candidate as rejected. Rejected candidates are not converted into learnings.
+
+## Automatic learning policy
+
+The daemon can review and publish candidates automatically through runtime policy.
+
+Operator surfaces:
+
+- `GET /v1/runtime/learning-policy`
+- `POST /v1/runtime/learning-policy`
+- `kheish-daemon runtime learning-policy get`
+- `kheish-daemon runtime learning-policy set`
+
+The current policy model contains:
+
+- `mode`
+- `capture`
+- `publication`
+- `judge`
+
+Current modes:
+
+- `manual_only`
+- `shadow`
+- `enabled`
+
+The current default mode is `shadow`.
+
+Important update rule:
+
+- `POST /v1/runtime/learning-policy` replaces the full policy
+- send `mode` explicitly when mutating policy
+- send `expected_revision` when multiple operators or automations may update runtime config
+- the policy is persisted in `runtime-config.json`; `learning-policy.json` is legacy migration input only
+
+Wrapped update shape:
+
+```json
+{
+  "policy": {
+    "mode": "shadow"
+  },
+  "expected_revision": 12
+}
+```
+
+The daemon also accepts legacy flat policy objects for compatibility, but a payload containing only `expected_revision` is rejected instead of resetting the policy implicitly.
+
+### Capture settings
+
+`capture` currently contains:
+
+- `run_summary_candidates`
+- `semantic_candidates`
+
+`capture.run_summary_candidates` defaults to `true`.
+
+`capture.semantic_candidates` currently contains:
+
+- `enabled`
+- `model`
+- `timeout_ms`
+- `max_candidates_per_run`
+
+Current semantic-capture defaults:
+
+- `enabled=false`
+- `model=null`
+- `timeout_ms=null`
+- `max_candidates_per_run=2`
+
+Current validation rules:
+
+- `timeout_ms` must be greater than zero when provided
+- `max_candidates_per_run` must be between `1` and `8`
+- daemon semantic capture drops `fact`, `preference`, and `decision` candidates that contain secret-like material, runtime redaction markers, or redactable provider/API tokens
+
+### Publication settings
+
+`publication` currently contains:
+
+- `default_action`
+- `allow_api_origin_active_publication`
+- `quarantined_rule_names`
+- `rules`
+
+Current action values:
+
+- `manual_review`
+- `reject`
+- `publish_provisional`
+- `publish_active`
+
+Current validation rules:
+
+- `default_action` cannot be `publish_active`
+- a `publish_active` rule must declare an explicit `kind`
+- `publish_active` is not supported for `procedure` learnings
+- quarantined rule names must be non-empty and unique
+- semantic `fact`, `preference`, and `decision` candidates/learnings that look like secrets are rejected before persistence, including common key/value assignment shapes such as `api-key:`, `x-api-key:`, `clientSecret:`, `secret_token=`, and `personal access token=`
+- equivalent same-subject/value forms such as `Project codename is Atlas` and `project codename: atlas` use the same deterministic semantic key for deduplication
+- automatic `publish_active` is downgraded to `manual_review` when the candidate conflicts with an active same-scope, same-kind learning with the same obvious subject and a different normalized value
+- explicit candidate publication also rejects an active same-scope, same-kind conflict unless the request names the replaced learning in `supersedes`
+- publishing an equivalent same-scope, same-kind prompt-visible learning reuses the existing learning id instead of creating a duplicate record
+
+### Judge settings
+
+`judge` currently contains:
+
+- `enabled`
+- `model`
+- `timeout_ms`
+
+The judge is model-backed and daemon-owned. It runs after deterministic policy evaluation and can only choose actions inside the policy envelope. In `enabled` mode, judge failures fail closed to `manual_review`.
+
+Current validation rule:
+
+- `judge.timeout_ms` must be greater than zero when provided
+
+### Rule matching semantics
+
+Publication rules are evaluated in order. The first matching rule wins. If no rule matches, the daemon falls back to `publication.default_action`.
+
+Each rule can match on:
+
+- `name`
+- `scope_kind`
+- `scope_id`
+- `kind`
+- `sensitivity`
+- `min_confidence`
+- `require_evidence`
+- `require_source_run`
+- `require_source_session`
+- `action`
+- `expires_after_ms`
+
+Important trusted-input rule:
+
+- `require_evidence`
+- `require_source_run`
+- `require_source_session`
+
+only match for daemon-origin candidates.
+
+That trusted-input rule affects rule matching only. API-origin candidates can still auto-publish when another rule matches and later daemon-owned verification succeeds.
+
+### Automatic publication outcomes
+
+The automation worker can currently decide:
+
+- `manual_review`
+- `reject`
+- `publish_provisional`
+- `publish_active`
+
+Additional runtime guardrails apply:
+
+- `procedure` can never auto-publish with the active tier
+- API-origin candidates are downgraded from automatic `publish_active` to `publish_provisional` unless `allow_api_origin_active_publication=true`
+- named quarantined rules are skipped during evaluation
+
+### Automatic `active` verification
+
+`publish_active` is still guarded by daemon-owned verification.
+
+Current behavior:
+
+- the candidate must carry a non-empty `content`
+- the candidate must have `source.run_id`
+- for daemon-origin semantic `fact`, `preference`, and `decision` candidates, the daemon can verify the content against the persisted run-memory record of the source run using exact containment or a conservative normalized-term match
+- otherwise the daemon checks source-run debug artifacts referenced by `evidence_refs`
+- if verification fails, the daemon downgrades the result to `publish_provisional`
+
+This means a policy rule and judge may still aim for `publish_active`, but the stored learning lands as provisional when daemon-owned verification does not support active publication.
+
+## Published learnings
+
+### Endpoints
+
+- `GET /v1/learnings`
+- `GET /v1/learnings/{learning_id}`
+- `POST /v1/learnings/{learning_id}/revoke`
+- `POST /v1/learnings/{learning_id}/supersede`
+- `POST /v1/learnings/revoke-matching`
+- `POST /v1/learnings/{learning_id}/promote-skill`
+
+### List filters
+
+`GET /v1/learnings` supports:
+
+- `query`
+- `scope_kind`
+- `scope_id`
+- `kind`
+- `status`
+- `policy_decision`
+- `policy_actor`
+- `matched_rule_name`
+
+Important returned fields on each learning include:
+
+- `status`
+- `publish_tier`
+- `verification_status`
+- `policy_decision`
+- `policy_actor`
+- `evidence_refs`
+- `supersedes`
+- `superseded_by`
+
+### Revoke payload
+
+`POST /v1/learnings/{learning_id}/revoke` accepts:
+
+- `reason`
+
+### Bulk revoke payload
+
+`POST /v1/learnings/revoke-matching` accepts the same main filters as learning listing plus:
+
+- `reason`
+
+Current filter fields:
+
+- `query`
+- `scope_kind`
+- `scope_id`
+- `kind`
+- `status`
+- `policy_decision`
+- `policy_actor`
+- `matched_rule_name`
+
+This is the main operator surface for bulk rollback of automatically published memory.
+
+### Supersede payload
+
+`POST /v1/learnings/{learning_id}/supersede` accepts:
+
+- `scope`
+- `kind`
+- `sensitivity`
+- `content`
+- `confidence`
+- `expires_at_ms`
+
+`content` is required for supersession. The same `1600`-character limit applies.
+
+This creates a new active learning and marks the older record as superseded.
+
+Current supersession rule:
+
+- the replacement record always uses `publish_tier=active`
+- the replacement `scope` must match the source learning scope; cross-scope migration must be modeled as an explicit new learning plus revocation instead of a normal supersession
+
+## Prompt visibility versus durability
+
+Published learnings are the source of truth, but they are not all prompt-eligible.
+
+To inspect the effective eligible projection before final prompt packing, use:
+
+- `GET /v1/sessions/{session_id}/memory-context`
+
+Important current prompt rules:
+
+- active `procedure` learnings remain excluded from `learned_context`
+- active `run_summary` learnings remain excluded from `learned_context`
+- learnings marked `sensitivity=sensitive` remain excluded from `learned_context` and session memory-search
+- learnings with `publish_tier=provisional` remain excluded
+- learnings with `verification_status=failed` remain excluded
+- automatically published learnings are prompt-visible only after `verification_status=verified`
+- learnings with `policy_decision=escalated` remain excluded
+- promoted procedure skills appear through `visible_skills` instead
+
+The runtime can still truncate or omit `learned_context` and `recovered_memory` later when it packs the final prompt for a specific input and model budget. For real session input, prompt-eligible learnings are ordered with query-aware lexical ranking against the pending input before that packing step, so relevant wider-scope learnings can beat newer or narrower-scope unrelated learnings. Prompt injection scores learning content only; `kind` and `scope` terms remain useful for `memory-search`, but they do not make a learning eligible for prompt injection by themselves. If at least one learning scores against the pending input, zero-score learnings are omitted from that prompt projection. If nothing scores, unrelated inputs receive no `learned_context`; explicit memory requests keep the existing recency/scope fallback.
+
+`GET /v1/sessions/{session_id}/memory-context?query=...` uses the same lexical ranking to preview that ordering without submitting a run.
+
+## Session memory search
+
+To inspect the broader session-visible memory browse/search surface, use:
+
+- `GET /v1/sessions/{session_id}/memory-search`
+
+That derived session view returns a bounded mix of:
+
+- visible learnings
+- recovered runs visible through the session's learning scopes
+- visible skills
+
+It is a search surface, not the canonical source of truth.
+
+When `query` is present, visible learnings use the same deterministic Unicode-aware lexical scoring as prompt retrieval. Returned learning results expose `score` and `matched_fields` so operators can see whether content, kind, or scope matched the query.
+
+## Promoted procedural skills
+
+Promotion turns one reviewed `procedure` learning into a daemon-owned reusable skill.
+
+### Promotion constraints
+
+Current production rules:
+
+- the source learning must have kind `procedure`
+- the source learning must be `active`
+- the source learning must use `publish_tier=active`
+- the source learning must use `workspace` scope
+- promoted procedure skills must use `fork`
+- promoted procedure skills must resolve to the `verification` agent profile
+
+### Endpoints
+
+- `POST /v1/learnings/{learning_id}/promote-skill`
+- `GET /v1/learning-skills`
+- `GET /v1/learning-skills/{skill_name}`
+- `POST /v1/learning-skills/{skill_name}/rollout-result`
+- `POST /v1/learning-skills/{skill_name}/revoke`
+- `POST /v1/learning-skills/{skill_name}/rollback`
+
+### Promotion payload
+
+`POST /v1/learnings/{learning_id}/promote-skill` accepts:
+
+- `skill_name`
+- `description`
+- `when_to_use`
+- `version`
+- `instructions`
+- `allowed_tools`
+- `blocked_tools`
+- `context`
+- `agent_profile`
+- `provider`
+- `model`
+- `fallback_model`
+- `status`
+
+Current validation notes:
+
+- `context` must resolve to `fork`
+- `agent_profile` must resolve to `verification`
+- `skill_name` must be single-line ASCII and may contain only letters, digits, `:`, `_`, and `-`
+- empty or whitespace-only `description` falls back to the generic non-sensitive default description
+- empty or whitespace-only `agent_profile`, `provider`, `model`, and `fallback_model` are normalized away
+- omitted `agent_profile` defaults to `verification`
+- omitted `status` defaults to `draft`
+- new promoted skills cannot start directly in `active`
+- `verified` requires daemon-validated verification evidence
+- `active` requires verification evidence, at least one successful canary rollout, and zero canary failures
+- changing the active definition requires a new draft rollout
+- `skill_name`, `description`, `when_to_use`, `version`, and `instructions` are rejected when they look like secret material
+- skill revocation and rollback reasons are also rejected when they look like secret material, so operator audit text cannot persist key/value secrets such as `api-key:` or `clientSecret:`
+- rollback refuses to remount a promoted skill if its source procedure learning is no longer active with the active publish tier
+
+Example:
+
+```json
+{
+  "skill_name": "learning:scheduler-review",
+  "description": "Run the scheduler review procedure in a verification child agent.",
+  "when_to_use": "Use when the operator explicitly asks for the learning:scheduler-review skill.",
+  "version": "1",
+  "instructions": "Reply with exactly `SCHEDULER_REVIEW_OK:${KHEISH_SKILL_ARGS}` and nothing else.",
+  "allowed_tools": ["read_file"],
+  "blocked_tools": [],
+  "context": "fork",
+  "agent_profile": "verification"
+}
+```
+
+### Learning-skill list filters
+
+`GET /v1/learning-skills` supports:
+
+- `source_learning_id`
+- `status`
+
+Promoted skill records expose rollout and audit fields such as:
+
+- `status`
+- `verification_status`
+- `evidence_refs`
+- `successful_run_count`
+- `distinct_session_count`
+- `verifier_run_ids`
+- `real_daemon_verified`
+- `last_verified_workspace_digest`
+- `canary_success_count`
+- `canary_failure_count`
+- `definition_fingerprint`
+- `lifecycle_events`
+
+For daemon-owned promoted skills, the durable promoted-skill record is authoritative. Startup repair rewrites daemon-owned skill files from the record when the loaded `SKILL.md` differs, and runtime `use_skill` rejects active promoted skills whose loaded catalog definition no longer matches the active record.
+
+### Rollout-result payload
+
+`POST /v1/learning-skills/{skill_name}/rollout-result` records daemon-validated rollout evidence from an existing run:
+
+- `kind`: `verification` or `canary`
+- `run_id`
+- `expected_output_contains`
+- `definition_fingerprint` optional guard; when supplied, it must match the current promoted-skill `definition_fingerprint`
+
+The referenced run must be a real daemon run. Successful evidence requires the run to be completed and its latest daemon output to contain `expected_output_contains`.
+Successful evidence notes retain the current definition fingerprint for audit.
+
+Verification evidence can be recorded while the skill is still `draft`. Canary evidence requires `status=canary`. A failed canary increments `canary_failure_count` and blocks activation until the operator starts a new draft rollout.
+
+### Revoke payload
+
+`POST /v1/learning-skills/{skill_name}/revoke` accepts:
+
+- `reason`
+
+### Rollback payload
+
+`POST /v1/learning-skills/{skill_name}/rollback` restores the latest historical active snapshot for the promoted skill and accepts:
+
+- `reason`
+
+## Relationship to the normal skills catalog
+
+Promoted skills are only added to the normal skill catalog when their promoted-skill record is `active`.
+
+Current rollout behavior:
+
+- `draft` stays durable but hidden
+- `verified` stays durable but hidden and requires verified daemon evidence
+- `canary` stays durable but hidden; canary rollout results are recorded against the current definition fingerprint
+- `active` becomes visible through `/v1/skills` and session-visible skill projection
+- `revoked` is removed from the visible catalog but retained durably for audit
+- rollback restores the latest retained active snapshot and remounts it in the visible catalog
+
+Those endpoints remain inspection-only. Actual execution still happens inside the runtime through `use_skill`.
+
+## CLI surface
+
+The CLI mirrors the learning plane:
+
+- `kheish-daemon learnings candidates ...`
+- `kheish-daemon learnings list`
+- `kheish-daemon learnings get`
+- `kheish-daemon learnings revoke`
+- `kheish-daemon learnings revoke-matching`
+- `kheish-daemon learnings supersede`
+- `kheish-daemon learnings skills list`
+- `kheish-daemon learnings skills get`
+- `kheish-daemon learnings skills promote`
+- `kheish-daemon learnings skills rollout-result`
+- `kheish-daemon learnings skills revoke`
+- `kheish-daemon learnings skills rollback`
+
+Current CLI note:
+
+- the CLI candidate-create surface does not currently expose `evidence_refs`
+- use the HTTP API when you need explicit evidence-backed automatic `publish_active` testing
+
+## Error model
+
+The learning surfaces return normal `400`, `404`, and `409` control-plane errors for validation and conflict cases.
+
+Examples of current client-visible validation failures include:
+
+- invalid learning scope
+- missing or empty content
+- content longer than `1600` characters
+- confidence outside `0..=100`
+- promoting a non-`procedure` learning
+- promoting a non-`active` learning
+- promoting a non-`workspace` learning
+- using a promoted-procedure context other than `fork`
+- activating a promoted skill before verification and canary evidence exists
+- recording canary evidence before the skill is in `canary`
+- invalid `skill_name`
+- invalid learning-policy publication rules
+
+## Operational behavior
+
+The current implementation is durable and restart-aware:
+
+- published learnings survive restart
+- promoted procedural skills survive restart
+- semantic capture can replay pending runs on boot without duplication
+- revoking or superseding a promoted source learning also revokes the linked promoted skill
+- the daemon repairs missing promoted-skill files on boot
+- the daemon does not silently rebind a promoted-skill record to an unrelated skill root

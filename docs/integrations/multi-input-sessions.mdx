@@ -1,0 +1,241 @@
+---
+title: Multiple input connectors in one session
+description: How to route several connectors into the same durable session, why to do it, and what behavior to expect.
+---
+
+# Multiple input connectors in one session
+
+Kheish can route several ingress connectors into the same durable session.
+
+This is the right pattern when one agent should keep working from the same history even though events arrive from different surfaces.
+
+Examples:
+
+- one Stripe sidecar, one Discord sidecar, and one email sidecar all feed the same customer session
+- one HTTP webhook and one Telegram bot both feed the same incident-response session
+- one Slack connector and one external monitoring bridge both feed the same operations session
+
+## Why use this pattern
+
+Use one shared session when:
+
+- the agent should keep one memory and one conversation history across several input sources
+- several systems describe the same real-world entity, such as one customer, one subscription, one ticket, or one incident
+- you want one operator or one agent to continue work as events arrive over time from different transports
+
+Do not use this pattern when:
+
+- each source should maintain its own independent context
+- each source represents a different customer, ticket, or workflow
+- you expect inputs from different sources to be merged into one atomic run
+
+Each inbound event still creates its own normal run. The shared session gives those runs the same durable history.
+
+## How it works
+
+Every connector resolves one target session before the daemon creates a run.
+
+For connectors that support it, the strongest way to force several inputs into the same session is:
+
+- create the session yourself
+- configure each connector with the same `fixed_session_id`
+
+That works because session resolution checks a connector-level fixed session first.
+
+For external connectors, the session resolution order is:
+
+1. connector `fixed_session_id`
+2. session already bound to derived external binding keys
+3. natural session id derived from `thread.path`
+4. natural session id derived from `routing_key`
+
+If your goal is “many connectors, one session”, prefer `fixed_session_id`.
+
+## Recommended pattern
+
+### 1. Create the session
+
+Create one session that will own the shared context:
+
+```bash
+./target/debug/kheish-daemon sessions create customer-acme
+```
+
+### 2. Point each connector at that session
+
+Configure every ingress connector that should feed this context with the same `fixed_session_id`.
+
+Example with two external sidecars:
+
+```bash
+./target/debug/kheish-daemon connectors put-external stripe-main --json '{
+  "platform": "stripe",
+  "mode": "remote_http",
+  "base_url": "http://127.0.0.1:8801",
+  "shared_token": { "value": "stripe-secret" },
+  "fixed_session_id": "customer-acme",
+  "session_policy": { "create_if_missing": true }
+}'
+```
+
+```bash
+./target/debug/kheish-daemon connectors put-external discord-main --json '{
+  "platform": "discord",
+  "mode": "child_process",
+  "base_url": "http://127.0.0.1:8802",
+  "shared_token": { "value": "discord-secret" },
+  "fixed_session_id": "customer-acme",
+  "include_self_output": true,
+  "session_policy": { "create_if_missing": true },
+  "child_process": {
+    "command": "python3",
+    "args": ["connectors/python/run_connector.py", "discord"]
+  }
+}'
+```
+
+You can apply the same idea to built-in connectors such as `http`, `slack`, or `telegram` when they expose `fixed_session_id`.
+
+### 3. Decide where outputs should go
+
+Input fan-in and output routing are separate.
+
+If you want the shared session to answer on one or more destinations, configure session reply targets for that session. Otherwise, connector-derived self-output or per-run reply routing decides where each answer goes.
+
+One current behavior matters here: connector-supplied explicit reply targets do not stay run-local. After the daemon schedules a non-daemon, non-scheduler input run, those explicit reply targets are also written back into the session's stored reply-target defaults for future work in that session.
+
+That means:
+
+- the current run still uses its own reply-target snapshot
+- a later ingress from another connector can change the session's default future output routes
+- if you want stable output policy across many connectors, set session reply targets deliberately instead of relying on whichever connector arrived last
+
+Read [Connectors and reply targets](../concepts/connectors-and-reply-targets) and [Output routing](./output-routing) for the delivery side.
+
+### 4. Let events create runs in the same session
+
+Once the connectors share one `fixed_session_id`, each inbound event produces a new run in that same session.
+
+The agent does not need a special tool or a special mailbox protocol for this. It simply receives a new run inside the same durable session.
+
+## What behavior to expect
+
+### Session continuity
+
+The main effect of this pattern is continuity:
+
+- the session history is shared
+- later runs see earlier context from that session
+- the agent can continue previous work even if the next trigger came from another connector
+
+### One event still means one run
+
+This pattern does **not** turn several inputs into one multiplexed in-memory agent loop.
+
+What actually happens is:
+
+- event A arrives on connector 1
+- the daemon resolves the target session
+- the daemon creates one run in that session
+- later, event B arrives on connector 2
+- the daemon creates another run in the same session
+
+So this is shared session state, not one live process waiting on multiple sockets.
+
+### Concurrent arrivals
+
+If several connectors receive events at nearly the same time, Kheish creates several separate runs against the same session, but only one run is active in a given session at a time. Later runs for that same session queue behind the active one.
+
+That means:
+
+- events are not merged automatically
+- ordering is not made atomic across connectors before submission, but execution inside one session is serialized once the runs are queued
+- you should design the prompt and workflow so the session can tolerate repeated or closely spaced inputs
+
+### Idempotency stays connector-local
+
+Connector ingress idempotency is still tracked per connector route, not globally across all connectors that happen to share one session.
+
+In practice, that means:
+
+- replaying the same Stripe event twice through the same Stripe connector can dedupe
+- replaying a Discord event through the Discord connector uses Discord connector idempotency
+- two different connectors feeding the same session do not share one cross-connector event id namespace
+
+### Session creation policy still applies
+
+If the target session does not already exist, the connector session policy decides whether the daemon may create it.
+
+So:
+
+- if you pre-create the session, ingress can target it directly
+- if you want the first event to create it automatically, keep `create_if_missing = true`
+- if the session is missing and auto-creation is disabled, ingress is rejected
+
+One more guard still applies even when the session already exists: the connector's session policy cannot conflict with the session's existing persona or capability scope. If those bindings disagree, ingress is rejected instead of silently rebinding the session.
+
+## Use cases
+
+### Customer operations
+
+Use one session per customer:
+
+- Stripe events describe billing state
+- Discord or email messages add human context
+- the same session accumulates the customer history and the agent can continue from earlier billing or support work
+
+Good session key:
+
+- `customer-acme`
+
+### Incident response
+
+Use one session per incident:
+
+- one monitoring webhook opens or updates the incident
+- one Telegram or Slack connector lets humans add live notes
+- the same session carries the incident timeline and follow-up tasks
+
+Good session key:
+
+- `incident-2026-04-18-db-latency`
+
+### Back-office workflows
+
+Use one session per business object:
+
+- one webhook announces state transitions
+- one human-facing connector carries review or approval comments
+- the same session keeps the history of what changed and what the agent already decided
+
+Good session key:
+
+- `subscription-sub_123`
+- `ticket-456`
+- `invoice-in_789`
+
+## When not to use `fixed_session_id`
+
+Do not force many unrelated conversations into one session with one global fixed id.
+
+That usually creates a noisy, mixed context.
+
+Instead:
+
+- use `thread.path` when the connector already has a durable conversation identity
+- use `routing_key` for threadless domain events that should still map repeatedly to one derived session
+- use durable binding keys when several connectors are configured to emit the same binding identity and you want later ingress to reuse the session that was already established from those keys
+- reserve `fixed_session_id` for the cases where you truly want one pre-decided shared session
+
+That binding-key path works today for built-in HTTP, Slack, Telegram, and external ingress. It is useful when one connector already established the session naturally and later traffic should keep reusing it without hard-coding one fixed session id. Read [Connector configuration](../reference/connector-configuration) and [External connectors protocol](../reference/external-connectors-protocol) if you want to configure that deliberately.
+
+Binding reuse is sticky, not a rebinding tool. Once one durable binding key is associated with one session, later ingress that presents the same key keeps targeting that session. Trying to point the same key at a different session is rejected instead of silently moving the binding.
+
+## Related pages
+
+- [Connectors](./connectors)
+- [Output routing](./output-routing)
+- [Connectors and reply targets](../concepts/connectors-and-reply-targets)
+- [Connector configuration](../reference/connector-configuration)
+- [Connectors API](../reference/connectors-api)
+- [External connectors protocol](../reference/external-connectors-protocol)

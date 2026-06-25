@@ -1,0 +1,33 @@
+services:
+  daemon:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: kheish-daemon:local
+    environment:
+      KHEISH_ROUTES_FILE: /etc/kheish/routes.toml
+      KHEISH_HTTP_AUTH_MODE: bearer
+      KHEISH_DAEMON_ADMIN_TOKEN_FILE: /run/secrets/admin-token
+      KHEISH_DAEMON_TOKEN_FILE: /run/secrets/admin-token
+      KHEISH_AUTH_STORE_MASTER_KEY_FILE: /run/secrets/auth-store-master-key
+      KHEISH_MCP_DISCOVERY: disabled
+    ports:
+      - "127.0.0.1:4000:4000"
+    volumes:
+      - daemon-state:/var/lib/kheish/state
+      - daemon-workspace:/workspace
+      - ./routes.example.toml:/etc/kheish/routes.toml:ro
+    secrets:
+      - admin-token
+      - auth-store-master-key
+    restart: unless-stopped
+
+volumes:
+  daemon-state:
+  daemon-workspace:
+
+secrets:
+  admin-token:
+    file: ./secrets/admin-token.txt
+  auth-store-master-key:
+    file: ./secrets/auth-store-master-key.txt

@@ -1,0 +1,100 @@
+---
+title: Skill format
+description: On-disk layout, frontmatter fields, runtime metadata, and precedence rules for deployable Kheish skills.
+---
+
+# Skill format
+
+Kheish loads skills from disk into a daemon-wide catalog at startup. A skill is a directory centered around `SKILL.md`, with optional runtime metadata under `agents/kheish.yaml`.
+
+## Directory layout
+
+The minimal layout is:
+
+```text
+my-skill/
+  SKILL.md
+```
+
+An optional runtime config lives here:
+
+```text
+my-skill/
+  SKILL.md
+  agents/
+    kheish.yaml
+```
+
+## Discovery roots
+
+The daemon discovers skills from:
+
+- explicit roots passed through daemon configuration such as `--skill-root`
+- repository roots under `skills/`
+- compatibility roots under `.claude/skills` and legacy `.agents/skills`
+- user roots under `~/skills`
+- compatibility user roots under `~/.claude/skills` and legacy `~/.agents/skills`
+
+Repository-local roots are discovered from the workspace root upward through its ancestor chain. Explicit roots take precedence over repository roots, and repository roots take precedence over user roots.
+
+## `SKILL.md`
+
+`SKILL.md` contains the reusable instruction body. It can start with YAML frontmatter.
+
+Supported frontmatter fields are:
+
+- `name`
+- `description`
+- `version`
+- `when_to_use`
+- `when-to-use`
+
+If `name` is omitted, Kheish derives one from the relative directory path under the discovered skill root, using `:` as the namespace separator.
+
+If `description` is omitted from frontmatter, Kheish derives it from the first prose paragraph in `SKILL.md`. A skill still needs a non-empty description one way or the other.
+
+## `agents/kheish.yaml`
+
+`agents/kheish.yaml` provides runtime metadata for the skill.
+
+Supported fields are:
+
+- `allowed_tools`
+- `blocked_tools`
+- `context`
+- `agent_profile`
+- `provider`
+- `model`
+- `fallback_model`
+
+On a named-route daemon:
+
+- `provider` should be one configured route identifier such as `openai`, `anthropic`, or `openrouter`
+- `model` and `fallback_model` should be backend model names for that route
+
+Unlike the CLI, skill metadata is not a selector parser. Prefer explicit `provider` plus raw `model` values in `agents/kheish.yaml`.
+
+The current `context` values are:
+
+- `inline`
+- `fork`
+
+Use `inline` when the skill should activate inside the current session and persist as session-scoped active skill state. Use `fork` when the skill should execute through an isolated child-agent path.
+
+## Precedence and conflicts
+
+Skills are keyed by their resolved name. When duplicate names exist across roots, the first higher-precedence root wins and lower-precedence duplicates are ignored with loader warnings.
+
+In practice, precedence is:
+
+1. explicit skill roots in daemon configuration order
+2. repository-local roots nearest the workspace root first
+3. within one ancestor, canonical `skills/` before compatibility roots
+4. user-level roots
+
+## Operational notes
+
+- Skills are loaded when the daemon starts.
+- The HTTP skill endpoints are inspection-only.
+- Runtime activation happens through `list_skills` and `use_skill`.
+- Inline activations are session-scoped. Fork activations run through a child-agent execution path.

@@ -1,0 +1,207 @@
+---
+title: Operating playbooks and flows
+description: Creating, publishing, starting, inspecting, and cancelling Playbook-backed Flows on a real daemon.
+---
+
+# Operating playbooks and flows
+
+Use this page when validating Playbook/Flow behavior against a real daemon. Treat the daemon CLI and HTTP API as the source of truth.
+
+## Prerequisites
+
+Build the daemon, load provider credentials, and start an isolated instance:
+
+```bash
+set -a
+source .env
+set +a
+
+cargo build -p kheish-daemon
+mkdir -p ./.kheish-workspace-flow-test
+
+./target/debug/kheish-daemon serve \
+  --bind 127.0.0.1:4000 \
+  --state-root .kheish-daemon-flow-test \
+  --workspace-root ./.kheish-workspace-flow-test \
+  --provider openai \
+  --model gpt-5.4
+```
+
+In another shell, verify the daemon:
+
+```bash
+./target/debug/kheish-daemon status
+./target/debug/kheish-daemon runtime get
+```
+
+## Create and validate a Playbook
+
+Write a manifest file:
+
+```json
+{
+  "playbook_id": "ops-inspection",
+  "version": "2026-04-23",
+  "title": "Operator inspection",
+  "objective": "Inspect a workspace and report what was verified.",
+  "phases": [
+    {
+      "phase_id": "inspect",
+      "objective": "Inspect the workspace root.",
+      "acceptance_criteria": ["The final run output states what was verified."]
+    }
+  ],
+  "acceptance_criteria": ["A run is created and inspectable through the daemon."]
+}
+```
+
+Validate it:
+
+```bash
+./target/debug/kheish-daemon playbooks validate --manifest-file playbook.json
+```
+
+Create the immutable version:
+
+```bash
+./target/debug/kheish-daemon playbooks create --manifest-file playbook.json
+```
+
+Copy the returned `digest` from the created version. Publish with evidence:
+
+```bash
+./target/debug/kheish-daemon playbooks publish ops-inspection \
+  --version 2026-04-23 \
+  --digest <digest> \
+  --status active \
+  --evidence-refs-json '[{"kind":"doc_review","id":"review-local","description":"manifest reviewed against daemon API"}]'
+```
+
+Expected result: the Playbook lists one active version.
+
+```bash
+./target/debug/kheish-daemon playbooks get ops-inspection
+```
+
+## Start a Flow
+
+Create a fresh session:
+
+```bash
+./target/debug/kheish-daemon sessions create flow-demo
+```
+
+Create the run request:
+
+```json
+{
+  "provider": "openai",
+  "source_plugin": "daemon",
+  "source_kind": "api",
+  "actor_id": "operator",
+  "content": "Inspect the workspace root and summarize what you verified.",
+  "input_items": [],
+  "attachments": [],
+  "generation": null,
+  "metadata": null,
+  "binding_keys": [],
+  "reply_targets": [],
+  "reply_plugin": null,
+  "reply_address": null
+}
+```
+
+Start the Flow:
+
+```bash
+./target/debug/kheish-daemon flows start \
+  --flow-id flow-demo-1 \
+  --idempotency-key flow-demo-1 \
+  --playbook-id ops-inspection \
+  --version 2026-04-23 \
+  --digest <digest> \
+  --session-id flow-demo \
+  --request-file flow-request.json
+```
+
+Expected result: the response contains a `flow_id`, a `run_id`, and `status`.
+
+## Inspect evidence
+
+Use Flow inspection first, then inspect the underlying primitives:
+
+```bash
+./target/debug/kheish-daemon flows get flow-demo-1
+./target/debug/kheish-daemon runs get <run_id>
+./target/debug/kheish-daemon agents list
+./target/debug/kheish-daemon sessions events flow-demo
+./target/debug/kheish-daemon approvals list --session-id flow-demo
+./target/debug/kheish-daemon tasks list flow-demo
+```
+
+When a Flow spawns sidechain agents, inspect the child sessions from `flows get` / `agents list` as well. Flow `primitive_refs` can include child run ids, child task ids, and approval/question ids that are no longer pending but remain visible through run events.
+
+For manual restart triage on a Flow:
+
+```bash
+./target/debug/kheish-daemon flows get <flow_id>
+./target/debug/kheish-daemon agents list
+./target/debug/kheish-daemon runs get <root_or_child_run_id>
+./target/debug/kheish-daemon runs events <root_or_child_run_id>
+./target/debug/kheish-daemon approvals list --session-id <root_or_child_session_id>
+./target/debug/kheish-daemon tasks list <root_or_child_session_id>
+./target/debug/kheish-daemon tasks get <root_or_child_session_id> <task_id>
+./target/debug/kheish-daemon tasks output <root_or_child_session_id> <task_id> --full
+```
+
+Use `flows get` for the aggregate `primitive_refs`, then use `agents list` to map child agent ids to child session ids. Task commands are session-scoped, so a `task_id` from `primitive_refs.task_ids` must be checked in the session that owns the corresponding child agent or root session.
+
+If debug capture was enabled before the run, inspect:
+
+```bash
+./target/debug/kheish-daemon runs debug <run_id>
+./target/debug/kheish-daemon runs debug-artifact <run_id> turn-0001-attempt-0001-provider-request
+```
+
+## Cancel a Flow
+
+Flow cancellation delegates to the referenced run:
+
+```bash
+./target/debug/kheish-daemon flows cancel flow-demo-1
+./target/debug/kheish-daemon runs get <run_id>
+```
+
+Expected result: cancellation delegates to the root run. If the root run is cancelled and no scoped child work changes the projection, `FlowView.status` becomes `cancelled`. If the root run is already terminal, it stays terminal; `FlowView.status` is still derived from all scoped run/task state and may not equal the embedded `run.status`.
+
+## Restart recovery live harness
+
+For the production restart scenario, use the checked-in harness:
+
+```bash
+scripts/e2e/restart_flow_recovery_live.sh
+```
+
+The harness builds `target/debug/kheish-daemon`, starts an isolated daemon with fresh `--state-root` and `--workspace-root`, starts a Playbook-backed Flow, uses Anthropic for the root run and OpenAI for the child worker, kills and restarts the daemon while a background shell task and write approval are active, then writes evidence under `tmp/evidence/<run-id>/`.
+
+The final oracle is `verdict.json`, not the model's final prose. The script fails if:
+
+- the shell task is not `failed` with `terminal_reason: "daemon_restarted"`
+- partial output is missing
+- the artifact exists before approval
+- provider debug artifacts do not show the expected real providers
+- `WORKER_RESTART_OK` appears without `task.status: "completed"`, `exit_code: 0`, and the final shell marker
+
+## Evidence Used
+
+- CLI commands: `crates/kheish-daemon/src/main.rs`, `crates/kheish-daemon/src/cli/commands/playbooks.rs`
+- API routes: `crates/kheish-daemon/src/api/handlers.rs`
+- Debugging order: [Debugging and recovery](./debugging-and-recovery)
+- This page requires live provider validation only when the started Flow actually reaches a real model provider.
+
+## Evidence Note
+
+- Code verified: `crates/kheish-daemon/src/cli/commands/playbooks.rs`, `crates/kheish-daemon/src/state/playbook_workflow.rs`, `crates/kheish-daemon/src/services/task.rs`, `scripts/e2e/restart_flow_recovery_live.sh`.
+- CLI/API verified: commands shown on this page are implemented in the current CLI/API code.
+- Daemon live tested for this note: no; run `scripts/e2e/restart_flow_recovery_live.sh` for real binary/provider evidence.
+- Provider-specific tested for this note: no in this documentation pass; the harness is configured for Anthropic `claude-opus-4-6` and OpenAI `gpt-5.4`.

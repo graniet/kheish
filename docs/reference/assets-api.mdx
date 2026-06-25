@@ -1,0 +1,227 @@
+---
+title: Assets API
+description: Import, inspect, and reuse daemon-owned assets for document and image inputs.
+---
+
+# Assets API
+
+The assets API stores files inside the daemon state root and returns stable identifiers that can be referenced from later session inputs.
+
+## HTTP endpoints
+
+- `GET /v1/assets`
+- `GET /v1/assets/{asset_id}`
+- `GET /v1/assets/{asset_id}/references`
+- `GET /v1/assets/{asset_id}/raw`
+- `POST /v1/assets`
+- `DELETE /v1/assets/{asset_id}?dry_run=true`
+- `DELETE /v1/assets/{asset_id}`
+- `POST /v1/assets/gc`
+
+`GET /v1/assets` supports an optional `query` filter over the asset identifier, file name, media type, digest, or derivation id.
+
+## Create an asset
+
+`POST /v1/assets` accepts one inline upload payload:
+
+```json
+{
+  "file_name": "note.txt",
+  "media_type": "text/plain",
+  "content_base64": "SU5MSU5FX0FTU0VUX09L"
+}
+```
+
+The daemon persists the raw payload, normalizes the media type, and returns the stored asset view.
+
+## Asset views
+
+Asset summaries returned by `GET /v1/assets` include:
+
+- `asset_id`
+- `media_type`
+- `file_name`
+- `sha256`
+- `byte_length`
+- `created_at_ms`
+
+`GET /v1/assets/{asset_id}` returns the full asset view, including:
+
+- `uri`, an opaque daemon-managed raw storage reference
+- `text_uri`, an opaque daemon-managed derived-text reference when the daemon extracted prompt-ready text from the asset
+- `text_sha256` and `text_byte_length`, integrity metadata for the derived text payload when present
+- `preview_image_uri`, an opaque daemon-managed visual preview reference when one exists
+- `preview_image_media_type`, the MIME type for that preview
+- `preview_image_sha256` and `preview_image_byte_length`, integrity metadata for the derived preview payload when present
+- `derivation_ids`, derivations whose result points at this asset
+
+## Reference inspection
+
+`GET /v1/assets/{asset_id}/references` returns the durable places that currently point at one asset:
+
+```json
+{
+  "asset_id": "asset-1",
+  "hard_reference_count": 2,
+  "soft_reference_count": 1,
+  "references": [
+    {
+      "domain": "runs",
+      "owner_id": "run-1",
+      "role": "input_attachment",
+      "hard": true,
+      "parent_id": "demo"
+    },
+    {
+      "domain": "observations",
+      "owner_id": "observation-1",
+      "role": "raw_asset",
+      "hard": false,
+      "parent_id": "screen",
+      "detail_id": "purged"
+    }
+  ]
+}
+```
+
+Hard references block retention-driven physical deletion. Purged observations are reported as soft
+lineage references, so old observation rows remain auditable without permanently pinning raw bytes.
+The current graph covers run inputs/outputs, session outputs, active and purged observations,
+pending/delivered/dead-lettered output deliveries, derivation subjects/results, board render/state
+revisions, channel pinned assets, channel message attachments/artifacts, and shared asset-to-asset
+text references such as transcription assets attached to audio.
+
+## Delete and GC
+
+`DELETE /v1/assets/{asset_id}?dry_run=true` returns the deletion plan without mutating state. The
+plan includes `blocked`, `reclaimable_bytes`, the removable daemon-owned files, and the same hard
+and soft references used by the reference endpoint.
+
+`DELETE /v1/assets/{asset_id}` executes the same plan only when `hard_reference_count` is zero. Hard
+references return `409 application/problem+json` with `domain: "assets"` and
+`code: "asset_delete_blocked"`. Soft references, currently purged observation lineage, do not block
+physical deletion.
+
+`POST /v1/assets/gc` plans or executes catalog-asset garbage collection:
+
+```json
+{ "dry_run": true }
+```
+
+`dry_run` defaults to `true`. GC execution deletes only catalog assets with no hard references and
+reports blocked assets instead of failing the whole operation. It also reports and can remove
+orphan payload files under `assets/raw`, `assets/text`, and `assets/preview` when no loaded asset
+metadata references their opaque `asset://...` URI. Daemon atomic-write temp files and tombstones
+are ignored. Reclaimable bytes are computed from current file metadata for raw payloads, owned
+derived text/previews, asset metadata, and orphan payload files; tombstones are not counted as
+reclaimable.
+
+## Supported media types
+
+The daemon currently accepts:
+
+- `text/plain`
+- `text/csv`
+- `text/markdown`
+- `application/json`
+- `application/pdf`
+- `application/dxf`
+- `image/png`
+- `image/jpeg`
+- `audio/wav`
+- `audio/webm`
+- `audio/mpeg`
+- `audio/mpga`
+- `audio/opus`
+- `audio/aac`
+- `audio/flac`
+- `audio/mp4`
+- `audio/m4a`
+- `audio/pcm`
+- `audio/l16`
+- `audio/l24`
+
+Declared media types may include parameters such as `audio/webm;codecs=opus`; the daemon strips
+those parameters before alias normalization and validation. Unsupported or mismatched file types are
+rejected before the asset is stored. Audio imports are
+sniffed before persistence: WAV must be RIFF/WAVE with coherent PCM/float/extensible `fmt `,
+non-empty block-aligned `data`, and either exact RIFF lengths or provider-style streaming length
+sentinels, plus an in-limit calculable duration. WebM must expose the WebM DocType, a Segment,
+a supported Opus/Vorbis audio track, and non-empty media data. MP3/MPGA must
+contain a complete MPEG audio frame directly or after an ID3 tag, and the first frame's declared
+sample rate/channel mode must fit daemon limits. Opus must be an Ogg page with an `OpusHead`
+packet and valid channel count. AAC must be ADTS/ADIF with bounded frame length and, for ADTS,
+valid sample-rate/channel metadata. FLAC must include the mandatory STREAMINFO block with valid
+sample-rate/channel metadata and an in-limit duration when total samples are declared. MP4/M4A must
+contain `ftyp`, non-empty media data, and an audio track handler. Raw PCM formats do not have
+container magic or channel/sample-rate metadata, so the daemon enforces non-empty payloads and
+sample-width alignment for `audio/pcm`, `audio/l16`, and `audio/l24`.
+
+## Normalization behavior
+
+Important daemon-side rules:
+
+- imports are deduplicated by normalized media type and content digest
+- CSV aliases normalize to `text/csv`
+- DXF aliases normalize to `application/dxf`
+- MP3 aliases normalize to `audio/mpeg`, MPGA aliases normalize to `audio/mpga`, AAC/FLAC/OPUS aliases normalize to their `audio/*` forms, PCM aliases normalize to `audio/pcm`, and M4A aliases normalize to `audio/m4a`
+- PNG and JPEG uploads are decoded and re-encoded into normalized daemon-owned image payloads
+- PDFs and supported text documents keep their raw payloads and, when possible, a derived text representation
+- supported audio assets can later gain a derived `text_uri` when the daemon performs speech-to-text and a transcription backend is configured
+- generated audio and transcription uploads revalidate through the same daemon audio parser before persistence/provider upload
+- DXF uploads also derive a PNG preview when the daemon can parse the plan
+- derived document text is what text-only routes consume later during prompt rendering
+
+Use `GET /v1/assets/{asset_id}/raw` when a client needs the exact persisted bytes rather than the metadata view.
+Raw reads re-check the stored byte length and SHA-256 before returning bytes. Derived text and preview reads also re-check their stored byte length and SHA-256 before prompt rendering, derivation/observation materialization, or provider attachment dispatch. If an on-disk payload changes while the daemon is running, the endpoint or run path returns `409 application/problem+json` with `domain: "assets"` and `code: "asset_integrity_mismatch"`.
+
+## Startup repair
+
+`GET /v1/status` includes `storage.asset_repair`, a bounded summary of asset startup repair work
+captured when the daemon loaded the asset store. Repairs that restore derived files are surfaced as
+health `info`; skipped metadata records caused by untrusted raw payloads are surfaced as health
+`warning`.
+
+On startup, the daemon:
+
+- quarantines corrupt `assets/meta/*.json` files instead of aborting the whole store load
+- preserves asset ID allocation across valid, skipped, and quarantined metadata files
+- skips metadata whose raw payload is missing, no longer matches its stored byte length/SHA-256, has an id that disagrees with the metadata filename, or points at another asset's raw URI
+- backfills legacy derived text/preview checksums only after the derived bytes match the valid raw payload's current derivation
+- restores missing, tampered, malformed, or incoherent owned derived text/preview payloads from the valid raw payload before exposing the asset
+- preserves verified attached text references that point at another loaded `text/plain` raw asset, and replaces other non-owned derived text URIs with the canonical derived text when one can be regenerated
+- removes only daemon atomic-write temp files from asset directories, leaving real orphan payloads for future GC tooling
+- validates durable tombstones before treating them as committed deletes, quarantines corrupt tombstone JSON, and completes partial delete crash windows by removing the tombstoned asset metadata plus daemon-owned raw/text/preview payloads in a single startup scan
+
+Retention-driven deletion first checks the cross-domain asset reference graph. It removes the
+asset's own raw payload and owned derived companions only when no hard reference remains outside
+the purged observation rows. Attached canonical text that points at another asset's raw payload is
+left intact so shared transcripts remain readable. Every physical deletion writes a tombstone under
+the daemon state root so deleted asset identifiers are not reused after restart. Startup cleanup
+does not follow cross-asset raw URIs or nested derived-path URIs from metadata, so shared
+transcripts and non-owned payload paths remain intact.
+
+## Limits
+
+Current limits enforced by the daemon:
+
+- maximum raw upload size: 12 MiB
+- maximum source image edge before decode: 16,384 pixels
+- maximum source image area before decode: 50,000,000 pixels
+- maximum source image decode allocation: 256 MiB
+- maximum normalized image edge after decode: 2,048 pixels
+- maximum normalized image size after re-encode: 4 MiB
+- maximum PDF text extraction pages: 128
+- maximum PDF object count before text extraction: 10,000
+- maximum PDF stream count before text extraction: 2,048
+- maximum individual PDF stream size before text extraction: 12 MiB
+- maximum total PDF stream size before text extraction: 12 MiB
+- maximum extracted PDF text size: 4 MiB
+- maximum DXF preview primitives: 20,000
+- maximum DXF preview line/polyline segments: 20,000
+- maximum points retained for one DXF polyline preview: 20,000
+- audio sample-rate metadata limit: 8,000-192,000 Hz when declared by the container
+- audio channel metadata limit: 1-8 channels when declared by the container
+- maximum declared/calculable audio duration: 30 minutes
+
+Use the asset store when you want stable reuse, restart safety, or explicit inspection of uploaded files before they are referenced by runs.

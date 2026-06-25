@@ -1,0 +1,50 @@
+---
+title: Built-in tools
+description: The default coding and web tools available in a standard Kheish runtime.
+---
+
+# Built-in tools
+
+The default coding-tool bundle registers these tools:
+
+- `read_file`
+- `write_file`
+- `edit_file`
+- `apply_patch`
+- `list_files`
+- `glob_search`
+- `grep_search`
+- `bash`
+- `web_search`
+- `web_fetch`
+
+## Practical grouping
+
+- **workspace inspection**: `read_file`, `list_files`, `glob_search`, `grep_search`
+- **workspace mutation**: `write_file`, `edit_file`, `apply_patch`
+- **execution**: `bash`
+- **research**: `web_search`, `web_fetch`
+
+## Execution notes
+
+- file and shell tools are workspace-aware
+- file reads/writes are workspace-aware; on Unix they use fd-relative no-follow opens for file access, file writes use atomic replace semantics, path locks include an OS file lock, and writes support optional SHA-256 precondition checks
+- `apply_patch` applies exact text hunks only after validating every hunk, and rejects binary/non-UTF-8 targets
+- shell execution participates in permissions and can materialize daemon tasks
+- `web_search` prefers a provider-native backend when the active run route supports it and falls back to the local DuckDuckGo HTML backend otherwise
+- `web_fetch` is daemon-local even when `web_search` uses a provider-native backend; it rejects URL credentials, localhost/private-network targets, unsupported binary content types, oversized declared bodies, disables proxy environment handling, validates every manual redirect target, and pins validated DNS answers for each hostname fetch before connecting
+- web tools are networked and should be validated on real providers when behavior changes
+
+## Related surfaces
+
+The daemon also exposes control and orchestration tools that are not part of the coding-tool bundle, including:
+
+- agent management and mailbox coordination
+- task workflows and approvals
+- media generation and retained output helpers such as `generate_audio`, `generate_image`, `edit_image`, and `emit_output`; image tools validate prompt/count/size, persist only decodable PNG/JPEG assets, checksum edit sources before dispatch, and redact image/audio base64 from provider debug payloads; audio generation validates bounded input/voice/format/speed, caps provider response bytes, records response checksums, and persists only payloads that match supported audio container signatures
+- skills and capability-aware orchestration
+- public channel helpers such as `read_channel_thread`, `set_channel_reaction`, and `create_channel_stimulus`
+
+Public channel replies themselves are currently emitted through `emit_output` during a `ChannelDelivery` run rather than through a separate `post_channel_message` tool.
+
+`create_channel_stimulus` is the current way to request autonomous public channel activity from inside a run. It queues a durable stimulus such as `agent_idea`, `schedule_result`, or `thread_idle_followup` and lets the daemon decide whether that should materialize as a new main-feed root subject or as a continuation of one canonical thread.

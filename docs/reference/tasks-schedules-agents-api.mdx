@@ -1,0 +1,411 @@
+---
+title: Tasks, schedules, and agents API
+description: Session-task inspection, durable schedules, sidechain creation, and mailbox delivery.
+---
+
+# Tasks, schedules, and agents API
+
+These endpoints cover session-scoped task inspection plus managed-agent orchestration.
+
+Daemon-owned **projects** and **project tasks** now have their own separate surface. Read [Projects API](./projects-api) for that model.
+
+Sessions that are channel members can also receive daemon-created runs of kind `ChannelDelivery`. Those runs still execute through the normal runs API and session queue. The public conversation itself lives in the separate [Channels API](./channels-api).
+
+Schedules, sidechains, and reviewer results can also feed public channel threads indirectly through durable channel stimuli and root-thread bindings. The schedule, task, and run themselves still remain session- and run-scoped; the channel only owns the public conversation projection.
+
+## Task endpoints
+
+- `GET /v1/sessions/{session_id}/tasks`
+- `GET /v1/sessions/{session_id}/tasks/{task_id}`
+- `GET /v1/sessions/{session_id}/tasks/{task_id}/output`
+- `POST /v1/sessions/{session_id}/tasks/{task_id}/stop`
+
+### List and inspect tasks
+
+`GET /v1/sessions/{session_id}/tasks` supports:
+
+- `status`: filter by `pending`, `in_progress`, `blocked`, `completed`, `failed`, or `cancelled`
+
+Task detail returns one `TaskRecord` with fields such as:
+
+- `id`
+- `title`
+- `description`
+- `status`
+- `owner_agent_id`
+- `blocked_by`
+- `blocks`
+- `output`
+- `metadata`
+- `created_at_ms`
+- `updated_at_ms`
+
+### Read task output
+
+`GET /v1/sessions/{session_id}/tasks/{task_id}/output` supports:
+
+- `wait`: wait for output or state change before returning
+- `timeout_ms`: wait duration when `wait=true`
+- `tail_bytes`: excerpt size, defaulting to a small tail view
+- `full`: include full captured output text when available
+
+The response is a `TaskOutputView`:
+
+- `retrieval_status`
+- `task`
+- `output_file_path`
+- `output_excerpt`
+- `output_text`
+- `output_truncated`
+- `output_size_bytes`
+- `output_total_bytes`
+- `output_rotated`
+- `output_rotation_count`
+
+`full=true` returns the full retained output body. After output rotation, the retained body starts with a daemon marker and contains the latest retained output window, not bytes that were already discarded by retention.
+
+Current `retrieval_status` values include:
+
+- `success`
+- `not_ready`
+- `timeout`
+
+`retrieval_status: "success"` means the daemon read the task output view. It does not mean the task succeeded. For daemon-managed shell tasks, treat command success as `task.status: "completed"` plus `task.metadata.exit_code: 0`. If `task.status` is `failed` or `cancelled`, clients and agents must not report the shell task as successful even when output retrieval succeeded.
+
+Example:
+
+```bash
+curl "http://127.0.0.1:4000/v1/sessions/demo/tasks/task-1/output?wait=true&timeout_ms=2000&tail_bytes=8192"
+```
+
+After daemon restart, an active daemon-managed shell task returns as `task.status: "failed"` with `task.metadata.terminal_reason: "daemon_restarted"` and `task.metadata.recovered_on_boot: true`; the output endpoint still returns partial captured output when available.
+
+Daemon-managed shell-task metadata also records shutdown evidence when a stop or restart recovery has to terminate a process tree:
+
+- `process_tree_shutdown_confirmed`: whether no tracked process remained after bounded signal escalation
+- `process_tree_shutdown_matched_target`: whether the persisted process identity matched before signalling
+- `process_tree_shutdown_signal_sent`: whether at least one process or process group signal was sent
+- `process_tree_shutdown_supported`: whether the current platform has daemon process-tree shutdown support
+- `process_tree_remaining_pids`: bounded remaining process ids when shutdown could not be confirmed
+
+If `POST .../stop` is called while a live shell task is still shutting down, the response may remain `in_progress` with `metadata.stop_requested=true`. Use `task_output?wait=true` or fetch the task again to observe the terminal state.
+
+### Stop a task
+
+`POST /v1/sessions/{session_id}/tasks/{task_id}/stop` accepts:
+
+```json
+{
+  "reason": "operator requested stop"
+}
+```
+
+## Schedule endpoints
+
+- `GET /v1/schedules`
+- `POST /v1/schedules`
+- `GET /v1/schedules/{schedule_id}`
+- `POST /v1/schedules/{schedule_id}/cancel`
+- `POST /v1/schedules/{schedule_id}/pause`
+- `POST /v1/schedules/{schedule_id}/resume`
+- `POST /v1/schedules/{schedule_id}/trigger`
+
+`GET /v1/schedules` supports:
+
+- `session_id`
+
+## Create a schedule
+
+`POST /v1/schedules` accepts a `ScheduleCreateRequest`.
+
+Required fields:
+
+- `name`
+- `target_session_id`
+- `cadence`
+- exactly one of:
+  - `request`
+  - `observation_materialization`
+
+Optional fields:
+
+- `target_agent_id`
+- `owner_session_id`
+- `owner_agent_id`
+- `created_by_run_id`
+- `max_executions`
+- `overlap_policy`
+- `misfire_policy`
+
+Important note:
+
+- `request` is a full `SubmitInputRequest`
+- when the nested schedule request uses only `input_items`, `content` can be omitted
+
+### Cadence variants
+
+`once`:
+
+```json
+{
+  "type": "once",
+  "fire_at_ms": 1760000000000
+}
+```
+
+`interval`:
+
+```json
+{
+  "type": "interval",
+  "every_seconds": 300
+}
+```
+
+`cron`:
+
+```json
+{
+  "type": "cron",
+  "expression": "0 */6 * * * *",
+  "timezone": "UTC"
+}
+```
+
+Important validation rules:
+
+- interval cadence must be at least 5 seconds
+- cron timezone defaults to `UTC`
+- `max_executions`, when set, must be greater than zero
+- when `observation_materialization` is used, its `target_session_id` must match the schedule `target_session_id`
+
+### Schedule policy fields
+
+`overlap_policy`:
+
+- `skip`
+- `queue_one`
+- `parallel`
+
+`misfire_policy`:
+
+- `{ "type": "coalesce_once" }`
+- `{ "type": "skip_missed" }`
+
+### Schedule creation example
+
+```json
+{
+  "name": "nightly-review",
+  "target_session_id": "ops-review",
+  "cadence": {
+    "type": "cron",
+    "expression": "0 0 2 * * *",
+    "timezone": "Europe/Paris"
+  },
+  "overlap_policy": "skip",
+  "misfire_policy": {
+    "type": "coalesce_once"
+  },
+  "request": {
+    "content": "Review the latest state and write a concise overnight summary.",
+    "generation": {
+      "model": "gpt-5.4",
+      "tool_choice": {
+        "type": "auto"
+      },
+      "allow_parallel_tool_calls": true,
+      "response_format": {
+        "type": "text"
+      }
+    }
+  }
+}
+```
+
+The response is a `ScheduleView`. Important fields include:
+
+- `schedule_id`
+- `name`
+- `target_session_id`
+- `status`
+- `cadence`
+- `overlap_policy`
+- `misfire_policy`
+- `max_executions`
+- `next_fire_at_ms`
+- `queued_fire_at_ms`
+- `in_flight_fire_at_ms`
+- `in_flight_run_id`
+- `last_fire_at_ms`
+- `last_dispatched_run_id`
+- `last_error`
+- `last_scheduler_error`
+- `scheduler_retry_after_ms`
+- `scheduler_retry_attempt`
+- `execution_count`
+- `consecutive_failures`
+- `recent_executions`
+- `request`
+
+`ScheduleView.misfire_policy` is returned with the same tagged-object shape.
+
+`recent_executions` is a bounded daemon-owned history of recent scheduler fires. Entries include the scheduled `fire_at_ms`, optional `run_id`, execution `status`, retry attempt, queued-fire marker, claim/dispatch/settle timestamps, retry deadline, and error text. The list is intentionally bounded so schedules remain cheap to list while still exposing enough evidence for duplicate-dispatch, retry, and overlap investigations.
+
+Scheduler dispatch retry policy is daemon-global. CLI `serve` exposes `--scheduler-retry-base-delay-ms`, `--scheduler-retry-max-delay-ms`, `--scheduler-retry-jitter-ms`, and `--scheduler-retry-max-attempts` with matching `KHEISH_SCHEDULER_*` environment variables. The effective policy is exposed through `GET /v1/runtime` and the `runtime.scheduler_policy` object in status output. Retry state is persisted on the schedule view so restart does not erase operator-visible backoff/error context.
+
+Pause, resume, cancel, and manual trigger all return:
+
+```json
+{
+  "schedule": {
+    "...": "ScheduleView"
+  }
+}
+```
+
+## Agent endpoints
+
+- `GET /v1/agents`
+- `GET /v1/agents/summaries`
+- `GET /v1/agents/{agent_id}`
+- `POST /v1/agents/{agent_id}/sidechains`
+- `GET /v1/agents/{agent_id}/mailbox`
+- `POST /v1/mailboxes`
+
+`GET /v1/agents` and `GET /v1/agents/{agent_id}` return `ManagedAgentSnapshot` records. These include the static `agent` record plus live state such as pending approvals, pending questions, the last assistant message, and the last runtime error.
+
+`GET /v1/agents/summaries` returns lightweight `AgentSummaryView` records for list-style inventory. It does not fan out to every live runtime for full snapshots, so operators and agent tools can list large agent trees without pulling assistant messages, journals, or pending request payloads. Use `GET /v1/agents/{agent_id}` for authoritative full state on one agent.
+
+The summaries endpoint supports additive filters:
+
+- `root_agent_id` or `root`: restrict to one root agent tree.
+- `session_id`: restrict to one agent session.
+- `status`: `idle`, `running`, `waiting_for_approval`, `waiting_for_user_input`, `failed`, or `completed`.
+- `has_runtime`: restrict by live runtime presence.
+
+Without pagination parameters it returns the legacy JSON array. A limit-only request still returns the legacy array shape while applying the bounded limit. With `page=true` or `cursor`, it returns a paginated envelope with `items`, `pagination.total_count`, and exact `counts` for the selected scope after active-run overlays. Summary rows include cheap daemon-run overlays such as `active_run_id`, `queued_run_count`, pending request counts, `pending_parent_clarification_count`, bounded parent-clarification run ids, `last_error`, bounded `last_output_preview`, and `last_activity_at_ms`.
+
+When a child agent has escalated a parent clarification, its summary status is projected as `waiting_for_user_input` until the parent answer, decline, expiry, or dead-letter settlement is durably recorded. This keeps `agents summaries`, `agents get`, and `wait_agent` from treating a child as settled while it is blocked on its parent.
+
+The CLI keeps `agents list` on the full snapshot contract and exposes the lightweight path as `agents summaries`, including `--root`, `--session-id`, `--status`, `--has-runtime`, and pagination flags. Inside agent tools, use `list_agent_summaries` for routine coordination and `list_agents` only when full runtime snapshots are needed.
+
+Public channel participation does not introduce a second agent runtime. A member session still uses the normal agent snapshot, mailbox, and run queue while the daemon separately keeps the public channel log and turn leases.
+
+## Spawn a sidechain
+
+`POST /v1/agents/{agent_id}/sidechains` accepts `SpawnSidechainRequest`.
+
+Top-level fields:
+
+- `session_id`
+- `thread_id`
+- `route_policy`
+- `provider`
+- `permission_mode`
+- `retention`
+- `nickname`
+- `spawn_request_id`
+- `fork_context`
+- `generation`
+- `tool_surface`
+- `capability_scope`
+- `credential_scope`
+- `subtask`
+
+The minimum required `fork_context` shape is:
+
+- `parent_assistant_message`
+- `inherited_tool_call_ids`
+- `system_prompt`
+
+Optional `fork_context` fields:
+
+- `team_name`
+- `isolation`
+- `prompt_merge_mode`
+- `provider`
+- `generation`
+- `tool_surface`
+- `worktree_path`
+
+Example:
+
+```json
+{
+  "nickname": "research-child",
+  "retention": "retain",
+  "route_policy": {
+    "provider": "openai",
+    "generation": {
+      "model": "gpt-5.4",
+      "tool_choice": {
+        "type": "auto"
+      },
+      "allow_parallel_tool_calls": true,
+      "response_format": {
+        "type": "text"
+      }
+    }
+  },
+  "fork_context": {
+    "parent_assistant_message": "Split this into a focused research task.",
+    "inherited_tool_call_ids": ["call_1", "call_2"],
+    "system_prompt": "You are a focused research sub-agent.",
+    "prompt_merge_mode": "append"
+  },
+  "subtask": {
+    "name": "Research stale-while-revalidate",
+    "description": "Collect the most important implementation patterns and tradeoffs.",
+    "content": "Produce a concise technical note with concrete references."
+  }
+}
+```
+
+Route normalization rules:
+
+- `route_policy` is the preferred modern form
+- compatibility `provider` plus `generation` may still be supplied
+- conflicting combinations are rejected with `400 Bad Request`
+
+Persona, capability, and credential inheritance:
+
+- child sessions inherit the parent's bound persona snapshot at spawn time
+- child sessions also inherit the parent's persisted capability scope
+- child sessions also inherit the parent's persisted credential scope
+- child sessions inherit the parent's effective permission mode unless `permission_mode` requests a narrower mode
+- explicit `permission_mode: "default"` is pinned as a child session override instead of falling through to the daemon global mode
+- sidechain spawn rejects `permission_mode` values that would widen the parent, for example `bypassPermissions` from a `default` parent
+- parent session-scoped permission updates are copied to the child session at spawn time
+- when the spawn request omits `credential_scope`, delegated children keep route access but lose connector credentials and credentialed MCP access by default
+- child `capability_scope`, `credential_scope`, and `tool_surface` can narrow the inherited surface further but cannot widen it
+
+## Mailbox delivery
+
+`POST /v1/mailboxes` posts one typed JSON envelope and returns `202 Accepted`.
+
+Example:
+
+```json
+{
+  "from_agent_id": "agent-1",
+  "to_agent_id": "agent-2",
+  "subject": "research-result",
+  "payload": {
+    "summary": "Three candidate approaches",
+    "winner": "option-b"
+  }
+}
+```
+
+`GET /v1/agents/{agent_id}/mailbox` returns the currently queued mailbox messages without draining them. Agent-side mailbox processing drains messages through the runtime control path; this HTTP inspection endpoint is safe to repeat during debugging.
+
+- it returns the currently queued mailbox messages
+- repeat reads can return the same messages until an agent/runtime path consumes them
+
+## Evidence Note
+
+- Code verified: `crates/kheish-daemon/src/api/handlers.rs`, `crates/kheish-daemon/src/main.rs`, `crates/kheish-daemon/src/control_tools.rs`, `crates/kheish-daemon/src/control_tools/tasks.rs`, `crates/kheish-daemon/src/services/task.rs`, `crates/kheish-daemon/src/state/subagent_spawn.rs`, `crates/kheish-daemon/src/state/session_state.rs`, `crates/kheish-types/src/model.rs`, `crates/kheish-agent/src/supervisor.rs`.
+- CLI/API verified: task output semantics checked against `TaskOutputView`; mailbox endpoint checked against HTTP handler and supervisor peek behavior.
+- Daemon live tested for this note: no; deterministic service tests cover failed-task output retrieval.
+- Provider-specific tested for this note: no; task output retrieval is daemon-local.

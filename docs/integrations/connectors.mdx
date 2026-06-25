@@ -1,0 +1,81 @@
+---
+title: Connectors
+description: Daemon-managed ingress connectors for HTTP, Slack, Telegram, and external sidecars.
+---
+
+# Connectors
+
+Connectors are daemon-managed transport resources for ingress and, when applicable, reply routing.
+
+They let external systems inject work into the daemon through daemon-managed ingress paths without copying transport config or secrets into each session.
+
+If you want the first real external-ingress success rather than the full model first, start with [Send one webhook event into Kheish](./webhook-quickstart).
+
+## Supported connectors
+
+Kheish currently supports:
+
+- generic HTTP webhook ingress, with HTTP reply routing available through output plugins
+- Slack webhook ingress plus Slack Web API output delivery
+- Telegram webhook or polling ingress plus Telegram Bot API output delivery
+- external connectors backed by user-authored or daemon-managed sidecars
+
+## Runtime-managed versus file-backed
+
+Connectors can come from two sources:
+
+- file-backed configuration loaded at startup
+- daemon-managed runtime connectors created through the runtime control plane
+
+Both sources feed the same resolved runtime registry. File-backed connectors remain inspectable but are immutable through the runtime CRUD surface.
+
+External connectors can additionally run in two modes:
+
+- `remote_http`: the daemon talks to one sidecar managed outside the process
+- `child_process`: the daemon launches and supervises the sidecar itself
+
+## Session derivation
+
+Connectors can either use a fixed session identifier or derive one from incoming request or conversation identity. This allows Kheish to map repeated external traffic back to one durable session.
+
+External connectors can derive sessions from either:
+
+- `thread.path`
+- `routing_key`
+- or `fixed_session_id`
+
+If you want several connectors to feed the same durable session on purpose, read [Multiple input connectors in one session](./multi-input-sessions).
+
+## Binding keys and reply targets
+
+Connectors can attach:
+
+- binding keys that help correlate external conversations
+- default reply targets for downstream output routing
+- self-output behavior so replies naturally route back to the originating conversation
+
+Connector-derived reply targets are session and run inputs to the normal output pipeline. They are not a separate delivery subsystem.
+
+## Telegram polling
+
+Telegram supports both webhook and polling ingress modes. Polling is daemon-managed and persists its cursor so consumed updates are not replayed after restart.
+
+## Connector secrets
+
+Daemon-managed connectors can resolve secrets from:
+
+- one write-only inline value at create or update time
+- one environment variable reference
+- one daemon secret-store reference
+
+Read APIs return redacted secret metadata rather than the raw secret values.
+
+Child-process external connectors can also fetch secret-backed platform credentials from the daemon at startup through `credential_slots`, without inheriting the daemon's full environment.
+
+Those `credential_slots` are now brokered. The child sidecar receives an opaque short-lived credential token and can only fetch the specific env-key secrets named in its connector config. It does not receive the daemon's root connector secrets as ambient environment variables.
+
+## Operational guidance
+
+Connectors are part of the deployment boundary, not just an app integration. Validate their authentication, session derivation, and reply routing behavior on a real daemon before relying on them in production.
+
+Read [Connectors and reply targets](../concepts/connectors-and-reply-targets), [Connectors API](../reference/connectors-api), [External connectors protocol](../reference/external-connectors-protocol), and [Connector configuration](../reference/connector-configuration) for the exact control-plane and file-backed models.

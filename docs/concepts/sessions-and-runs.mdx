@@ -1,0 +1,151 @@
+---
+title: Sessions and runs
+description: Durable sessions, queued runs, and the separation between conversation state and concrete execution.
+---
+
+# Sessions and runs
+
+Sessions and runs are the core execution boundary in Kheish.
+
+## Sessions
+
+A session is a durable conversation and control context. It owns:
+
+- the conversation identifier and optional thread identifier
+- the append-only session journal
+- checkpoints and metadata used for restore
+- session-scoped control state such as tasks, bindings, reply targets, and active inline skills
+- an optional bound persona snapshot captured from one daemon-managed persona record
+- an optional persisted session capability scope that can further restrict skills and MCP visibility
+- an optional persisted session credential scope that can further restrict routes, connector credentials, and credentialed MCP usage
+- an optional persisted route policy used as the default for future runs in that session
+- the primary agent mapping and any session-scoped sidechain state related to that session
+
+Sessions are designed to survive restarts. The daemon restores them from persisted records rather than relying on caller memory.
+
+## Runs
+
+A run is one concrete execution request associated with a session. Runs are created for:
+
+- direct input submitted through the CLI or HTTP API
+- channel-driven public turns
+- scheduled inputs
+- approval resumes
+- user-question resumes
+- mailbox-driven execution
+- parent clarification flows
+
+Each run has its own lifecycle and status independent of the client that submitted it.
+
+Channel-driven public turns are still normal session runs. The shared public conversation itself lives in the channel resource, not in the session journal. Read [Channels and public conversations](./channels-and-public-conversations) for that model.
+
+Project-task start is also still a normal session run. The project owns assignment, dependencies, and optional public discussion state, but the actual execution still happens inside the assignee session. Read [Projects and project tasks](./projects-and-project-tasks) for that coordination layer.
+
+Flow start is also still a normal session run. A Flow records the Playbook version and correlation metadata around the run, but the run remains the concrete execution source of truth. Read [Playbooks and flows](./playbooks-and-flows) for that projection layer.
+
+## Input payloads
+
+Runs can be created from plain text or from multimodal input that references daemon-owned assets.
+
+The daemon supports two request shapes:
+
+- compatibility `content` plus `attachments`
+- ordered `input_items` for interleaving text and files
+
+In both cases the session journal keeps normalized asset references rather than relying on caller-local paths. Read [Assets and multimodal input](./assets-and-multimodal-input) for the exact model.
+
+## Why the split matters
+
+Separating sessions from runs gives Kheish several important properties:
+
+- the same session can accumulate many runs over time
+- callers can submit work asynchronously and inspect it later
+- run-scoped route and model selection does not mutate the daemon globally
+- a session can keep one stable persona snapshot across later runs without following later persona edits automatically
+- a session can narrow the daemon-global skill and MCP inventory without changing the daemon itself
+- sessions can carry a default route policy without forcing every run to repeat the same override
+- approvals and questions can resume the exact suspended run instead of starting a new one blindly
+
+## Run-derived recovery
+
+Terminal runs can also seed a compact recovered-memory layer for later runs in the same session.
+
+This is daemon-owned derived state, not an extra user-authored note stream. The daemon stores sanitized compact summaries from terminal runs and can inject a bounded, policy-controlled subset of them back into later prompts for the same session. Read [Recovered run memory](./recovered-run-memory) for the exact storage, ranking, retention, and budgeting rules.
+
+## Run-scoped routing
+
+Route and model selection are pinned when a run is created. Effective route precedence is:
+
+1. explicit run override
+2. persisted session route policy
+3. daemon default route
+
+If daemon defaults change later, an active or queued run does not drift to a different route unexpectedly.
+
+On a named-route daemon, the stored route policy keeps the configured route id, not only the technical provider family.
+
+## Session reply-target defaults
+
+Sessions can also carry durable reply-target defaults.
+
+Those defaults are prospective:
+
+- future session inputs can snapshot them into new runs
+- future daemon-owned output can fall back to them
+- future background shell tasks created after the change can snapshot them
+- future schedule fires can observe them when the stored schedule request does not already carry explicit reply routing
+
+They are not retroactive:
+
+- an active or queued run keeps the reply targets it already captured
+- a suspended run waiting for approval or structured user input keeps its in-flight reply state
+- an already created background shell task keeps the reply targets it already captured
+- an already materialized run created from a schedule fire keeps the reply targets it already captured
+
+Kheish therefore treats session reply-target mutation as a way to change the session's future delivery defaults, not as a live rewrite of in-flight work.
+
+## Waiting states
+
+Runs can pause in the middle of execution. The most important waiting states are:
+
+- waiting for approval
+- waiting for structured user input
+- queued behind another active run in the same session
+
+The daemon keeps enough state to resume these runs without reconstructing them from caller context.
+
+## Session persona bindings
+
+Kheish treats personas as a two-layer model:
+
+- the daemon stores mutable persona records
+- each session stores an optional immutable persona snapshot copied from one persona record
+
+That means:
+
+- persona changes are session-scoped, not run-scoped
+- existing sessions do not follow later persona updates automatically
+- binding or clearing a session persona is restricted to sessions that are idle for topology mutation
+- sidechains inherit the parent session's current persona snapshot when they are spawned
+
+Sessions can also carry one persisted capability scope override. The runtime derives an `effective_capability_scope` by intersecting:
+
+- the persona binding baseline, if one exists
+- the session-local capability scope override
+
+That effective scope controls:
+
+- which skills are visible and usable
+- which MCP servers, tools, and helper tools are visible
+
+Read [Personas](./personas) for the full record-versus-binding model and the authoring workflow.
+
+Sessions can also carry one persisted credential scope override. That scope gates:
+
+- which daemon routes may resolve credentials
+- which connector secrets may be used
+- which credentialed MCP servers may actually execute
+
+Sidechains inherit both the effective capability boundary and the effective credential boundary from the parent, then optionally narrow them further.
+
+Read [MCP](../runtime/mcp), [Skills](../runtime/skills), and [Security and auth](../operators/security-and-auth) for the filtered runtime and auth surfaces those scopes produce.

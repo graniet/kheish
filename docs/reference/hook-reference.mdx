@@ -1,0 +1,97 @@
+---
+title: Hook reference
+description: Hook events, executor types, and the data model used by daemon-configured hooks.
+---
+
+# Hook reference
+
+This page summarizes the hook events and executor types supported by Kheish.
+
+## Contract version
+
+Hook invocations use wire contract `contract_version: 1`. The daemon includes this value and a stable `invocation_key` in the JSON payload sent to command and HTTP executors. Prompt and agent executors can receive the same payload by including `{{invocation_json}}` in their template. In-process callback executors are already compiled against the typed `HookInvocation` Rust contract and do not receive the wire wrapper.
+
+Hook outcomes may include `contract_version`. Outcomes with a future version are rejected so an older daemon does not silently misread a newer hook contract.
+
+Persisted hook settings are stored as schema version `1`. The daemon still reads legacy flat `{"hooks": ...}` files for recovery and migration, then writes the versioned envelope on the next successful save.
+
+## Hook events
+
+Important hook event families include:
+
+- tool lifecycle: `pre_tool_use`, `post_tool_use`, `post_tool_use_failure`
+- permission lifecycle: `permission_request`, `permission_denied`
+- session lifecycle: `setup`, `session_start`, `session_end`, `user_prompt_submit`, `stop`, `stop_failure`
+- subagent lifecycle: `subagent_start`, `subagent_stop`, `teammate_idle`
+- task lifecycle: `task_created`, `task_completed`
+- compaction: `pre_compact`, `post_compact`
+- file and runtime changes: `file_changed`, `cwd_changed`, `instructions_loaded`, `config_change`
+- auxiliary events: `elicitation`, `elicitation_result`, `notification`, `worktree_create`, `worktree_remove`
+
+## Executor types
+
+Kheish supports these hook executors:
+
+- `command`
+- `http`
+- `prompt`
+- `agent`
+- `callback`
+
+Runtime hook updates are validated before they are persisted. Invalid hook definitions do not create a runtime-config revision. The daemon rejects empty hook names, empty commands/templates/callback names, zero or excessive timeouts, `agent.max_turns = 0`, excessive retries, and unsafe HTTP targets.
+
+## Hook outcome model
+
+Hook handlers can return structured effects such as:
+
+- `continue_execution`
+- `stop_reason`
+- `decision`
+- `permission`
+- `updated_input`
+- `updated_output`
+- `updated_permissions`
+- `additional_contexts`
+- `initial_user_message`
+- `watch_paths`
+- `retry`
+
+Not every event consumes every effect. Blocking effects are enforced by policy events such as `setup`, `session_start`, `user_prompt_submit`, `instructions_loaded`, `stop`, `config_change`, `pre_compact`, `permission_request`, and subagent/worktree start hooks. Blocking policy hooks run in declaration order and stop dispatching later hooks after a block or fail-closed outcome, so a guard hook cannot be bypassed by a later side-effecting hook. `permission_denied` remains an aggregation event for retry/context outcomes and does not short-circuit later hooks. Observer-style events may record hook failures and context without changing the triggering action.
+
+## Failure policy
+
+Each hook can define:
+
+```json
+{
+  "failure_policy": {
+    "mode": "open",
+    "max_retries": 1
+  }
+}
+```
+
+`mode: "open"` records the failure and lets the triggering action continue. `mode: "closed"` records the failure and returns a blocking outcome after retries are exhausted. Retries are capped by the daemon and share the configured hook timeout as a total budget, including backoff. HTTP transport failures, timeouts, `429`, `408`, and `5xx` are retryable; HTTP `Retry-After` is honored within a daemon cap. Redirects, unsafe targets, malformed outcomes, and non-retryable `4xx` responses are terminal and go straight to the configured failure policy.
+
+Failed hook executions are written to the hook dead-letter store under the daemon state root. The store is pruned by count and total bytes so repeated hook failures cannot grow daemon state without bound. The status snapshot exposes `status.hooks.dead_lettered_count`, `status.hooks.unresolved_dead_lettered_count`, last dead-letter metadata, retry/failure counters, and dead-letter persistence failures. Health warnings are based on unresolved records. Operators can inspect the latest redacted records through the admin-only `GET /v1/runtime/hooks/dead-letter` and close the incident loop with `POST /v1/runtime/hooks/dead-letter/{id}/resolve`.
+
+Dead-letter records store redacted errors, safe targets, attempt counts, failure mode, contract version, and invocation/definition digests. They do not store raw command bodies, full HTTP URLs, or full invocation payloads, and older records are redacted again when served through the API. Resolving a record appends a redacted resolution ledger entry; it does not delete or rewrite the original failure evidence. Hook dead letters are not replayed automatically because many hooks mutate policy or call external systems and are not safe to repeat without operator-specific context.
+
+If a hook task panics or is cancelled inside the daemon, the same failure policy is applied: fail-open hooks are recorded and skipped, while fail-closed hooks produce a blocking outcome. Persisted runtime hook settings that are invalid for the current daemon build are not activated on startup; the daemon disables hooks so operators can recover through the runtime API.
+
+Command hooks run in a dedicated process group on Unix. When a command hook times out, the daemon terminates the group before recording the failure so descendants do not keep running after the hook budget is exhausted.
+
+## HTTP hardening
+
+HTTP hooks are intended for public, explicit integration endpoints. The daemon:
+
+- allows only `http` and `https`
+- rejects userinfo, `localhost`, `.localhost`, private/local/link-local/documentation/benchmark/reserved IP ranges, IPv4-mapped or compatible blocked addresses, NAT64, 6to4, Teredo, and documentation IPv6 ranges
+- resolves hostnames before execution and pins the request to the validated addresses
+- disables proxies and redirects
+- applies a bounded total timeout and response-size cap
+- sends a stable `Idempotency-Key` header
+
+## Operational guidance
+
+Prefer a small number of well-scoped hooks over a large number of overlapping handlers. Hooks are powerful enough to change runtime policy, mutate execution, and alter observability.

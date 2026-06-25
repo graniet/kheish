@@ -1,0 +1,82 @@
+---
+title: Start Here
+description: Understand what runs where in the Kheish ecosystem and pick the shortest path to your first real success.
+---
+
+# Start Here
+
+Kheish is easiest to understand when you treat the daemon as the center of the system.
+
+The daemon owns durable state, runs, approvals, tasks, assets, routing, and ingress. Everything else talks to it.
+
+This repository contains the daemon and its docs.
+
+The SDK, connectors, and capture runtime are separate packages or sibling repositories around that daemon.
+
+## What runs where
+
+- **`kheish-daemon`** runs the control plane, session journal, run execution, approvals, tasks, assets, channels, projects, observations, and routing.
+- **`kheish-daemon`** also includes built-in connector support for daemon-managed ingress such as HTTP, Slack, and Telegram.
+- **`kheish-sdk`** is the thin client layer for application code. It speaks to the daemon over the control-plane API.
+- **`kheish-connectors`** is the sidecar companion for external connectors. Use it when you want connector logic that lives outside the daemon binary.
+- **`kheish-capture`** is the host-local capture runtime. It pushes observations into daemon-owned observation sources so they can be listed or materialized later.
+
+The daemon is the prerequisite for everything else.
+
+## Choose your first path
+
+If you are new to Kheish, use this order:
+
+1. [Run Kheish](./quickstart) to get one working daemon, one session, and one completed run.
+2. Then choose the next lane that matches your goal:
+   - [Running the daemon](../operators/running-the-daemon), [Docker and containers](../operators/docker-and-containers), and [Security and auth](../operators/security-and-auth) if you are operating a real instance
+   - [Use Kheish from Python](./python-sdk-quickstart) if you are integrating from application code
+   - [Send one webhook event into Kheish](../integrations/webhook-quickstart) if you want the first external ingress path
+   - [Capture one observation](../integrations/capture-quickstart) later, when you want host-local observation ingestion
+
+## Before you start
+
+- Work from a fresh daemon when you want deterministic validation. Reusing stale state roots is a common source of confusion.
+- Keep one provider credential available in your shell before the first run. The examples below use OpenAI plus `gpt-5.4`.
+- Prefer one fresh session per quickstart lane so you can tell which run belongs to which example.
+- Treat the daemon CLI and HTTP API as ground truth. The daemon owns the state model; the surrounding repos are clients and producers.
+
+If you keep credentials in a repository-local `.env`, load them before the daemon quickstart:
+
+```bash
+set -a
+source .env
+set +a
+```
+
+## What each quickstart proves
+
+- **Run Kheish** proves the runtime is up, can accept input, and can complete a real model-backed run.
+- **Use Kheish from Python** proves application code can create runs against the same daemon.
+- **Send one webhook event into Kheish** proves external ingress can materialize work into a durable session.
+- **Capture one observation** proves host-local capture can provision a daemon observation source and upload media into it.
+
+## Minimal first-run CLI surface
+
+For the very first daemon success, you only need:
+
+- `serve`
+- `runtime get`
+- `sessions create`
+- `sessions input --wait`
+
+If a run pauses instead of completing, then inspect:
+
+- `approvals list`
+- `tasks list`
+- `runs get`
+
+## When to leave the quickstarts
+
+After the first successful run, read:
+
+- [Overview](./overview) for the product model
+- [Sessions and runs](../concepts/sessions-and-runs) for the daemon execution model
+- [Approvals and questions](../concepts/approvals-and-questions) for blocked and resumable workflows
+- [Providers and routing](../runtime/providers-and-routing) for route selection and credentials
+- [Running the daemon](../operators/running-the-daemon) and [Security and auth](../operators/security-and-auth) before exposing the control plane beyond localhost

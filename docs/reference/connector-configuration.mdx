@@ -1,0 +1,207 @@
+---
+title: Connector configuration
+description: TOML structure and field-level guidance for HTTP, Slack, Telegram, and external connectors.
+---
+
+# Connector configuration
+
+Connector settings can come from two places:
+
+- a TOML file passed to `--connectors-config`
+- the daemon-managed runtime connector store
+
+This page covers the shared connector config model and the file-backed TOML shape.
+
+## Top-level structure
+
+```toml
+[[http_connectors]]
+name = "webhook"
+
+[[slack_connectors]]
+name = "support"
+
+[[telegram_connectors]]
+name = "bot"
+
+[[external_connectors]]
+name = "discord-main"
+```
+
+## HTTP connectors
+
+HTTP connectors support:
+
+- `name`
+- `fixed_session_id`
+- `actor_id`
+- `bearer_token`, `bearer_token_env`, or `bearer_token_secret_ref`
+- `allow_unauthenticated_ingress`
+- `hmac_secret`, `hmac_secret_env`, or `hmac_secret_secret_ref`
+- `require_hmac_signature`
+- `signature_max_age_secs`
+- `require_idempotency_key`
+- `ingress_events_per_second`
+- `default_reply_targets`
+- `default_binding_keys`
+- `session_policy`
+
+They are intended for generic webhook ingress and can derive fallback sessions from binding keys when needed. By default, accepted ingress payloads must include `idempotency_key`; if HMAC is enabled, clients sign the raw body with `X-Kheish-Timestamp` and `X-Kheish-Signature`, where the timestamp is Unix seconds. HMAC-only connectors count as authenticated, but HMAC requires idempotency to stay enabled. HMAC signatures must use the strict `v1=<64 hex>` form and duplicate timestamp/signature headers are rejected. Unauthenticated connectors do not accept payload-chosen `session_id`, payload `binding_keys`, payload reply targets, or asset/board payloads; use bearer or HMAC auth for those capabilities. Payload metadata cannot set daemon-owned ingress keys such as `connector_ingress_key` or `http_ingress_*`. Daemon-configured `default_binding_keys` are still allowed for public connectors because the caller cannot choose them. Accepted idempotent requests persist hashed `connector_ingress_key` / `http_ingress_key` plus HTTP-specific fingerprint metadata, and the connector-ingress receipt shard stores the same payload fingerprint for restart recovery and duplicate-payload conflict checks without storing the raw idempotency key. HTTP ingress rate limits are checked before idempotency receipt reservation for absent keys, so rejected requests cannot strand pending receipts. HTTP output reply routes reject secret-bearing, invalid, hop-by-hop, body-owned, proxy-forwarding, and idempotency-owned headers, send a stable daemon-owned `Idempotency-Key` header, honor numeric or HTTP-date downstream `Retry-After`, block private/local DNS results before delivery, and ignore proxy environment variables.
+
+## Slack connectors
+
+Slack connectors support:
+
+- `name`
+- `bot_token`, `bot_token_env`, or `bot_token_secret_ref`
+- `signing_secret`, `signing_secret_env`, or `signing_secret_secret_ref`
+- `allow_unauthenticated_ingress`
+- `api_base_url`
+- `fixed_session_id`
+- `include_self_output`
+- `additional_reply_targets`
+- `additional_binding_keys`
+- `session_policy`
+- `ingress_events_per_second`
+- `allowed_api_app_ids`
+- `allowed_enterprise_ids`
+- `allowed_team_ids`
+- `allowed_channel_ids`
+- `allowed_file_hosts`
+- `team_bot_tokens`
+
+Slack sessions can be derived from channel and thread context when a fixed session ID is not configured. Enterprise Grid payloads include enterprise/team scope in the derived session and reply route. File downloads require authenticated ingress and are limited to Slack file hosts, the configured API host, or explicit HTTPS `allowed_file_hosts`.
+Slack reply targets are validated when they are persisted on sessions as well as when they are delivered: `allowed_enterprise_ids`, `allowed_team_ids`, and `allowed_channel_ids` reject out-of-policy targets before they can become dead-lettered output work. Events API payloads also validate every `authorizations[]` enterprise/team entry against the same allowlists, not only the context team selected for the derived session.
+Slack ingress has a per connector/team/channel token bucket through `ingress_events_per_second`; rejected callbacks return HTTP `429` with `Retry-After`. Slack `app_rate_limited` Events API callbacks are authenticated and allowlist-checked, then acknowledged without creating a daemon run.
+Slack Web API `429` responses with `Retry-After`, and JSON `ok=false,error=ratelimited` responses without a header, are mapped to durable retry-after delivery failures.
+
+## Telegram connectors
+
+Telegram connectors support:
+
+- `name`
+- `bot_token`, `bot_token_env`, or `bot_token_secret_ref`
+- `secret_token`, `secret_token_env`, or `secret_token_secret_ref`
+- `allow_unauthenticated_ingress`
+- `api_base_url`
+- `ingress_mode`
+- `polling_timeout_seconds`
+- `ingress_events_per_second`
+- `allowed_chat_ids`
+- `fixed_session_id`
+- `include_self_output`
+- `additional_reply_targets`
+- `additional_binding_keys`
+- `session_policy`
+
+`ingress_mode` can be `webhook` or `polling`. Polling requires a bot token. Webhook requests are accepted only for webhook-mode connectors and must include `update_id` for idempotency/recovery. Polling and webhook ingress handle normal messages, edited messages, and callback queries; unsupported authenticated webhook update types are acknowledged as skipped so Telegram does not retry them as daemon failures. Duplicate `update_id` submissions return the existing run only when the payload fingerprint matches; different-payload replays fail with `409`. New Telegram updates are rate-limited by `ingress_events_per_second` after idempotency dedupe and before Bot API `getFile` or media download work, so duplicate `update_id` submissions do not consume the bucket. Callback queries are acknowledged through the Bot API only after validation and durable run submission when a bot token is configured, and duplicate callback `update_id` submissions return the existing run without another acknowledgement. `allowed_chat_ids` is optional and, when non-empty, restricts both inbound chats and outbound reply targets; it is also projected in connector views for operator audit. `api_base_url` must be an absolute HTTP(S) URL without userinfo, query, or fragment. Telegram Bot API and media clients ignore proxy environment variables, do not follow redirects, and redact bot-token-bearing URLs in errors. Telegram output chunks long text into 4096-character messages, persists per-delivery chunk/attachment progress, and respects capped Bot API flood-wait `retry_after` values.
+
+## External connectors
+
+External connectors support:
+
+- `name`
+- `platform`
+- `mode`
+- `base_url`
+- `allow_private_network`
+- `shared_token`, `shared_token_env`, or `shared_token_secret_ref`
+- `allow_unauthenticated_ingress`
+- `fixed_session_id`
+- `include_self_output`
+- `additional_reply_targets`
+- `additional_binding_keys`
+- `session_policy`
+- `ingress_events_per_second`
+- `child_process`
+
+`mode` can be:
+
+- `remote_http`
+- `child_process`
+
+`child_process` supports:
+
+- `command`
+- `args`
+- `env`
+- `credential_slots`
+- `working_dir`
+
+Example:
+
+```toml
+[[external_connectors]]
+name = "discord-main"
+platform = "discord"
+mode = "child_process"
+base_url = "http://127.0.0.1:8787"
+shared_token_secret_ref = "connectors.external.discord-main.shared_token"
+include_self_output = true
+ingress_events_per_second = 100
+
+[external_connectors.session_policy]
+create_if_missing = true
+credential_scope.route_allow = ["openai"]
+
+[external_connectors.child_process]
+command = "python3"
+args = ["connectors/python/run_connector.py", "discord"]
+
+[external_connectors.child_process.env]
+DISCORD_REQUIRE_MENTION = "true"
+
+[external_connectors.child_process.credential_slots]
+DISCORD_BOT_TOKEN = "connectors.external.discord-main.bot_token"
+```
+
+Guidance:
+
+- use `fixed_session_id` when every inbound event should land in one known session
+- otherwise let the sidecar derive sessions from `thread.path` or `routing_key`
+- use `credential_slots` when the sidecar needs platform secrets without inheriting the daemon environment; the daemon serves those slots through short-lived brokered leases rather than long-lived env injection
+- child-process stdin/stdout/stderr are not inherited by the daemon, spawn/readiness/exit failures retry with backoff, and Unix shutdown signals the sidecar process group
+- every `credential_slots` secret ref must already exist as a non-empty generic secret when the connector config is resolved; startup and `put-external` fail closed when a slot is missing, empty, or points at a provider credential
+- each credential lease is bound to the connector name, env key, and concrete `secret_ref`; remapping `DISCORD_BOT_TOKEN` to a different slot makes the old lease unusable for the new secret
+- keep `remote_http` `base_url` values on public HTTP(S) targets by default; `allow_private_network=true` is an explicit local/trusted-sidecar opt-in
+- keep `base_url` loopback-only for `child_process` connectors
+- do not put credentials in `base_url`; URL userinfo and empty `shared_token` values are rejected
+- expect daemon runtime and delivery clients to ignore proxy environment variables, reject redirects, revalidate DNS answers, and pin validated addresses for each request
+- new external events are rate-limited before the daemon writes a durable ingress reservation; duplicate or pending event ids are resolved through the existing receipt path without consuming another rate-limit token
+- external ingress receipts store hashed event ids plus payload fingerprints, while run metadata exposes `external_event_key_sha256` and `external_event_fingerprint` for operator inspection
+- runtime manifests are cached briefly and revalidated instead of being trusted indefinitely
+- sidecar delivery should return `committed` only with a 2xx HTTP status; retryable/terminal failures should use the matching status value
+- delivery is at-least-once, so sidecars should deduplicate by `delivery_id` or `Idempotency-Key`
+
+## Secret-source precedence
+
+For each connector secret field, the runtime resolves sources in this order:
+
+1. secret-store reference
+2. environment variable reference
+3. inline value
+
+For daemon-managed connectors, the runtime control plane can also accept a write-only secret `value`, store it into the secret store, and keep the connector bound to the resulting `secret_ref`.
+
+## Runtime-managed connectors
+
+Daemon-managed connectors use the same underlying config fields as file-backed connectors, but they are persisted under the daemon state root instead of one external TOML file.
+
+`session_policy` supports:
+
+- `create_if_missing`
+- `persona_id`
+- `capability_scope`
+- `credential_scope`
+
+Use the runtime connector API when you want to:
+
+- create or replace one connector through HTTP or CLI
+- rotate a connector secret through the secret store
+- inspect the currently active connector inventory without reading files directly
+
+For external connectors, also read [External connectors protocol](./external-connectors-protocol) for the ingress and delivery contract.
+
+## Reply routing
+
+Connector configuration is not only about ingress. It also shapes output routing through self-output behavior and additional reply targets, which are turned into normalized reply handles for the output pipeline.

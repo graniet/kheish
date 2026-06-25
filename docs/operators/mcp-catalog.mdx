@@ -1,0 +1,588 @@
+---
+title: MCP catalog
+description: Enable built-in MCP profiles and validate them on a real daemon.
+---
+
+# MCP catalog
+
+Kheish ships a built-in MCP catalog for common operator surfaces such as documentation, repository context, planning, browser UI checks, observability, data development, deployment, and business tools.
+
+The catalog has two jobs:
+
+- discovery: show common MCP servers, their auth shape, risk class, profile, and secret-store slots
+- startup: start only entries that Kheish marks as `supported`
+
+The catalog is not auto-enabled. Start only the profiles you need:
+
+```bash
+./target/debug/kheish-daemon serve \
+  --bind 127.0.0.1:4000 \
+  --state-root .kheish-daemon-mcp-test \
+  --workspace-root .kheish-workspace-mcp-test \
+  --mcp-profile docs
+```
+
+Multiple profiles can be selected:
+
+```bash
+./target/debug/kheish-daemon serve \
+  --mcp-profile docs \
+  --mcp-profile repo
+```
+
+or:
+
+```bash
+KHEISH_MCP_PROFILES=docs,repo ./target/debug/kheish-daemon serve
+```
+
+## Inspect the catalog
+
+These commands are local CLI commands. They do not require a running daemon:
+
+```bash
+./target/debug/kheish-daemon mcp profiles list
+./target/debug/kheish-daemon mcp profiles get docs
+./target/debug/kheish-daemon mcp catalog list
+./target/debug/kheish-daemon mcp catalog list --profile repo
+./target/debug/kheish-daemon mcp catalog list --supported-only
+./target/debug/kheish-daemon mcp catalog get github
+```
+
+The important fields are:
+
+- `status`: `supported` means Kheish can start the server directly from a selected profile; `catalog_only` means the entry is documented but not started by built-in profiles yet.
+- `risk`: coarse operator risk classification.
+- `auth`: the expected auth shape.
+- `credential_env`: conventional environment variable names used by the upstream server or token.
+- `credential_secret_refs`: daemon secret-store refs. For `supported` entries, Kheish reads these refs during built-in profile startup. For `catalog_only` entries, they are wiring hints you can reuse from explicit MCP config.
+- `profiles`: built-in profiles that include the entry.
+
+## Profiles
+
+The built-in profiles are intentionally narrow:
+
+- `docs`: read-only documentation servers such as OpenAI Docs, Microsoft Learn, and Cloudflare docs.
+- `repo`: repository and source-control context such as GitHub and GitLab.
+- `planning`: planning systems such as Linear.
+- `knowledge`: knowledge-base systems.
+- `communication`: team communication systems.
+- `browser-ui`: browser automation and UI inspection.
+- `observability`: issue, event, log, and monitoring context.
+- `data-dev`: development data-plane tools.
+- `deploy-infra`: deployment and cloud infrastructure surfaces.
+- `business`: billing, payment, and design surfaces.
+
+Some profiles currently contain only `catalog_only` entries. Before enabling a profile, check what Kheish can start directly:
+
+```bash
+./target/debug/kheish-daemon mcp catalog list --profile knowledge --supported-only
+```
+
+Starting a profile with no supported entries fails clearly instead of silently enabling an empty MCP inventory.
+
+Do not use a broad profile as a shortcut for every session. Select the daemon inventory you need, then narrow model-visible MCP tools with persona or session capability scopes when the workload only needs part of that inventory.
+
+For large agent fan-out, keep MCP inventory daemon-level and narrow the model-visible tools per persona or session. One daemon MCP server is not multiplied per agent; the scaling pressure is the total server/tool inventory loaded into the daemon and exposed into prompts. For 50x-100x agent workloads, validate the profile count and `runtime.mcp.tool_names` size before rollout, and avoid enabling write-capable profiles globally when only a small role needs them.
+
+## Built-in entries
+
+Current built-in entries include:
+
+| Profile | Supported entries | Catalog-only entries |
+| --- | --- | --- |
+| `docs` | OpenAI Docs, Microsoft Learn, Cloudflare Docs, Cloudflare Agents SDK Docs | none |
+| `repo` | GitLab | GitHub |
+| `planning` | Linear | Atlassian Rovo |
+| `knowledge` | none | Notion, Atlassian Rovo |
+| `communication` | none | Slack |
+| `browser-ui` | none | Playwright |
+| `observability` | none | Sentry |
+| `data-dev` | Neon | none |
+| `deploy-infra` | Cloudflare Docs, Cloudflare Agents SDK Docs, Cloudflare API | Vercel |
+| `business` | Stripe | Figma |
+
+`supported` means Kheish can start the entry directly from `--mcp-profile`. `catalog_only` means the entry is visible for planning and secret-slot discovery, but you must provide explicit MCP config before Kheish starts it.
+
+`mcp profiles get <profile>` can show both supported and catalog-only entries. Profile expansion starts only supported entries; manual-config-required entries such as GitHub stay visible in catalog/profile metadata but are skipped until you provide explicit `--mcp-config`.
+
+Common reasons for `catalog_only` are:
+
+- the upstream server depends on vendor OAuth that has not passed Kheish's true-binary promotion gate
+- the upstream server is a local stdio command distributed as a mutable executable or container image, so the operator should own the exact command and version
+
+## GitHub and Linear quick answer
+
+- Linear is a supported built-in HTTP MCP entry. Use `--mcp-profile planning`, but store `mcp.linear.LINEAR_API_KEY` first for useful account-backed Linear access. Without that token, the daemon can attempt startup but Linear returns `Auth required`.
+- GitHub is usable today, but it is manual-config-required. `--mcp-profile repo` does not start GitHub yet; store `mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN`, then provide an explicit Docker stdio MCP config with `--mcp-config`.
+
+## Connection matrix
+
+Use this matrix to decide how a user connects each built-in entry.
+
+| Entry | Profile | Status | Auth | How to connect |
+| --- | --- | --- | --- | --- |
+| `openai-docs` | `docs` | `supported` | none | Start `--mcp-profile docs`. No token. |
+| `microsoft-learn` | `docs` | `supported` | none | Start `--mcp-profile docs`. No token. |
+| `cloudflare-docs` | `docs`, `deploy-infra` | `supported` | none | Start `--mcp-profile docs` or `--mcp-profile deploy-infra`. No token. |
+| `cloudflare-agents-docs` | `docs`, `deploy-infra` | `supported` | none | Start `--mcp-profile docs` or `--mcp-profile deploy-infra`. No token. |
+| `github` | `repo` | `catalog_only` | bearer | Store `mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN`, then use explicit stdio Docker config. |
+| `gitlab` | `repo` | `supported` | optional bearer | Start `--mcp-profile repo`; store `mcp.gitlab.GITLAB_TOKEN` when account access is needed. |
+| `linear` | `planning` | `supported` | optional bearer | Store `mcp.linear.LINEAR_API_KEY`, then start `--mcp-profile planning`. Without a token, Linear reports `Auth required`. |
+| `notion` | `knowledge` | `catalog_only` | OAuth | Validate account login only against a vendor endpoint you have confirmed; built-in profiles do not start or expose tools yet. |
+| `atlassian` | `planning`, `knowledge` | `catalog_only` | OAuth | Validate account login only against a vendor endpoint you have confirmed; built-in profiles do not start or expose tools yet. |
+| `slack` | `communication` | `catalog_only` | OAuth client app | Kheish does not create the Slack OAuth app; account login requires upstream app setup and does not promote the entry yet. |
+| `playwright` | `browser-ui` | `catalog_only` | none | Use explicit stdio config for `npx -y @playwright/mcp@latest`, preferably pinned in production. |
+| `sentry` | `observability` | `catalog_only` | bearer | Store `mcp.sentry.SENTRY_ACCESS_TOKEN`, then use explicit stdio config. |
+| `neon` | `data-dev` | `supported` | optional bearer | Start `--mcp-profile data-dev`; store `mcp.neon.NEON_API_KEY` when account access is needed. |
+| `vercel` | `deploy-infra` | `catalog_only` | OAuth | Validate account login only against a vendor endpoint you have confirmed; built-in profiles do not start or expose tools yet. |
+| `cloudflare-api` | `deploy-infra` | `supported` | optional bearer | Start `--mcp-profile deploy-infra`; store `mcp.cloudflare-api.CLOUDFLARE_API_TOKEN` when account access is needed. |
+| `stripe` | `business` | `supported` | optional bearer | Start `--mcp-profile business`; store `mcp.stripe.STRIPE_SECRET_KEY` when account access is needed. Built-in startup currently exposes only `search_stripe_documentation`. |
+| `figma` | `business` | `catalog_only` | OAuth | Validate account login only against a vendor endpoint you have confirmed; built-in profiles do not start or expose tools yet. |
+
+### Supported entries with no auth
+
+These are the simplest entries:
+
+```bash
+./target/debug/kheish-daemon serve \
+  --bind 127.0.0.1:4020 \
+  --state-root .kheish-daemon-docs-mcp \
+  --workspace-root .kheish-workspace-docs-mcp \
+  --mcp-discovery disabled \
+  --mcp-profile docs
+```
+
+Use `docs` for read-only documentation. Use `deploy-infra` only when you also want Cloudflare infrastructure surfaces; that profile includes `cloudflare-api` in addition to Cloudflare documentation servers.
+
+### Supported entries with optional bearer auth
+
+For entries marked `optional_bearer`, the catalog shape supports bearer auth without requiring a token at config-render time. That does not mean every upstream server is useful anonymously. Linear currently requires an authenticated bearer for account-backed operations; without `mcp.linear.LINEAR_API_KEY`, the runtime snapshot reports the Linear server as disconnected with an auth-required error.
+
+The pattern is the same for each supported token entry:
+
+```bash
+export KHEISH_AUTH_STORE_MASTER_KEY="$(./target/debug/kheish-daemon secrets generate)"
+export LINEAR_API_KEY=...
+
+./target/debug/kheish-daemon mcp auth slots linear
+./target/debug/kheish-daemon mcp auth set linear \
+  --from-env LINEAR_API_KEY \
+  --offline \
+  --state-root .kheish-daemon-linear-mcp
+
+./target/debug/kheish-daemon serve \
+  --bind 127.0.0.1:4021 \
+  --state-root .kheish-daemon-linear-mcp \
+  --workspace-root .kheish-workspace-linear-mcp \
+  --mcp-discovery disabled \
+  --mcp-profile planning
+```
+
+Use the matching entry id, environment variable, secret ref, and profile:
+
+| Entry id | Environment variable | Secret ref | Profile |
+| --- | --- | --- | --- |
+| `gitlab` | `GITLAB_TOKEN` | `mcp.gitlab.GITLAB_TOKEN` | `repo` |
+| `linear` | `LINEAR_API_KEY` | `mcp.linear.LINEAR_API_KEY` | `planning` |
+| `neon` | `NEON_API_KEY` | `mcp.neon.NEON_API_KEY` | `data-dev` |
+| `cloudflare-api` | `CLOUDFLARE_API_TOKEN` | `mcp.cloudflare-api.CLOUDFLARE_API_TOKEN` | `deploy-infra` |
+| `stripe` | `STRIPE_SECRET_KEY` | `mcp.stripe.STRIPE_SECRET_KEY` | `business` |
+
+### Getting tokens
+
+- Linear: create a personal API key from [Settings > Account > Security & Access](https://linear.app/settings/account/security). Linear documents the hosted MCP server at [Linear MCP server](https://linear.app/docs/mcp); Kheish's built-in Linear path uses the bearer/API-key route through the daemon secret store.
+- GitHub: create a personal access token at [GitHub personal access tokens](https://github.com/settings/personal-access-tokens/new), and follow GitHub's [personal access token guidance](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens). Grant only the repository, issue, pull request, organization, or package scopes your agents need, and check whether your organization requires token approval.
+
+For built-in profile startup, use the daemon secret store. The daemon path does not read `GITLAB_TOKEN`, `LINEAR_API_KEY`, or similar catalog credential variables directly from its process environment. Environment-backed auth is available for explicit custom config fields such as `bearer_token_env_var`, `env_http_headers`, or local command `env`, but built-in catalog auth should go through `mcp auth set`.
+
+For Stripe, the built-in catalog intentionally narrows the tool surface to `search_stripe_documentation`. If you need broader Stripe account actions, use explicit MCP config with your own `enabled_tools` after reviewing the risk for that daemon.
+
+### Linear example
+
+Use the same shell for the secret import and daemon start, or re-export the same `KHEISH_AUTH_STORE_MASTER_KEY` before starting the daemon.
+
+```bash
+export KHEISH_AUTH_STORE_MASTER_KEY="$(./target/debug/kheish-daemon secrets generate)"
+export LINEAR_API_KEY=...
+
+./target/debug/kheish-daemon mcp auth slots linear
+./target/debug/kheish-daemon mcp auth set linear \
+  --from-env LINEAR_API_KEY \
+  --offline \
+  --state-root .kheish-daemon-linear-mcp
+
+mkdir -p .kheish-workspace-linear-mcp
+
+./target/debug/kheish-daemon serve \
+  --bind 127.0.0.1:4021 \
+  --state-root .kheish-daemon-linear-mcp \
+  --workspace-root .kheish-workspace-linear-mcp \
+  --mcp-discovery disabled \
+  --mcp-profile planning
+```
+
+Verify the runtime snapshot:
+
+```bash
+./target/debug/kheish-daemon --base-url http://127.0.0.1:4021 runtime get \
+  | jq '.mcp.servers[] | select(.server == "linear")'
+```
+
+The Linear server should report `connected: true`, `source: "built_in_catalog"`, and `uses_credentials: true`. If it reports `Auth required`, confirm that the token was stored into the same `--state-root` and that the daemon was started with the same auth-store master key.
+
+### Catalog-only stdio entries
+
+`github`, `sentry`, and `playwright` are catalog-only because Kheish should not silently start mutable local executables or container images from a broad profile. Store any token in Kheish, then own the exact command through `--mcp-config`.
+
+GitHub and Sentry have catalog secret slots:
+
+```bash
+export KHEISH_AUTH_STORE_MASTER_KEY="$(./target/debug/kheish-daemon secrets generate)"
+export GITHUB_PERSONAL_ACCESS_TOKEN=...
+export SENTRY_ACCESS_TOKEN=...
+
+./target/debug/kheish-daemon mcp auth set github \
+  --from-env GITHUB_PERSONAL_ACCESS_TOKEN \
+  --offline \
+  --state-root .kheish-daemon-stdio-mcp
+
+./target/debug/kheish-daemon mcp auth set sentry \
+  --from-env SENTRY_ACCESS_TOKEN \
+  --offline \
+  --state-root .kheish-daemon-stdio-mcp
+```
+
+Then wire the server you want explicitly:
+
+```toml
+# mcp.stdio.toml
+[mcp_servers.github]
+command = "docker"
+args = [
+  "run",
+  "-i",
+  "--rm",
+  "-e",
+  "GITHUB_PERSONAL_ACCESS_TOKEN",
+  "-e",
+  "GITHUB_TOOLSETS",
+  "ghcr.io/github/github-mcp-server"
+]
+env = { GITHUB_TOOLSETS = "context,repos,issues,pull_requests,users" }
+env_secret_refs = { GITHUB_PERSONAL_ACCESS_TOKEN = "mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN" }
+inherit_env = false
+startup_timeout_sec = 60
+tool_timeout_sec = 120
+
+[mcp_servers.sentry]
+command = "npx"
+args = ["-y", "@sentry/mcp-server@latest"]
+env_secret_refs = { SENTRY_ACCESS_TOKEN = "mcp.sentry.SENTRY_ACCESS_TOKEN" }
+inherit_env = false
+startup_timeout_sec = 60
+tool_timeout_sec = 120
+
+[mcp_servers.playwright]
+command = "npx"
+args = ["-y", "@playwright/mcp@latest"]
+inherit_env = false
+startup_timeout_sec = 60
+tool_timeout_sec = 120
+```
+
+For production, pin local binaries, npm packages, or container images to reviewed versions or digests instead of copying the catalog endpoint blindly. The catalog records the upstream default shape; the operator owns the artifact that actually runs.
+
+Start with explicit config:
+
+```bash
+./target/debug/kheish-daemon serve \
+  --bind 127.0.0.1:4022 \
+  --state-root .kheish-daemon-stdio-mcp \
+  --workspace-root .kheish-workspace-stdio-mcp \
+  --mcp-discovery disabled \
+  --mcp-config mcp.stdio.toml
+```
+
+### Catalog-only OAuth entries
+
+`notion`, `atlassian`, `slack`, `vercel`, and `figma` are catalog-only because their catalog auth shape is OAuth or OAuth client app. Kheish has a generic OAuth account flow for spec-compliant HTTP MCP servers, but these vendor entries are not promoted into built-in profiles until their discovery, login, refresh, retry, scope, and tool-use behavior has passed true-binary E2E.
+
+Use these entries as planning metadata until you validate the vendor flow or provide an operator-owned auth path, such as a vendor-supported machine token, a pre-authorized endpoint, or an internal proxy. For OAuth account validation only, start a daemon with `KHEISH_AUTH_STORE_MASTER_KEY` configured, pass the matching `--base-url` when the daemon is not on the default URL, then attempt login against the vendor endpoint you have confirmed. Use `--url` when you are validating a custom endpoint or when you do not want to rely on the catalog URL:
+
+```bash
+./target/debug/kheish-daemon --base-url http://127.0.0.1:4020 mcp oauth login <entry-id> --url https://mcp.vendor.example/mcp
+./target/debug/kheish-daemon --base-url http://127.0.0.1:4020 mcp oauth status <entry-id>
+```
+
+You can reference the stored account from explicit config, but current Kheish will report OAuth-backed servers as fail-closed rather than exposing their tools:
+
+```toml
+[mcp_servers.vendor]
+url = "https://mcp.vendor.example/mcp"
+oauth_slot_ref = "mcp.oauth.vendor"
+oauth_resource = "https://mcp.vendor.example/mcp"
+oauth_scopes = ["read"]
+```
+
+If a vendor endpoint requires a pre-registered client, pass `--client-id` and a secret source such as `--client-secret-env`. Startup remains fail-closed if the server needs OAuth material before Kheish has a scoped execution context; that is expected and is why these entries are not started by built-in profiles.
+
+### Verify every connection
+
+After startup, verify the daemon view instead of trusting that the process launched:
+
+```bash
+./target/debug/kheish-daemon --base-url http://127.0.0.1:4022 runtime get
+```
+
+Check:
+
+- `runtime.mcp.servers[*].connected`
+- `runtime.mcp.servers[*].error`
+- `runtime.mcp.servers[*].source`
+- `runtime.mcp.servers[*].catalog_entry_id` for built-in profile entries
+- `runtime.mcp.tool_names`
+- `runtime.mcp.selected_profiles`
+
+For supported catalog startup, `source` should be `built_in_catalog`. For explicit config, including catalog-only entries, `source` should be `codex_config`.
+
+## GitHub example
+
+GitHub is in the built-in catalog, but it is currently `catalog_only`. That means:
+
+- `mcp catalog get github` shows the expected server, risk, profile, and token slot
+- `mcp auth set github ...` can store the token in the daemon secret store
+- `--mcp-profile repo` does not start GitHub yet
+- to use GitHub today, provide explicit MCP config
+
+The official local [GitHub MCP server](https://github.com/github/github-mcp-server) uses Docker image `ghcr.io/github/github-mcp-server` and reads `GITHUB_PERSONAL_ACCESS_TOKEN`. Create a GitHub token with only the permissions your agents need, then store it in Kheish. The variable `GITHUB_PERSONAL_ACCESS_TOKEN` below is only the local source value; Kheish stores it under `mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN`.
+
+```bash
+export KHEISH_AUTH_STORE_MASTER_KEY="$(./target/debug/kheish-daemon secrets generate)"
+export GITHUB_PERSONAL_ACCESS_TOKEN=...
+
+./target/debug/kheish-daemon mcp auth slots github
+./target/debug/kheish-daemon mcp auth set github \
+  --from-env GITHUB_PERSONAL_ACCESS_TOKEN \
+  --offline \
+  --state-root .kheish-daemon-github-mcp
+```
+
+Then write explicit config:
+
+```bash
+cat > mcp.github.toml <<'TOML'
+[mcp_servers.github]
+command = "docker"
+args = [
+  "run",
+  "-i",
+  "--rm",
+  "-e",
+  "GITHUB_PERSONAL_ACCESS_TOKEN",
+  "-e",
+  "GITHUB_TOOLSETS",
+  "ghcr.io/github/github-mcp-server"
+]
+env = { GITHUB_TOOLSETS = "context,repos,issues,pull_requests,users" }
+env_secret_refs = { GITHUB_PERSONAL_ACCESS_TOKEN = "mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN" }
+inherit_env = false
+startup_timeout_sec = 60
+tool_timeout_sec = 120
+TOML
+```
+
+Start the daemon with the same state root and master key. Keep `KHEISH_AUTH_STORE_MASTER_KEY` exported in this shell, or re-export the same value before starting the daemon.
+
+```bash
+docker pull ghcr.io/github/github-mcp-server
+mkdir -p .kheish-workspace-github-mcp
+
+./target/debug/kheish-daemon serve \
+  --bind 127.0.0.1:4020 \
+  --state-root .kheish-daemon-github-mcp \
+  --workspace-root .kheish-workspace-github-mcp \
+  --mcp-discovery disabled \
+  --mcp-config mcp.github.toml \
+  --provider openai \
+  --model gpt-5.4 \
+  --api-key "$OPENAI_API_KEY"
+```
+
+Inspect the loaded server:
+
+```bash
+./target/debug/kheish-daemon --base-url http://127.0.0.1:4020 runtime get \
+  | jq '.mcp.servers[] | select(.server == "github")'
+```
+
+In the runtime snapshot, the GitHub server should show `transport: "stdio"`, `source: "codex_config"`, `uses_credentials: true`, and `credential_secret_refs` containing `mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN`. If it is disconnected, inspect the server `error`; common causes are Docker not running, the image pull taking longer than the startup timeout, or an insufficient GitHub token.
+
+For production, pin the Docker image to a version or digest that you have reviewed. Tune `GITHUB_TOOLSETS` and, when needed, `GITHUB_TOOLS` to the least tool surface required. For read-only sessions, add the upstream server flag `--read-only` after the image name in `args`. For GitHub Enterprise Server or Enterprise Cloud with data residency, GitHub's upstream server supports `GITHUB_HOST`; add it to `env` and to the Docker `-e` list. The example above follows the upstream quickstart shape, but Kheish intentionally keeps this entry outside direct profile startup until the startup artifact is operator-owned.
+
+## External MCP config
+
+Use explicit config when:
+
+- the MCP server is not in the built-in catalog
+- the catalog entry is `catalog_only`
+- you need a local binary, container, custom endpoint, enterprise hostname, or narrower tool surface
+
+Pass the file with `--mcp-config`. Add `--mcp-discovery disabled` when you want exactly that file and no auto-import from Codex-compatible defaults.
+
+### Streamable HTTP
+
+For bearer-token auth, store the token as a generic opaque secret and reference it:
+
+```bash
+export KHEISH_AUTH_STORE_MASTER_KEY="$(./target/debug/kheish-daemon secrets generate)"
+export ACME_MCP_TOKEN=...
+
+./target/debug/kheish-daemon secrets set mcp.custom.acme.BEARER_TOKEN \
+  --provider generic \
+  --from-env ACME_MCP_TOKEN \
+  --offline \
+  --state-root .kheish-daemon-acme-mcp
+```
+
+```toml
+# mcp.acme.toml
+[mcp_servers.acme]
+url = "https://mcp.acme.example/mcp"
+bearer_token_secret_ref = "mcp.custom.acme.BEARER_TOKEN"
+enabled_tools = ["search", "fetch"]
+startup_timeout_sec = 15
+tool_timeout_sec = 120
+```
+
+For non-bearer headers, use `http_header_secret_refs`:
+
+```toml
+[mcp_servers.acmeHeader]
+url = "https://mcp.acme.example/mcp"
+http_header_secret_refs = { "x-api-key" = "mcp.custom.acme.X_API_KEY" }
+```
+
+Do not configure `Authorization` in `headers`, `env_http_headers`, or `http_header_secret_refs` together with `bearer_token_secret_ref` or `bearer_token_env_var`; Kheish rejects that conflict at startup.
+
+### Stdio
+
+For local commands, keep secrets out of literal config and use `env_secret_refs`:
+
+```bash
+export ACME_LOCAL_TOKEN=...
+
+./target/debug/kheish-daemon secrets set mcp.custom.acmeLocal.ACME_TOKEN \
+  --provider generic \
+  --from-env ACME_LOCAL_TOKEN \
+  --offline \
+  --state-root .kheish-daemon-acme-mcp
+```
+
+```toml
+[mcp_servers.acmeLocal]
+command = "/opt/acme/acme-mcp"
+args = ["stdio"]
+env_secret_refs = { ACME_TOKEN = "mcp.custom.acmeLocal.ACME_TOKEN" }
+inherit_env = false
+startup_timeout_sec = 30
+tool_timeout_sec = 120
+```
+
+When `env_secret_refs` is present, Kheish forces a restricted child environment and rejects `inherit_env = true`. Put every needed environment value in `env` or `env_secret_refs`.
+
+For either custom example, start the daemon with the same state root and the same `KHEISH_AUTH_STORE_MASTER_KEY` that you used when writing the secret. Replace `mcp.acme.toml` with the config file you wrote:
+
+```bash
+mkdir -p .kheish-workspace-acme-mcp
+
+./target/debug/kheish-daemon serve \
+  --bind 127.0.0.1:4023 \
+  --state-root .kheish-daemon-acme-mcp \
+  --workspace-root .kheish-workspace-acme-mcp \
+  --mcp-discovery disabled \
+  --mcp-config mcp.acme.toml
+```
+
+### Startup and rotation
+
+MCP inventory is loaded at daemon startup. After editing `--mcp-config` or rotating an MCP secret, restart the daemon to reconnect MCP servers with the new settings.
+
+## Validate on a real daemon
+
+Use a fresh state root and workspace root:
+
+```bash
+cargo build -p kheish-daemon
+rm -rf .kheish-daemon-mcp-test .kheish-workspace-mcp-test
+mkdir -p .kheish-workspace-mcp-test
+
+./target/debug/kheish-daemon serve \
+  --bind 127.0.0.1:4017 \
+  --state-root .kheish-daemon-mcp-test \
+  --workspace-root .kheish-workspace-mcp-test \
+  --mcp-discovery disabled \
+  --mcp-profile docs \
+  --provider openai \
+  --model gpt-5.4 \
+  --api-key "$OPENAI_API_KEY"
+```
+
+In another terminal:
+
+```bash
+./target/debug/kheish-daemon --base-url http://127.0.0.1:4017 status
+./target/debug/kheish-daemon --base-url http://127.0.0.1:4017 runtime get
+```
+
+Verify:
+
+- `runtime.mcp.selected_profiles` contains `docs`.
+- `runtime.mcp.servers[*].source` is `built_in_catalog` for catalog servers.
+- the OpenAI Docs server has `profiles` containing `docs` and `catalog_entry_id` set to `openai-docs`.
+- `runtime.mcp.tool_names` contains MCP helper tools and qualified MCP tools from connected servers.
+- disconnected optional servers are visible with an explicit `error`, not silently ignored.
+
+The repository also includes a local true-binary MCP suite:
+
+```bash
+scripts/e2e/run_mcp_local_true_binary.sh
+```
+
+That suite builds `target/debug/kheish-daemon`, then runs the catalog, bearer secret-store, and MCP OAuth account-protocol harnesses:
+
+```bash
+scripts/e2e/mcp_catalog_true_binary.sh
+scripts/e2e/mcp_secret_store_true_binary.sh
+scripts/e2e/mcp_oauth_protocol_true_binary.sh
+```
+
+The suite and individual harnesses write evidence under `tmp/e2e/<run-id>/`, including `status.json`, `runtime.json`, catalog or secret output, daemon logs, local MCP request logs when applicable, and `verdict.json`. The secret-store harness uses a local Streamable HTTP MCP fixture that rejects incorrect bearer auth, then verifies that the raw token is absent from the evidence directory.
+
+For credentialed supported entries, store the token in the daemon secret store before startup. Example:
+
+```bash
+export KHEISH_AUTH_STORE_MASTER_KEY="$(./target/debug/kheish-daemon secrets generate)"
+export GITLAB_TOKEN=...
+./target/debug/kheish-daemon mcp auth slots gitlab
+./target/debug/kheish-daemon mcp auth set gitlab \
+  --from-env GITLAB_TOKEN \
+  --offline \
+  --state-root .kheish-daemon-mcp-test
+./target/debug/kheish-daemon serve \
+  --state-root .kheish-daemon-mcp-test \
+  --workspace-root .kheish-workspace-mcp-test \
+  --mcp-profile repo
+```
+
+`mcp auth set` writes a generic opaque secret to the catalog slot, such as `mcp.gitlab.GITLAB_TOKEN`. The daemon reads that slot at startup; the token value is not returned by `mcp catalog`, `runtime get`, or `secrets get`.
+
+GitHub is present in the built-in catalog, but it is currently `catalog_only`; use explicit MCP config for it until Kheish ships a pinned, directly supported GitHub startup path.
+
+## Evidence note
+
+- Code verified: `crates/kheish-mcp/src/catalog.rs`, `crates/kheish-mcp/src/config.rs`, `crates/kheish-mcp/src/manager.rs`, `crates/kheish-daemon/src/main.rs`, `crates/kheish-daemon/src/cli/commands/mcp.rs`, `crates/kheish-daemon/src/cli/serve.rs`.
+- CLI verified: `mcp catalog list`, `mcp catalog get`, `mcp profiles list`, `mcp profiles get`, `mcp auth slots`, `mcp auth set`, and `mcp oauth login/status/refresh/logout`.
+- Daemon live tested: yes, using fresh state roots and workspace roots via `run_mcp_local_true_binary.sh`, which runs `mcp_catalog_true_binary.sh`, `mcp_secret_store_true_binary.sh`, and the MCP OAuth account-protocol harness `mcp_oauth_protocol_true_binary.sh`.
+- Vendor manual live checks: GitHub explicit stdio Docker config was validated outside the local harness with a temporary evidence directory: `mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN` stored in the Kheish secret store, true daemon startup, OpenAI `gpt-5.4`, runtime `source: "codex_config"`, and a real authenticated `mcp__github__get_me` tool call. Linear without `LINEAR_API_KEY` was checked as a fail-closed auth-required path only; authenticated Linear tool-use still requires a real `LINEAR_API_KEY` validation.
+- Provider-specific tested: GitHub was validated with OpenAI `gpt-5.4`; other MCP servers and provider routes should still be validated before rollout.

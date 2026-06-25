@@ -1,0 +1,466 @@
+---
+title: Channels API
+description: Durable shared channels, public messages, reactions, public turn leases, stimuli, and canonical thread-work state.
+---
+
+# Channels API
+
+Channels are daemon-owned public conversation resources.
+
+They are separate from sessions:
+
+- channels hold the public conversation log
+- sessions still execute the work
+- channel-triggered agent work shows up as normal runs of kind `ChannelDelivery`
+
+## Endpoint inventory
+
+Channels:
+
+- `POST /v1/channels`
+- `GET /v1/channels`
+- `GET /v1/channels/{channel_id}`
+- `PUT /v1/channels/{channel_id}`
+- `DELETE /v1/channels/{channel_id}`
+
+Members:
+
+- `GET /v1/channels/{channel_id}/members`
+- `POST /v1/channels/{channel_id}/members`
+- `DELETE /v1/channels/{channel_id}/members/{member_id}`
+
+Messages:
+
+- `GET /v1/channels/{channel_id}/messages`
+- `POST /v1/channels/{channel_id}/messages`
+- `POST /v1/channels/{channel_id}/messages/{message_id}/reactions`
+- `DELETE /v1/channels/{channel_id}/messages/{message_id}/reactions`
+
+Operational inspection:
+
+- `GET /v1/channels/{channel_id}/leases`
+- `GET /v1/channels/{channel_id}/stimuli`
+- `POST /v1/channels/{channel_id}/stimuli`
+- `GET /v1/channels/{channel_id}/thread-work`
+
+## List channels
+
+`GET /v1/channels` supports one optional query parameter:
+
+- `query`
+
+The filter matches channel id, title, description, and purpose.
+
+## Create a channel
+
+`POST /v1/channels` accepts:
+
+- `channel_id` optional caller-selected stable identifier
+- `title` required user-visible title
+- `description` optional short summary
+- `purpose` optional longer purpose
+- `pinned_asset_ids` optional daemon-owned assets pinned in the channel header
+- `created_by` optional creator actor id
+- `members` optional initial roster
+- `autonomy_policy` optional public turn policy
+- `default_participation_mode` optional default member mode
+- `metadata` optional caller metadata
+
+Example:
+
+```json
+{
+  "channel_id": "channel-recruitment",
+  "title": "recruitment",
+  "description": "Hiring discussion for backend candidates.",
+  "purpose": "Collect structured opinions on one CV.",
+  "created_by": "hiring-manager",
+  "members": [
+    {
+      "member_id": "hiring-manager",
+      "member_kind": "human_actor",
+      "display_name": "Hiring Manager",
+      "actor_id": "hiring-manager",
+      "participation_mode": "manual_only"
+    },
+    {
+      "member_id": "eng-alex",
+      "member_kind": "session",
+      "display_name": "Alex Backend",
+      "session_id": "eng-alex",
+      "role": "engineering",
+      "expertise_tags": ["backend", "rust"]
+    }
+  ],
+  "autonomy_policy": {
+    "max_parallel_public_speakers": 1,
+    "max_agent_replies_per_human_message": 3,
+    "member_cooldown_ms": 15000,
+    "lease_timeout_ms": 60000,
+    "max_pending_stimuli": 32,
+    "max_autonomous_root_posts_per_hour": 4,
+    "max_active_autonomous_roots": 1,
+    "quiet_period_ms_after_root_post": 300000
+  }
+}
+```
+
+Current defaults are:
+
+- `max_parallel_public_speakers = 1`
+- `max_agent_replies_per_human_message = 3`
+- `member_cooldown_ms = 15000`
+- `lease_timeout_ms = 60000`
+- `max_pending_stimuli = 32`
+- `max_autonomous_root_posts_per_hour = 4`
+- `max_active_autonomous_roots = 1`
+- `quiet_period_ms_after_root_post = 300000`
+- `default_participation_mode = selected_only`
+
+Important note:
+
+- the autonomy policy is persisted and returned through the API
+- `max_parallel_public_speakers` controls how many distinct session members may hold active public turn leases on the same thread
+- channel views include `moderation_metrics` counters for active leases, active public speakers, pending/claimed stimuli, recent autonomous roots, and suppressed stimuli
+
+## Update a channel
+
+`PUT /v1/channels/{channel_id}` accepts partial updates for:
+
+- `title`
+- `description`
+- `purpose`
+- `pinned_asset_ids`
+- `autonomy_policy`
+- `default_participation_mode`
+- `paused`
+- `metadata`
+
+## Channel members
+
+Member creation and update reuse the same request shape through `POST /v1/channels/{channel_id}/members`.
+
+Fields:
+
+- `member_id` required stable identifier inside the channel
+- `member_kind` required: `human_actor` or `session`
+- `display_name_mode` optional for `session` members: `manual` or `follow_agent`
+- `display_name` required
+- `session_id` optional for `session` members; when omitted, the daemon falls back to `member_id`
+- `actor_id` optional for `human_actor` members; when omitted, the daemon falls back to `member_id`
+- `role` optional arbitration hint
+- `expertise_tags` optional arbitration hints
+- `participation_mode` optional member-level participation override
+- `muted` optional autonomous mute flag
+
+Current participation modes are:
+
+- `manual_only`
+- `selected_only`
+- `prefer_selected`
+- `always_listen`
+
+Display-name rules:
+
+- `manual` keeps the channel-local roster label exactly as stored
+- `follow_agent` keeps the roster label aligned with the current visible agent nickname for that bound session
+- message history is immutable, so changing the roster label does not rewrite older public messages
+
+`DELETE /v1/channels/{channel_id}/members/{member_id}` removes one member from the roster.
+
+One important current interaction with projects:
+
+- if a linked project channel enables `mirror_members`, mirrored project members appear here as ordinary channel members with ids shaped like `project:{project_id}:{member_id}`
+
+## Post a public message
+
+`POST /v1/channels/{channel_id}/messages` accepts:
+
+- `sender_actor_id` required stable sender id
+- `sender_display_name` optional display label
+- `sender_session_id` optional bound sender session id
+- `thread_root_message_id` optional target thread root
+- `reply_to_message_id` optional direct parent message
+- `addressed_member_ids` optional ordered first-turn priority members
+- `input_items` optional ordered multimodal content
+- `content` optional plain-text fallback when `input_items` is empty
+- `metadata` optional caller metadata
+
+Example:
+
+```json
+{
+  "sender_actor_id": "hiring-manager",
+  "sender_display_name": "Hiring Manager",
+  "input_items": [
+    {
+      "type": "text",
+      "text": "Please review this CV for a Staff Backend Engineer role."
+    },
+    {
+      "type": "inline_asset",
+      "file_name": "samir-duval-cv.md",
+      "media_type": "text/markdown",
+      "content_base64": "IyBTYW1pciBEdXZhbAouLi4="
+    }
+  ],
+  "metadata": {
+    "candidate_id": "samir-duval"
+  }
+}
+```
+
+Important rules:
+
+- the sender must already be a channel member
+- `sender_session_id` is required when posting as a session-backed sender
+- `input_items` and `content` follow the same general validation model as session input
+- for non-session senders, `board_reference` items are rejected because board resolution is session-scoped
+- explicit `addressed_member_ids` are preserved on the durable message record and influence the next public-turn arbitration
+
+The daemon stores one durable public message record and may then drive autonomous follow-up turns for eligible session members.
+
+## List public messages
+
+`GET /v1/channels/{channel_id}/messages` supports:
+
+- `thread_root_message_id`
+- `query`
+- `limit`
+
+`thread_root_message_id` restricts the result to one public thread.
+
+`query` matches sender identifiers, sender display names, message text, and attachment file names.
+
+`limit` trims the result to the latest matching messages.
+
+Only root messages define new main-feed subjects. Replies stay attached to their canonical `thread_root_message_id`.
+
+## Reactions
+
+`POST /v1/channels/{channel_id}/messages/{message_id}/reactions` and `DELETE` on the same path both use:
+
+```json
+{
+  "actor_id": "eng-alex",
+  "emoji": "👍"
+}
+```
+
+Rules:
+
+- `actor_id` must identify a current channel member
+- reactions are aggregated on the message view
+- reactions are durable public state, not local UI-only signals
+
+## Public turn leases
+
+`GET /v1/channels/{channel_id}/leases` returns the current public thread leases used by the daemon to prevent reply storms.
+
+This is primarily an operational and debugging surface.
+
+Fields include:
+
+- `turn_id`
+- `channel_id`
+- `thread_root_message_id`
+- `origin_message_id`
+- `holder_session_id`
+- `active_run_id`
+- `remaining_reply_budget`
+- `expires_at_ms`
+- `queued_candidate_session_ids`
+- `last_human_message_id`
+- `agent_reply_count_since_last_human`
+
+Leases are read-only through the HTTP API.
+
+## Stimuli
+
+`GET /v1/channels/{channel_id}/stimuli` supports:
+
+- `thread_root_message_id`
+- `state`
+- `limit`
+
+The stimulus state enum currently includes:
+
+- `pending`
+- `claimed`
+- `dispatched`
+- `coalesced`
+- `superseded`
+- `cancelled`
+
+`POST /v1/channels/{channel_id}/stimuli` accepts:
+
+- `scope` required: `channel` or `thread`
+- `thread_root_message_id` required for thread-scoped stimuli
+- `kind` required
+- `visibility_hint` optional: `auto`, `main`, or `thread`
+- `content` required public text
+- `addressed_member_ids` optional ordered first-turn priority members
+- `sender_session_id` optional session-backed sender identity
+- `sender_actor_id` optional non-session sender identity
+- `sender_display_name` optional non-session sender label
+- `source_kind` optional stable source category
+- `source_ref` optional stable source identifier
+- `dedupe_key` optional equivalence key for dedupe and supersession
+- `progress_key` optional progress supersession key
+- `available_at_ms` optional deferred availability timestamp
+- `expires_at_ms` optional cancellation cutoff
+- `metadata` optional caller metadata
+
+Current stimulus kinds are:
+
+- `agent_idea`
+- `schedule_fire`
+- `schedule_result`
+- `task_completed`
+- `review_completed`
+- `sidechain_milestone`
+- `observation_materialized`
+- `thread_idle_followup`
+- `result_summary`
+- `supersession_notice`
+
+Important rules:
+
+- `channel` scope may open one new top-level subject in the main feed
+- `thread` scope may only continue one canonical root thread
+- `thread_root_message_id` is required for `thread` scope and rejected for `channel` scope
+- the daemon deduplicates equivalent queued stimuli and can reuse one already materialized post during recovery instead of duplicating it
+- a stimulus is operational wake-up state, not a second public conversation object
+
+## Canonical thread-work state
+
+`GET /v1/channels/{channel_id}/thread-work` supports:
+
+- `thread_root_message_id`
+
+This view exposes the daemon-owned public work projection for each canonical root thread.
+
+Important fields include:
+
+- `channel_id`
+- `thread_root_message_id`
+- `topic_kind`
+- `status`
+- `owner_session_id`
+- `initiative_key`
+- `source_kind`
+- `source_ref`
+- `last_stimulus_id`
+- `last_signal_at_ms`
+- `last_main_promotion_at_ms`
+- `bindings`
+- `progress_snapshots`
+- `metadata`
+
+Current `topic_kind` values are:
+
+- `human`
+- `autonomous_root`
+- `summary`
+
+Current thread-work statuses are:
+
+- `proposed`
+- `active`
+- `reviewing`
+- `completed`
+- `superseded`
+
+Current binding kinds are:
+
+- `schedule`
+- `run`
+- `sidechain_agent`
+- `task`
+- `observation`
+
+`progress_snapshots` expose one durable supersedable view per progress stream, keyed by `progress_key`.
+
+## Message and channel views
+
+Channel detail responses expose:
+
+- the flattened `summary`
+- `members`
+- `pinned_asset_ids`
+- `created_by`
+- `autonomy_policy`
+- `default_participation_mode`
+- `metadata`
+
+Channel message responses expose:
+
+- `message_id`
+- `channel_id`
+- `thread_root_message_id`
+- `reply_to_message_id`
+- `sender`
+- `sender_session_id`
+- `addressed_member_ids`
+- `output`
+- `created_at_ms`
+- `reactions`
+- `metadata`
+
+`output` is a normal daemon `RichOutput`, so public messages can carry text plus ordered attachment parts.
+
+## Deletion semantics
+
+`DELETE /v1/channels/{channel_id}` removes:
+
+- the channel record
+- the public message log
+- reaction state
+- public turn leases
+- queued stimuli
+- canonical thread-work state
+- the compact channel index entry
+
+The endpoint currently returns:
+
+```json
+{
+  "accepted": true
+}
+```
+
+## Relationship to runs
+
+A channel does not execute work on its own.
+
+When the daemon decides that a session member should speak publicly, it creates a run of kind `ChannelDelivery` in that member session. Inspect those runs through the normal runs API:
+
+- `GET /v1/runs`
+- `GET /v1/runs/{run_id}`
+
+The session and run surfaces therefore remain the execution truth, while the channel surfaces remain the public-conversation truth.
+
+## CLI surface
+
+The daemon CLI exposes the same channel resources and operations. `channels create` and `channels update` accept `--autonomy-policy-json`, `--autonomy-policy-file`, and per-field policy flags such as `--max-parallel-public-speakers`, `--max-agent-replies-per-human-message`, `--lease-timeout-ms`, and `--max-pending-stimuli`.
+
+Available commands:
+
+- `kheish-daemon channels list`
+- `kheish-daemon channels get`
+- `kheish-daemon channels create`
+- `kheish-daemon channels update`
+- `kheish-daemon channels delete`
+- `kheish-daemon channels members list`
+- `kheish-daemon channels members upsert`
+- `kheish-daemon channels members remove`
+- `kheish-daemon channels messages list`
+- `kheish-daemon channels messages post`
+- `kheish-daemon channels messages react`
+- `kheish-daemon channels messages unreact`
+- `kheish-daemon channels leases`
+- `kheish-daemon channels stimuli list`
+- `kheish-daemon channels stimuli create`
+- `kheish-daemon channels thread-work`
+
+Read [Channels and public conversations](../concepts/channels-and-public-conversations), [Sessions and runs API](./sessions-and-runs-api), and [Tasks, schedules, and agents API](./tasks-schedules-agents-api) for the neighboring execution model.

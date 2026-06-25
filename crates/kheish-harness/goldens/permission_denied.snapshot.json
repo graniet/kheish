@@ -1,0 +1,158 @@
+{
+  "run_meta": {
+    "session_id": "fixture-session-2",
+    "thread_id": null,
+    "input_source_plugin": "memory",
+    "input_source_kind": "test",
+    "input_event_offset": 0,
+    "completion_follow_up_count": 0,
+    "max_output_tokens_recovery_count": 0,
+    "autocompact": {
+      "consecutive_failures": 0,
+      "turn_counter": 2
+    },
+    "policy": {
+      "max_turns": 4,
+      "keep_last_messages": 3,
+      "snip_token_budget": 120000,
+      "snip_keep_minimum_messages": 10,
+      "microcompact_keep_recent": 5,
+      "microcompact_idle_timeout_ms": 900000,
+      "autocompact_threshold_tokens": 1024,
+      "autocompact_buffer_tokens": 13000,
+      "session_memory_min_tokens": 10000,
+      "session_memory_max_tokens": 40000
+    },
+    "engine_version": "0.1.0"
+  },
+  "turns": [
+    {
+      "turn": 1,
+      "prompt": {
+        "checkpoint_offset_used": null,
+        "summary_digest": null,
+        "summary_text": null,
+        "system_sections": [],
+        "messages": [
+          {
+            "id": "user-0",
+            "role": "user",
+            "digest": "51a3cfb5819e404393c2c725c282306242710b0fd4a20f08a2b550085fd96939",
+            "content_digest": "cced28c6dc3f99c2396a5eaad732bf6b28142335892b1cd0e6af6cdb53f5ccfa"
+          }
+        ],
+        "open_tool_call_ids": []
+      },
+      "assistant_message_id": "assistant-deny",
+      "assistant_message_digest": "966ffadab052c654c76c2c9e6b035bbefbfd9cfe467e09cac9f99abab498e962",
+      "stop_reason": "tool_calls",
+      "tool_calls": [
+        {
+          "call_id": "call-denied",
+          "tool_name": "delete_everything",
+          "input_digest": "ad912f7b3df717e48cbec6d735d0a02bdef1569dd700e374445aea82120592d5",
+          "input_canonical_json": {
+            "scope": "all"
+          }
+        }
+      ],
+      "tool_results": [
+        {
+          "call_id": "call-denied",
+          "decision": {
+            "type": "deny",
+            "reason": "destructive tool"
+          },
+          "result_is_error": true,
+          "result_digest": "ef3b2c26d23f7c5b9e6c2aed5f2611787ebf2e7476e06febfd38112d7d4b6c74",
+          "result_canonical_json": {
+            "error": "destructive tool",
+            "permission_denied": true,
+            "tool": "delete_everything"
+          }
+        }
+      ]
+    },
+    {
+      "turn": 2,
+      "prompt": {
+        "checkpoint_offset_used": null,
+        "summary_digest": null,
+        "summary_text": null,
+        "system_sections": [],
+        "messages": [
+          {
+            "id": "user-0",
+            "role": "user",
+            "digest": "51a3cfb5819e404393c2c725c282306242710b0fd4a20f08a2b550085fd96939",
+            "content_digest": "cced28c6dc3f99c2396a5eaad732bf6b28142335892b1cd0e6af6cdb53f5ccfa"
+          },
+          {
+            "id": "assistant-deny",
+            "role": "assistant",
+            "digest": "5648b907d57e4bb55178b8dfbdaeccf2718da5399ea702cba5ff81bb5c9a0812",
+            "content_digest": "f79eb293bf29e0d386ab39de4c421587a9a3690a75793e8add633bed9db531d6"
+          },
+          {
+            "id": "tool-message-call-denied",
+            "role": "tool",
+            "digest": "26f65a1b6c5aca2a644f05e7c3b88a54f8a62a094a91faeb29ecf789f636c7ec",
+            "content_digest": "ef3b2c26d23f7c5b9e6c2aed5f2611787ebf2e7476e06febfd38112d7d4b6c74"
+          }
+        ],
+        "open_tool_call_ids": []
+      },
+      "assistant_message_id": "assistant-recovery",
+      "assistant_message_digest": "34e7b43883cbd5f4e93662ed56560ed56515e93f54e49c4576ee140c9d9ce23f",
+      "stop_reason": "completed",
+      "tool_calls": [],
+      "tool_results": []
+    }
+  ],
+  "checkpoints": [],
+  "final_state": {
+    "messages": [
+      {
+        "id": "user-0",
+        "role": "user",
+        "digest": "51a3cfb5819e404393c2c725c282306242710b0fd4a20f08a2b550085fd96939",
+        "content_digest": "cced28c6dc3f99c2396a5eaad732bf6b28142335892b1cd0e6af6cdb53f5ccfa"
+      },
+      {
+        "id": "assistant-deny",
+        "role": "assistant",
+        "digest": "5648b907d57e4bb55178b8dfbdaeccf2718da5399ea702cba5ff81bb5c9a0812",
+        "content_digest": "f79eb293bf29e0d386ab39de4c421587a9a3690a75793e8add633bed9db531d6"
+      },
+      {
+        "id": "tool-message-call-denied",
+        "role": "tool",
+        "digest": "26f65a1b6c5aca2a644f05e7c3b88a54f8a62a094a91faeb29ecf789f636c7ec",
+        "content_digest": "ef3b2c26d23f7c5b9e6c2aed5f2611787ebf2e7476e06febfd38112d7d4b6c74"
+      },
+      {
+        "id": "assistant-recovery",
+        "role": "assistant",
+        "digest": "de334346816622c56b0fe433edb047f58c694fdce6fe97a76dd72d2d100f9cd0",
+        "content_digest": "56f131ffe6f4f5c9cecb93966c389f02d9a067015c13d4c01fb73cb9f3690c36"
+      }
+    ],
+    "message_digests": [
+      "51a3cfb5819e404393c2c725c282306242710b0fd4a20f08a2b550085fd96939",
+      "5648b907d57e4bb55178b8dfbdaeccf2718da5399ea702cba5ff81bb5c9a0812",
+      "26f65a1b6c5aca2a644f05e7c3b88a54f8a62a094a91faeb29ecf789f636c7ec",
+      "de334346816622c56b0fe433edb047f58c694fdce6fe97a76dd72d2d100f9cd0"
+    ],
+    "message_roles": [
+      "user",
+      "assistant",
+      "tool",
+      "assistant"
+    ],
+    "completed_tool_result_digests": [
+      "b5e64cbc0bacccc123b7cfda914d827c9b4b5932d6c5ed1fb41ca702b2611ede"
+    ],
+    "open_tool_call_ids": [],
+    "canonical_state_digest": "63569efe6a4df6fe5f2f4bfe20bcd29b3d76047d2d5776ac42bd53da620d0343"
+  }
+}

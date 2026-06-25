@@ -1,0 +1,38 @@
+# Default daemon route inventory backed by daemon-managed auth refs.
+#
+# This file is intended to be checked in and used as the baseline operator route inventory.
+# Per-run and per-session model selectors can target these route ids, for example:
+#   kheish-daemon sessions input demo --model openai/gpt-5.4 "..."
+#   kheish-daemon agents spawn-sidechain agent-1 --model anthropic/claude-opus-4-6
+#
+# Before using this file, generate and export one auth-store master key for both
+# secret writes and daemon boot:
+#   export KHEISH_AUTH_STORE_MASTER_KEY="$(./target/debug/kheish-daemon secrets generate)"
+# Generate this once per state root and reuse it. Replacing the key for an
+# existing auth store makes previously written secret slots unreadable.
+#
+# Then populate the referenced slots into the same state root you will boot:
+#   mkdir -p .kheish-daemon-data
+#   kheish-daemon secrets set anthropic.prod --offline --state-root .kheish-daemon-data --provider anthropic --from-env ANTHROPIC_API_KEY
+#   kheish-daemon secrets set openai.prod --offline --state-root .kheish-daemon-data --provider openai --from-env OPENAI_API_KEY
+#
+# Then start the daemon with:
+#   ./target/debug/kheish-daemon serve --state-root .kheish-daemon-data --routes-file routes.default.toml
+#
+# Production guidance:
+# - Keep checked-in default routes on daemon-managed `auth_ref` slots.
+# - Avoid inline `api_key` values in the default inventory so session credential scopes,
+#   brokered leases, revocation, and signed external-action audit stay centralized.
+
+version = 1
+default_route = "anthropic"
+
+[routes.anthropic]
+driver = "anthropic"
+default_model = "claude-sonnet-4-6"
+auth_ref = "anthropic.prod"
+
+[routes.openai]
+driver = "openai"
+default_model = "gpt-5.4"
+auth_ref = "openai.prod"

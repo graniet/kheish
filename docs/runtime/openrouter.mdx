@@ -1,0 +1,143 @@
+---
+title: OpenRouter
+description: Configure OpenRouter as a first-class route, understand the supported daemon surfaces, and use route-aware selectors safely.
+---
+
+# OpenRouter
+
+OpenRouter is a first-class Kheish route driver.
+
+Use it when you want one daemon-owned route that can target vendor-prefixed model identifiers such as:
+
+- `openai/gpt-5.4-mini`
+- `anthropic/claude-sonnet-4`
+- `google/gemini-2.5-pro`
+
+## Recommended route file
+
+```toml
+version = 1
+default_route = "openrouter"
+
+[routes.openrouter]
+driver = "openrouter"
+default_model = "openai/gpt-5.4-mini"
+model_support = "any"
+auth_ref = "openrouter.primary"
+```
+
+`model_support = "any"` is the normal OpenRouter setting because the model strings are usually vendor-prefixed.
+
+Bootstrap the secret slot before startup:
+
+```bash
+export KHEISH_AUTH_STORE_MASTER_KEY="$(./target/debug/kheish-daemon secrets generate)"
+
+./target/debug/kheish-daemon secrets set openrouter.primary \
+  --offline \
+  --state-root .kheish-daemon-data \
+  --provider openrouter \
+  --from-env OPENROUTER_API_KEY
+```
+
+Then start the daemon:
+
+```bash
+./target/debug/kheish-daemon serve \
+  --bind 127.0.0.1:4000 \
+  --state-root .kheish-daemon-data \
+  --workspace-root .kheish-workspace \
+  --routes-file ./routes.toml
+```
+
+OpenRouter routes are API-key-backed routes. They do not use OpenAI account auth imports such as Codex.
+
+## Route-aware selectors
+
+Use the configured route id as the selector prefix:
+
+- `openrouter/openai/gpt-5.4-mini`
+- `openrouter/anthropic/claude-sonnet-4`
+
+Examples:
+
+```bash
+./target/debug/kheish-daemon runtime set-model openrouter/openai/gpt-5.4-mini
+
+./target/debug/kheish-daemon sessions input demo \
+  --provider openrouter \
+  --model openai/gpt-5.4-mini \
+  "Summarize the attached files and be concise."
+```
+
+On a named-route daemon, `provider` means the route id. The backend request still receives the normalized model string without the `openrouter/` prefix.
+
+## Current built-in surface
+
+OpenRouter currently participates in these daemon-owned surfaces:
+
+- text runs
+- vision-capable runs with supported image attachments
+- `generate_image`
+- `edit_image`
+- `generate_audio`
+- daemon-owned speech-to-text and canonical-text derivation for supported audio assets
+
+At startup, the daemon can discover OpenRouter model capabilities from OpenRouter's Models API. The discovery mode is controlled by `KHEISH_OPENROUTER_MODEL_DISCOVERY`:
+
+- unset: best effort for the normal `openrouter.ai` API, disabled for local mock base URLs
+- `required`: startup fails if discovery fails or returns no model data
+- `disabled`: startup skips discovery and uses the built-in backend defaults
+
+When discovery is available, `runtime get`, `status.provider_readiness.routes[]`, and route-resolution debug artifacts reflect the resolved model. Text/tool/structured-output/vision/image capabilities are narrowed per concrete OpenRouter model. For daemon-owned audio and transcription, OpenRouter routes expose the built-in audio backends even when the active chat model is text-only, because those tools target dedicated OpenRouter media endpoints and models.
+
+The current OpenRouter route capability matrix is:
+
+- `matrix_version = 2`
+- `multimodal_input`: discovered per model
+- `native_web_search = false`
+- `image_generation`: discovered per model
+- `image_edit`: discovered per model
+- `audio_generation = true` when the OpenRouter audio backend is configured
+- `transcription = true` when the OpenRouter transcription backend is configured
+
+Those flags are surfaced by `runtime get` and by `status.provider_readiness.routes[]`. They describe daemon backend availability for the named route, not only the underlying vendor family.
+
+## Audio and asset behavior
+
+OpenAI-backed and OpenRouter-backed audio generation are exposed through `generate_audio`. The tool returns daemon-owned audio assets and may also return a transcript.
+
+OpenRouter speech synthesis targets `/v1/audio/speech`. Ordinary chat models on an OpenRouter route are mapped to the default `openai/gpt-4o-mini-tts-2025-12-15` speech model unless the tool request supplies an explicit TTS model. Common OpenAI aliases such as `tts-1`, `tts-1-hd`, and `gpt-4o-mini-tts` are normalized to that OpenRouter model. The local validator accepts the OpenRouter formats `mp3` and `pcm`, rejects unknown voices before provider upload, caps provider response bytes before buffering the whole body, and persists generated audio only after daemon-side payload sniffing.
+
+OpenRouter speech-to-text targets `/v1/audio/transcriptions`. Ordinary chat models are mapped to the default `openai/gpt-4o-mini-transcribe` model unless a transcription model such as `openai/whisper-1` is supplied explicitly. Canonical-text derivations for audio assets use the selected transcription route. The runtime rejects unsupported audio media types and payloads above the 25 MiB transcription request limit before opening a provider request, and treats missing transcript text in a successful OpenRouter response as a non-retryable contract error.
+
+OpenRouter media debug artifacts store request/response metadata, redacted headers, byte counts, model names, media types, and response checksums. They do not store raw audio bytes or transcript text.
+
+To make generated audio visibly part of the final answer, the agent must follow `generate_audio` with `emit_output` and either:
+
+- include the returned asset ids in `parts`
+- or set `include_artifacts_inline = true`
+
+The general asset store accepts broader retained audio formats such as:
+
+- `audio/wav`
+- `audio/webm`
+- `audio/mpeg`
+- `audio/mpga`
+- `audio/opus`
+- `audio/aac`
+- `audio/flac`
+- `audio/mp4`
+- `audio/m4a`
+- `audio/pcm`
+
+Observation-source uploads remain stricter. `microphone_segment` sources still accept only `audio/wav` and `audio/webm`.
+
+## Operational notes
+
+- `base_url` is optional. The built-in provider defaults already target the normal OpenRouter API.
+- `web_search` does not currently use an OpenRouter-native provider backend.
+- `generate_audio` appears only when the daemon has an audio backend configured for one route. Today, the built-in audio-generation backends are OpenAI and OpenRouter.
+- route-file capability overrides may disable `audio_generation` or `transcription` on one OpenRouter route. Enabling those flags on a driver without a matching backend is rejected by startup and `doctor routes`.
+
+Read [Providers and routing](./providers-and-routing) for route precedence and selector grammar, [Tools](./tools) for control-tool behavior, and [Assets and multimodal input](../concepts/assets-and-multimodal-input) for asset normalization and transcription behavior.

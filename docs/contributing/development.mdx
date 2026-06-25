@@ -1,0 +1,66 @@
+---
+title: Development
+description: Repository setup, testing strategy, and contributor workflow for the Kheish daemon project.
+---
+
+# Development
+
+This repository is a Rust workspace. The daemon, runtime, connectors, skills, session store, and output system evolve together.
+
+## Build and test
+
+```bash
+cargo build -p kheish-daemon
+cargo test --workspace
+```
+
+Recommended focused validation for daemon work:
+
+```bash
+cargo test -p kheish-types -p kheish-core -p kheish-runtime --lib
+cargo test -p kheish-coding-tools --lib
+cargo test -p kheish-daemon --lib
+```
+
+## Live validation
+
+When a change touches daemon or runtime behavior, validate it on a real daemon with real providers. Use:
+
+- a fresh state root
+- a fresh session
+- explicit route identifiers and model settings
+- daemon CLI and HTTP API as the source of truth
+
+## Documentation changes
+
+Keep the documentation aligned with the daemon's actual behavior. When the implementation and docs disagree, the daemon wins and the docs must be updated.
+
+For Playbook and Flow documentation, attach a short review note to the change. It should identify:
+
+- source files or existing docs checked for each strong technical claim
+- whether CLI commands were verified
+- whether a real daemon was used
+- whether provider-specific behavior was actually tested or not applicable
+
+Do not publish a Playbook or Flow API page before the matching daemon route, CLI command, and DTO exist.
+
+## Local docs preview
+
+Mintlify does not support Node 25+. Use one LTS Node release, such as Node 22, when running the docs preview locally.
+
+This repository keeps the Mintlify config in `docs/docs.json`, so run the preview from the `docs/` directory:
+
+```bash
+cd docs
+mint dev
+```
+
+If your shell defaults to another Node version, prepend the Homebrew Node 22 binary on macOS:
+
+```bash
+PATH="/opt/homebrew/opt/node@22/bin:$PATH" mint dev
+```
+
+## Operator guide
+
+For the detailed operator workflow used during development and live validation, refer to the repository-root `AGENTS.md` file in your local checkout.

@@ -1,0 +1,71 @@
+{
+  "name": "compaction_tool_loop",
+  "policy": {
+    "max_turns": 4,
+    "compact_after_chars": 80,
+    "keep_last_messages": 2
+  },
+  "input": {
+    "source": {
+      "plugin": "memory",
+      "kind": "test"
+    },
+    "conversation": {
+      "session_id": "fixture-session-1",
+      "thread_id": "fixture-thread-1"
+    },
+    "actor": {
+      "id": "user-1",
+      "display_name": null
+    },
+    "payload": {
+      "type": "text",
+      "content": "Bonjour, voici un contexte suffisamment long pour forcer une compaction avant le deuxieme appel modele."
+    },
+    "attachments": [],
+    "metadata": null,
+    "reply": null
+  },
+  "scripted_turns": [
+    {
+      "assistant_message_id": "assistant-1",
+      "assistant_content": "Je vais utiliser un tool pour enrichir le contexte avant la reponse finale.",
+      "tool_calls": [
+        {
+          "id": "call-1",
+          "name": "lookup_context",
+          "input": {
+            "query": "important state"
+          }
+        }
+      ]
+    },
+    {
+      "assistant_message_id": "compaction-1",
+      "assistant_content": "<analysis>done</analysis><summary>\n1. Primary Request and Intent\n- The user wants the task completed.\n2. Current Work\n- Waiting to continue after the tool result.\n</summary>",
+      "tool_calls": []
+    },
+    {
+      "assistant_message_id": "assistant-2",
+      "assistant_content": "Voila la reponse finale avec le contexte complete.",
+      "tool_calls": []
+    }
+  ],
+  "tool_outputs": [
+    {
+      "call_id": "call-1",
+      "output": {
+        "state": "resolved"
+      },
+      "is_error": false
+    }
+  ],
+  "expect": {
+    "final_message_id": "assistant-2",
+    "turns": 2,
+    "min_checkpoints": 1,
+    "summary_turns": [2],
+    "tool_result_errors": 0,
+    "denied_calls": []
+  }
+}

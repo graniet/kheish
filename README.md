@@ -1,99 +1,128 @@
-# Kheish
-
 <p align="center">
-  <img src="docs/logo.png" alt="Kheish Logo" width="250">
+  <img src="docs/logo.png" alt="Kheish" width="180">
 </p>
 
-**Kheish** is an open-source, multi-role **agent** designed for complex tasks that require structured, step-by-step collaboration with Large Language Models (LLMs). Rather than a simple orchestrator, Kheish itself acts as an **intelligent agent** that can request modules on demand, integrate user feedback, switch between specialized roles (Proposer, Reviewer, Validator, Formatter, etc.), and ultimately deliver a refined result. By harnessing multiple “sub-agents” (roles) within one framework, Kheish tackles tasks like security audits, file searches, RAG-based exploration, and more.
+<h1 align="center">Kheish</h1>
 
-## Highlights of Kheish as an **Agent**
+<p align="center">
+  <em>Persistent agent runtime and control plane for long-lived, tool-using AI workflows.</em>
+</p>
 
-- **Adaptive Role Switching**  
-  Kheish functions as a single agent with multiple internal roles:
-  - **Proposer**: Generates or updates proposals based on user input and context.  
-  - **Reviewer**: Critically evaluates proposals, identifying flaws or requesting improvements.  
-  - **Validator**: Final gatekeeper ensuring correctness and completeness.  
-  - **Formatter**: Takes a validated solution and converts it into a final presentation format (Markdown, etc.).  
-  These roles can be enabled or disabled depending on the task definition in your YAML file.
+---
 
-- **On-Demand Module Requests**  
-  As an agent, Kheish can spontaneously invoke modules if it needs more information or functionality. Modules include:  
-  - **Filesystem (`fs`)**: Reading files chunk by chunk, indexing them in RAG.  
-  - **Shell (`sh`)**: Running limited shell commands with sandboxed allowances.  
-  - **RAG (`rag`)**: Storing and retrieving large amounts of text via embeddings, enabling chunk-based queries.  
-  - **SSH (`ssh`)**: Secure remote commands.  
-  - **Memories (`memories`)**: Storing or recalling data outside the immediate LLM context (long-term memory).
+## The invariant: agents outlive callers
 
-- **Feedback & Iteration**  
-  In many tasks, Kheish re-checks and revises its own proposals. For example:
-  1. **Proposer** suggests a solution.
-  2. **Reviewer** critiques and possibly requests changes.
-  3. **Proposer** refines based on feedback.
-  4. **Validator** delivers final approval or requests more fixes.  
-  This iterative approach provides an agent that grows the solution’s quality step by step.
+Kheish enforces **one rule**:
 
-- **Retrieval-Augmented Generation (RAG)**  
-  For large codebases or multi-file contexts, Kheish indexes data in a vector store. It can retrieve relevant snippets later without stuffing the entire text into a single LLM prompt. This agent-based RAG integration reduces token usage and scales to bigger projects.
+> An agent's execution is durable, scoped, and accountable — independently of any caller, process, or human reachability.
 
-- **Single Agent, Many Tasks**  
-  Kheish can handle parallel or serial tasks by defining separate YAML configurations or combining them into a single multi-step scenario. Each role or module request is orchestrated **internally** by Kheish’s logic—no external orchestrator needed.
+Everything else in this README is a consequence of that single invariant. If a feature does not protect this rule, it does not belong in the daemon.
 
-## Example Tasks
+The rule has three properties, and they are not separable:
 
-| Task Name | Description |
-|-----------|-------------|
-| `audit-code` | A thorough security audit of a codebase, identifying potential vulnerabilities via multi-step agent roles. |
-| `hf-secret-finder` | Requests the Hugging Face API, clones the repositories, and uses `trufflehog` (via the `sh` module) to detect secrets. |
-| `find-in-file` | Searches for a secret across multiple files, chunk-reading them with `fs`. |
-| `weather-blog-post` | Fetches live weather data (via `web` or a custom module) and writes a humorous blog post about it. |
+- **Caller / execution separation.** The thing that *asks* for an agent run is not the thing that *runs* it. A CLI, a Slack message, a webhook, your code — all of them submit; the daemon executes. The caller can crash, disconnect, log out, get rate-limited, or never come back. The run keeps going.
+- **Survives interruptions.** Process restart, machine reboot, network blip, missing human, expired credential, paused approval, deferred question — none of these are exceptions. They are normal points in the run's lifecycle, journaled, replay-safe, and resumed by the daemon when the world is ready again.
+- **Governed.** Every action an agent takes happens under a named authority (a session, a sidechain, a brokered lease) with a stated scope and an append-only audit trail. Approvals, leases, scope narrowing, and signed external-action records are not optional features — they are how the rule is upheld.
 
-## How Kheish Works
+That is the product. The daemon, the connectors, the capture pipeline, the multi-provider routing, the skills, the schedules — they exist to keep that one rule true under real-world conditions.
 
-1. **Reads a YAML Configuration**  
-   Includes the agent roles, modules, the workflow of steps, and final output instructions.
-2. **Builds an Agent**  
-   Kheish loads the roles (Proposer, Reviewer, etc.) and hooks in the modules for possible requests.  
-3. **Executes Steps Internally**  
-   The agent:
-   - Gathers context (files, text).
-   - Generates or refines a solution (`Proposer`).
-   - Seeks feedback (`Reviewer`) if needed.
-   - Validates correctness (`Validator`).
-   - Formats the final result (`Formatter`).
-4. **Optional RAG Integration**  
-   If large data is encountered, the agent chunk-indexes it into a vector store, retrieving relevant pieces via semantic queries.
-5. **API Integration**
-   Kheish provides a REST API that allows:
-   - Task submission and monitoring
-   - Real-time status updates
-   - Result retrieval
-   - Module execution control
-6. **Output**  
-   Once validated, Kheish saves or exports the final solution. If further feedback is provided, it can loop back into revision mode automatically.
+## What this addresses
 
-## Installation & Usage
+LangChain, AutoGen, CrewAI and vanilla SDK loops are excellent at composing agents *inside an application*. Kheish addresses a different failure mode: **what happens when the application, the human, or the credential boundary disappears while the run is still alive.**
 
-1. **Clone the Repository**  
-   ```bash
-   git clone https://github.com/yourusername/kheish.git
-   cd kheish
-   ```
-2. **Install Dependencies**  
-   - Rust toolchain (latest stable).  
-   - `OPENAI_API_KEY` or other relevant environment variables for your chosen LLM provider.
-3. **Build**  
-   ```bash
-   cargo build --release
-   ```
-4. **Run a Task**  
-   ```bash
-   ./target/release/kheish --task-config examples/tasks/audit-code.yaml
-   ```
+In the in-process model, the agent and the caller share a fate:
+
+- the agent lives inside the caller — caller dies, run dies
+- state is in process memory — reboot is data loss
+- the agent runs with the caller's credentials — every script holds long-lived secrets
+- "human in the loop" is a blocked thread waiting on stdin
+- audit is whatever you remembered to log
+
+Kheish decouples them. The agent is a daemon-managed resource, like a database row or a workflow execution. Callers — a CLI, Slack, a webhook, your code — submit and observe; they do not host the run. Composition stays in your application; execution moves into the daemon.
+
+## What Kheish is not
+
+- Not a **coding agent** like OpenHands / Aider / Cursor. You can run one on top of Kheish; coding is one workload among many.
+- Not an **LLM router** like LiteLLM. Routing is included, but Kheish is the layer above.
+- Not a **chatbot framework**. Slack and Telegram are *one* ingress among many.
+- Not the right tool if you only need a single LLM call. Use the SDK directly.
+
+The thing to read this against: **Kubernetes is a control plane for containers. Temporal is a control plane for workflows. Kheish is a control plane for AI agents.** Same shape, same reason it exists — to make the running thing outlive the caller, and to make the operator the source of truth instead of the script.
+
+## Quickstart
+
+Build the daemon binary; it acts as the server *and* the CLI client.
+
+```bash
+cargo build -p kheish-daemon
+```
+
+Start the daemon. By default it binds `127.0.0.1:4000` and journals state under `./.kheish-daemon`. To actually run an agent you need a provider key — set at least one of `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, or `XAI_API_KEY` in the daemon's environment before `serve`:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...   # any one provider is enough
+./target/debug/kheish-daemon serve
+```
+
+In another terminal, talk to it via the same binary as a client:
+
+```bash
+# 1. Confirm the daemon is alive (works without any provider key)
+./target/debug/kheish-daemon status
+
+# 2. Open a session
+./target/debug/kheish-daemon sessions create demo
+
+# 3. Submit input — returns a run id immediately; the run continues in the daemon
+./target/debug/kheish-daemon sessions input demo "Inspect this repo and summarize it."
+
+# 4. Observe runs attached to the session
+./target/debug/kheish-daemon runs list --session-id demo
+
+# 5. Wait until a run reaches a terminal state, or stream live events
+./target/debug/kheish-daemon runs wait <run-id>
+./target/debug/kheish-daemon runs stream <run-id>
+```
+
+Stop the daemon, restart `serve`, and the same `runs list` reflects journaled state — including any approval or user-question gates that paused mid-run. That round-trip is the invariant in action.
+
+> If you only want to confirm the control plane works without spending tokens, the no-provider path is `status` → `capabilities` → `sessions create demo` → `sessions get demo`. Submitting input requires a configured provider.
+
+## Core Capabilities
+
+- Persistent sessions with journaled state, checkpoints, and restart recovery
+- Detached runs with approvals and structured user-question flows
+- Multi-agent orchestration with sidechains, tasks, schedules, and mailboxes
+- Brokered runtime auth with per-session and per-agent subjects, revocable short-lived leases, and signed external-action audit
+- Daemon-owned observation sources, captured records, and materialization flows for screenshots, webcam snapshots, microphone segments, and other external capture producers
+- Extensible runtime with built-in tools, hooks, skills, MCP, daemon-managed ingress connectors, and generic output plugins
+- Operator control plane over HTTP/SSE with runtime reconfiguration and debug capture
+
+## Architecture
+
+Kheish is organized as a Rust workspace centered around a daemon control plane, a provider-agnostic runtime, an orchestration layer, and a shared session and journal model. The daemon is the operational entry point and the source of truth for sessions, runs, tasks, approvals, runtime configuration, and external integrations.
+
+The runtime supports daemon-managed route inventories across Anthropic, OpenAI, Google, and xAI drivers, plus built-in coding and web tools, reusable skills, lifecycle hooks, MCP-backed tools, daemon-managed ingress connectors, and generic routed output delivery. Long-lived credentials stay in daemon-managed auth slots, while runs and child sidecars resolve brokered short-lived leases instead of receiving root secrets directly. Long-lived agent state is persisted through append-only session records and restored on restart.
+
+## Capture and Observations
+
+Kheish models capture as **durable observations**, not provider-specific media input.
+
+A screen snapshot, webcam frame, microphone segment, browser event, or external connector payload is ingested into daemon-owned observation sources, retained under policy, and later materialized into a normal session run. Sources carry retention, sensitivity, and materialization policy; ingest is gated by per-source upload tokens with leases, expiration, and one-command revocation.
+
+This means agents can reason over external context without depending on where it came from — a host-local capture process, a browser extension, a webhook, a connector, or another system. From the agent's point of view, it is just an observation.
+
+See [`docs/capture.md`](docs/capture.md) for supported source kinds and media types, capture-agent provisioning, capture-group correlation, transcription-derived canonical text, and the `kheish-capture` host-local reference runtime.
+
+## Security
+
+Before exposing the daemon beyond localhost, enable control-plane authentication and review the active permission, hook, connector, and output-routing configuration for your deployment. Kheish includes built-in bearer auth for the control plane, brokered runtime auth for credential-backed execution, and signed append-only audit records for external actions.
+Sessions and sidechains can further narrow auth-backed resources through `CredentialScope`, so delegated work can keep route access without inheriting connector or MCP credentials by default.
 
 ## Contributing
 
-Contributions to Kheish are welcome! Feel free to open issues or submit pull requests on [GitHub](https://github.com/graniet/kheish).
+See [AGENTS.md](AGENTS.md) for the operator guide used when working in this repository.
 
 ## License
 
-Licensed under [Apache 2.0](LICENSE).
+See [LICENSE](LICENSE).

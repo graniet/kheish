@@ -1,0 +1,69 @@
+---
+title: Skills API
+description: Skill catalog endpoints and the runtime surfaces used to inspect and activate reusable skills.
+---
+
+# Skills API
+
+Kheish exposes the skill registry through both control-plane endpoints and runtime tools.
+
+## HTTP endpoints
+
+- `GET /v1/skills`
+- `GET /v1/skills/{skill_name}`
+- `GET /v1/sessions/{session_id}/skills`
+
+`GET /v1/skills` supports a `query` filter and returns summary data such as name, description, version, scope, digest, runtime metadata, and resolved paths.
+
+`GET /v1/skills/{skill_name}` returns the full definition, including instructions.
+
+`GET /v1/sessions/{session_id}/skills` also supports `query`, but it returns only the skills currently visible to that session after capability filtering and promoted-skill source-scope filtering.
+
+For ordinary on-disk and daemon-loaded skills, the `/v1/skills` surface is inspection-only. Skill activation still happens inside the runtime through tools, not through a direct execution endpoint.
+
+Promoted procedural skills add related control-plane endpoints under the learning surface:
+
+- `POST /v1/learnings/{learning_id}/promote-skill`
+- `GET /v1/learning-skills`
+- `GET /v1/learning-skills/{skill_name}`
+- `POST /v1/learning-skills/{skill_name}/rollout-result`
+- `POST /v1/learning-skills/{skill_name}/revoke`
+- `POST /v1/learning-skills/{skill_name}/rollback`
+
+Those promoted-skill endpoints are documented in [Learnings API](./learnings-api).
+
+## Runtime surfaces
+
+Inside the agent runtime, skills are exposed through:
+
+- `list_skills`
+- `use_skill`
+
+These tools let the model discover the available catalog and activate a skill explicitly.
+
+Important runtime rule:
+
+- `list_skills` and `use_skill` operate on the session-visible skill surface, not on the raw global catalog
+
+## Execution model
+
+The skill surface distinguishes between:
+
+- session-scoped inline activation
+- forked execution through a child agent path
+
+When `use_skill` waits for a forked child to settle, the returned `spawn` payload includes the child snapshot and can also include `final_output` when the child emitted a canonical run output. Prefer that canonical output over `spawn.snapshot.last_assistant_message` when you need the child’s final result.
+
+The waited fork response can also include the child `launch_run_id`, which lets operators inspect the child run through the normal run-debug endpoints.
+
+Promoted procedural skills add stricter execution guarantees:
+
+- they only execute through `fork`
+- they must use the `verification` child-agent profile
+- they run inside a dedicated worktree under `.kheish-procedural-worktrees/...`
+- only `active` promoted skills are visible through `/v1/skills` and `/v1/sessions/{session_id}/skills`
+- activation requires daemon-validated verification evidence plus a successful canary with no canary failures; rollout evidence can be guarded against the current promoted-skill `definition_fingerprint`
+- activation rejects daemon-owned catalog drift by comparing the loaded skill definition with the durable active promoted-skill record
+- rollback restores the latest historical active snapshot and remounts it
+
+Use the control-plane API for operator inspection and the runtime tools for execution-time behavior.

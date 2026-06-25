@@ -1,0 +1,160 @@
+---
+title: Personas API
+description: Daemon-managed persona records, session persona bindings, and the binding rules that keep sessions stable.
+---
+
+# Personas API
+
+Read [Personas](../concepts/personas) first for the record-versus-binding model. This page focuses on the concrete HTTP and CLI surface.
+
+## The two layers
+
+- A **persona record** is a daemon-owned template stored under the state root and updated through `/v1/personas`.
+- A **session persona binding** is one immutable snapshot copied into session metadata.
+
+This distinction is operationally important:
+
+- updating a persona record does not retcon existing sessions
+- each session keeps the exact persona snapshot it bound
+- sidechains inherit the parent session's current persona snapshot when they are spawned
+
+## Persona record endpoints
+
+- `GET /v1/personas`
+- `POST /v1/personas`
+- `GET /v1/personas/{persona_id}`
+- `PUT /v1/personas/{persona_id}`
+
+`GET /v1/personas` accepts one optional `query` parameter that matches persona identifiers and display names by substring.
+
+`POST /v1/personas` accepts:
+
+- `persona_id` optional caller-selected identifier
+- `display_name`
+- `soul`
+- `capability_scope` optional capability baseline inherited by future bound sessions
+- `default_skills` optional inline skill assignments resolved and frozen into future session bindings
+- `metadata` optional JSON metadata
+
+The CLI also exposes a Markdown import workflow:
+
+```bash
+kheish-daemon personas import ./reviewer.md --persona-id reviewer
+```
+
+`personas import` reads the Markdown file as the persona `soul`.
+
+Import rules and options:
+
+- only `.md` and `.markdown` files are accepted
+- `--display-name` overrides the derived name
+- otherwise the first Markdown heading becomes the display name
+- if the file has no heading, the file stem is used
+- `--capability-scope-json` and `--capability-scope-file` can attach one capability baseline at import time
+- `--default-skills-json` and `--default-skills-file` can attach persona default inline skills at import time
+- `--metadata-json` and `--metadata-file` can attach metadata at import time
+
+`PUT /v1/personas/{persona_id}` can replace:
+
+- `display_name`
+- `soul`
+- `capability_scope`
+- `default_skills`
+- `metadata`
+
+Persona detail responses return the latest mutable record, including the full `soul`, the latest `capability_scope`, and the latest `default_skills`.
+
+## Session persona endpoints
+
+- `POST /v1/sessions/{session_id}/persona`
+- `PUT /v1/sessions/{session_id}/persona`
+- `DELETE /v1/sessions/{session_id}/persona`
+
+`POST` and `PUT` both bind the specified persona to the session by copying the current persona snapshot into session metadata. `DELETE` clears the bound persona from the session.
+
+These mutation endpoints are intentionally stricter than normal session input:
+
+- they only succeed while the session is idle for topology mutation
+- they are blocked by active or queued runs, pending approvals or questions, mailbox backlog, waiting agent states, or live descendants
+- they do not mutate queued or suspended work in place
+- they update the session snapshot returned by `GET /v1/sessions/{session_id}`
+- they freeze the persona's current `soul`, `capability_scope`, and resolved `default_skills` into the session binding
+
+Do not treat these endpoints as a live profile switch for an in-flight run.
+
+## Session creation and listing
+
+`POST /v1/sessions` accepts one optional `persona_id` field:
+
+```json
+{
+  "session_id": "review-demo",
+  "persona_id": "reviewer"
+}
+```
+
+If the requested `session_id` already exists, the daemon can reuse that existing session. In that case, a supplied `persona_id` must match the session's existing bound persona or the request is rejected.
+
+`GET /v1/sessions` accepts one optional `persona_id` query parameter:
+
+```text
+GET /v1/sessions?persona_id=reviewer
+```
+
+This filter applies to the session's currently bound persona snapshot, not to the latest mutable state of the source persona record.
+
+## Session persona summary shape
+
+Session list and detail responses return only a compact persona summary:
+
+```json
+{
+  "persona": {
+    "persona_id": "reviewer",
+    "persona_version": 3,
+    "display_name": "Reviewer",
+    "bound_at_ms": 1760000000000
+  }
+}
+```
+
+The session surfaces do not return the full `soul`. Use `GET /v1/personas/{persona_id}` when you need the latest mutable persona record itself.
+
+The corresponding session detail also exposes:
+
+- the persisted session `capability_scope`
+- the derived `effective_capability_scope`
+
+## Runtime semantics
+
+The bound session persona snapshot is injected into the runtime system prompt as a dedicated `persona` section when the binding has non-empty instructions and the daemon is not running with a global `override_prompt`.
+
+That gives Kheish two stable properties:
+
+- resumed runs and restored runtimes keep the same session persona after restart
+- child sidechains inherit the parent snapshot that existed at spawn time rather than following later persona edits
+
+The same binding also carries:
+
+- the persona capability baseline used to compute the session's effective capability scope
+- the persona default inline skills that seed the runtime's active inline skill set
+
+## CLI equivalents
+
+The daemon CLI exposes the same surface:
+
+- `kheish-daemon personas list`
+- `kheish-daemon personas create`
+- `kheish-daemon personas import`
+- `kheish-daemon personas get`
+- `kheish-daemon personas update`
+- `kheish-daemon sessions create --persona-id ...`
+- `kheish-daemon sessions set-persona ...`
+- `kheish-daemon sessions clear-persona ...`
+
+The persona authoring commands also accept:
+
+- `--capability-scope-json` or `--capability-scope-file`
+- `--default-skills-json` or `--default-skills-file`
+
+Use the CLI when you want operator-grade session inspection and persona mutation without constructing raw HTTP requests.

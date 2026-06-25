@@ -1,0 +1,162 @@
+---
+title: Capture One Observation
+description: Use the host-local capture runtime to provision one observation source and upload one fixture observation into the daemon.
+---
+
+# Capture One Observation
+
+This is an expansion path, not the main quickstart lane.
+
+Use it after you already have a working daemon. The capture runtime is host-local and lives in the sibling `kheish-capture` repository.
+
+If the daemon is not already working, start with [Run Kheish](../introduction/quickstart) first.
+
+## What you need first
+
+- one running `kheish-daemon`
+- Rust and Cargo
+- the sibling `kheish-capture` repository cloned locally
+
+The commands below assume it is checked out next to this repository as `../kheish-capture`.
+
+This quickstart uses one deterministic fixture source, not live microphone capture. That keeps the first success independent of OS media permissions or device setup.
+
+All commands below are meant to be run from the `kheish-daemon` repository root so that the daemon CLI and the sibling capture repo paths stay consistent.
+
+For fleet-style host provisioning, the daemon CLI can now render agent configs and create source leases directly:
+
+```bash
+./target/debug/kheish-daemon capture provision \
+  --batch-id local-demo \
+  --agent-id laptop-01 \
+  --out-dir .kheish-capture-configs
+```
+
+The provisioned agent is visible with `capture agents list`, heartbeat alerts are visible with `capture alerts`, and `capture revoke laptop-01 --reason "retired"` invalidates every token lease owned by that agent. The lower-level fixture flow below remains useful when you want to hand-author one minimal config.
+The generated config contains a dedicated `capture_agent.heartbeat_token`; use that token for `capture heartbeat --heartbeat-token ...`. Source `upload_token` values are accepted only by observation upload endpoints.
+
+## 1. Create one minimal capture config
+
+From the `kheish-daemon` repository root, create a one-source config in the sibling `kheish-capture` repository:
+
+```bash
+cat > ../kheish-capture/capture.quickstart.toml <<'TOML'
+[daemon]
+base_url = "http://127.0.0.1:4000"
+# Uncomment the next line if your daemon requires bearer auth.
+# admin_bearer_token = "replace-me-admin-token"
+request_timeout_ms = 30000
+user_agent = "kheish-capture-agent/dev"
+
+[spool]
+root_dir = ".kheish-capture-quickstart"
+max_pending_items = 128
+max_pending_bytes = 134217728
+upload_batch_size = 4
+retry_initial_delay_ms = 500
+retry_max_delay_ms = 30000
+
+[[sources]]
+source_id = "screen-fixture-quickstart"
+display_name = "Screen Fixture Quickstart"
+kind = "screen_snapshot"
+enabled = true
+stream_id = "display-main"
+sensitivity = "sensitive"
+trigger = { mode = "once" }
+remote = { ensure_exists = true, upload_token = "replace-me-screen-upload-token", retention_seconds = 604800, max_active_observations = 512, max_active_bytes = 536870912, allow_materialization = true, allow_output_delivery = false }
+driver = { driver = "fixture", path = "../kheish-capture/fixtures/image/screen.png", media_type = "image/png", max_emissions = 1 }
+TOML
+```
+
+Replace `replace-me-screen-upload-token` with one strong token string before you run the next steps.
+
+If your daemon requires bearer auth, also uncomment `admin_bearer_token` and set it to one valid control-plane token. That is required for `doctor` and `sources apply`, because both operations hit admin daemon endpoints.
+
+You do not need to pre-create the daemon observation source for this quickstart. `sources apply` will create or rotate it remotely because `remote.ensure_exists = true`.
+
+## 2. Validate the local config and daemon reachability
+
+```bash
+cargo run --manifest-path ../kheish-capture/Cargo.toml -p kheish-capture-agent -- \
+  doctor --config ../kheish-capture/capture.quickstart.toml
+```
+
+`doctor` verifies:
+
+- the config parses
+- the fixture source can be instantiated
+- the spool can be opened
+- the daemon is reachable
+
+## 3. Ensure the remote observation source exists
+
+```bash
+cargo run --manifest-path ../kheish-capture/Cargo.toml -p kheish-capture-agent -- \
+  sources apply --config ../kheish-capture/capture.quickstart.toml
+```
+
+This provisions or updates the remote daemon source named `screen-fixture-quickstart`.
+
+## 4. Run one one-shot capture
+
+```bash
+cargo run --manifest-path ../kheish-capture/Cargo.toml -p kheish-capture-agent -- \
+  sources run \
+    --config ../kheish-capture/capture.quickstart.toml \
+    --source-id screen-fixture-quickstart
+```
+
+That runs only the selected source once, uploads the fixture image through the daemon observation ingest path, drains the local spool, and exits.
+
+## 5. Verify the observation from the daemon
+
+If your daemon requires bearer auth and you are using the host-built CLI, export one control-plane token first:
+
+```bash
+export KHEISH_DAEMON_TOKEN="<admin token>"
+```
+
+If you built the daemon binary on the host:
+
+```bash
+./target/debug/kheish-daemon observations sources get screen-fixture-quickstart
+./target/debug/kheish-daemon observations list --source-id screen-fixture-quickstart
+```
+
+If you are using the Docker quickstart instead:
+
+```bash
+docker compose -f docker/compose.yaml exec daemon \
+  kheish-daemon observations sources get screen-fixture-quickstart
+docker compose -f docker/compose.yaml exec daemon \
+  kheish-daemon observations list --source-id screen-fixture-quickstart
+```
+
+After the run, the source should exist and at least one observation should be visible in the daemon.
+
+## What this quickstart proves
+
+You are proving that:
+
+- the host-local capture runtime can reach the daemon
+- one local source can provision its remote observation source
+- one real media artifact can be uploaded into daemon-owned observation storage
+
+## Important scope note
+
+This path is intentionally conservative:
+
+- it uses one fixture image
+- it does not require live microphone, screen, or webcam permissions
+- it does not require Docker
+
+Live microphone capture exists in `kheish-capture`, but it is a later step. Screen and webcam fixture ingestion are the current deterministic bring-up path in this repository layout.
+
+## Next steps
+
+Once the first observation exists, continue with:
+
+- [Capture and observations](../concepts/capture-and-observations) for the model
+- [Observations and derivations API](../reference/observations-and-derivations-api) for source management, upload, and materialization
+- [Tasks and schedules](../concepts/tasks-and-schedules) if you want automated follow-up work after materialization

@@ -1,0 +1,235 @@
+---
+title: Recovered run memory
+description: Daemon-owned episodic memory derived from terminal runs, with bounded prompt recovery, durable indexing, and scope-aware search.
+---
+
+# Recovered run memory
+
+Recovered run memory is Kheish's daemon-owned episodic memory layer.
+
+It is built from terminal runs and exists for two related jobs:
+
+- recover a small amount of recent run history into the next prompt without replaying whole transcripts
+- expose compact run-derived memory to operator inspection and session-scoped memory search
+
+It is not the same thing as durable semantic learning, and it is not a free-form user note system.
+
+## What it is
+
+Recovered run memory is currently:
+
+- daemon-owned rather than model-provider-owned
+- derived from persisted run state
+- compact and episodic rather than semantic or procedural
+- prompt-bounded and best-effort
+- restart-safe
+- sanitized before durable run-memory storage
+- controlled by a daemon runtime policy
+
+The prompt projection remains intentionally narrow:
+
+- only the current session receives a recovered-memory prompt section
+- only a small bounded subset of recent entries is injected
+- injected entries are framed as historical run data, not fresh instructions
+- Markdown code fences inside recovered summaries are neutralized before rendering
+
+The storage and search surfaces are broader:
+
+- the daemon stores run-memory records separately from the session journal
+- the daemon indexes them by session and by visible learning scope
+- session memory search can browse or query recovered runs visible through the session's current learning scopes
+
+## What is captured
+
+Kheish only builds recovered run memory from terminal runs:
+
+- `completed`
+- `failed`
+- `interrupted`
+- `cancelled`
+
+Each durable run-memory record stores:
+
+- the owning `session_id`
+- the originating `run_id`
+- the capture timestamp
+- the terminal run status
+- one compact `summary`
+- optional `request_preview`
+- optional `outcome_preview`
+- optional daemon-owned `artifact_ids`
+- optional compact `failure_markers`
+- visible `scope_keys` retained for later search and retrieval
+- one semantic-capture replay receipt
+
+The compact summary is derived from durable daemon state rather than from caller-local prompt text. It may include:
+
+- the run request preview
+- the latest recorded assistant text
+- an error preview for failed runs
+- a terminal status note when no better output exists
+
+The summary is capped daemon-side instead of storing a full transcript excerpt.
+
+## Storage model
+
+Recovered run memory lives outside the append-only session journal.
+
+The current storage layout has two parts:
+
+- a filesystem-backed `run-memories/` store under the daemon state root
+- a daemon topology index that tracks run-memory pointers by session and by scope
+
+The session journal and checkpoints remain the canonical conversation history. Recovered run memory is a derived read model used for recovery and search.
+
+## Prompt projection
+
+On a new input, the daemon loads the current session's tracked run-memory pointers and builds one bounded `recovered_memory` bundle.
+
+The effective limits come from the runtime run-memory policy:
+
+- `enabled`
+- `retention_ms`
+- `max_tracked_per_session`
+- `max_prompt_entries`
+- `redact_pii`
+- `search_visibility`
+
+Current defaults:
+
+- `enabled=true`
+- `retention_ms=2592000000` (`30` days)
+- `max_tracked_per_session=32`
+- `max_prompt_entries=3`
+- `redact_pii=true`
+- `search_visibility=session_only`
+
+Operators can inspect or replace the policy through:
+
+- `GET /v1/runtime/run-memory-policy`
+- `POST /v1/runtime/run-memory-policy`
+
+When a pending input is available, eligible entries are ranked against that input before prompt projection. Recency is the fallback and tie-breaker.
+
+If a run-memory file is missing, unreadable, or expired, the daemon skips it, prunes the stale pointer, and continues the run.
+
+The runtime then packs the recovered bundle into one system section named `recovered_memory`. The core engine strips that derived payload before persisting the canonical input event so the session journal does not duplicate recovered memory back into the transcript.
+
+Operators can inspect the effective projection through:
+
+- `GET /v1/sessions/{session_id}/memory-context`
+
+That derived session view shows recovered memory alongside learned context and session-visible skills.
+
+## Privacy and redaction
+
+Run-memory summaries, request previews, outcome previews, and failure markers are scrubbed before they are persisted. For direct and scheduled input runs, the scrubber reads the durable request payload before building the compact preview, so secrets are redacted before preview truncation.
+
+The scrubber applies the daemon debug redactor for known secret and token shapes, then redacts common PII shapes such as:
+
+- OpenAI/Anthropic/GitHub/Slack/AWS-style tokens
+- bearer tokens and JWT-like compact tokens
+- sensitive URL query parameters such as `token`, `api_key`, `signature`, and `secret`
+- PEM private-key blocks, including truncated captured blocks
+- email addresses
+- SSN-like values
+- phone-like values
+- Luhn-valid card-like values
+
+This protects the derived run-memory store, memory-search results, recovered prompt instructions, and debug artifacts that contain recovered-memory prompt context.
+
+The canonical session journal remains separate. If a user originally sent sensitive text, full debug artifacts that intentionally capture the raw transcript can still contain that original conversation content according to the active debug policy. Run-memory redaction is not a global transcript scrubber.
+
+## Session memory search
+
+Recovered run memory also participates in the session memory-search surface:
+
+- `GET /v1/sessions/{session_id}/memory-search`
+
+Important distinction:
+
+- prompt injection uses only the current session's bounded recovered-memory bundle
+- memory search returns only recovered runs from the requested session by default
+- operators can opt in to scope-visible recovered-run search with `search_visibility=learning_scopes`
+
+With `learning_scopes`, a session can search more recovered run records than it will automatically inject into the next prompt. Keep the default `session_only` mode when recovered-run summaries may reveal cross-session operational context.
+
+Current search behavior:
+
+- when `query` is omitted, the daemon returns a recent browse view
+- when `query` is present, the daemon ranks visible learnings, recovered runs, and visible skills with deterministic query-term scoring
+- recovered-run results come from the daemon's tracked run-memory index, not from transcript replay
+
+## Budgeting and overflow avoidance
+
+Recovered run memory is packed before prompt submission instead of being appended blindly.
+
+The runtime estimates the current prompt cost from:
+
+- the system sections
+- visible messages
+- active tool state
+- restored compacted history
+- the incoming input payload
+
+It then applies a recovered-memory budget derived from:
+
+- the daemon compaction policy budget
+- model-aware context-window reservations when Kheish knows the selected model family
+
+When recovered memory does not fit, Kheish drops older entries first. If nothing fits, it omits recovered memory entirely rather than forcing overflow risk into the prompt.
+
+Final runtime prompt-budget omissions are counted in `/v1/status.run_memory.metrics.prompt_limit_omitted_total`, together with daemon-side omissions caused by `max_prompt_entries`. `/v1/status.run_memory.metrics.injected_total` counts recovered-memory entries only after final runtime prompt packing has kept them in the rendered provider prompt.
+
+## Retention and pruning
+
+Recovered run memory uses daemon-side retention rules from the runtime run-memory policy:
+
+- records older than `retention_ms` are pruned
+- only the newest `max_tracked_per_session` records per session are kept
+- pruned records are deleted from `run-memories/`
+
+The daemon rebuilds the run-memory index on boot from persisted runs plus persisted run-memory files, then writes the pruned result back to the topology index. During rebuild it repairs stale pointers and removes store files that no longer belong to a terminal run, including invalid safe-storage names, unknown run ids, non-terminal run leftovers, and duplicate legacy files when a canonical `__safe` file exists. Broken run-memory store scans fail the boot repair instead of silently skipping orphan cleanup.
+
+The daemon also reapplies pruning immediately when the runtime run-memory policy changes. Runtime enforcement deletes expired records and orphan or duplicate store files before replacing the in-memory index; enforcement errors are returned to the caller instead of being logged as a successful policy update. Read-time expiry still runs as a fallback so a long-running daemon does not keep injecting stale run memory until restart.
+
+Run-memory status and metrics are exposed in `/v1/status.run_memory`, including the effective policy, indexed counts, stale indexed record count, stored/injected counters, pruning counters, redaction counters, and ranking/omission counters.
+
+`/v1/status.run_memory.maintenance` exposes the last bounded startup or runtime-policy maintenance report. It includes the source, timestamp, whether the index was rebuilt, TTL/overflow/orphan prune counts, scan/prune error counts, and bounded diagnostics with only action, reason, run id, path, and a short message. `/v1/status.health` and `kheish-daemon doctor` surface warning diagnostics for failed run-memory maintenance and info diagnostics for successful repairs.
+
+## Semantic-capture replay receipts
+
+Run-memory records now also carry a durable semantic-capture receipt:
+
+- `pending`
+- `completed`
+- `skipped`
+
+This receipt does not change the recovered-memory prompt path directly. It exists so daemon-owned semantic capture can:
+
+- mark a completed run as needing semantic extraction
+- survive crashes and restarts without duplicating extraction
+- replay only unfinished capture work on boot
+
+When semantic capture is enabled, completed runs can leave their run-memory record in `pending` until extraction has either completed or abstained. On boot, the daemon replays only those pending records.
+
+## Current scope
+
+Recovered run memory is still intentionally narrow:
+
+- compact episodic memory only
+- no vector store
+- no embeddings
+- no learned embedding reranker
+- no free-form semantic promotion inside this layer
+- no procedural promotion inside this layer
+
+Durable semantic memory and promoted procedures live in the separate learning plane.
+
+## Validation
+
+This implementation is covered by:
+
+- unit tests for indexing, retention, pruning, ranking, redaction, policy validation, prompt budgeting, and file-store behavior
+- real-daemon tests for recovery, restart, corrupted files, configurable TTL, query ranking, redaction, metrics, and pruning
+- live-provider smoke tests that verify recovered memory appears in provider request debug artifacts without leaking scrubbed recovered-memory fields

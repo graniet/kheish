@@ -1,0 +1,40 @@
+---
+title: Approvals and structured questions
+description: Human-in-the-loop suspension points for sensitive actions and explicit user input.
+---
+
+# Approvals and structured questions
+
+Kheish can stop a run and wait for an operator or user decision without losing execution state.
+
+## Approvals
+
+Approvals are triggered when a tool execution requires human review under the active permission policy. An approval captures:
+
+- the pending tool call
+- the justification context
+- the request identifier used for resolution
+
+Once resolved, the suspended run resumes rather than starting over from scratch.
+
+## Structured user questions
+
+Structured user questions are used when the agent needs explicit input rather than guessing. They are designed for:
+
+- multiple-choice or constrained answers
+- optional declines
+- resumable execution after the answer is posted
+
+This is different from a generic chat turn. The daemon knows the run is blocked on an explicit input contract and can surface it as pending work.
+
+## Operational effect
+
+Both approvals and structured questions push the run into a waiting state. This lets:
+
+- another client resolve the wait later
+- the daemon restart and restore the pending state
+- operators inspect the exact blocking reason through the API and CLI
+
+## Recommended usage
+
+Use approvals for risky tool execution and structured questions when the model genuinely needs user choice or clarification. Avoid using either as a substitute for normal conversational turns when the run can proceed safely on its own.

@@ -1,0 +1,191 @@
+---
+title: Playbooks and flows API
+description: HTTP API for immutable Playbook versions and Flow projections over normal Kheish runs.
+---
+
+# Playbooks and flows API
+
+Playbooks and Flows are control-plane resources. They coordinate normal Kheish runs rather than replacing them.
+
+## Endpoint inventory
+
+Playbooks:
+
+- `GET /v1/playbooks`
+- `POST /v1/playbooks`
+- `POST /v1/playbooks/validate`
+- `GET /v1/playbooks/{playbook_id}`
+- `POST /v1/playbooks/{playbook_id}/publish`
+- `POST /v1/playbooks/{playbook_id}/revoke`
+
+Flows:
+
+- `GET /v1/flows`
+- `POST /v1/flows`
+- `GET /v1/flows/{flow_id}`
+- `POST /v1/flows/{flow_id}/cancel`
+- `POST /v1/flows/{flow_id}/evidence`
+- `POST /v1/flows/{flow_id}/verify/product-view`
+- `GET /v1/flows/{flow_id}/stream`
+
+## Playbook manifest
+
+`POST /v1/playbooks/validate` and `POST /v1/playbooks` both accept:
+
+```json
+{
+  "manifest": {
+    "playbook_id": "ops-inspection",
+    "version": "2026-04-23",
+    "title": "Operator inspection",
+    "objective": "Inspect a workspace and report what was verified.",
+    "phases": [
+      {
+        "phase_id": "inspect",
+        "objective": "Inspect the workspace root.",
+        "acceptance_criteria": ["The run output states what was verified."]
+      }
+    ],
+    "acceptance_criteria": ["A run is created and inspectable through the daemon."]
+  }
+}
+```
+
+The daemon computes a digest over the immutable manifest body. Creating the same `playbook_id + version + digest` is idempotent. Creating the same `playbook_id + version` with a different digest is rejected.
+
+Manifest fields such as `tools`, `runtime_defaults`, `scopes`, and `required_evidence` are stored and digest-covered. Flow start still executes a normal `SubmitInputRequest`; enforcement is expressed through start-time scope checks and Flow contract projection rather than a separate workflow runtime.
+
+When `tools.enforce` is true, Flow views evaluate scoped session journals against the manifest `allow`/`deny` lists. A completed run that used a blocked or non-allowed tool is projected as fail-closed instead of `succeeded`.
+
+`scopes.required_capability_scope` and `scopes.required_credential_scope` use the daemon `CapabilityScope` and `CredentialScope` shapes. Flow start rejects sessions whose current scope is wider than these requirements. This keeps scope enforcement on the existing session capability/credential machinery rather than introducing a second runtime.
+
+`required_evidence` can be declared at the manifest top level and per phase. Missing required evidence prevents a completed Flow from reporting success. Known primitive refs such as `run`, `task`, `agent`, `approval`, `question`, `schedule`, `output`, and `flow` must resolve inside the Flow projection; other evidence kinds are treated as operator attestations and can be appended later.
+
+## Publish and revoke
+
+`POST /v1/playbooks/{playbook_id}/publish` accepts:
+
+```json
+{
+  "version": "2026-04-23",
+  "digest": "sha256-digest",
+  "status": "active",
+  "evidence_refs": [
+    {
+      "kind": "run",
+      "id": "run-1",
+      "description": "real daemon validation"
+    }
+  ]
+}
+```
+
+Allowed publish statuses are `verified`, `canary`, and `active`. Publishing to one of those statuses requires `evidence_refs`.
+
+`POST /v1/playbooks/{playbook_id}/revoke` accepts:
+
+```json
+{
+  "version": "2026-04-23",
+  "digest": "sha256-digest",
+  "reason": "replaced by a safer version",
+  "evidence_refs": []
+}
+```
+
+## Start a Flow
+
+`POST /v1/flows` accepts:
+
+```json
+{
+  "flow_id": "flow-demo-1",
+  "idempotency_key": "flow-demo-1",
+  "playbook_ref": {
+    "playbook_id": "ops-inspection",
+    "version": "2026-04-23",
+    "digest": "sha256-digest"
+  },
+  "session_id": "flow-demo",
+  "request": {
+    "provider": "openai",
+    "source_plugin": "daemon",
+    "source_kind": "api",
+    "actor_id": "operator",
+    "content": "Inspect the workspace root and summarize what you verified.",
+    "input_items": [],
+    "attachments": [],
+    "generation": null,
+    "metadata": null,
+    "binding_keys": [],
+    "reply_targets": [],
+    "reply_plugin": null,
+    "reply_address": null
+  },
+  "metadata": {},
+  "evidence_refs": []
+}
+```
+
+The `request` field is the normal `SubmitInputRequest` shape used by session run creation. The daemon validates and normalizes that request through the existing session-run path.
+
+Flow start writes daemon-owned `kheish_flow` metadata into the underlying run. Callers must not provide that metadata key themselves. The metadata includes the Flow id, Playbook id, version, digest, and a daemon-generated nonce used for recovery matching.
+
+Retries are idempotent only when the submitted `flow_id`, `idempotency_key`, Playbook reference, session id, input request, Flow metadata, and evidence refs match the existing Flow.
+
+## Flow status
+
+Flow status is derived from scoped daemon primitives, not from a persisted `flow.status` field. The scope starts with the root run and includes sidechain agents spawned from that run, runs in those child sessions, scoped session tasks, and approval/question ids from current run state and historical run events.
+
+`FlowView.status` uses Flow statuses such as `succeeded`; the embedded `run`, when present, is a normal `RunView` with normal run statuses such as `completed`. Any interrupted scoped run projects the Flow to `interrupted`.
+
+- no run reference yet -> `pending`
+- cancelled before run scheduling -> `cancelled`
+- failed scoped run or failed scoped task -> `failed`
+- cancelled scoped run or cancelled scoped task -> `cancelled`
+- waiting scoped run or blocked scoped task -> `waiting`
+- queued/running scoped run or pending/in-progress scoped task -> `running`
+- completed scoped work with no failed/cancelled/running/waiting work -> `succeeded`
+- interrupted scoped run -> `interrupted`
+- missing referenced run -> `unknown`
+
+Failure and cancellation are fail-closed: a scoped failed task prevents the Flow from appearing succeeded just because the root run produced a positive final answer.
+
+Flow views include:
+
+- `phase_states`: one derived entry per manifest phase with `pending`, `satisfied`, or `blocked`.
+- `contract`: generic validation checks for required evidence and enforced tool policy.
+- `completed_at_ms`: the first terminal projection boundary. Later reused child-session activity is ignored so an old Flow cannot regress after it has settled.
+
+## Append Flow evidence
+
+`POST /v1/flows/{flow_id}/evidence` accepts:
+
+```json
+{
+  "evidence_refs": [
+    {
+      "kind": "manual",
+      "id": "review",
+      "description": "operator reviewed the output"
+    }
+  ]
+}
+```
+
+Appending evidence is idempotent by `kind + id`. Known daemon primitive kinds must resolve inside the Flow projection. The response is the updated `FlowView`, so operators can immediately see whether required evidence gates now pass.
+
+`GET /v1/flows/{flow_id}/stream` is a thin proxy over the referenced run stream. It does not create a second Flow event bus.
+
+## Evidence Used
+
+- DTOs and status mapping: `crates/kheish-daemon/src/playbooks.rs`
+- API routes: `crates/kheish-daemon/src/api/handlers.rs`
+- Run scheduling path: `crates/kheish-daemon/src/state/playbook_workflow.rs`
+
+## Evidence Note
+
+- Code verified: `crates/kheish-daemon/src/playbooks.rs`, `crates/kheish-daemon/src/state/playbook_workflow.rs`, `crates/kheish-daemon/src/api/handlers.rs`, `crates/kheish-daemon/src/cli/commands/playbooks.rs`.
+- CLI/API verified: endpoint inventory and command names checked against implemented routes and CLI commands.
+- Daemon live tested for this note: yes; an isolated daemon with OpenAI `gpt-5.4` started a Flow, completed a real provider run, failed closed while required manual evidence was missing, then recovered to `succeeded` after `flows evidence`.
+- Provider-specific tested for this note: OpenAI `gpt-5.4` smoke for Flow start, run completion, evidence gate, and evidence append.

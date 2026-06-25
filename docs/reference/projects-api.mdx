@@ -1,0 +1,340 @@
+---
+title: Projects API
+description: Daemon-owned projects, project members, linked channels, project tasks, and project-task start operations.
+---
+
+# Projects API
+
+Projects are daemon-owned coordination resources layered over sessions, runs, and channels.
+
+They do not replace the normal execution model:
+
+- sessions still execute work
+- runs still represent concrete execution
+- channels still hold public conversation
+
+Read [Projects and project tasks](../concepts/projects-and-project-tasks) for the model before using this API.
+
+The CLI mirrors this surface under `kheish-daemon projects ...`.
+
+## Endpoint inventory
+
+Projects:
+
+- `GET /v1/projects`
+- `POST /v1/projects`
+- `GET /v1/projects/{project_id}`
+- `PUT /v1/projects/{project_id}`
+- `DELETE /v1/projects/{project_id}`
+
+Project members:
+
+- `GET /v1/projects/{project_id}/members`
+- `POST /v1/projects/{project_id}/members`
+- `DELETE /v1/projects/{project_id}/members/{member_id}`
+
+Linked channels:
+
+- `GET /v1/projects/{project_id}/channels`
+- `POST /v1/projects/{project_id}/channels`
+- `DELETE /v1/projects/{project_id}/channels/{channel_id}`
+
+Project tasks:
+
+- `GET /v1/projects/{project_id}/tasks`
+- `POST /v1/projects/{project_id}/tasks`
+- `GET /v1/projects/{project_id}/tasks/{task_id}`
+- `PUT /v1/projects/{project_id}/tasks/{task_id}`
+- `DELETE /v1/projects/{project_id}/tasks/{task_id}`
+- `POST /v1/projects/{project_id}/tasks/{task_id}/start`
+
+## List projects
+
+`GET /v1/projects` supports:
+
+- `query`
+- `status`
+- `member_session_id`
+- `channel_id`
+
+`query` matches project id, display name, and description.
+
+Current project statuses are:
+
+- `active`
+- `paused`
+- `completed`
+- `archived`
+
+## Create a project
+
+`POST /v1/projects` accepts:
+
+- `project_id` optional stable caller-selected identifier
+- `display_name` required
+- `description` optional
+- `status` optional, defaulting to `active`
+- `members` optional initial project members
+- `channel_links` optional initial linked channels
+- `metadata` optional caller metadata
+
+Example:
+
+```json
+{
+  "project_id": "release-2026-q2",
+  "display_name": "Release 2026 Q2",
+  "description": "Coordinate the release across reviewer and implementer sessions.",
+  "members": [
+    {
+      "member_id": "implementer",
+      "member_kind": "session",
+      "display_name": "Implementer",
+      "session_id": "impl-session",
+      "role": "implementation",
+      "expertise_tags": ["rust"]
+    },
+    {
+      "member_id": "release-manager",
+      "member_kind": "human_actor",
+      "display_name": "Release manager",
+      "actor_id": "release-manager",
+      "role": "operator"
+    }
+  ],
+  "channel_links": [
+    {
+      "channel_id": "release-room",
+      "role": "coordination",
+      "default_for_new_tasks": true,
+      "mirror_members": true
+    }
+  ]
+}
+```
+
+Current validation rules:
+
+- `display_name` is required
+- channel ids must already exist
+- one project cannot register the same session twice under different member ids
+
+If no linked channel is marked as `default_for_new_tasks`, the daemon marks the first linked channel as the default.
+
+## Project members
+
+`POST /v1/projects/{project_id}/members` upserts one member.
+
+Fields:
+
+- `member_id` required stable identifier inside the project
+- `member_kind` required: `human_actor` or `session`
+- `display_name` required
+- `session_id` optional for `session` members
+- `agent_id` optional for `session` members
+- `actor_id` optional for `human_actor` members
+- `role` optional
+- `expertise_tags` optional
+- `metadata` optional
+
+Current member rules:
+
+- `session_id` and `agent_id` are mutually exclusive
+- omitting both on a session member falls back to `member_id`
+- task ownership is only valid for session-backed members
+- one session cannot appear twice in the same project under different member ids
+
+`DELETE /v1/projects/{project_id}/members/{member_id}` removes one member.
+
+Removal is rejected while that member still owns any non-terminal project task.
+
+## Linked channels
+
+`POST /v1/projects/{project_id}/channels` upserts one linked channel.
+
+Fields:
+
+- `channel_id` required existing daemon channel id
+- `role` optional semantic label
+- `default_for_new_tasks` optional boolean
+- `mirror_members` optional boolean
+- `metadata` optional
+
+Current link behavior:
+
+- at most one linked channel is kept as `default_for_new_tasks=true`
+- when `mirror_members=true`, project members are mirrored into the linked channel
+- mirrored channel member ids are namespaced as `project:{project_id}:{member_id}`
+- if the current default link is removed and another link remains, the first remaining link becomes the new default
+
+`DELETE /v1/projects/{project_id}/channels/{channel_id}` removes one link.
+
+Removal is rejected while non-terminal project tasks still reference that channel as their current discussion channel.
+
+## Project tasks
+
+Project tasks currently store:
+
+- `project_task_id`
+- `project_id`
+- `title`
+- `description`
+- `status`
+- `assignee_member_id`
+- `primary_session_id`
+- `latest_run_id`
+- `discussion`
+- `blocked_by`
+- `output`
+- `created_at_ms`
+- `updated_at_ms`
+- `metadata`
+
+Current statuses reuse the shared task status set:
+
+- `pending`
+- `in_progress`
+- `blocked`
+- `completed`
+- `failed`
+- `cancelled`
+
+## List project tasks
+
+`GET /v1/projects/{project_id}/tasks` supports:
+
+- `query`
+- `status`
+- `assignee_member_id`
+
+`query` matches task id, title, description, and recorded output.
+
+## Create a project task
+
+`POST /v1/projects/{project_id}/tasks` accepts:
+
+- `project_task_id` optional stable caller-selected identifier
+- `title` required
+- `description` optional
+- `status` optional, defaulting to `pending`
+- `assignment`
+- `discussion_channel_id`
+- `discussion_thread_root_message_id`
+- `blocked_by`
+- `latest_run_id`
+- `output`
+- `metadata`
+
+`assignment` accepts exactly one of:
+
+- `assignee_member_id`
+- `assignee_session_id`
+- `assignee_agent_id`
+
+Current task creation rules:
+
+- the project must be `active`
+- `title` is required
+- assignments resolve to an existing project member
+- only session-backed members can be task assignees
+- `discussion_channel_id` and `discussion_thread_root_message_id` must be provided together
+- explicit discussion channels must already be linked to the project
+- `latest_run_id`, when set, must belong to the assignee session
+- dependency ids must already exist in the same project
+- self-dependency and dependency cycles are rejected
+
+Example:
+
+```json
+{
+  "project_task_id": "review-routing",
+  "title": "Review route-file changes",
+  "description": "Inspect the release routing before rollout.",
+  "assignment": {
+    "assignee_member_id": "implementer"
+  },
+  "blocked_by": ["collect-release-notes"]
+}
+```
+
+## Update a project task
+
+`PUT /v1/projects/{project_id}/tasks/{task_id}` accepts partial updates for:
+
+- `title`
+- `description`
+- `status`
+- `assignment`
+- `clear_assignment`
+- `discussion_channel_id`
+- `discussion_thread_root_message_id`
+- `clear_discussion`
+- `blocked_by`
+- `latest_run_id`
+- `output`
+- `clear_output`
+- `metadata`
+
+Important current rules:
+
+- assignment still accepts exactly one of member/session/agent id
+- `latest_run_id` is validated against the effective assignee session
+- replacing `blocked_by` re-runs dependency validation and cycle checks
+
+## Delete a project task
+
+`DELETE /v1/projects/{project_id}/tasks/{task_id}` removes one task.
+
+Deletion is rejected while other project tasks still depend on it through `blocked_by`.
+
+## Start a project task
+
+`POST /v1/projects/{project_id}/tasks/{task_id}/start` creates a normal daemon run in the assigned session.
+
+Request fields:
+
+- `provider` optional route override
+- `model` optional model override
+- `kickoff_message` optional replacement kickoff text when the daemon creates a new discussion thread
+- `metadata` optional caller metadata attached to the spawned run
+
+The routing rules are the same as normal session input. On a named-route daemon, `provider` can carry a configured `route_id` rather than only a raw provider family.
+
+Current start rules:
+
+- the project must be `active`
+- the task must be assigned
+- the assignee must be a session-backed project member
+- every dependency must already be `completed`
+- terminal tasks must be reopened before start
+- a second start is rejected while `latest_run_id` still points at a non-terminal run
+
+Current start behavior:
+
+1. if the task already has a valid linked discussion thread, the daemon reuses it
+2. otherwise, if the project has one linked default channel, the daemon can create a kickoff thread there
+3. otherwise, the run still starts without a public discussion thread
+4. the daemon submits a normal input run in the assignee session
+5. the task stores the new `latest_run_id`
+
+Returned value:
+
+- the created `RunView`
+
+Current task status mapping after start:
+
+- queued run -> task stays `pending`
+- every other current run state -> task becomes `in_progress`
+
+## Operational notes
+
+- `DELETE /v1/projects/{project_id}` is rejected while the project still has tasks
+- deleting a channel is rejected while any project still links it
+- ending a session is rejected while it is still a project member
+- ending a session is also rejected while it still owns non-terminal project tasks
+
+## Related reading
+
+- [Projects and project tasks](../concepts/projects-and-project-tasks)
+- [Channels API](./channels-api)
+- [Sessions and runs API](./sessions-and-runs-api)

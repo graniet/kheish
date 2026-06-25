@@ -1,0 +1,886 @@
+---
+title: Sessions and runs API
+description: Session lifecycle, session-scoped defaults, inline vs detached execution, and run inspection.
+---
+
+# Sessions and runs API
+
+Sessions are the durable execution containers. Runs are individual execution attempts queued or executed inside those sessions.
+
+Channels are separate top-level public conversation resources. When a channel decides that one session should speak publicly, the daemon creates a normal run of kind `ChannelDelivery` inside that session. Read [Channels API](./channels-api) for the public conversation surface.
+
+Projects are also separate top-level daemon resources. Starting a project task still creates a normal run inside the assigned session rather than a separate project-local executor. Read [Projects API](./projects-api) for that coordination layer.
+
+## Endpoint inventory
+
+Sessions:
+
+- `POST /v1/sessions`
+- `GET /v1/sessions`
+- `GET /v1/sessions/{session_id}`
+- `GET /v1/sessions/{session_id}/memory-context`
+- `GET /v1/sessions/{session_id}/memory-search`
+- `GET /v1/sessions/{session_id}/skills`
+- `POST /v1/sessions/{session_id}/persona`
+- `PUT /v1/sessions/{session_id}/persona`
+- `DELETE /v1/sessions/{session_id}/persona`
+- `POST /v1/sessions/{session_id}/capability-scope`
+- `PUT /v1/sessions/{session_id}/capability-scope`
+- `DELETE /v1/sessions/{session_id}/capability-scope`
+- `POST /v1/sessions/{session_id}/credential-scope`
+- `PUT /v1/sessions/{session_id}/credential-scope`
+- `DELETE /v1/sessions/{session_id}/credential-scope`
+- `GET /v1/sessions/{session_id}/reply-targets`
+- `POST /v1/sessions/{session_id}/reply-targets`
+- `PUT /v1/sessions/{session_id}/reply-targets`
+- `DELETE /v1/sessions/{session_id}/reply-targets`
+- `POST /v1/sessions/{session_id}/route-policy`
+- `PUT /v1/sessions/{session_id}/route-policy`
+- `DELETE /v1/sessions/{session_id}/route-policy`
+- `GET /v1/sessions/{session_id}/events`
+- `GET /v1/sessions/{session_id}/stream`
+- `POST /v1/sessions/{session_id}/input`
+- `POST /v1/sessions/{session_id}/runs`
+- `POST /v1/sessions/{session_id}/interrupt`
+- `POST /v1/sessions/{session_id}/end`
+
+Runs:
+
+- `GET /v1/runs`
+- `GET /v1/runs/{run_id}`
+- `GET /v1/runs/{run_id}/external-actions`
+- `GET /v1/runs/{run_id}/events`
+- `GET /v1/runs/{run_id}/stream`
+- `POST /v1/runs/{run_id}/cancel`
+- `GET /v1/runs/{run_id}/debug`
+- `GET /v1/runs/{run_id}/debug/artifacts/{artifact_id}`
+- `POST /v1/runs/prune`
+
+Output deliveries:
+
+- `GET /v1/deliveries`
+- `GET /v1/deliveries/dead-letter`
+- `GET /v1/deliveries/{delivery_id}`
+- `POST /v1/deliveries/{delivery_id}/replay`
+
+Questions and approvals live on separate resume endpoints. Read [Questions and approvals API](./questions-and-approvals-api).
+
+## Create or reuse a session
+
+`POST /v1/sessions` accepts:
+
+- `session_id`: optional caller-selected identifier
+- `thread_id`: optional provider-side thread id
+- `persona_id`: optional persona bound at creation time
+- `capability_scope`: optional session capability override persisted on the session
+- `credential_scope`: optional session credential override persisted on the session
+
+Example:
+
+```json
+{
+  "session_id": "review-demo",
+  "persona_id": "reviewer",
+  "capability_scope": {
+    "skill_deny": ["live-inline-marker"]
+  },
+  "credential_scope": {
+    "route_allow": ["openai"],
+    "mcp_server_deny": ["github"]
+  }
+}
+```
+
+Behavior:
+
+- The handler currently returns `201 Created`.
+- If the requested `session_id` already exists, Kheish reuses that session.
+- Caller-selected `session_id` values must not be empty, `.` or `..`; dot-only path segments are reserved because URI clients normalize them before they reach the daemon.
+- A reuse request is rejected if the supplied `persona_id` conflicts with the already bound persona.
+- A reuse request is also rejected if the supplied `capability_scope` conflicts with the already persisted session scope.
+- A reuse request is also rejected if the supplied `credential_scope` conflicts with the already persisted session scope.
+
+`GET /v1/sessions` supports one query parameter:
+
+- `persona_id`: filter by currently bound persona snapshot
+- `page=true`: return a cursor-paginated envelope instead of the legacy array
+- `cursor`: continue from a previous paginated response
+- `limit`: bound the response size; without `page=true` this keeps the legacy array shape but still applies the limit and validates `limit=0`
+
+## Session-scoped defaults
+
+The daemon lets you persist session-local defaults that future runs inherit unless they are overridden per request.
+
+### Route policy
+
+`POST` and `PUT` on `/v1/sessions/{session_id}/route-policy` both persist the same `SessionRoutePolicy` shape:
+
+```json
+{
+  "route_policy": {
+    "provider": "openrouter",
+    "generation": {
+      "model": "openai/gpt-5.4-mini",
+      "tool_choice": "auto",
+      "allow_parallel_tool_calls": true,
+      "response_format": {
+        "type": "text"
+      }
+    }
+  }
+}
+```
+
+Fields:
+
+- `provider`: preferred daemon route id
+- `generation.model`
+- `generation.fallback_model`
+- `generation.tool_choice`
+- `generation.allow_parallel_tool_calls`
+- `generation.max_output_tokens`
+- `generation.temperature`
+- `generation.response_format`
+
+Route precedence is:
+
+1. explicit run override on `SubmitInputRequest`
+2. persisted session `route_policy`
+3. daemon `default_route`
+
+Named-route rule:
+
+- On a named-route daemon, the request `provider` field carries the route id, not necessarily the underlying provider family.
+
+Terminology note:
+
+- request `provider` selects a configured route id
+- backend responses and secret records may still use `provider` to name the underlying provider family
+
+### Session capability scope
+
+`POST` and `PUT` on `/capability-scope` both accept:
+
+```json
+{
+  "capability_scope": {
+    "skill_allow": ["research:browser"],
+    "skill_deny": ["live-inline-marker"],
+    "mcp_server_allow": ["openaiDeveloperDocs"],
+    "mcp_tool_deny": ["mcp__openaiDeveloperDocs__fetch_openai_doc"]
+  }
+}
+```
+
+Supported fields:
+
+- `skill_allow`
+- `skill_deny`
+- `mcp_server_allow`
+- `mcp_server_deny`
+- `mcp_tool_allow`
+- `mcp_tool_deny`
+
+The daemon normalizes the scope before persistence. The effective runtime scope is:
+
+1. persona capability baseline, when the session has a bound persona
+2. restricted by the persisted session capability scope
+
+### Session credential scope
+
+`POST` and `PUT` on `/credential-scope` both accept:
+
+```json
+{
+  "credential_scope": {
+    "route_allow": ["openai", "anthropic"],
+    "connector_allow": ["slack-prod"],
+    "connector_credential_allow": ["slack-prod:BOT_TOKEN"],
+    "mcp_server_deny": ["github"]
+  }
+}
+```
+
+Supported fields:
+
+- `route_allow`
+- `route_deny`
+- `connector_allow`
+- `connector_deny`
+- `connector_credential_allow`
+- `connector_credential_deny`
+- `mcp_server_allow`
+- `mcp_server_deny`
+
+This scope does not replace `CapabilityScope`.
+
+- `CapabilityScope` decides what the session can see or call
+- `CredentialScope` decides which auth-backed routes, connector credentials, and credentialed MCP surfaces can actually resolve
+
+Normalization rules worth remembering:
+
+- entries are trimmed, sorted, and deduplicated before persistence
+- `*` collapses an allow-list or deny-list to that wildcard alone
+- if you scope connectors with `connector_allow` or `connector_deny` and leave `connector_credential_allow` empty, concrete connector credential env keys default to denied
+
+Mutation rule:
+
+- persona, capability-scope, and credential-scope changes are only allowed while the session is idle for topology mutation
+- non-idle credential-scope mutation is returned as `409 Conflict`
+
+CLI examples:
+
+```bash
+./target/debug/kheish-daemon sessions set-credential-scope demo \
+  --credential-scope-file scope.json
+
+./target/debug/kheish-daemon sessions set-credential-scope demo --clear
+```
+
+## Inspect effective memory and visible skills
+
+Kheish exposes derived session-inspection endpoints that show what the daemon currently considers eligible for the next run before final prompt packing.
+
+### Session memory context
+
+`GET /v1/sessions/{session_id}/memory-context` returns a `SessionMemoryContextView`.
+
+Optional query parameter:
+
+- `query`: preview learned-context and recovered-memory ordering for a specific pending input without starting a run
+
+Important fields:
+
+- `session_id`
+- `effective_capability_scope`
+- `learning_scopes`
+- `learned_context`
+- `recovered_memory`
+- `visible_skills`
+
+This is a derived runtime-facing view, not the canonical session journal. Use it to inspect:
+
+- which semantic learnings are currently prompt-eligible
+- which recovered run memories are currently eligible for recovery
+- which skills are currently visible to the session
+
+Recovered run memories in this view are loaded from the daemon run-memory store, sanitized before storage, and filtered by the effective runtime run-memory policy. Expired or unreadable run-memory pointers are pruned as the view is built.
+
+The runtime can still truncate or omit parts of `learned_context` or `recovered_memory` later when it packs the final prompt for one specific input and model budget. A real run with pending input can rank both learned-context entries and recovered run-memory entries against that input before prompt projection.
+
+Current projection rules worth remembering:
+
+- `procedure` and `run_summary` learnings stay out of `learned_context`
+- learnings marked `sensitivity=sensitive` stay out of `learned_context` and `memory-search`
+- when a query is available and at least one prompt-eligible learning scores above zero, zero-score learnings are omitted from `learned_context`; if nothing scores, the daemon keeps the recency/scope fallback
+- learnings with `publish_tier=provisional` stay out of `learned_context`
+- learnings with `verification_status=failed` stay out of `learned_context`
+- automatically published learnings stay out of `learned_context` until `verification_status=verified`
+- learnings with `policy_decision=escalated` stay out of `learned_context`
+- promoted procedural skills only appear in `visible_skills` after their promoted-skill rollout state becomes `active`
+
+### Session memory search
+
+`GET /v1/sessions/{session_id}/memory-search` returns a bounded `SessionMemorySearchView`.
+
+Supported query parameters:
+
+- `query`
+- `limit`
+
+Current behavior:
+
+- when `query` is omitted, the daemon returns a recent browse view
+- when `query` is present, the daemon lexically ranks visible learnings, recovered runs, and visible skills; learning scores include deterministic query-term matching against Unicode content/kind/scope fields, and recovered-run scores include deterministic query-term matching against sanitized run-memory summaries/previews
+- recovered-run search is session-only by default; set runtime `run_memory_policy.search_visibility=learning_scopes` to opt in to searching recovered runs visible through the session's learning scopes
+- returned result kinds are `learning`, `recovered_run`, and `skill`
+- learnings marked `sensitivity=sensitive` are excluded from session memory-search
+- skills only appear in the search results when a query is present
+- omitted `limit` defaults to `12`
+- the daemon clamps `limit` to a maximum of `50`
+- expired or unreadable recovered-run records are pruned instead of being returned
+
+Important distinction:
+
+- `memory-context` shows the current eligible automatic projection
+- `memory-search` shows the broader daemon-owned memory browse/search surface visible to that session, but recovered-run results keep a session-local boundary unless `run_memory_policy.search_visibility=learning_scopes`
+
+Returned search results include operator-facing metadata such as:
+
+- `source_id`
+- `title`
+- `excerpt`
+- `score`
+- `timestamp_ms`
+- `scope`
+- `prompt_eligible`
+- `matched_fields`
+
+### Session-visible skills
+
+`GET /v1/sessions/{session_id}/skills` returns the skills currently visible to that session.
+
+Supported query parameter:
+
+- `query`
+
+This endpoint applies the same visibility rules used during input assembly and runtime tool exposure:
+
+- effective session capability scope
+- promoted-skill source-scope visibility
+
+### Session reply targets
+
+Structured session reply-target requests are accepted on:
+
+- `POST /v1/sessions/{session_id}/reply-targets`
+- `PUT /v1/sessions/{session_id}/reply-targets`
+
+Example:
+
+```json
+{
+  "reply_targets": [
+    {
+      "type": "telegram",
+      "connector": "prod-bot",
+      "chat_id": 123456789,
+      "message_thread_id": 12
+    },
+    {
+      "type": "http",
+      "url": "https://example.com/hooks/kheish",
+      "headers": {
+        "X-Delivery-Topic": "triage"
+      }
+    }
+  ]
+}
+```
+
+Supported request variants:
+
+- `raw`
+- `external`
+- `telegram`
+- `slack`
+- `http`
+
+`GET /v1/sessions/{session_id}/reply-targets` returns a `SessionReplyTargetsView` envelope:
+
+```json
+{
+  "reply_targets": [
+    {
+      "plugin": "telegram",
+      "address": "{\"connector\":\"prod-bot\",\"chat_id\":123456789,\"message_thread_id\":12}"
+    }
+  ]
+}
+```
+
+The returned `reply_targets` array is normalized `ReplyHandle` data, not the original structured request shape.
+
+### Persona binding
+
+Session persona mutation accepts:
+
+```json
+{
+  "persona_id": "reviewer"
+}
+```
+
+These endpoints mutate the bound session snapshot, not the underlying persona record:
+
+- `POST /v1/sessions/{session_id}/persona`
+- `PUT /v1/sessions/{session_id}/persona`
+- `DELETE /v1/sessions/{session_id}/persona`
+
+Persona and capability-scope changes are only allowed while the session is idle for topology mutation.
+
+## Submit work
+
+Kheish intentionally exposes two session submission modes:
+
+- `POST /v1/sessions/{session_id}/input`
+  - executes inline and returns an updated `SessionView`
+- `POST /v1/sessions/{session_id}/runs`
+  - queues detached work and returns `202 Accepted` with a `RunView`
+
+Use `/input` when the client wants the session view after execution. Use `/runs` when the client wants an explicit run handle for later polling or streaming.
+
+`/input` is accepted only while the session has no active or queued run. If work is already in progress, the daemon returns `409 application/problem+json` with domain `sessions` and code `session_busy`. Use `/runs` for detached submissions that may queue behind existing work.
+
+### `SubmitInputRequest`
+
+Request fields:
+
+- `provider`: optional run-scoped route override
+- `source_plugin`
+- `source_kind`
+- `actor_id`
+- `content`
+- `input_items`
+- `attachments`
+- `generation`
+- `completion_requirements`
+- `metadata`
+- `binding_keys`
+- `reply_targets`
+- `reply_plugin`
+- `reply_address`
+
+Important rules:
+
+- `input_items` cannot be combined with compatibility `content` or `attachments`
+- `content` defaults to an empty string, so ordered `input_items` requests can omit it
+- `content`, `attachments`, or `input_items` must provide actual input
+- `binding_keys` are durable session-affinity keys remembered by the daemon
+- one binding key cannot later be rebound to a different session
+- `reply_targets` accepts either normalized `ReplyHandle` objects or the same structured variants used by session reply-target defaults
+- `reply_plugin` and `reply_address` are compatibility fields; prefer `reply_targets`
+
+Attachment inputs use the same daemon-owned asset model documented in [Assets API](./assets-api). Inline assets require both a non-empty `file_name` and non-empty `content_base64`.
+
+### Generic input/output schema
+
+`input_items` is the preferred provider-neutral input surface. Supported item variants:
+
+- `{"type": "text", "text": "..."}`
+- `{"type": "asset_reference", "asset_id": "asset-1"}`
+- `{"type": "board_reference", "board_id": "board-1", "revision_id": "rev-1"}`
+- `{"type": "inline_asset", "file_name": "note.txt", "media_type": "text/plain", "content_base64": "..."}`
+
+Assistant output is stored as `DaemonOutputRecord` entries. Important fields:
+
+- `session_id`, `run_id`, `plugin`, and `address`
+- `content`, the plain text fallback
+- `parts`, the structured output parts
+- `artifacts`, the daemon-owned artifact references emitted with the output
+- `source_kind`, one of `assistant_text`, `emit_output`, or `daemon_emit_output`
+
+Persisted `parts` use this shape:
+
+```json
+{
+  "content": "Report attached.",
+  "parts": [
+    { "type": "text", "text": "Report attached." },
+    {
+      "type": "attachment",
+      "attachment": {
+        "id": "asset-1",
+        "media_type": "text/markdown",
+        "file_name": "report.md"
+      }
+    }
+  ],
+  "artifacts": [
+    {
+      "id": "asset-1",
+      "media_type": "text/markdown",
+      "file_name": "report.md"
+    }
+  ],
+  "source_kind": "emit_output"
+}
+```
+
+Normal assistant messages become daemon outputs automatically. The built-in `emit_output` tool is for explicit structured output and accepts `content`, `parts`, `artifact_ids`, and `include_artifacts_inline`. Tool input `asset` parts are normalized into persisted `attachment` parts. Event timestamps live on `RunEventEntry.timestamp_ms`, not on `DaemonOutputRecord`.
+
+### Content plus attachments example
+
+```json
+{
+  "provider": "openrouter",
+  "generation": {
+    "model": "openai/gpt-5.4-mini",
+    "tool_choice": "auto",
+    "allow_parallel_tool_calls": true,
+    "max_output_tokens": 4000,
+    "response_format": {
+      "type": "text"
+    }
+  },
+  "content": "Review the attached specification and produce a concise summary.",
+  "attachments": [
+    {
+      "type": "asset_reference",
+      "asset_id": "asset-123"
+    }
+  ],
+  "binding_keys": ["team:docs"],
+  "completion_requirements": [
+    {
+      "type": "workspace_file",
+      "path": "reports/spec-summary.md"
+    }
+  ]
+}
+```
+
+### Ordered multimodal input example
+
+```json
+{
+  "provider": "openrouter",
+  "generation": {
+    "model": "openai/gpt-5.4-mini",
+    "tool_choice": "auto",
+    "allow_parallel_tool_calls": true,
+    "response_format": {
+      "type": "text"
+    }
+  },
+  "input_items": [
+    {
+      "type": "text",
+      "text": "Compare this screenshot with the note that follows."
+    },
+    {
+      "type": "inline_asset",
+      "file_name": "screen.png",
+      "media_type": "image/png",
+      "content_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB..."
+    },
+    {
+      "type": "asset_reference",
+      "asset_id": "asset-note-1"
+    }
+  ]
+}
+```
+
+### Completion requirements
+
+Current daemon-enforced completion requirements are explicit and opt-in.
+
+Supported shape today:
+
+```json
+[
+  {
+    "type": "workspace_file",
+    "path": "reports/final.md"
+  }
+]
+```
+
+## Inspect session state
+
+`GET /v1/sessions/{session_id}` returns a `SessionView` containing:
+
+- `session_id`
+- `agent_id`
+- `snapshot`
+- `route_policy`
+- `capability_scope`
+- `effective_capability_scope`
+- `credential_scope`
+- `effective_credential_scope`
+- `persona`
+- `reply_targets`
+- `outputs`
+
+`GET /v1/sessions/{session_id}/events` returns `SessionEventLogView`:
+
+- `session`
+- `daemon_outputs`
+- `run_events`
+
+`GET /v1/sessions/{session_id}/stream` exposes the session SSE stream:
+
+```bash
+curl -N http://127.0.0.1:4000/v1/sessions/demo/stream
+```
+
+The stream is a session-filtered view of the daemon event bus. It supports `?cursor=<event_id>`
+and browser `Last-Event-ID` replay with decimal-string event ids, emits id-less typed `heartbeat`
+keepalives, and emits `stream_gap` with `skipped`, `reason`, `scope`, `skipped_is_estimate`, and
+optional `resume_after_id` when the requested cursor is older than the bounded replay window,
+predates the current daemon event-id epoch after restart, or the client falls behind the live
+channel. Filtered-stream scoped loss metadata is bounded; if the client falls behind beyond that
+metadata window, the stream emits a conservative gap. CLI stream commands abort individual SSE
+frames above 1 MiB, so use list/get endpoints for bulk output reconciliation.
+
+## Session interrupt and end
+
+`POST /v1/sessions/{session_id}/interrupt` returns:
+
+- `interrupted`
+- `snapshot`
+
+`POST /v1/sessions/{session_id}/end` accepts:
+
+```json
+{
+  "reason": "done"
+}
+```
+
+## Run inspection
+
+`GET /v1/runs` supports these query parameters:
+
+- `session_id`
+- `limit`, clamped to at most `100`
+- `priority_active`, which sorts active or pending work first when true
+
+Run kinds:
+
+- `input`
+- `scheduled_input`
+- `observation_materialization`
+- `scheduled_observation_materialization`
+- `mailbox_delivery`
+- `channel_delivery`
+- `parent_clarification`
+- `approval_resume`
+- `user_question_resume`
+
+Run statuses:
+
+- `queued`
+- `running`
+- `waiting_for_approval`
+- `waiting_for_user_question`
+- `completed`
+- `failed`
+- `interrupted`
+- `cancelled`
+
+The run lifecycle is a constrained state machine. Normal execution moves `queued -> running`,
+`running -> waiting_for_approval|waiting_for_user_question|completed|failed|interrupted|cancelled`,
+and waiting runs may resume to `running` or settle terminally. `running -> queued` is reserved for
+daemon restart recovery of replayable daemon-owned work; ordinary API mutations that attempt to
+rewind lifecycle state return `409 application/problem+json` with domain `runs` and code
+`run_state_conflict`.
+
+If restart repair finds more than one wait-capable run in a session, the first durable waiting run
+keeps the active slot. Extra waiting runs are requeued only when their payload is daemon-owned and
+safe to replay, such as scheduled, mailbox, observation, or parent-clarification work. Extra normal
+input runs are interrupted instead of replaying stale user/provider state.
+
+`RunView` includes:
+
+- `run_id`
+- `session_id`
+- `agent_id`
+- `kind`
+- `status`
+- `submitted_at_ms`
+- `updated_at_ms`
+- `started_at_ms`
+- `finished_at_ms`
+- `queued_position`
+- `request`
+- `input_attachments`
+- `input_metadata`
+- `pending_approval_ids`
+- `pending_approvals`
+- `pending_question_ids`
+- `pending_questions`
+- `outputs`
+- `deliveries`
+- `error`
+
+`RunView.request` is a compact `RunRequestSummary`:
+
+- `source_plugin`
+- `source_kind`
+- `actor_id`
+- `text_preview`
+- `provider`, the resolved route selector used for the run
+- `model`, the resolved model used for the run
+- `approval_count`
+- `question_count`
+
+Use `GET /v1/runs/{run_id}` as the source of truth for the route and model actually used by one execution.
+
+## Output delivery inspection
+
+Connector-backed output delivery is stored in the daemon delivery queue. Operator views are redacted: they expose the plugin, a target digest, attempts, safe error codes, timestamps, counts, and associated `run_id`, but not raw reply addresses or payload metadata.
+
+`GET /v1/deliveries` supports:
+
+- `session_id`
+- `run_id`
+- `plugin`
+- `status`: `pending`, `retrying`, `delivered`, or `dead_lettered`
+- `page`, `limit`, `cursor`
+
+`GET /v1/deliveries/dead-letter` is the same list filtered to `dead_lettered`.
+
+`POST /v1/deliveries/{delivery_id}/replay` replays one dead-lettered delivery by creating a new pending delivery with a new `delivery_id` and `replayed_from_delivery_id` pointing at the original dead letter. The original DLQ record remains as audit history. Replays are idempotent by default; a later non-forced replay returns the existing pending, delivered, or dead-lettered replay. Use `force=true` only when an intentional second replay is needed.
+
+`status.delivery.dead_lettered` is historical. `status.delivery.unresolved_dead_lettered` counts DLQ entries that do not yet have a completed replay and is the count used for the delivery health warning.
+
+`RunView.deliveries` embeds the same redacted delivery views for the run, so `runs get <run_id>` shows whether output is still pending, retrying, delivered, or dead-lettered.
+
+Persisted run event variants:
+
+- `accepted`
+- `queued`
+- `started`
+- `waiting_for_approval`
+- `approval_resolved`
+- `waiting_for_user_question`
+- `user_question_resolved`
+- `parent_clarification_resolved`
+- `output`
+- `completed`
+- `failed`
+- `interrupted`
+- `cancelled`
+
+Common event payload shapes:
+
+- `accepted`, `queued`, `started`, `completed`, `interrupted`, and `cancelled` include the current run projection.
+- `waiting_for_approval` includes pending approval ids, and new events also include the full pending approval request payloads under `requests` for audit. Older persisted events may contain ids only.
+- `approval_resolved` includes the exact resolution payloads that resumed the run, including `behavior`, optional `updated_input`, `justification`, and denial `reason`.
+- `waiting_for_user_question` includes pending question ids and the run projection. New events also include the full pending structured question payloads under `requests` for audit. Older persisted events may contain ids only.
+- `user_question_resolved` includes the exact structured answer payload that resumed a normal waiting run.
+- `parent_clarification_resolved` includes the requester child agent/session ids, the request id, decline flag, and exact structured resolution delivered to the child.
+- `output` includes the appended `DaemonOutputRecord` and the run projection.
+- `failed` includes the error string and the run projection.
+
+### Run external actions
+
+`GET /v1/runs/{run_id}/external-actions` returns the signed external-action audit records attached to that run.
+
+Important fields include:
+
+- `action_id`
+- `timestamp_ms`
+- `session_id`
+- `agent_id`
+- `run_id`
+- `tool_call_id`
+- `principal_id`
+- `parent_principal_id`
+- `grant_id`
+- `phase`
+- `kind`
+- `target`
+- `request_digest`
+- `response_digest`
+- `outcome`
+- `prev_hash`
+- `record_hash`
+- `signature_alg`
+- `key_id`
+- `signature`
+
+Use this endpoint when you need the durable operator audit for outbound calls or side effects without opening the full debug bundle.
+
+## Run debug surfaces
+
+`GET /v1/runs/{run_id}/debug` returns one `RunDebugView`:
+
+- `run_id`
+- `level`
+- `artifacts`
+
+Each artifact summary includes:
+
+- `artifact_id`
+- `format`
+- `updated_at_ms`
+- `bytes`: on-disk bytes
+- `plaintext_bytes`: retained UTF-8 payload bytes after any truncation
+- `sha256`: checksum of the retained plaintext bytes
+- `truncated`
+- `original_bytes`: present when the artifact was truncated by the size budget
+- `encrypted`: true when the artifact is encrypted at rest
+
+`GET /v1/runs/{run_id}/debug/artifacts/{artifact_id}` returns raw UTF-8 text, not a JSON envelope.
+
+Useful artifact ids usually include request, provider event stream, and normalized response records such as:
+
+- `turn-0001-attempt-0001-model-request`
+- `turn-0001-attempt-0001-provider-request`
+- `turn-0001-attempt-0001-provider-events`
+- `turn-0001-attempt-0001-model-response`
+
+Always discover artifact ids from the debug view before fetching bodies. Repeated provider/media
+artifacts that do not have a turn/attempt number keep the base id for the first payload and use
+timestamp suffixes for later payloads so evidence is not overwritten.
+
+## Run debug retention
+
+`POST /v1/runs/prune` explicitly prunes heavy debug evidence for terminal runs older than `older_than_ms`.
+The daemon also runs the configured debug TTL against stale terminal and orphaned debug bundles on
+boot and periodically during serve. Known non-terminal runs are protected so resumable runs keep
+their evidence.
+
+This endpoint is intentionally non-destructive for the control-plane audit:
+
+- run records remain available through `GET /v1/runs/{run_id}`
+- run events remain available through `GET /v1/runs/{run_id}/events`
+- only debug bundles returned by `GET /v1/runs/{run_id}/debug` are cleared
+- session journals, deliveries, external-action audit records, and run-memory records are outside this debug-evidence prune
+
+Core run records and run-event history are retained indefinitely by default. `runs prune` only
+removes debug evidence; it is not run-history GC.
+
+Request fields:
+
+- `older_than_ms`: required positive age threshold
+- `session_id`: optional session scope
+- `limit`: optional positive maximum number of candidate debug bundles to prune or report
+- `dry_run`: when true, reports candidates without deleting debug files
+
+Response fields:
+
+- `dry_run`
+- `now_ms`
+- `cutoff_ms`
+- `limit`
+- `matched_run_count`: eligible terminal runs with debug bundles before `limit` is applied
+- `candidate_run_ids`
+- `candidate_debug_bytes`
+- `pruned_debug_run_ids`
+- `pruned_debug_bytes`
+
+Retention validation errors such as non-positive `older_than_ms` or `limit` return `400 application/problem+json` with domain `runs` and code `run_retention_invalid_request`.
+
+Default automatic debug retention is 7 days. Operators can override the debug store at daemon start:
+
+- `KHEISH_DEBUG_TTL_MS`: automatic debug retention TTL; `0` disables automatic TTL cleanup
+- `KHEISH_DEBUG_GC_INTERVAL_MS`: periodic retention interval
+- `KHEISH_DEBUG_MAX_ARTIFACT_BYTES`: retained plaintext bytes per artifact
+- `KHEISH_DEBUG_MAX_RUN_BYTES`: retained artifact-body bytes per run
+- `KHEISH_DEBUG_MAX_ARTIFACTS_PER_RUN`: retained artifacts per run
+- `KHEISH_DEBUG_MAX_STORE_BYTES`: optional global debug-store cap; periodic maintenance prunes the
+  oldest terminal and orphaned bundles first, while protecting known non-terminal runs
+
+If `KHEISH_DEBUG_CAPTURE_KEY` or `KHEISH_DEBUG_CAPTURE_KEY_FILE` is configured but invalid, the
+daemon rejects non-`off` debug capture before runs start so evidence is not silently dropped.
+
+CLI:
+
+```bash
+./target/debug/kheish-daemon runs prune \
+  --older-than-ms 604800000 \
+  --session-id demo \
+  --limit 100 \
+  --dry-run
+```
+
+## Run events and cancellation
+
+`GET /v1/runs/{run_id}/events` returns the persisted `RunEventEntry[]` list, not the SSE envelope format.
+
+`GET /v1/runs/{run_id}/stream` exposes the run SSE stream:
+
+```bash
+curl -N http://127.0.0.1:4000/v1/runs/run-1/stream
+```
+
+The stream is a run-filtered view of the daemon event bus and supports the same decimal-string
+`cursor`, `Last-Event-ID`, typed `heartbeat`, and `stream_gap` semantics as the daemon-wide stream.
+
+`POST /v1/runs/{run_id}/cancel` returns the updated `RunView`. Cancelling an already-cancelled run
+is naturally idempotent: the daemon returns the same terminal projection and does not append a
+second `cancelled` lifecycle event.

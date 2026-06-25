@@ -1,0 +1,124 @@
+---
+title: Use Kheish From Python
+description: Connect one Python program to a running Kheish daemon and complete one real response run.
+---
+
+# Use Kheish from Python
+
+This is the shortest honest path from a running daemon to one completed SDK-backed run.
+
+If the daemon is not already working, start with [Run Kheish](./quickstart) first.
+
+This page documents the Python package from the separate `kheish-sdks` project. The daemon remains the source of truth for sessions and runs.
+
+## What you need first
+
+- one running `kheish-daemon`
+- Python with `pip`
+- one reachable daemon base URL
+- one bearer token only if your daemon requires control-plane auth
+
+For the local binary quickstart, `http://127.0.0.1:4000` is enough and no token is needed.
+
+For the Docker quickstart, export the daemon token first:
+
+```bash
+export KHEISH_TOKEN="$(cat docker/secrets/admin-token.txt)"
+```
+
+In both cases, point the SDK at the daemon:
+
+```bash
+export KHEISH_BASE_URL="http://127.0.0.1:4000"
+```
+
+## 1. Install the SDK
+
+```bash
+pip install kheish-sdk
+```
+
+If you are developing across sibling repositories instead of using the published package:
+
+```bash
+pip install -e ../kheish-sdks/python
+```
+
+## 2. Run one SDK-backed response
+
+Pick one fresh session id first so reruns stay clean:
+
+```bash
+export SDK_SESSION_ID="sdk-demo-$(date +%s)"
+```
+
+```bash
+python - <<'PY'
+import os
+from kheish import Kheish, Route
+
+with Kheish.from_env() as client:
+    run = client.responses.create(
+        session=os.environ["SDK_SESSION_ID"],
+        prompt="Reply with SDK_QUICKSTART_OK and one short sentence about why typed SDKs help integrators.",
+        route=Route.openai("gpt-5.4"),
+    )
+    result = run.wait(raise_on_failure=True)
+    print(result.output_text)
+PY
+```
+
+This mirrors the checked-in `responses_basic.py` example from the sibling `kheish-sdks` repository, but keeps the first success inline.
+
+If your daemon is not using an OpenAI route, the simplest first-success adjustment is to remove `route=...` and let the daemon default route apply.
+
+## 3. Verify the run from the daemon
+
+If you built the daemon binary on the host:
+
+```bash
+./target/debug/kheish-daemon runs list --session-id "$SDK_SESSION_ID"
+./target/debug/kheish-daemon sessions get "$SDK_SESSION_ID"
+./target/debug/kheish-daemon sessions events "$SDK_SESSION_ID"
+```
+
+If you are using the Docker quickstart instead:
+
+```bash
+docker compose -f docker/compose.yaml exec daemon \
+  kheish-daemon runs list --session-id "$SDK_SESSION_ID"
+docker compose -f docker/compose.yaml exec daemon \
+  kheish-daemon sessions get "$SDK_SESSION_ID"
+docker compose -f docker/compose.yaml exec daemon \
+  kheish-daemon sessions events "$SDK_SESSION_ID"
+```
+
+These commands should show:
+
+- one durable session named by `$SDK_SESSION_ID`
+- at least one completed run
+- at least one input event created by the SDK call
+
+## What this quickstart proves
+
+You are not only talking to a model. You are proving that:
+
+- application code can target the daemon directly
+- the daemon still owns the session and run lifecycle
+- SDK callers and daemon CLI inspection work against the same durable state
+
+## Next steps
+
+Once the basic SDK path works, the next useful lanes are:
+
+- [Overview](./overview) for the product model
+- [Sessions and runs](../concepts/sessions-and-runs) for the daemon execution model
+- [Approvals and questions](../concepts/approvals-and-questions) for blocked and resumable flows
+- [Webhook quickstart](../integrations/webhook-quickstart) for the first external ingress path
+
+For richer Python examples, the sibling `kheish-sdks` repository also includes:
+
+- `responses_basic.py`
+- `human_in_the_loop.py`
+- `session_persona_reply_targets.py`
+- `external_connector_fixed_session.py`
