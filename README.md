@@ -8,6 +8,12 @@
   <em>Persistent agent runtime and control plane for long-lived, tool-using AI workflows.</em>
 </p>
 
+<p align="center">
+  <a href="https://kheish.ai"><img src="https://img.shields.io/badge/Website-kheish.ai-ED1C2E?style=for-the-badge&logo=firefoxbrowser&logoColor=white" alt="Website"></a>
+  &nbsp;
+  <a href="https://docs.kheish.ai"><img src="https://img.shields.io/badge/Docs-docs.kheish.ai-0B0C0E?style=for-the-badge&logo=readthedocs&logoColor=white" alt="Documentation"></a>
+</p>
+
 ---
 
 ## The invariant: agents outlive callers
