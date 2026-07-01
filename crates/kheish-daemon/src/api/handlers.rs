@@ -3754,6 +3754,7 @@ where
         context,
         crate::stack::StackImportOptions {
             resources: request.resources,
+            allow_secret_env: request.allow_secret_env,
         },
     )
     .await

@@ -653,6 +653,7 @@ pub(crate) struct StackApplyOptions {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct StackImportOptions {
     pub(crate) resources: Vec<String>,
+    pub(crate) allow_secret_env: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -863,9 +864,8 @@ where
         )
         .into());
     }
-    let declared_resources = ResolvedStack::from_context(&context)
-        .await?
-        .desired_resource_keys();
+    let resolved = ResolvedStack::from_context(&context).await?;
+    let declared_resources = resolved.desired_resource_keys();
     let resources = import_resources_from_manifest(&declared_resources, options.resources)?;
     let ledger_path = resolve_ledger_path(client, context.state_root_override.as_deref()).await?;
     let _ledger_lock = LedgerLock::acquire(&ledger_path)?;
@@ -874,7 +874,14 @@ where
     for resource in resources {
         let key = ResourceKey::parse(&resource)?;
         let live = fetch_live_resource_value(client, &key).await?;
-        let digest = digest_json(&live)?;
+        let digest = import_resource_digest(
+            &key,
+            &live,
+            &resolved,
+            &ledger,
+            &context.ownership_id(),
+            options.allow_secret_env,
+        )?;
         if let Some(owner) = ledger.owner_of_resource(&key)
             && owner != context.ownership_id()
         {
@@ -885,7 +892,21 @@ where
             )
             .into());
         }
-        ledger.record_resource(&context.ownership_id(), &key, digest);
+        if key.kind == "secret" {
+            if let Some(fingerprint) = imported_secret_fingerprint(
+                &key,
+                &resolved,
+                &ledger,
+                options.allow_secret_env,
+            )? {
+                ledger.record_secret(&context.ownership_id(), &key.id, fingerprint.clone());
+                ledger.record_resource(&context.ownership_id(), &key, fingerprint);
+            } else {
+                ledger.record_resource(&context.ownership_id(), &key, digest);
+            }
+        } else {
+            ledger.record_resource(&context.ownership_id(), &key, digest);
+        }
         adopted.push(StackAction::new(
             "import",
             key.kind,
@@ -901,6 +922,51 @@ where
         ledger_path: ledger_path.display().to_string(),
         adopted,
     })
+}
+
+fn import_resource_digest(
+    key: &ResourceKey,
+    live: &Value,
+    resolved: &ResolvedStack,
+    ledger: &ApplyLedger,
+    ownership_id: &str,
+    allow_secret_env: bool,
+) -> Result<String> {
+    if key.kind == "secret"
+        && let Some(fingerprint) =
+            imported_secret_fingerprint(key, resolved, ledger, allow_secret_env)?
+    {
+        return Ok(fingerprint);
+    }
+    if let Some(fingerprint) = ledger.secret_fingerprint(ownership_id, &key.id) {
+        return Ok(fingerprint.to_string());
+    }
+    digest_json(live)
+}
+
+fn imported_secret_fingerprint(
+    key: &ResourceKey,
+    resolved: &ResolvedStack,
+    ledger: &ApplyLedger,
+    allow_secret_env: bool,
+) -> Result<Option<String>> {
+    if key.kind != "secret" {
+        return Ok(None);
+    }
+    let Some(secret) = resolved.secrets.iter().find(|secret| secret.slot == key.id) else {
+        return Ok(None);
+    };
+    let Some(env_name) = secret.value_env.as_deref() else {
+        return Ok(None);
+    };
+    if !allow_secret_env {
+        return Ok(None);
+    }
+    Ok(Some(secret_fingerprint(
+        &ledger.ledger_salt,
+        &secret.slot,
+        env_name,
+    )?))
 }
 
 fn import_resources_from_manifest(
@@ -986,6 +1052,7 @@ where
     };
 
     add_startup_actions(context, &resolved, &mut plan);
+    add_mcp_requirement_actions(client, &resolved, &mut plan).await?;
     add_secret_actions(
         client,
         context,
@@ -1032,6 +1099,17 @@ fn validate_self_contained_api_manifest(context: &StackContext) -> Result<()> {
         {
             file_refs.push(format!(
                 "spec.schedules[{}].request.content_file",
+                schedule.name
+            ));
+        }
+        if schedule
+            .flow_start
+            .as_ref()
+            .and_then(|flow_start| flow_start.request.content_file.as_ref())
+            .is_some()
+        {
+            file_refs.push(format!(
+                "spec.schedules[{}].flow_start.request.content_file",
                 schedule.name
             ));
         }
@@ -1110,6 +1188,23 @@ fn validate_stack(context: &StackContext) -> Result<StackValidation> {
         &mut validation,
     );
     validate_unique(
+        "spec.requires.mcp.servers",
+        document
+            .spec
+            .requires
+            .mcp
+            .servers
+            .iter()
+            .map(StackMcpServerRequirementSpec::name),
+        &mut validation,
+    );
+    validate_unique(
+        "spec.requires.mcp.tools",
+        document.spec.requires.mcp.tools.iter().map(String::as_str),
+        &mut validation,
+    );
+    validate_mcp_requirement_details(&document.spec.requires.mcp, &mut validation);
+    validate_unique(
         "spec.playbooks[] playbook_id/version",
         document.spec.playbooks.iter().filter_map(|playbook| {
             playbook
@@ -1151,6 +1246,8 @@ fn validate_stack(context: &StackContext) -> Result<StackValidation> {
 
 fn validate_resource_count(document: &StackDocument, validation: &mut StackValidation) {
     let resource_count = document.spec.requires.secrets.len()
+        + document.spec.requires.mcp.servers.len()
+        + document.spec.requires.mcp.tools.len()
         + usize::from(document.spec.startup.routes.is_some())
         + usize::from(document.spec.startup.connectors_config.is_some())
         + document.spec.startup.mcp_profiles.len()
@@ -1187,6 +1284,40 @@ where
                 .errors
                 .push(format!("{path} contains duplicate value {value}"));
         }
+    }
+}
+
+fn validate_mcp_requirement_details(
+    requirements: &StackMcpRequirements,
+    validation: &mut StackValidation,
+) {
+    for server in &requirements.servers {
+        let StackMcpServerRequirementSpec::Detailed(details) = server else {
+            continue;
+        };
+        if details
+            .source
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            validation
+                .errors
+                .push("spec.requires.mcp.servers[].source cannot be empty".to_string());
+        }
+        if details
+            .catalog_entry_id
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            validation
+                .errors
+                .push("spec.requires.mcp.servers[].catalog_entry_id cannot be empty".to_string());
+        }
+        validate_unique(
+            "spec.requires.mcp.servers[].credential_secret_refs",
+            details.credential_secret_refs.iter().map(String::as_str),
+            validation,
+        );
     }
 }
 
@@ -1933,6 +2064,125 @@ fn add_startup_actions(context: &StackContext, resolved: &ResolvedStack, plan: &
     ));
 }
 
+async fn add_mcp_requirement_actions<C>(
+    client: &C,
+    resolved: &ResolvedStack,
+    plan: &mut StackPlan,
+) -> Result<()>
+where
+    C: StackControlPlane + Sync,
+{
+    if resolved.mcp_requirements.servers.is_empty() && resolved.mcp_requirements.tools.is_empty() {
+        return Ok(());
+    }
+    let runtime = client
+        .get_json::<crate::RuntimeSettingsView>("/v1/runtime")
+        .await?;
+    for server in &resolved.mcp_requirements.servers {
+        let (present, reason) = mcp_server_requirement_status(&runtime, server);
+        if !present {
+            plan.errors.push(format!(
+                "required MCP server `{}` is not satisfied in the daemon runtime: {reason}",
+                server.name
+            ));
+        }
+        plan.actions.push(StackAction::new(
+            "requirements",
+            "mcp_server",
+            &server.name,
+            if present { "noop" } else { "blocked" },
+            reason,
+        ));
+    }
+    for tool in &resolved.mcp_requirements.tools {
+        let present = mcp_tool_active(&runtime, tool);
+        if !present {
+            plan.errors.push(format!(
+                "required MCP tool `{tool}` is not active in the daemon runtime"
+            ));
+        }
+        plan.actions.push(StackAction::new(
+            "requirements",
+            "mcp_tool",
+            tool,
+            if present { "noop" } else { "blocked" },
+            if present {
+                "required MCP tool is active"
+            } else {
+                "required MCP tool is missing from the active MCP surface"
+            },
+        ));
+    }
+    Ok(())
+}
+
+fn mcp_server_requirement_status(
+    runtime: &crate::RuntimeSettingsView,
+    requirement: &ResolvedMcpServerRequirement,
+) -> (bool, String) {
+    let Some(server) = runtime
+        .mcp
+        .servers
+        .iter()
+        .find(|server| server.server == requirement.name)
+    else {
+        return (false, "required MCP server is absent".to_string());
+    };
+    if !server.connected {
+        return (false, "required MCP server is disconnected".to_string());
+    }
+    if let Some(source) = requirement.source.as_deref()
+        && server.source.as_deref() != Some(source)
+    {
+        return (
+            false,
+            format!(
+                "required MCP server source `{source}` does not match live source `{}`",
+                server.source.as_deref().unwrap_or("<none>")
+            ),
+        );
+    }
+    if let Some(catalog_entry_id) = requirement.catalog_entry_id.as_deref()
+        && server.catalog_entry_id.as_deref() != Some(catalog_entry_id)
+    {
+        return (
+            false,
+            format!(
+                "required MCP server catalog entry `{catalog_entry_id}` does not match live catalog entry `{}`",
+                server.catalog_entry_id.as_deref().unwrap_or("<none>")
+            ),
+        );
+    }
+    if let Some(uses_credentials) = requirement.uses_credentials
+        && server.uses_credentials != uses_credentials
+    {
+        return (
+            false,
+            format!(
+                "required MCP server uses_credentials={uses_credentials} does not match live uses_credentials={}",
+                server.uses_credentials
+            ),
+        );
+    }
+    for secret_ref in &requirement.credential_secret_refs {
+        if !server
+            .credential_secret_refs
+            .iter()
+            .any(|live| live == secret_ref)
+        {
+            return (
+                false,
+                format!("required MCP server does not reference secret `{secret_ref}`"),
+            );
+        }
+    }
+    (true, "required MCP server is connected".to_string())
+}
+
+fn mcp_tool_active(runtime: &crate::RuntimeSettingsView, name: &str) -> bool {
+    runtime.mcp.tool_names.iter().any(|tool| tool == name)
+}
+
 async fn add_secret_actions<C>(
     client: &C,
     context: &StackContext,
@@ -1971,6 +2221,9 @@ where
         } else {
             None
         };
+        let provider_mismatch = live
+            .as_ref()
+            .is_some_and(|status| status.provider != secret.provider);
         let operation = if live.is_none() {
             if secret.value_env.is_some() {
                 "create"
@@ -1978,6 +2231,21 @@ where
                 plan.errors.push(format!(
                     "required secret {} is missing and has no value_env source",
                     secret.slot
+                ));
+                "blocked"
+            }
+        } else if provider_mismatch {
+            if secret.value_env.is_some() {
+                "update"
+            } else {
+                let live_provider = live
+                    .as_ref()
+                    .map(|status| status.provider.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                plan.errors.push(format!(
+                    "required secret {} exists with provider {live_provider} but manifest requires {} and has no value_env source",
+                    secret.slot,
+                    secret.provider
                 ));
                 "blocked"
             }
@@ -2379,6 +2647,9 @@ where
             }
             let fingerprint = secret_fingerprint(&ledger.ledger_salt, &secret.slot, env_name)?;
             if live.is_some()
+                && live
+                    .as_ref()
+                    .is_some_and(|status| status.provider == secret.provider)
                 && ledger
                     .secret_fingerprint(&context.ownership_id(), &secret.slot)
                     .is_some_and(|stored| stored == fingerprint)
@@ -2889,8 +3160,6 @@ where
                 )
                 .await;
             }
-            ledger.record_resource(&context.ownership_id(), &key, session.digest.clone());
-            ledger.save(ledger_path).await?;
         } else {
             if let Some(persona_id) = session.persona_id.clone() {
                 client
@@ -3168,6 +3437,7 @@ where
             .iter()
             .map(|error| StackVerificationCheck::failed("validate", error)),
     );
+    checks.extend(run_mcp_requirement_checks(client, &resolved).await?);
     if resolved.runtime_digest.is_some() {
         let live = client
             .get_json::<crate::RuntimeSettingsView>("/v1/runtime")
@@ -3186,11 +3456,25 @@ where
                 "/v1/runtime/secrets/{encoded}"
             ))
             .await?;
+        let (ok, detail) = match live.as_ref() {
+            None => (false, "required secret is missing".to_string()),
+            Some(status) if status.provider != secret.provider => (
+                false,
+                format!(
+                    "required secret provider mismatch: live provider {} does not match manifest provider {}",
+                    status.provider, secret.provider
+                ),
+            ),
+            Some(_) => (
+                true,
+                "required secret exists and provider matches".to_string(),
+            ),
+        };
         checks.push(StackVerificationCheck::new(
             "secret",
             &secret.slot,
-            live.is_some(),
-            "required secret exists",
+            ok,
+            &detail,
         ));
     }
     for connector in &resolved.connectors {
@@ -3360,6 +3644,45 @@ where
             ))
         }
     }
+}
+
+async fn run_mcp_requirement_checks<C>(
+    client: &C,
+    resolved: &ResolvedStack,
+) -> Result<Vec<StackVerificationCheck>>
+where
+    C: StackControlPlane + Sync,
+{
+    if resolved.mcp_requirements.servers.is_empty() && resolved.mcp_requirements.tools.is_empty() {
+        return Ok(Vec::new());
+    }
+    let runtime = client
+        .get_json::<crate::RuntimeSettingsView>("/v1/runtime")
+        .await?;
+    let mut checks = Vec::new();
+    checks.extend(resolved.mcp_requirements.servers.iter().map(|server| {
+        let (ok, detail) = mcp_server_requirement_status(&runtime, server);
+        StackVerificationCheck::new(
+            "requirement",
+            &format!("mcp_server/{}", server.name),
+            ok,
+            &detail,
+        )
+    }));
+    checks.extend(resolved.mcp_requirements.tools.iter().map(|tool| {
+        let active = mcp_tool_active(&runtime, tool);
+        StackVerificationCheck::new(
+            "requirement",
+            &format!("mcp_tool/{tool}"),
+            active,
+            if active {
+                "required MCP tool is active"
+            } else {
+                "required MCP tool is missing from the active MCP surface"
+            },
+        )
+    }));
+    Ok(checks)
 }
 
 fn runtime_matches(live: &crate::RuntimeSettingsView, desired: &StackRuntimeSpec) -> bool {
@@ -4116,6 +4439,8 @@ enum RestartPolicy {
 struct StackRequires {
     #[serde(default)]
     secrets: Vec<StackSecretRequirement>,
+    #[serde(default)]
+    mcp: StackMcpRequirements,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -4127,6 +4452,64 @@ struct StackSecretRequirement {
     provider: kheish_auth::AuthProvider,
     #[serde(default)]
     value_env: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StackMcpRequirements {
+    #[serde(default)]
+    servers: Vec<StackMcpServerRequirementSpec>,
+    #[serde(default)]
+    tools: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum StackMcpServerRequirementSpec {
+    Name(String),
+    Detailed(StackMcpServerRequirementDetails),
+}
+
+impl StackMcpServerRequirementSpec {
+    fn name(&self) -> &str {
+        match self {
+            Self::Name(name) => name,
+            Self::Detailed(details) => &details.name,
+        }
+    }
+
+    fn resolved(&self) -> ResolvedMcpServerRequirement {
+        match self {
+            Self::Name(name) => ResolvedMcpServerRequirement {
+                name: name.clone(),
+                source: None,
+                catalog_entry_id: None,
+                uses_credentials: None,
+                credential_secret_refs: Vec::new(),
+            },
+            Self::Detailed(details) => ResolvedMcpServerRequirement {
+                name: details.name.clone(),
+                source: details.source.clone(),
+                catalog_entry_id: details.catalog_entry_id.clone(),
+                uses_credentials: details.uses_credentials,
+                credential_secret_refs: details.credential_secret_refs.clone(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StackMcpServerRequirementDetails {
+    name: String,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    catalog_entry_id: Option<String>,
+    #[serde(default)]
+    uses_credentials: Option<bool>,
+    #[serde(default)]
+    credential_secret_refs: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -4381,6 +4764,7 @@ struct ResolvedStack {
     runtime: StackRuntimeSpec,
     runtime_digest: Option<String>,
     secrets: Vec<ResolvedSecret>,
+    mcp_requirements: ResolvedMcpRequirements,
     connectors: Vec<ResolvedConnector>,
     personas: Vec<ResolvedPersona>,
     sessions: Vec<ResolvedSession>,
@@ -4586,6 +4970,18 @@ impl ResolvedStack {
             runtime: context.document.spec.runtime.clone(),
             runtime_digest,
             secrets,
+            mcp_requirements: ResolvedMcpRequirements {
+                servers: context
+                    .document
+                    .spec
+                    .requires
+                    .mcp
+                    .servers
+                    .iter()
+                    .map(StackMcpServerRequirementSpec::resolved)
+                    .collect(),
+                tools: context.document.spec.requires.mcp.tools.clone(),
+            },
             connectors,
             personas,
             sessions,
@@ -4729,6 +5125,21 @@ struct ResolvedSecret {
     slot: String,
     provider: kheish_auth::AuthProvider,
     value_env: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ResolvedMcpRequirements {
+    servers: Vec<ResolvedMcpServerRequirement>,
+    tools: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedMcpServerRequirement {
+    name: String,
+    source: Option<String>,
+    catalog_entry_id: Option<String>,
+    uses_credentials: Option<bool>,
+    credential_secret_refs: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -5543,13 +5954,96 @@ mod tests {
         }
     }
 
+    struct RuntimeMcpControlPlane {
+        runtime: crate::RuntimeSettingsView,
+    }
+
+    impl RuntimeMcpControlPlane {
+        fn with_mcp(servers: &[&str], tools: &[&str]) -> Self {
+            Self {
+                runtime: crate::RuntimeSettingsView {
+                    mcp: kheish_mcp::McpRuntimeSnapshot {
+                        servers: servers
+                            .iter()
+                            .map(|server| kheish_mcp::McpServerSnapshot {
+                                server: (*server).to_string(),
+                                connected: true,
+                                ..Default::default()
+                            })
+                            .collect(),
+                        tool_names: tools.iter().map(|tool| (*tool).to_string()).collect(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            }
+        }
+
+        fn with_mcp_snapshot(servers: Vec<kheish_mcp::McpServerSnapshot>, tools: &[&str]) -> Self {
+            Self {
+                runtime: crate::RuntimeSettingsView {
+                    mcp: kheish_mcp::McpRuntimeSnapshot {
+                        servers,
+                        tool_names: tools.iter().map(|tool| (*tool).to_string()).collect(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StackControlPlane for RuntimeMcpControlPlane {
+        async fn get_json<T>(&self, path: &str) -> Result<T>
+        where
+            T: DeserializeOwned + Send,
+        {
+            match path {
+                "/v1/runtime" => encode_response(self.runtime.clone()),
+                "/v1/schedules" => encode_response(Vec::<crate::ScheduleView>::new()),
+                _ => bail!("unexpected GET {path}"),
+            }
+        }
+
+        async fn get_json_optional<T>(&self, _path: &str) -> Result<Option<T>>
+        where
+            T: DeserializeOwned + Send,
+        {
+            Ok(None)
+        }
+
+        async fn post_json<B, T>(&self, path: &str, _body: &B) -> Result<T>
+        where
+            B: Serialize + Sync + ?Sized,
+            T: DeserializeOwned + Send,
+        {
+            bail!("unexpected POST {path}")
+        }
+
+        async fn put_json<B, T>(&self, path: &str, _body: &B) -> Result<T>
+        where
+            B: Serialize + Sync + ?Sized,
+            T: DeserializeOwned + Send,
+        {
+            bail!("unexpected PUT {path}")
+        }
+
+        async fn delete_json<T>(&self, path: &str) -> Result<T>
+        where
+            T: DeserializeOwned + Send,
+        {
+            bail!("unexpected DELETE {path}")
+        }
+    }
+
     #[derive(Default)]
     struct RecordingControlPlane {
         deletes: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
-    impl StackControlPlane for RecordingControlPlane {
+impl StackControlPlane for RecordingControlPlane {
         async fn get_json<T>(&self, path: &str) -> Result<T>
         where
             T: DeserializeOwned + Send,
@@ -5592,19 +6086,31 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
     struct LiveSecretControlPlane {
         posts: std::sync::Mutex<Vec<String>>,
+        provider: kheish_auth::AuthProvider,
+    }
+
+    impl Default for LiveSecretControlPlane {
+        fn default() -> Self {
+            Self {
+                posts: std::sync::Mutex::new(Vec::new()),
+                provider: kheish_auth::AuthProvider::Generic,
+            }
+        }
     }
 
     #[async_trait::async_trait]
-    impl StackControlPlane for LiveSecretControlPlane {
+impl StackControlPlane for LiveSecretControlPlane {
         async fn get_json<T>(&self, path: &str) -> Result<T>
         where
             T: DeserializeOwned + Send,
         {
             if path == "/v1/schedules" {
                 return encode_response(Vec::<crate::ScheduleView>::new());
+            }
+            if path.starts_with("/v1/runtime/secrets/") {
+                return encode_response(self.secret_status());
             }
             bail!("unexpected GET {path}")
         }
@@ -5614,15 +6120,7 @@ mod tests {
             T: DeserializeOwned + Send,
         {
             if path.starts_with("/v1/runtime/secrets/") {
-                let status = kheish_auth::AuthSlotStatus {
-                    slot_id: kheish_auth::AuthSlotId::new("stack.test.LIVE_SECRET"),
-                    provider: kheish_auth::AuthProvider::Generic,
-                    mode: kheish_auth::AuthMode::OpaqueSecret,
-                    summary: "configured".to_string(),
-                    updated_at_ms: 1,
-                    details: BTreeMap::new(),
-                };
-                return encode_response(Some(status));
+                return encode_response(Some(self.secret_status()));
             }
             Ok(None)
         }
@@ -5649,6 +6147,19 @@ mod tests {
             T: DeserializeOwned + Send,
         {
             bail!("unexpected DELETE {path}")
+        }
+    }
+
+    impl LiveSecretControlPlane {
+        fn secret_status(&self) -> kheish_auth::AuthSlotStatus {
+            kheish_auth::AuthSlotStatus {
+                slot_id: kheish_auth::AuthSlotId::new("stack.test.LIVE_SECRET"),
+                provider: self.provider,
+                mode: kheish_auth::AuthMode::OpaqueSecret,
+                summary: "configured".to_string(),
+                updated_at_ms: 1,
+                details: BTreeMap::new(),
+            }
         }
     }
 
@@ -6792,6 +7303,7 @@ spec:
             context,
             StackImportOptions {
                 resources: vec!["session/triage".to_string()],
+                allow_secret_env: false,
             },
         )
         .await
@@ -6826,6 +7338,7 @@ spec: {}
             context,
             StackImportOptions {
                 resources: vec!["session/victim".to_string()],
+                allow_secret_env: false,
             },
         )
         .await
@@ -6881,6 +7394,7 @@ spec:
             context,
             StackImportOptions {
                 resources: vec!["connector/http/ingress".to_string()],
+                allow_secret_env: false,
             },
         )
         .await
@@ -6916,7 +7430,10 @@ spec: {}
         let error = import_stack(
             &EmptyControlPlane,
             context,
-            StackImportOptions { resources },
+            StackImportOptions {
+                resources,
+                allow_secret_env: false,
+            },
         )
         .await
         .unwrap_err();
@@ -6952,6 +7469,50 @@ spec:
             &validation,
             "file reference reviewer.md is not allowed through the daemon Stack API"
         ));
+    }
+
+    #[tokio::test]
+    async fn apply_rejects_flow_start_file_refs_through_daemon_api_context() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: flow-file-self-contained
+spec:
+  schedules:
+    - name: flow-file-ref
+      target_session_id: reviewer
+      cadence:
+        type: once
+        fire_at_ms: 4102444800000
+      flow_start:
+        playbook_ref:
+          playbook_id: feature-flow
+          version: "1"
+          digest: digest
+        request:
+          content_file: prompt.md
+"#;
+        let context = StackContext::from_manifest(raw, PathBuf::from("."), None, false).unwrap();
+
+        let error = apply_stack(
+            &EmptyControlPlane,
+            context,
+            StackApplyOptions {
+                dry_run: true,
+                force_restart: false,
+                allow_secret_env: false,
+                prune: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(
+            message.contains("spec.schedules[flow-file-ref].flow_start.request.content_file"),
+            "{message}"
+        );
     }
 
     #[tokio::test]
@@ -7077,6 +7638,227 @@ spec:
 
         assert!(!validation.valid);
         assert!(errors_contain(&validation, "resource limit"));
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_duplicate_mcp_requirements() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: duplicate-mcp-requires
+spec:
+  requires:
+    mcp:
+      servers: ["github", "github"]
+      tools: ["mcp__github__get_issue", ""]
+"#;
+
+        let validation = validate_stack_context(&context(raw)).await.unwrap();
+
+        assert!(!validation.valid);
+        assert!(errors_contain(
+            &validation,
+            "spec.requires.mcp.servers contains duplicate value github"
+        ));
+        assert!(errors_contain(
+            &validation,
+            "spec.requires.mcp.tools cannot be empty"
+        ));
+    }
+
+    #[tokio::test]
+    async fn plan_blocks_when_required_mcp_surface_is_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: missing-mcp
+spec:
+  requires:
+    mcp:
+      servers: ["github"]
+      tools: ["mcp__github__create_pull_request"]
+"#;
+        let context = StackContext::from_manifest(
+            raw,
+            PathBuf::from("."),
+            Some(temp.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+
+        let plan = build_plan(
+            &RuntimeMcpControlPlane::with_mcp(&[], &[]),
+            &context,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(!plan.valid);
+        assert!(plan.errors.iter().any(|error| {
+            error.contains("required MCP server `github` is not satisfied in the daemon runtime")
+        }));
+        assert!(plan.errors.iter().any(|error| {
+            error.contains("required MCP tool `mcp__github__create_pull_request` is not active")
+        }));
+        assert!(
+            plan.actions
+                .iter()
+                .any(|action| action.resource_type == "mcp_server"
+                    && action.resource_id == "github"
+                    && action.operation == "blocked")
+        );
+        assert!(
+            plan.actions
+                .iter()
+                .any(|action| action.resource_type == "mcp_tool"
+                    && action.resource_id == "mcp__github__create_pull_request"
+                    && action.operation == "blocked")
+        );
+
+        let verification = verify_stack(
+            &RuntimeMcpControlPlane::with_mcp(&[], &[]),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(!verification.valid);
+        assert!(verification.checks.iter().any(|check| {
+            check.target == "mcp_tool/mcp__github__create_pull_request"
+                && !check.ok
+                && check
+                    .detail
+                    .contains("missing from the active MCP surface")
+        }));
+    }
+
+    #[tokio::test]
+    async fn plan_checks_detailed_mcp_server_requirements() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: credentialed-mcp
+spec:
+  requires:
+    mcp:
+      servers:
+        - name: github
+          source: codex_config
+          uses_credentials: true
+          credential_secret_refs: ["mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN"]
+      tools: ["mcp__github__create_pull_request"]
+"#;
+        let context = StackContext::from_manifest(
+            raw,
+            PathBuf::from("."),
+            Some(temp.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+        let uncredentialed = RuntimeMcpControlPlane::with_mcp_snapshot(
+            vec![kheish_mcp::McpServerSnapshot {
+                server: "github".to_string(),
+                source: Some("codex_config".to_string()),
+                connected: true,
+                tools: vec!["mcp__github__create_pull_request".to_string()],
+                ..Default::default()
+            }],
+            &["mcp__github__create_pull_request"],
+        );
+
+        let plan = build_plan(&uncredentialed, &context, false, false)
+            .await
+            .unwrap();
+        assert!(!plan.valid);
+        assert!(plan.errors.iter().any(|error| {
+            error.contains("required MCP server `github` is not satisfied")
+                && error.contains("uses_credentials=true")
+        }));
+
+        let credentialed = RuntimeMcpControlPlane::with_mcp_snapshot(
+            vec![kheish_mcp::McpServerSnapshot {
+                server: "github".to_string(),
+                source: Some("codex_config".to_string()),
+                uses_credentials: true,
+                credential_secret_refs: vec!["mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN".to_string()],
+                connected: true,
+                tools: vec!["mcp__github__create_pull_request".to_string()],
+                ..Default::default()
+            }],
+            &["mcp__github__create_pull_request"],
+        );
+
+        let plan = build_plan(&credentialed, &context, false, false)
+            .await
+            .unwrap();
+        assert!(plan.valid, "{:?}", plan.errors);
+    }
+
+    #[tokio::test]
+    async fn plan_and_verify_accept_active_mcp_requirements() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: active-mcp
+spec:
+  requires:
+    mcp:
+      servers: ["github"]
+      tools: ["mcp__github__create_pull_request"]
+"#;
+        let context = StackContext::from_manifest(
+            raw,
+            PathBuf::from("."),
+            Some(temp.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+        let control =
+            RuntimeMcpControlPlane::with_mcp(&["github"], &["mcp__github__create_pull_request"]);
+
+        let plan = build_plan(&control, &context, false, false).await.unwrap();
+        assert!(plan.valid, "{:?}", plan.errors);
+        assert!(
+            plan.actions
+                .iter()
+                .any(|action| action.resource_type == "mcp_server"
+                    && action.resource_id == "github"
+                    && action.operation == "noop")
+        );
+        assert!(
+            plan.actions
+                .iter()
+                .any(|action| action.resource_type == "mcp_tool"
+                    && action.resource_id == "mcp__github__create_pull_request"
+                    && action.operation == "noop")
+        );
+
+        let verification = verify_stack(&control, &context).await.unwrap();
+        assert!(verification.valid, "{:?}", verification.checks);
+        assert!(
+            verification
+                .checks
+                .iter()
+                .any(|check| check.kind == "requirement"
+                    && check.target == "mcp_server/github"
+                    && check.ok)
+        );
+        assert!(
+            verification
+                .checks
+                .iter()
+                .any(|check| check.kind == "requirement"
+                    && check.target == "mcp_tool/mcp__github__create_pull_request"
+                    && check.ok)
+        );
     }
 
     #[tokio::test]
@@ -7289,6 +8071,147 @@ spec:
         );
         assert!(client.posts.lock().unwrap().is_empty());
         assert!(!stack_ledger_path(temp.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn import_value_env_secret_records_fingerprint_without_rewrite() {
+        let _guard = crate::debug::debug_capture_env_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let env_name = "KHEISH_STACK_TEST_IMPORT_SECRET_FINGERPRINT";
+        unsafe {
+            std::env::set_var(env_name, "imported-value");
+        }
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: imported-live-secret
+spec:
+  requires:
+    secrets:
+      - ref: stack.test.LIVE_SECRET
+        provider: generic
+        value_env: KHEISH_STACK_TEST_IMPORT_SECRET_FINGERPRINT
+"#;
+        let context = StackContext::from_manifest(
+            raw,
+            PathBuf::from("."),
+            Some(temp.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+        let client = LiveSecretControlPlane::default();
+
+        import_stack(
+            &client,
+            context.clone(),
+            StackImportOptions {
+                resources: vec!["secret/stack.test.LIVE_SECRET".to_string()],
+                allow_secret_env: true,
+            },
+        )
+        .await
+        .unwrap();
+        let plan = build_plan(&client, &context, false, true).await.unwrap();
+
+        unsafe {
+            std::env::remove_var(env_name);
+        }
+        assert!(plan.valid, "{:?}", plan.errors);
+        assert!(plan.actions.iter().any(|action| {
+            action.resource_type == "secret"
+                && action.resource_id == "stack.test.LIVE_SECRET"
+                && action.operation == "noop"
+        }));
+
+        let ledger = ApplyLedger::load_or_new(&stack_ledger_path(temp.path()))
+            .await
+            .unwrap();
+        let down_actions = plan_down(&context, &ledger);
+        assert!(down_actions.iter().any(|action| {
+            action.resource_type == "secret"
+                && action.resource_id == "stack.test.LIVE_SECRET"
+                && action.operation == "blocked"
+        }));
+    }
+
+    #[tokio::test]
+    async fn secret_provider_drift_is_not_hidden_by_matching_fingerprint() {
+        let _guard = crate::debug::debug_capture_env_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let env_name = "KHEISH_STACK_TEST_SECRET_PROVIDER_DRIFT";
+        unsafe {
+            std::env::set_var(env_name, "same-value");
+        }
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: provider-drift-secret
+spec:
+  requires:
+    secrets:
+      - ref: stack.test.LIVE_SECRET
+        provider: open_ai
+        value_env: KHEISH_STACK_TEST_SECRET_PROVIDER_DRIFT
+"#;
+        let context = StackContext::from_manifest(
+            raw,
+            PathBuf::from("."),
+            Some(temp.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+        let client = LiveSecretControlPlane::default();
+
+        import_stack(
+            &client,
+            context.clone(),
+            StackImportOptions {
+                resources: vec!["secret/stack.test.LIVE_SECRET".to_string()],
+                allow_secret_env: true,
+            },
+        )
+        .await
+        .unwrap();
+        let plan = build_plan(&client, &context, false, true).await.unwrap();
+
+        unsafe {
+            std::env::remove_var(env_name);
+        }
+        assert!(plan.valid, "{:?}", plan.errors);
+        assert!(plan.actions.iter().any(|action| {
+            action.resource_type == "secret"
+                && action.resource_id == "stack.test.LIVE_SECRET"
+                && action.operation == "update"
+        }));
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_secret_provider_drift() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: verify-provider-drift-secret
+spec:
+  requires:
+    secrets:
+      - ref: stack.test.LIVE_SECRET
+        provider: open_ai
+"#;
+        let context = context(raw);
+        let client = LiveSecretControlPlane::default();
+
+        let report = verify_stack(&client, &context).await.unwrap();
+
+        assert!(!report.valid);
+        assert!(report.checks.iter().any(|check| {
+            check.kind == "secret"
+                && check.target == "stack.test.LIVE_SECRET"
+                && !check.ok
+                && check.detail.contains("provider mismatch")
+        }));
     }
 
     #[tokio::test]

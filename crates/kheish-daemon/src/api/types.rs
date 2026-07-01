@@ -182,6 +182,9 @@ pub struct StackImportRequest {
     /// Optional explicit resource keys such as `persona/demo` or `connector/http/inbox`.
     #[serde(default)]
     pub resources: Vec<String>,
+    /// Records value_env fingerprints for imported secrets. The caller attests the live secret matches the environment value.
+    #[serde(default)]
+    pub allow_secret_env: bool,
 }
 
 /// KheishStack down request body.

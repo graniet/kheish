@@ -1824,6 +1824,11 @@ struct StackImportArgs {
         help = "Resource to adopt, formatted as kind/id; may be repeated"
     )]
     resources: Vec<String>,
+    #[arg(
+        long,
+        help = "Allow imported value_env secrets to be fingerprinted from the daemon environment"
+    )]
+    allow_secret_env: bool,
 }
 
 #[derive(Args, Debug, Clone)]

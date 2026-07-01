@@ -13,9 +13,29 @@ spec:
       - ref: mcp.linear.LINEAR_API_KEY
         provider: generic
         value_env: LINEAR_API_KEY
-      - ref: mcp.github.GITHUB_TOKEN
+      - ref: mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN
         provider: generic
-        value_env: GITHUB_TOKEN
+        value_env: GITHUB_PERSONAL_ACCESS_TOKEN
+    mcp:
+      servers:
+        - name: github
+          source: codex_config
+          uses_credentials: true
+          credential_secret_refs: ["mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN"]
+        - name: linear
+          source: codex_config
+          uses_credentials: true
+          credential_secret_refs: ["mcp.linear.LINEAR_API_KEY"]
+      tools:
+        - mcp__github__create_pull_request
+        - mcp__github__get_pull_request
+        - mcp__github__list_pull_requests
+        - mcp__github__list_pull_request_comments
+        - mcp__github__reply_to_review_comment
+        - mcp__linear__create_comment
+        - mcp__linear__get_issue
+        - mcp__linear__list_issues
+        - mcp__linear__update_issue
   personas:
     - persona_id: feature-pr-operator
       display_name: Feature PR Operator
@@ -26,6 +46,7 @@ spec:
         mcp_tool_allow:
           - mcp__github__create_pull_request
           - mcp__github__get_pull_request
+          - mcp__github__list_pull_requests
           - mcp__github__list_pull_request_comments
           - mcp__github__reply_to_review_comment
           - mcp__linear__create_comment
@@ -41,6 +62,7 @@ spec:
         mcp_tool_allow:
           - mcp__github__create_pull_request
           - mcp__github__get_pull_request
+          - mcp__github__list_pull_requests
           - mcp__github__list_pull_request_comments
           - mcp__github__reply_to_review_comment
           - mcp__linear__create_comment

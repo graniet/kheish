@@ -102,6 +102,7 @@ pub(crate) async fn run_stack_command(
             let request = StackImportRequest {
                 stack: stack_manifest_request(&args.file.file, !args.file.no_strict_scopes).await?,
                 resources: args.resources,
+                allow_secret_env: args.allow_secret_env,
             };
             let report = client
                 .post_json::<_, StackImportReport>("/v1/stacks/import", &request)

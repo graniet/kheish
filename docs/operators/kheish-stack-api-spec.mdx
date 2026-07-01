@@ -51,8 +51,8 @@ Apply order is semantic, not cosmetic:
 3. personas
 4. connectors
 5. sessions
-6. schedules
-7. playbooks
+6. playbooks
+7. schedules
 8. verification
 
 Startup-only changes such as route files, MCP profile loading, and file-backed connector config are plan-only in v1alpha1. The daemon reports them as blocked because it cannot hot-reload or self-restart those inputs safely.
@@ -69,7 +69,7 @@ Strict scope validation is always enforced in v1alpha1. Legacy `strict_scopes: f
 
 Wildcard allow entries require explicit `spec.apply.allow_wildcard_scopes: true`.
 
-Secrets supplied with `value_env` are not read during plan/apply unless the caller explicitly passes `allow_secret_env=true` (or the matching CLI flag). The ledger stores only a salted fingerprint. HTTP connector secrets in a Stack must use `secret_ref` or `env`; inline connector `value` fields are rejected because the daemon cannot read them back for drift comparison.
+Secrets supplied with `value_env` are not read during plan/apply/import unless the caller explicitly passes `allow_secret_env=true` (or the matching CLI flag). The ledger stores only a salted fingerprint. When a secret already exists because MCP needed it before daemon startup, `stack import --resource secret/<slot> --allow-secret-env` adopts the slot and records the fingerprint without rewriting the live secret. HTTP connector secrets in a Stack must use `secret_ref` or `env`; inline connector `value` fields are rejected because the daemon cannot read them back for drift comparison.
 
 ## Deletion
 
