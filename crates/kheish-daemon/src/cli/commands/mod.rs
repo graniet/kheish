@@ -22,4 +22,5 @@ pub(crate) mod runtime;
 pub(crate) mod schedules;
 pub(crate) mod secrets;
 pub(crate) mod sessions;
+pub(crate) mod stack;
 pub(crate) mod tasks;

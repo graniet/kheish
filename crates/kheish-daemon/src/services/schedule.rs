@@ -3,7 +3,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use tokio::sync::{Mutex, Notify};
 
 use crate::DaemonScheduleStatusSummaryView;
@@ -160,6 +160,26 @@ impl ScheduleService {
     pub(crate) async fn create_schedule(&self, record: ScheduleRecord) -> Result<ScheduleView> {
         let view = record.view.clone();
         let mut schedules = self.schedules.lock().await;
+        self.schedule_store.save_schedule(&record)?;
+        schedules.insert(view.schedule_id.clone(), record);
+        drop(schedules);
+        self.notify.notify_waiters();
+        Ok(view)
+    }
+
+    /// Persists and registers one new schedule only when its public name is unused.
+    pub(crate) async fn create_schedule_if_name_absent(
+        &self,
+        record: ScheduleRecord,
+    ) -> Result<ScheduleView> {
+        let view = record.view.clone();
+        let mut schedules = self.schedules.lock().await;
+        if schedules
+            .values()
+            .any(|candidate| candidate.view.name == view.name)
+        {
+            bail!("schedule {} already exists", view.name);
+        }
         self.schedule_store.save_schedule(&record)?;
         schedules.insert(view.schedule_id.clone(), record);
         drop(schedules);

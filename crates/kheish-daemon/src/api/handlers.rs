@@ -1,6 +1,7 @@
 //! HTTP handlers and router assembly for daemon APIs.
 
 use std::convert::Infallible;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +24,7 @@ use kheish_auth::{
 use kheish_core::ModelDriver;
 use kheish_types::HookSettings;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::events::sse_stream;
@@ -64,9 +66,11 @@ use super::types::{
     SetSessionCredentialScopeRequest, SetSessionGoalRequest, SetSessionPersonaRequest,
     SetSessionReplyTargetsRequest, SetSessionRoutePolicyRequest, SetSystemPromptRequest,
     SetToolRuntimeLimitsRequest, SkillListQuery, SkillSummaryView, SkillView,
-    SpawnSidechainRequest, StartProjectTaskRequest, StopTaskRequest, SubmitInputRequest,
-    SubmitRunRequest, SupersedeLearningRequest, TaskListQuery, TaskOutputQuery, UpdateBoardRequest,
-    UpdateChannelRequest, UpdatePersonaRequest, UpdateProjectRequest, UpdateProjectTaskRequest,
+    SpawnSidechainRequest, StackApplyRequest, StackDownRequest, StackImportRequest,
+    StackManifestRequest, StackPlanRequest, StartProjectTaskRequest, StopTaskRequest,
+    SubmitInputRequest, SubmitRunRequest, SupersedeLearningRequest, TaskListQuery, TaskOutputQuery,
+    UpdateBoardRequest, UpdateChannelRequest, UpdatePersonaRequest, UpdateProjectRequest,
+    UpdateProjectTaskRequest,
 };
 use crate::assets::MAX_ASSET_BYTES;
 use crate::problems::DaemonProblem;
@@ -89,6 +93,7 @@ use crate::{
 // the HTTP body budget above the raw asset limit so valid images are not
 // rejected before they reach asset validation.
 const CONTROL_PLANE_JSON_BODY_LIMIT_BYTES: usize = MAX_ASSET_BYTES * 2;
+const STACK_CONTROL_PLANE_JSON_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 const DEFAULT_LIST_PAGE_LIMIT: usize = 50;
 const MAX_LIST_PAGE_LIMIT: usize = 100;
 
@@ -337,6 +342,20 @@ where
     M: ModelDriver + Send + Sync + 'static,
 {
     let probe_state = state.clone();
+    let stack_routes = Router::new()
+        .route("/v1/stacks/validate", post(validate_stack::<M>))
+        .route("/v1/stacks/plan", post(plan_stack::<M>))
+        .route("/v1/stacks/apply", post(apply_stack::<M>))
+        .route("/v1/stacks/verify", post(verify_stack::<M>))
+        .route("/v1/stacks/import", post(import_stack::<M>))
+        .route("/v1/stacks/down", post(down_stack::<M>))
+        .route(
+            "/v1/stacks/{ownership_id}/ledger",
+            get(get_stack_ledger::<M>),
+        )
+        .layer(DefaultBodyLimit::max(
+            STACK_CONTROL_PLANE_JSON_BODY_LIMIT_BYTES,
+        ));
     let control_plane = Router::new()
         .route("/v1/status", get(status::<M>))
         .route("/v1/capabilities", get(capabilities))
@@ -519,6 +538,7 @@ where
             "/v1/projects/{project_id}/tasks/{task_id}/start",
             post(start_project_task::<M>),
         )
+        .merge(stack_routes)
         .route(
             "/v1/playbooks",
             get(list_playbooks::<M>).post(create_playbook::<M>),
@@ -1123,6 +1143,7 @@ fn openapi_spec() -> Value {
                 "405": { "$ref": "#/components/responses/Problem" },
                 "409": { "$ref": "#/components/responses/Problem" },
                 "413": { "$ref": "#/components/responses/Problem" },
+                "422": { "$ref": "#/components/responses/Problem" },
                 "429": { "$ref": "#/components/responses/Problem" },
                 "503": { "$ref": "#/components/responses/Problem" },
                 "500": { "$ref": "#/components/responses/Problem" }
@@ -1247,6 +1268,7 @@ fn openapi_base_responses() -> Value {
         "405": { "$ref": "#/components/responses/Problem" },
         "409": { "$ref": "#/components/responses/Problem" },
         "413": { "$ref": "#/components/responses/Problem" },
+        "422": { "$ref": "#/components/responses/Problem" },
         "429": { "$ref": "#/components/responses/Problem" },
         "503": { "$ref": "#/components/responses/Problem" },
         "500": { "$ref": "#/components/responses/Problem" }
@@ -1302,6 +1324,7 @@ fn attach_common_pagination_parameters(paths: &mut serde_json::Map<String, Value
                 "405": { "$ref": "#/components/responses/Problem" },
                 "409": { "$ref": "#/components/responses/Problem" },
                 "413": { "$ref": "#/components/responses/Problem" },
+                "422": { "$ref": "#/components/responses/Problem" },
                 "429": { "$ref": "#/components/responses/Problem" },
                 "503": { "$ref": "#/components/responses/Problem" },
                 "500": { "$ref": "#/components/responses/Problem" }
@@ -2140,6 +2163,34 @@ const CONTROL_PLANE_OPENAPI_ROUTES: &[OpenApiRouteSpec] = &[
     OpenApiRouteSpec {
         path: "/v1/projects/{project_id}/tasks/{task_id}/start",
         methods: &["POST"],
+    },
+    OpenApiRouteSpec {
+        path: "/v1/stacks/validate",
+        methods: &["POST"],
+    },
+    OpenApiRouteSpec {
+        path: "/v1/stacks/plan",
+        methods: &["POST"],
+    },
+    OpenApiRouteSpec {
+        path: "/v1/stacks/apply",
+        methods: &["POST"],
+    },
+    OpenApiRouteSpec {
+        path: "/v1/stacks/verify",
+        methods: &["POST"],
+    },
+    OpenApiRouteSpec {
+        path: "/v1/stacks/import",
+        methods: &["POST"],
+    },
+    OpenApiRouteSpec {
+        path: "/v1/stacks/down",
+        methods: &["POST"],
+    },
+    OpenApiRouteSpec {
+        path: "/v1/stacks/{ownership_id}/ledger",
+        methods: &["GET"],
     },
     OpenApiRouteSpec {
         path: "/v1/playbooks",
@@ -3566,6 +3617,205 @@ where
         .await
         .map(Json)
         .map_err(internal_error)
+}
+
+fn stack_context_from_request<M>(
+    state: &DaemonState<M>,
+    request: StackManifestRequest,
+) -> Result<crate::stack::StackContext, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    let root = request
+        .file_root
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    crate::stack::StackContext::from_manifest(
+        &request.manifest,
+        root,
+        Some(state.state_root().to_path_buf()),
+        request.strict_scopes.unwrap_or(true),
+    )
+    .map_err(internal_error)
+}
+
+async fn parse_stack_json_request<T>(request: Request<Body>) -> Result<T, ApiError>
+where
+    T: DeserializeOwned,
+{
+    let bytes = to_bytes(request.into_body(), STACK_CONTROL_PLANE_JSON_BODY_LIMIT_BYTES)
+        .await
+        .map_err(|_| {
+            ApiError::coded(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "stacks",
+                "stack_payload_too_large",
+                format!(
+                    "KheishStack request body exceeds the {STACK_CONTROL_PLANE_JSON_BODY_LIMIT_BYTES} byte limit"
+                ),
+            )
+        })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        ApiError::coded(
+            StatusCode::BAD_REQUEST,
+            "stacks",
+            "stack_invalid_json",
+            format!("failed to parse KheishStack request JSON: {error}"),
+        )
+    })
+}
+
+async fn validate_stack<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    request: Request<Body>,
+) -> Result<Json<crate::StackValidation>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    let request = parse_stack_json_request::<StackManifestRequest>(request).await?;
+    let context = stack_context_from_request(state.as_ref(), request)?;
+    crate::stack::validate_stack_context(&context)
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn plan_stack<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    request: Request<Body>,
+) -> Result<Json<crate::StackPlan>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    let request = parse_stack_json_request::<StackPlanRequest>(request).await?;
+    let only_changes = request.only_changes;
+    let allow_secret_env = request.allow_secret_env;
+    let context = stack_context_from_request(state.as_ref(), request.stack)?;
+    let client = crate::stack::StateStackControlPlane::new(state);
+    crate::stack::plan_stack(&client, &context, only_changes, allow_secret_env)
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn apply_stack<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    request: Request<Body>,
+) -> Result<Json<crate::StackApplyReport>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    let request = parse_stack_json_request::<StackApplyRequest>(request).await?;
+    let context = stack_context_from_request(state.as_ref(), request.stack)?;
+    let client = crate::stack::StateStackControlPlane::new(state);
+    crate::stack::apply_stack(
+        &client,
+        context,
+        crate::stack::StackApplyOptions {
+            dry_run: request.dry_run,
+            force_restart: request.force_restart,
+            allow_secret_env: request.allow_secret_env,
+            prune: request.prune,
+        },
+    )
+    .await
+    .map(Json)
+    .map_err(internal_error)
+}
+
+async fn verify_stack<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    request: Request<Body>,
+) -> Result<Json<crate::StackVerificationReport>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    let request = parse_stack_json_request::<StackManifestRequest>(request).await?;
+    let context = stack_context_from_request(state.as_ref(), request)?;
+    let client = crate::stack::StateStackControlPlane::new(state);
+    crate::stack::verify_stack(&client, &context)
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn import_stack<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    request: Request<Body>,
+) -> Result<Json<crate::StackImportReport>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    let request = parse_stack_json_request::<StackImportRequest>(request).await?;
+    let context = stack_context_from_request(state.as_ref(), request.stack)?;
+    let client = crate::stack::StateStackControlPlane::new(state);
+    crate::stack::import_stack(
+        &client,
+        context,
+        crate::stack::StackImportOptions {
+            resources: request.resources,
+        },
+    )
+    .await
+    .map(Json)
+    .map_err(internal_error)
+}
+
+async fn down_stack<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    request: Request<Body>,
+) -> Result<Json<crate::StackDownReport>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    let request = parse_stack_json_request::<StackDownRequest>(request).await?;
+    let context = stack_context_from_request(state.as_ref(), request.stack)?;
+    let client = crate::stack::StateStackControlPlane::new(state);
+    crate::stack::down_stack(
+        &client,
+        context,
+        crate::stack::StackDownOptions { yes: request.yes },
+    )
+    .await
+    .map(Json)
+    .map_err(internal_error)
+}
+
+async fn get_stack_ledger<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    AxumPath(ownership_id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    let path = crate::stack::stack_ledger_path(state.state_root());
+    let ledger = match tokio::fs::read(&path).await {
+        Ok(bytes) => serde_json::from_slice::<Value>(&bytes).map_err(|error| {
+            internal_error(anyhow!(
+                "failed to parse stack ledger {}: {error}",
+                path.display()
+            ))
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({
+            "version": 1,
+            "stacks": {},
+        }),
+        Err(error) => {
+            return Err(internal_error(
+                anyhow!(error).context(format!("failed to read {}", path.display())),
+            ));
+        }
+    };
+    let stack = ledger
+        .get("stacks")
+        .and_then(|stacks| stacks.get(&ownership_id))
+        .cloned()
+        .unwrap_or(Value::Null);
+    json_value(serde_json::json!({
+        "ownership_id": ownership_id,
+        "ledger_path": path.display().to_string(),
+        "stack": stack,
+    }))
 }
 
 async fn list_playbooks<M>(
@@ -7608,12 +7858,20 @@ fn internal_error(error: anyhow::Error) -> ApiError {
         || message.contains("publish status must be verified, canary, or active")
         || message.contains("requires evidence_refs")
         || message.contains("evidence_refs is required")
+        || message.contains("KheishStack manifest exceeds")
+        || message.contains("KheishStack manifest uses YAML anchor/alias")
+        || message.contains("failed to parse KheishStack")
+        || message.contains("file reference")
+            && message.contains("not allowed through the daemon Stack API")
+        || message.contains("file references")
+            && message.contains("not allowed through the daemon Stack API")
         || message.contains("evidence kind is required")
         || message.contains("evidence id is required")
         || message.contains("does not resolve inside flow")
         || message.contains("must be appended after the flow projection exists")
         || message.contains("flow requires narrower session capability_scope")
         || message.contains("flow requires narrower session credential_scope")
+        || message.contains("credential_scope does not allow route")
         || message.contains("metadata key `") && message.contains("` is daemon-owned")
         || message.contains("metadata must be an object when daemon metadata is attached")
         || message.contains("report_path must be workspace-relative")
@@ -7917,6 +8175,23 @@ fn typed_problem_code(message: &str, status: StatusCode) -> Option<(&'static str
         if message.contains("tool runtime limit ") {
             return Some(("runtime", "invalid_tool_runtime_limits"));
         }
+        if message.contains("credential_scope does not allow route") {
+            return Some(("runtime", "route_blocked_by_credential_scope"));
+        }
+        if message.contains("KheishStack manifest exceeds") {
+            return Some(("stacks", "stack_manifest_too_large"));
+        }
+        if message.contains("KheishStack manifest uses YAML anchor/alias") {
+            return Some(("stacks", "yaml_anchors_not_supported"));
+        }
+        if message.contains("failed to parse KheishStack") {
+            return Some(("stacks", "stack_invalid_manifest"));
+        }
+        if (message.contains("file reference") || message.contains("file references"))
+            && message.contains("not allowed through the daemon Stack API")
+        {
+            return Some(("stacks", "stack_file_refs_not_supported"));
+        }
         if is_invalid_learning_policy_error(message) {
             return Some(("runtime", "invalid_learning_policy"));
         }
@@ -7927,11 +8202,15 @@ fn typed_problem_code(message: &str, status: StatusCode) -> Option<(&'static str
 #[cfg(test)]
 mod tests {
     use anyhow::anyhow;
-    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use axum::body::Body;
+    use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 
     use crate::problems::DaemonProblem;
 
-    use super::{direct_run_idempotency_key, internal_error};
+    use super::{
+        STACK_CONTROL_PLANE_JSON_BODY_LIMIT_BYTES, direct_run_idempotency_key, internal_error,
+        parse_stack_json_request,
+    };
 
     #[test]
     fn internal_error_classifies_persona_not_found() {
@@ -8039,6 +8318,62 @@ mod tests {
             assert_eq!(error.status, StatusCode::BAD_REQUEST, "{message}");
             assert_eq!(error.code, "bad_request", "{message}");
         }
+    }
+
+    #[test]
+    fn internal_error_classifies_stack_manifest_guards() {
+        let anchor = internal_error(anyhow!(
+            "KheishStack manifest uses YAML anchor/alias token `&` at line 4, column 11; anchors and aliases are disabled"
+        ));
+        assert_eq!(anchor.status, StatusCode::BAD_REQUEST);
+        assert_eq!(anchor.domain, Some("stacks"));
+        assert_eq!(anchor.code, "yaml_anchors_not_supported");
+
+        let size = internal_error(anyhow!(
+            "KheishStack manifest exceeds the 262144 byte limit"
+        ));
+        assert_eq!(size.status, StatusCode::BAD_REQUEST);
+        assert_eq!(size.domain, Some("stacks"));
+        assert_eq!(size.code, "stack_manifest_too_large");
+
+        let file_ref = internal_error(anyhow!(
+            "file references are not allowed through the daemon Stack API; submit a self-contained manifest: spec.personas[reviewer].soul_file"
+        ));
+        assert_eq!(file_ref.status, StatusCode::BAD_REQUEST);
+        assert_eq!(file_ref.domain, Some("stacks"));
+        assert_eq!(file_ref.code, "stack_file_refs_not_supported");
+    }
+
+    #[tokio::test]
+    async fn parse_stack_json_request_enforces_stack_body_limit_before_json_parse() {
+        let request = Request::builder()
+            .body(Body::from(
+                "x".repeat(STACK_CONTROL_PLANE_JSON_BODY_LIMIT_BYTES + 1),
+            ))
+            .expect("request");
+
+        let error = parse_stack_json_request::<crate::StackManifestRequest>(request)
+            .await
+            .expect_err("oversized stack body should be rejected");
+
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(error.domain, Some("stacks"));
+        assert_eq!(error.code, "stack_payload_too_large");
+    }
+
+    #[tokio::test]
+    async fn parse_stack_json_request_reports_typed_invalid_json() {
+        let request = Request::builder()
+            .body(Body::from("{not-json"))
+            .expect("request");
+
+        let error = parse_stack_json_request::<crate::StackManifestRequest>(request)
+            .await
+            .expect_err("invalid stack JSON should be rejected");
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.domain, Some("stacks"));
+        assert_eq!(error.code, "stack_invalid_json");
     }
 
     #[test]
@@ -8478,6 +8813,18 @@ mod tests {
             spec["paths"]["/v1/agents/audit"]["get"].is_object(),
             "agent audit path should be documented"
         );
+        assert!(
+            spec["paths"]["/v1/stacks/plan"]["post"].is_object(),
+            "stack plan path should be documented"
+        );
+        assert!(
+            spec["paths"]["/v1/stacks/apply"]["post"].is_object(),
+            "stack apply path should be documented"
+        );
+        assert!(
+            spec["paths"]["/v1/stacks/{ownership_id}/ledger"]["get"].is_object(),
+            "stack ledger path should be documented"
+        );
         assert_eq!(
             spec["paths"]["/v1/agents/summaries"]["get"]["parameters"][0]["name"],
             "root_agent_id"
@@ -8762,7 +9109,7 @@ mod tests {
                         panic!("OpenAPI operation {method} {} has no responses", route.path)
                     });
                 for status in [
-                    "400", "401", "403", "404", "405", "409", "413", "429", "503", "500",
+                    "400", "401", "403", "404", "405", "409", "413", "422", "429", "503", "500",
                 ] {
                     assert_eq!(
                         responses[status]["$ref"], "#/components/responses/Problem",

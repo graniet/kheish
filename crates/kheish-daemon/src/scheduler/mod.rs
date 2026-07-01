@@ -267,9 +267,7 @@ pub(crate) fn validate_schedule_create_request(request: &ScheduleCreateRequest) 
     Ok(())
 }
 
-pub(crate) fn summarize_schedule_create_request(
-    request: &ScheduleCreateRequest,
-) -> RunRequestSummary {
+pub fn summarize_schedule_create_request(request: &ScheduleCreateRequest) -> RunRequestSummary {
     match (
         request.request.as_ref(),
         request.observation_materialization.as_ref(),

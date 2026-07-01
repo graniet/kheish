@@ -56,9 +56,11 @@ pub use types::{
     SetSessionGoalRequest, SetSessionPersonaRequest, SetSessionReplyTargetsRequest,
     SetSessionRoutePolicyRequest, SetSystemPromptRequest, SetToolRuntimeLimitsRequest,
     SidechainSubtaskRequest, SkillListQuery, SkillRuntimeView, SkillSummaryView, SkillView,
-    SlackConnectorView, SpawnSidechainRequest, StartProjectTaskRequest, StopTaskRequest,
-    SubmitInputItemRequest, SubmitInputRequest, SubmitRunRequest, SupersedeLearningRequest,
-    TaskListQuery, TaskOutputQuery, TelegramConnectorView, UpdateBoardRequest,
-    UpdateChannelRequest, UpdatePersonaRequest, UpdateProjectRequest, UpdateProjectTaskRequest,
+    SlackConnectorView, SpawnSidechainRequest, StackApplyRequest, StackDownRequest,
+    StackImportRequest, StackManifestRequest, StackPlanRequest, StartProjectTaskRequest,
+    StopTaskRequest, SubmitInputItemRequest, SubmitInputRequest, SubmitRunRequest,
+    SupersedeLearningRequest, TaskListQuery, TaskOutputQuery, TelegramConnectorView,
+    UpdateBoardRequest, UpdateChannelRequest, UpdatePersonaRequest, UpdateProjectRequest,
+    UpdateProjectTaskRequest,
 };
 pub(crate) use types::{validate_input_attachment_requests, validate_submit_input_items};

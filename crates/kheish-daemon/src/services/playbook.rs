@@ -169,6 +169,23 @@ impl PlaybookService {
         &self,
         request: CreatePlaybookRequest,
     ) -> Result<PlaybookView> {
+        self.create_playbook_with_existing_policy(request, false)
+            .await
+    }
+
+    pub(crate) async fn create_playbook_if_version_absent(
+        &self,
+        request: CreatePlaybookRequest,
+    ) -> Result<PlaybookView> {
+        self.create_playbook_with_existing_policy(request, true)
+            .await
+    }
+
+    async fn create_playbook_with_existing_policy(
+        &self,
+        request: CreatePlaybookRequest,
+        reject_existing_version: bool,
+    ) -> Result<PlaybookView> {
         let validation = validate_playbook_manifest(&request.manifest);
         if !validation.valid {
             bail!(
@@ -205,6 +222,9 @@ impl PlaybookService {
                     "playbook {playbook_id}@{version} already exists with digest {}",
                     existing.digest
                 );
+            }
+            if reject_existing_version {
+                bail!("playbook {playbook_id}@{version} already exists");
             }
             return Ok(record_to_view(record, Some(&version)));
         }

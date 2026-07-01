@@ -6694,7 +6694,7 @@ async fn daemon_sidechain_spawn_persists_restricted_scopes_and_tool_surface() ->
             thread_id: None,
             persona_id: None,
             credential_scope: Some(kheish_types::CredentialScope {
-                route_allow: vec!["anthropic".to_string(), "openai".to_string()],
+                route_allow: vec!["openai".to_string(), "scripted".to_string()],
                 connector_allow: vec!["slack".to_string(), "github".to_string()],
                 connector_credential_allow: vec![
                     "slack:bot_token".to_string(),
@@ -6794,7 +6794,7 @@ async fn daemon_sidechain_spawn_persists_restricted_scopes_and_tool_surface() ->
                 ..kheish_types::CapabilityScope::default()
             }),
             credential_scope: Some(kheish_types::CredentialScope {
-                route_allow: vec!["openai".to_string()],
+                route_allow: vec!["scripted".to_string()],
                 connector_allow: vec!["github".to_string()],
                 connector_credential_allow: vec!["github:app_token".to_string()],
                 ..kheish_types::CredentialScope::default()
@@ -6820,7 +6820,7 @@ async fn daemon_sidechain_spawn_persists_restricted_scopes_and_tool_surface() ->
     );
     assert_eq!(
         child.credential_scope.route_allow,
-        vec!["openai".to_string()]
+        vec!["scripted".to_string()]
     );
     assert_eq!(
         child.credential_scope.connector_allow,
@@ -6832,7 +6832,7 @@ async fn daemon_sidechain_spawn_persists_restricted_scopes_and_tool_surface() ->
     );
     assert_eq!(
         child.effective_credential_scope.route_allow,
-        vec!["openai".to_string()]
+        vec!["scripted".to_string()]
     );
 
     let snapshot = client
@@ -39666,6 +39666,67 @@ async fn daemon_session_route_policy_drives_input_runs_without_explicit_override
 }
 
 #[tokio::test]
+async fn daemon_text_runs_reject_default_route_blocked_by_credential_scope() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-text-route-scope");
+    let (address, shutdown) = routed_scripted_daemon(&state_root, Vec::new()).await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+
+    create_test_session(&client, &base, "text-route-scoped").await?;
+    client
+        .post(format!(
+            "{base}/v1/sessions/text-route-scoped/credential-scope"
+        ))
+        .json(&SetSessionCredentialScopeRequest {
+            credential_scope: Some(kheish_types::CredentialScope {
+                route_deny: vec!["anthropic".to_string()],
+                ..kheish_types::CredentialScope::default()
+            }),
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let response = client
+        .post(format!("{base}/v1/sessions/text-route-scoped/runs"))
+        .json(&SubmitInputRequest {
+            source_plugin: None,
+            source_kind: None,
+            actor_id: None,
+            provider: None,
+            content: "hello".to_string(),
+            input_items: Vec::new(),
+            attachments: Vec::new(),
+            generation: None,
+            completion_requirements: None,
+            metadata: None,
+            reply_address: None,
+            binding_keys: Vec::new(),
+            reply_targets: Vec::new(),
+            reply_plugin: None,
+        })
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let problem = response.json::<ProblemDetails>().await?;
+    assert_eq!(problem.domain.as_deref(), Some("runtime"));
+    assert_eq!(problem.code, "route_blocked_by_credential_scope");
+    let runs = client
+        .get(format!("{base}/v1/runs?session_id=text-route-scoped"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<RunView>>()
+        .await?;
+    assert!(runs.is_empty());
+
+    let _ = shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
 async fn daemon_clearing_session_route_policy_stops_future_route_inheritance() -> Result<()> {
     let temp = tempdir()?;
     let state_root = temp.path().join("daemon-session-route-clear");
@@ -49577,7 +49638,7 @@ async fn daemon_observation_materialization_respects_transcription_credential_sc
         ))
         .json(&SetSessionCredentialScopeRequest {
             credential_scope: Some(kheish_types::CredentialScope {
-                route_allow: vec!["blocked-route".to_string()],
+                route_allow: vec!["scripted".to_string()],
                 ..kheish_types::CredentialScope::default()
             }),
         })

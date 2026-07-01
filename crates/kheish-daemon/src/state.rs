@@ -588,6 +588,10 @@ where
         self.readiness.load(Ordering::SeqCst)
     }
 
+    pub(crate) fn state_root(&self) -> &Path {
+        &self.state_root
+    }
+
     pub(crate) fn readiness_handle(&self) -> Arc<AtomicBool> {
         self.readiness.clone()
     }
@@ -641,6 +645,15 @@ where
         config: crate::HttpInputConnectorConfig,
     ) -> Result<crate::HttpInputConnectorConfig> {
         self.connector_service.put_http_connector(config).await
+    }
+
+    pub(crate) async fn put_http_connector_if_absent(
+        &self,
+        config: crate::HttpInputConnectorConfig,
+    ) -> Result<crate::HttpInputConnectorConfig> {
+        self.connector_service
+            .put_http_connector_if_absent(config)
+            .await
     }
 
     pub(crate) async fn delete_connector(&self, kind: &str, name: &str) -> Result<bool> {
@@ -766,6 +779,39 @@ where
             anyhow::bail!("MCP OAuth account slots must use the `mcp.oauth.` namespace");
         }
         let status = self.auth_manager.put_record(record).await?;
+        self.shutdown_mcp_servers_referencing_secret_ref(&slot_id, true)
+            .await;
+        self.connector_service.reload_resolved().await?;
+        Ok(status)
+    }
+
+    pub(crate) async fn put_auth_record_if_absent(
+        &self,
+        record: AuthSlotRecord,
+    ) -> Result<AuthSlotStatus> {
+        load_auth_store_master_key_from_env()?.ok_or_else(|| {
+            anyhow!(
+                "{AUTH_STORE_MASTER_KEY_ENV} must be set before using the daemon secret manager"
+            )
+        })?;
+        let slot_id = record.slot_id.0.clone();
+        let connector_or_mcp_secret_ref = slot_id.starts_with("connectors.")
+            || slot_id.starts_with("mcp.")
+            || self.connector_service.uses_secret_ref(&slot_id).await;
+        if connector_or_mcp_secret_ref
+            && !matches!(
+                record.provider,
+                AuthProvider::Generic | AuthProvider::McpOAuth
+            )
+        {
+            anyhow::bail!(
+                "connector and MCP secret slots must use generic opaque or MCP OAuth records"
+            );
+        }
+        if record.provider == AuthProvider::McpOAuth && !slot_id.starts_with("mcp.oauth.") {
+            anyhow::bail!("MCP OAuth account slots must use the `mcp.oauth.` namespace");
+        }
+        let status = self.auth_manager.put_record_if_absent(record).await?;
         self.shutdown_mcp_servers_referencing_secret_ref(&slot_id, true)
             .await;
         self.connector_service.reload_resolved().await?;

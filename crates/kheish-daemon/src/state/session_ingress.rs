@@ -108,18 +108,51 @@ where
         let policy = self.effective_session_route_policy(session_id).await?;
         let (provider, generation) =
             Self::merge_session_route_policy(&policy, provider, generation);
-        self.resolve_generation_route(provider.as_deref(), generation)
+        let (resolved_provider, resolved_generation) =
+            self.resolve_generation_route(provider.as_deref(), generation)?;
+        if let Some(route_id) = resolved_provider.as_deref() {
+            let scope = self
+                .load_session_credential_scope(session_id)
+                .await?
+                .normalized();
+            anyhow::ensure!(
+                !scope.constrains_routes() || scope.allows_route(route_id),
+                "session {session_id} credential_scope does not allow route `{route_id}`"
+            );
+        }
+        Ok((resolved_provider, resolved_generation))
     }
 
     pub(crate) async fn create_session(
         self: &Arc<Self>,
         request: CreateSessionRequest,
     ) -> Result<SessionView> {
+        self.create_session_with_existing_policy(request, false)
+            .await
+    }
+
+    pub(crate) async fn create_session_if_absent(
+        self: &Arc<Self>,
+        request: CreateSessionRequest,
+    ) -> Result<SessionView> {
+        self.create_session_with_existing_policy(request, true)
+            .await
+    }
+
+    async fn create_session_with_existing_policy(
+        self: &Arc<Self>,
+        request: CreateSessionRequest,
+        reject_existing: bool,
+    ) -> Result<SessionView> {
+        let _create_guard = self.session_service.session_control_lock().lock().await;
         let session_id = request
             .session_id
             .unwrap_or_else(|| self.session_service.next_session_id());
         validate_new_session_id(&session_id)?;
         if let Some(agent_id) = self.session_service.session_agent_id(&session_id).await {
+            if reject_existing {
+                bail!("session {session_id} already exists");
+            }
             if let Some(requested_persona_id) = request.persona_id.as_deref() {
                 let bound = self.load_session_persona_binding(&session_id).await?;
                 anyhow::ensure!(

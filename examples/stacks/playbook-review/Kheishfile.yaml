@@ -1,0 +1,60 @@
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: playbook-review
+  labels:
+    example: playbook
+spec:
+  apply:
+    strict_scopes: true
+    restart_policy: plan_only
+  connectors:
+    - kind: http
+      name: stack-review-webhook
+      spec:
+        actor_id: stack-review
+        fixed_session_id: playbook-review
+        allow_unauthenticated_ingress: true
+        require_hmac_signature: false
+        require_idempotency_key: false
+        allow_payload_reply_targets: false
+  personas:
+    - persona_id: playbook-reviewer
+      display_name: Playbook Reviewer
+      soul: |
+        Review daemon playbooks for clarity, executable acceptance criteria, and evidence requirements. Keep feedback concrete and tied to the manifest.
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_deny: ["*"]
+        mcp_tool_deny: ["*"]
+  sessions:
+    - session_id: playbook-review
+      persona_id: playbook-reviewer
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_deny: ["*"]
+        mcp_tool_deny: ["*"]
+      credential_scope:
+        route_allow: ["openai"]
+        connector_deny: ["*"]
+        connector_credential_deny: ["*"]
+        mcp_server_deny: ["*"]
+      route_policy:
+        provider: openai
+        generation:
+          model: gpt-5.4
+          reasoning:
+            effort: medium
+  playbooks:
+    - manifest_file: playbook.yaml
+  verification:
+    - name: persona
+      type: persona_exists
+      persona_id: playbook-reviewer
+    - name: session
+      type: session_exists
+      session_id: playbook-review
+    - name: playbook
+      type: playbook_version_exists
+      playbook_id: review-playbook-manifest
+      version: "1.0.0"

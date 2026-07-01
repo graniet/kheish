@@ -216,6 +216,16 @@ impl ConnectorRegistry {
         Ok(())
     }
 
+    /// Installs a previously resolved registry snapshot without resolving secrets or env again.
+    pub fn replace_with_resolved(&self, resolved: ConnectorRegistry) {
+        let state = resolved
+            .inner
+            .read()
+            .expect("connector registry rwlock poisoned")
+            .clone();
+        self.replace_resolved(state);
+    }
+
     /// Returns the named Slack connector.
     pub fn external(&self, name: &str) -> Option<ResolvedExternalConnector> {
         self.inner

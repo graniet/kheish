@@ -1,0 +1,38 @@
+playbook_id: review-playbook-manifest
+version: "1.0.0"
+title: Review Playbook Manifest
+objective: Review a Kheish Playbook manifest and produce actionable corrections.
+description: A compact operator playbook for checking manifest quality before publishing.
+inputs:
+  - name: manifest_path
+    description: Workspace path to the playbook manifest under review.
+    required: true
+roles:
+  - role_id: reviewer
+    purpose: Inspect the manifest and report risks, missing evidence, and unclear phase gates.
+phases:
+  - phase_id: inspect
+    objective: Read the manifest and identify structural or operational issues.
+    acceptance_criteria:
+      - The review references concrete manifest fields.
+  - phase_id: report
+    objective: Produce a concise remediation report.
+    acceptance_criteria:
+      - The report separates blocking issues from suggestions.
+acceptance_criteria:
+  - Blocking schema or workflow issues are called out first.
+  - Evidence expectations and phase gates are reviewed.
+evidence_expectations:
+  - Reviewer cites the manifest path and relevant fields.
+tools:
+  enforce: true
+  deny:
+    - bash
+runtime_defaults:
+  provider: openai
+  model: gpt-5.4
+scopes:
+  capability_scope: No MCP tools or shell access required for the default review path.
+  credential_scope: Model route access only.
+metadata:
+  owner: examples

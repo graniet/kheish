@@ -393,6 +393,20 @@ impl ConnectorService {
         Ok(config)
     }
 
+    /// Creates one daemon-managed HTTP connector only when no connector with that name exists.
+    pub(crate) async fn put_http_connector_if_absent(
+        &self,
+        config: HttpInputConnectorConfig,
+    ) -> Result<HttpInputConnectorConfig> {
+        self.put_managed_connector_if_absent("http", &config.name, |settings| {
+            upsert_named(&mut settings.http_connectors, config.clone(), |value| {
+                &value.name
+            });
+        })
+        .await?;
+        Ok(config)
+    }
+
     /// Deletes one daemon-managed connector when it exists.
     pub(crate) async fn delete_connector(&self, kind: &str, name: &str) -> Result<bool> {
         let kind = ConnectorKind::parse(kind)?;
@@ -488,6 +502,30 @@ impl ConnectorService {
         self.persist_and_rebuild(&mut guard, next).await
     }
 
+    async fn put_managed_connector_if_absent<F>(
+        &self,
+        kind: &str,
+        name: &str,
+        mutate: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&mut ConnectorSettings),
+    {
+        let kind = ConnectorKind::parse(kind)?;
+        self.reject_file_backed_connector_collision(kind, name)?;
+        let mut guard = self.daemon_settings.lock().await;
+        if connector_name_set(&guard, kind).contains(name) {
+            bail!("{kind} connector {name} already exists");
+        }
+        let mut next = guard.clone();
+        mutate(&mut next);
+        self.runtime_disabled_connectors
+            .write()
+            .expect("connector runtime disabled set rwlock poisoned")
+            .remove(&(kind, name.to_string()));
+        self.persist_and_rebuild(&mut guard, next).await
+    }
+
     async fn persist_and_rebuild(
         &self,
         current: &mut tokio::sync::MutexGuard<'_, ConnectorSettings>,
@@ -495,9 +533,9 @@ impl ConnectorService {
     ) -> Result<()> {
         validate_no_cross_source_name_collisions(&self.file_settings, &daemon_settings)?;
         let merged = self.resolvable_merged_settings(&daemon_settings);
-        let _validated = ConnectorRegistry::resolve(merged.clone(), self.auth_manager.as_ref())?;
+        let resolved = ConnectorRegistry::resolve(merged, self.auth_manager.as_ref())?;
         self.store.save(&daemon_settings)?;
-        self.registry.rebuild(merged, self.auth_manager.as_ref())?;
+        self.registry.replace_with_resolved(resolved);
         **current = daemon_settings;
         Ok(())
     }
@@ -509,9 +547,9 @@ impl ConnectorService {
     ) -> Result<()> {
         validate_no_cross_source_name_collisions(&self.file_settings, &daemon_settings)?;
         let merged = self.resolvable_merged_settings(&daemon_settings);
-        let _validated = ConnectorRegistry::resolve(merged.clone(), self.auth_manager.as_ref())?;
+        let resolved = ConnectorRegistry::resolve(merged, self.auth_manager.as_ref())?;
         self.store.save(&daemon_settings)?;
-        self.registry.rebuild(merged, self.auth_manager.as_ref())?;
+        self.registry.replace_with_resolved(resolved);
         **current = daemon_settings;
         Ok(())
     }

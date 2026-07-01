@@ -1,0 +1,44 @@
+---
+title: KheishStack
+description: Reconcile daemon resources from a local KheishStack file.
+---
+
+`KheishStack` is a v1alpha1 operator format for reconciling daemon resources through the daemon control-plane API. The CLI is only a transport adapter: it reads a local file, resolves relative file references against that file's directory, and submits a self-contained manifest to the daemon. The daemon API does not read caller-local files from `soul_file`, `content_file`, or `manifest_file`.
+
+The CLI supports:
+
+- `kheish-daemon stack init --output-file Kheishfile.yaml`
+- `kheish-daemon stack validate --file Kheishfile.yaml`
+- `kheish-daemon stack plan --file Kheishfile.yaml`
+- `kheish-daemon stack diff --file Kheishfile.yaml`
+- `kheish-daemon stack apply --file Kheishfile.yaml`
+- `kheish-daemon stack verify --file Kheishfile.yaml`
+- `kheish-daemon stack import --file Kheishfile.yaml --resource kind/id`
+- `kheish-daemon stack down --file Kheishfile.yaml`
+
+v1alpha1 reconciles secrets, runtime permission/debug settings, HTTP connectors, personas, sessions, schedules, playbooks, and existence probes. It rejects fail-open capability and credential scopes by default.
+
+## Ledger Scope
+
+The apply ledger at `<daemon-state-root>/kheish-apply/ledger.json` is daemon-owned reconciliation state. Inspect one stack with:
+
+```bash
+kheish-daemon --base-url http://127.0.0.1:4000 stack plan --file Kheishfile.yaml
+curl http://127.0.0.1:4000/v1/stacks/<ownership_id>/ledger
+```
+
+The ledger records current ownership, desired digests, secret fingerprints, and a hash-chained local operation history. Use it for daemon-local idempotence, ownership adoption, and conservative prune/down planning. It is not a remote notarized audit log and must not be treated as tamper-evident compliance history.
+
+Do not pass a separate `--state-root` to stack commands. Start the daemon with the intended `--state-root`; the daemon API owns the ledger under that root.
+
+## Limits
+
+- Stack API request bodies are capped at 1 MiB. The embedded manifest is capped at 256 KiB, YAML anchors/aliases are disabled before parse, and a manifest can declare at most 512 resources.
+- Only `kind: http` connectors are supported in v1alpha1, because HTTP connector live views can be compared safely without reading secret values.
+- Startup-only config such as routes, MCP profiles, and connector config files is plan-only and blocks apply; it is not hot-reloaded or accepted silently.
+- Schedule updates are create-only in the current daemon API. Drift on immutable schedule fields blocks apply.
+- Secret values are never read back. When `value_env` is used, callers must pass `--allow-secret-env`; the ledger stores a salted fingerprint. HTTP connector secrets must use `secret_ref` or `env`, not inline `value`.
+- `down --yes` and prune execute supported teardown actions and skip blocked resources. Stack-managed secrets are daemon-global credentials, never deleted automatically, and remain ledger-owned until an operator explicitly handles them.
+- Connector `session_policy` scopes and declared persona/session scopes are always validated fail-closed in v1alpha1. A scope family needs an explicit allow-list or `*_deny: ["*"]`; partial deny-lists are rejected because they remain fail-open in the daemon. Legacy `strict_scopes: false` and `--no-strict-scopes` inputs are accepted only as compatibility no-ops.
+
+See `examples/stacks/linear-triage-daily` and `examples/stacks/playbook-review` for runnable stacks.

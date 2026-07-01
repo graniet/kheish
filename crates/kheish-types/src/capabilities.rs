@@ -152,6 +152,11 @@ impl CredentialScope {
             && self.mcp_server_deny.is_empty()
     }
 
+    /// Returns true when the route dimension is explicitly constrained.
+    pub fn constrains_routes(&self) -> bool {
+        !self.route_allow.is_empty() || !self.route_deny.is_empty()
+    }
+
     /// Returns a normalized copy with trimmed, sorted, deduplicated entries.
     pub fn normalized(&self) -> Self {
         Self {

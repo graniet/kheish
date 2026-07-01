@@ -32,6 +32,7 @@ mod scheduler;
 mod service;
 mod services;
 mod shell_tasks;
+mod stack;
 mod state;
 mod state_files;
 mod transcription;
@@ -87,10 +88,12 @@ pub use api::{
     SetSessionGoalRequest, SetSessionPersonaRequest, SetSessionReplyTargetsRequest,
     SetSessionRoutePolicyRequest, SetSystemPromptRequest, SetToolRuntimeLimitsRequest,
     SidechainSubtaskRequest, SkillListQuery, SkillRuntimeView, SkillSummaryView, SkillView,
-    SlackConnectorView, SpawnSidechainRequest, StartProjectTaskRequest, StopTaskRequest,
-    SubmitInputItemRequest, SubmitInputRequest, SubmitRunRequest, SupersedeLearningRequest,
-    TaskListQuery, TaskOutputQuery, TelegramConnectorView, UpdateBoardRequest,
-    UpdateChannelRequest, UpdatePersonaRequest, UpdateProjectRequest, UpdateProjectTaskRequest,
+    SlackConnectorView, SpawnSidechainRequest, StackApplyRequest, StackDownRequest,
+    StackImportRequest, StackManifestRequest, StackPlanRequest, StartProjectTaskRequest,
+    StopTaskRequest, SubmitInputItemRequest, SubmitInputRequest, SubmitRunRequest,
+    SupersedeLearningRequest, TaskListQuery, TaskOutputQuery, TelegramConnectorView,
+    UpdateBoardRequest, UpdateChannelRequest, UpdatePersonaRequest, UpdateProjectRequest,
+    UpdateProjectTaskRequest,
 };
 pub use boards::{BoardRevisionView, BoardSummaryView, BoardView};
 pub use builders::{
@@ -208,11 +211,16 @@ pub use runs::{
 pub use scheduler::{
     ScheduleCadence, ScheduleCreateRequest, ScheduleExecutionRecord, ScheduleExecutionStatus,
     ScheduleMisfirePolicy, ScheduleOverlapPolicy, ScheduleRecord, ScheduleStatus, ScheduleView,
-    SchedulerPolicyConfig,
+    SchedulerPolicyConfig, summarize_schedule_create_request,
 };
 pub use service::DaemonService;
 pub use services::ExternalActionAuditRecord;
 pub use shell_tasks::TaskOutputView;
+pub use stack::{
+    STACK_MANIFEST_BODY_LIMIT_BYTES, StackAction, StackApplyReport, StackDownReport,
+    StackImportReport, StackPlan, StackPlanSummary, StackValidation, StackVerificationCheck,
+    StackVerificationReport, generic_stack_template, validate_stack_manifest_source,
+};
 pub(crate) use state::{
     ConnectorIngressReservation, DaemonOutputPlugin, DaemonOutputReceiver, DaemonState,
     DaemonToolControlAdapter, FileDaemonStore,

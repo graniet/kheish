@@ -1,0 +1,74 @@
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: linear-triage-daily
+  labels:
+    example: linear-triage
+spec:
+  apply:
+    strict_scopes: true
+    restart_policy: plan_only
+  requires:
+    secrets:
+      - ref: mcp.linear.LINEAR_API_KEY
+        provider: generic
+  personas:
+    - persona_id: linear-triage-operator
+      display_name: Linear Triage Operator
+      soul_file: persona.md
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_allow: ["linear"]
+        mcp_tool_allow:
+          - mcp__linear__list_issues
+          - mcp__linear__get_issue
+          - mcp__linear__update_issue
+          - mcp__linear__create_comment
+  sessions:
+    - session_id: linear-triage-daily
+      persona_id: linear-triage-operator
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_allow: ["linear"]
+        mcp_tool_allow:
+          - mcp__linear__list_issues
+          - mcp__linear__get_issue
+          - mcp__linear__update_issue
+          - mcp__linear__create_comment
+      credential_scope:
+        route_allow: ["openai"]
+        connector_deny: ["*"]
+        connector_credential_deny: ["*"]
+        mcp_server_allow: ["linear"]
+      route_policy:
+        provider: openai
+        generation:
+          model: gpt-5.4
+          reasoning:
+            effort: medium
+  schedules:
+    - name: linear-triage-daily
+      target_session_id: linear-triage-daily
+      cadence:
+        type: interval
+        every_seconds: 86400
+      overlap_policy: skip
+      misfire_policy:
+        type: coalesce_once
+      request:
+        provider: openai
+        content_file: prompt.md
+        generation:
+          model: gpt-5.4
+          reasoning:
+            effort: medium
+  verification:
+    - name: persona
+      type: persona_exists
+      persona_id: linear-triage-operator
+    - name: session
+      type: session_exists
+      session_id: linear-triage-daily
+    - name: schedule
+      type: schedule_exists
+      schedule_name: linear-triage-daily

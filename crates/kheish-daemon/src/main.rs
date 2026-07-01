@@ -208,6 +208,12 @@ enum Command {
         #[command(subcommand)]
         command: PlaybooksCommand,
     },
+    /// Reconcile daemon resources from a KheishStack file.
+    #[command(visible_alias = "kheishfile")]
+    Stack {
+        #[command(subcommand)]
+        command: StackCommand,
+    },
     /// Start and inspect Flow projections over normal daemon runs.
     #[command(visible_alias = "flow")]
     Flows {
@@ -1304,6 +1310,26 @@ enum PlaybooksCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum StackCommand {
+    /// Write a starter KheishStack file.
+    Init(StackInitArgs),
+    /// Validate a KheishStack file without contacting mutable endpoints.
+    Validate(StackFileArgs),
+    /// Compute daemon drift and the apply order.
+    Plan(StackPlanArgs),
+    /// Print only non-noop drift actions.
+    Diff(StackPlanArgs),
+    /// Apply daemon resources in reconciliation order.
+    Apply(StackApplyArgs),
+    /// Verify that live daemon resources match the stack.
+    Verify(StackFileArgs),
+    /// Adopt existing daemon resources into the local apply ledger.
+    Import(StackImportArgs),
+    /// Plan or execute teardown for ledger-owned stack resources.
+    Down(StackDownArgs),
+}
+
+#[derive(Subcommand, Debug)]
 enum FlowsCommand {
     /// List Flow projections.
     List {
@@ -1725,6 +1751,90 @@ struct PlaybookManifestInputArgs {
     manifest_json: Option<String>,
     #[arg(long)]
     manifest_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug, Clone)]
+struct StackFileArgs {
+    #[arg(short = 'f', long, default_value = "Kheishfile.yaml")]
+    file: PathBuf,
+    #[arg(
+        long,
+        help = "State root used for the apply ledger when it cannot be derived from the daemon"
+    )]
+    state_root: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Deprecated no-op; KheishStack v1alpha1 always enforces fail-closed scope validation"
+    )]
+    no_strict_scopes: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+struct StackPlanArgs {
+    #[command(flatten)]
+    file: StackFileArgs,
+    #[arg(long, help = "Omit noop actions from the rendered plan")]
+    only_changes: bool,
+    #[arg(
+        long,
+        help = "Allow fingerprints for secret values provided through value_env entries"
+    )]
+    allow_secret_env: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+struct StackApplyArgs {
+    #[command(flatten)]
+    file: StackFileArgs,
+    #[arg(long, help = "Only print the plan; do not mutate the daemon or ledger")]
+    dry_run: bool,
+    #[arg(
+        long,
+        help = "Deprecated compatibility flag; startup-only config still blocks apply"
+    )]
+    force_restart: bool,
+    #[arg(
+        long,
+        help = "Allow ledger-owned resources omitted from the stack to be pruned"
+    )]
+    prune: bool,
+    #[arg(
+        long,
+        help = "Allow fingerprints for secret values provided through value_env entries"
+    )]
+    allow_secret_env: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+struct StackInitArgs {
+    #[arg(short = 'o', long = "output-file", default_value = "Kheishfile.yaml")]
+    output_file: PathBuf,
+    #[arg(long, default_value = "kheish-stack")]
+    name: String,
+    #[arg(long, help = "Overwrite the output file if it already exists")]
+    force: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+struct StackImportArgs {
+    #[command(flatten)]
+    file: StackFileArgs,
+    #[arg(
+        long = "resource",
+        help = "Resource to adopt, formatted as kind/id; may be repeated"
+    )]
+    resources: Vec<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+struct StackDownArgs {
+    #[command(flatten)]
+    file: StackFileArgs,
+    #[arg(
+        long,
+        help = "Execute supported destructive actions; default is plan-only"
+    )]
+    yes: bool,
 }
 
 #[derive(Args, Debug)]

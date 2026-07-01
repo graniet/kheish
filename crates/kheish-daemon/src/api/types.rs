@@ -129,6 +129,71 @@ pub struct ProblemDetails {
     pub domain: Option<String>,
 }
 
+/// Common KheishStack request body.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackManifestRequest {
+    /// Raw YAML or JSON KheishStack manifest.
+    pub manifest: String,
+    /// Deprecated compatibility field. Stack APIs require a self-contained manifest and reject file references.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_root: Option<String>,
+    /// Deprecated compatibility field. KheishStack v1alpha1 always enforces strict scope validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_scopes: Option<bool>,
+}
+
+/// KheishStack plan request body.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackPlanRequest {
+    #[serde(flatten)]
+    pub stack: StackManifestRequest,
+    /// When true, omits no-op and verification-only actions from the response.
+    #[serde(default)]
+    pub only_changes: bool,
+    /// Allows value_env secrets to be read from the daemon environment for fingerprint planning.
+    #[serde(default)]
+    pub allow_secret_env: bool,
+}
+
+/// KheishStack apply request body.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackApplyRequest {
+    #[serde(flatten)]
+    pub stack: StackManifestRequest,
+    /// Returns the plan-shaped apply report without mutating daemon resources.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Allows value_env secrets to be read from the daemon environment.
+    #[serde(default)]
+    pub allow_secret_env: bool,
+    /// Deprecated compatibility field. Startup-only drift remains blocked by the daemon Stack API.
+    #[serde(default)]
+    pub force_restart: bool,
+    /// Prunes ledger-owned resources omitted from the desired manifest when supported.
+    #[serde(default)]
+    pub prune: bool,
+}
+
+/// KheishStack import request body.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackImportRequest {
+    #[serde(flatten)]
+    pub stack: StackManifestRequest,
+    /// Optional explicit resource keys such as `persona/demo` or `connector/http/inbox`.
+    #[serde(default)]
+    pub resources: Vec<String>,
+}
+
+/// KheishStack down request body.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackDownRequest {
+    #[serde(flatten)]
+    pub stack: StackManifestRequest,
+    /// Executes supported destructive operations. When false, returns the plan only.
+    #[serde(default)]
+    pub yes: bool,
+}
+
 impl ProblemDetails {
     /// Builds one daemon problem document.
     pub fn new(status: u16, code: impl Into<String>, detail: impl Into<String>) -> Self {
@@ -160,6 +225,7 @@ fn problem_title(status: u16) -> String {
         405 => "Method Not Allowed",
         409 => "Conflict",
         413 => "Payload Too Large",
+        422 => "Unprocessable Entity",
         429 => "Too Many Requests",
         503 => "Service Unavailable",
         500 => "Internal Server Error",
@@ -4767,6 +4833,10 @@ mod tests {
         assert_eq!(
             ProblemDetails::new(405, "method_not_allowed", "wrong method").title,
             "Method Not Allowed"
+        );
+        assert_eq!(
+            ProblemDetails::new(422, "validation_failed", "blocked").title,
+            "Unprocessable Entity"
         );
         assert_eq!(
             ProblemDetails::new(503, "service_unavailable", "draining").title,

@@ -1,0 +1,90 @@
+---
+title: KheishStack API Spec
+description: Production target for daemon-owned as-code reconciliation.
+---
+
+# KheishStack API Spec
+
+`KheishStack` is the generic as-code manifest for daemon resources. The daemon must treat it as data: it never knows about examples such as Linear triage, and it never branches on scenario names.
+
+## Shape
+
+The public resource is:
+
+- `apiVersion: kheish.ai/v1alpha1`
+- `kind: KheishStack`
+- `metadata.name`
+- `spec`: secrets, startup requirements, runtime settings, connectors, personas, sessions, schedules, playbooks, verification probes
+
+The manifest is strict: unknown fields are rejected, including HTTP connector `spec` fields. The daemon API accepts a self-contained manifest. Local file references such as `soul_file`, `content_file`, and `manifest_file` are resolved by the CLI before submission; the daemon does not read caller-local files through Stack APIs. Stack API request bodies are capped at 1 MiB, the embedded manifest is capped at 256 KiB, YAML anchors/aliases are disabled before parse, and a manifest can declare at most 512 resources.
+
+## Daemon API
+
+The daemon owns reconciliation through:
+
+- `POST /v1/stacks/validate`
+- `POST /v1/stacks/plan`
+- `POST /v1/stacks/apply`
+- `POST /v1/stacks/verify`
+- `POST /v1/stacks/import`
+- `POST /v1/stacks/down`
+- `GET /v1/stacks/{ownership_id}/ledger`
+
+The CLI is a transport adapter: it may read a local `Kheishfile.yaml`, resolve local file references, and submit the manifest/options to the daemon, but the authoritative plan/apply/ledger logic lives in the daemon.
+
+## Ledger
+
+The ledger lives under the daemon state root:
+
+```text
+<state_root>/kheish-apply/ledger.json
+```
+
+It records ownership, desired digests, secret fingerprints, and a hash-chained local operation history. The daemon must hold a ledger lock during mutating operations. This is production ownership state for reconciliation, but not a remote notarized audit log.
+
+## Apply Order
+
+Apply order is semantic, not cosmetic:
+
+1. secrets
+2. runtime settings
+3. personas
+4. connectors
+5. sessions
+6. schedules
+7. playbooks
+8. verification
+
+Startup-only changes such as route files, MCP profile loading, and file-backed connector config are plan-only in v1alpha1. The daemon reports them as blocked because it cannot hot-reload or self-restart those inputs safely.
+
+## Security
+
+Strict scope validation is always enforced in v1alpha1. Legacy `strict_scopes: false` inputs are accepted only as compatibility no-ops. Any omitted or empty allow/deny family is rejected because current daemon scope behavior is fail-open. A partial deny-list is also rejected unless the matching allow-list is explicit; use `*_deny: ["*"]` to close a family completely. This applies to:
+
+- persona capability scopes
+- session capability scopes
+- session credential scopes
+- connector `session_policy` capability and credential scopes
+- schedule route providers against target session credential scopes
+
+Wildcard allow entries require explicit `spec.apply.allow_wildcard_scopes: true`.
+
+Secrets supplied with `value_env` are not read during plan/apply unless the caller explicitly passes `allow_secret_env=true` (or the matching CLI flag). The ledger stores only a salted fingerprint. HTTP connector secrets in a Stack must use `secret_ref` or `env`; inline connector `value` fields are rejected because the daemon cannot read them back for drift comparison.
+
+## Deletion
+
+`down` and `prune` only execute operations with daemon support:
+
+- connectors: delete
+- schedules: cancel
+- sessions: end
+
+Secrets, personas, playbooks, learnings, and runtime singleton settings are not hard-deleted by v1alpha1. Secrets are daemon-global credentials, so even ledger-owned secrets are retained and must be deleted explicitly through the secret API after dependency review. Blocked resources are skipped and remain ledger-owned; supported actions in the same down/prune request still execute.
+
+## Out Of Scope For V1
+
+- Custom persistent agent templates
+- Behavioral probe runner that executes model/tool-deny assertions
+- Hot reload for startup route/MCP config
+- Non-HTTP connector drift comparison
+- Remote file reference fetching

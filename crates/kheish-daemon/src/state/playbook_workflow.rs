@@ -37,6 +37,15 @@ where
         self.playbook_service.create_playbook(request).await
     }
 
+    pub(crate) async fn create_playbook_if_version_absent(
+        &self,
+        request: crate::CreatePlaybookRequest,
+    ) -> Result<PlaybookView> {
+        self.playbook_service
+            .create_playbook_if_version_absent(request)
+            .await
+    }
+
     pub(crate) async fn publish_playbook(
         &self,
         playbook_id: &str,

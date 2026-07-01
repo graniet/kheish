@@ -26,6 +26,14 @@ impl DaemonProblem {
         Self::new(409, domain, code, detail)
     }
 
+    pub(crate) fn unprocessable(
+        domain: &'static str,
+        code: &'static str,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self::new(422, domain, code, detail)
+    }
+
     pub(crate) fn not_found(
         domain: &'static str,
         code: &'static str,

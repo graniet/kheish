@@ -1,0 +1,7414 @@
+//! KheishStack command handlers.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine as _;
+use rand::RngCore as _;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
+
+const STACK_API_VERSION: &str = "kheish.ai/v1alpha1";
+const STACK_KIND: &str = "KheishStack";
+const LEDGER_VERSION: u32 = 1;
+const LEDGER_DIR: &str = "kheish-apply";
+const LEDGER_FILE: &str = "ledger.json";
+pub const STACK_MANIFEST_BODY_LIMIT_BYTES: usize = 256 * 1024;
+const STACK_MAX_RESOURCE_COUNT: usize = 512;
+
+#[async_trait::async_trait]
+pub(crate) trait StackControlPlane {
+    async fn get_json<T>(&self, path: &str) -> Result<T>
+    where
+        T: DeserializeOwned + Send;
+
+    async fn get_json_optional<T>(&self, path: &str) -> Result<Option<T>>
+    where
+        T: DeserializeOwned + Send;
+
+    async fn post_json<B, T>(&self, path: &str, body: &B) -> Result<T>
+    where
+        B: Serialize + Sync + ?Sized,
+        T: DeserializeOwned + Send;
+
+    async fn put_json<B, T>(&self, path: &str, body: &B) -> Result<T>
+    where
+        B: Serialize + Sync + ?Sized,
+        T: DeserializeOwned + Send;
+
+    async fn delete_json<T>(&self, path: &str) -> Result<T>
+    where
+        T: DeserializeOwned + Send;
+
+    async fn create_secret_if_absent(
+        &self,
+        slot: &str,
+        record: &kheish_auth::AuthSlotRecord,
+    ) -> Result<kheish_auth::AuthSlotStatus> {
+        let encoded = url_encode_path_segment(slot);
+        let path = format!("/v1/runtime/secrets/{encoded}");
+        if self
+            .get_json_optional::<kheish_auth::AuthSlotStatus>(&path)
+            .await?
+            .is_some()
+        {
+            bail!("secret `{slot}` already exists");
+        }
+        self.post_json("/v1/runtime/secrets", record).await
+    }
+
+    async fn put_connector_if_absent(
+        &self,
+        kind: &str,
+        name: &str,
+        spec: &Value,
+    ) -> Result<crate::ConnectorView> {
+        let path = format!(
+            "/v1/runtime/connectors/{}/{}",
+            url_encode_path_segment(kind),
+            url_encode_path_segment(name)
+        );
+        if self
+            .get_json_optional::<crate::ConnectorView>(&path)
+            .await?
+            .is_some()
+        {
+            bail!("{kind} connector {name} already exists");
+        }
+        self.put_json(&path, spec).await
+    }
+
+    async fn create_persona_if_absent(
+        &self,
+        request: &crate::CreatePersonaRequest,
+    ) -> Result<crate::PersonaView> {
+        let persona_id = request
+            .persona_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("stack persona create requires persona_id"))?;
+        let path = format!("/v1/personas/{}", url_encode_path_segment(persona_id));
+        if self
+            .get_json_optional::<crate::PersonaView>(&path)
+            .await?
+            .is_some()
+        {
+            bail!("persona {persona_id} already exists");
+        }
+        self.post_json("/v1/personas", request).await
+    }
+
+    async fn create_session_if_absent(
+        &self,
+        request: &crate::CreateSessionRequest,
+    ) -> Result<crate::SessionView> {
+        let session_id = request
+            .session_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("stack session create requires session_id"))?;
+        let path = format!("/v1/sessions/{}", url_encode_path_segment(session_id));
+        if self
+            .get_json_optional::<crate::SessionView>(&path)
+            .await?
+            .is_some()
+        {
+            bail!("session {session_id} already exists");
+        }
+        self.post_json("/v1/sessions", request).await
+    }
+
+    async fn create_schedule_if_absent(
+        &self,
+        request: &crate::ScheduleCreateRequest,
+    ) -> Result<crate::ScheduleView> {
+        let live = self
+            .get_json::<Vec<crate::ScheduleView>>("/v1/schedules")
+            .await?;
+        if live.iter().any(|schedule| schedule.name == request.name) {
+            bail!("schedule {} already exists", request.name);
+        }
+        self.post_json("/v1/schedules", request).await
+    }
+
+    async fn create_playbook_version_if_absent(
+        &self,
+        request: &crate::CreatePlaybookRequest,
+    ) -> Result<crate::PlaybookView> {
+        let playbook_id = &request.manifest.playbook_id;
+        let version = &request.manifest.version;
+        let path = format!("/v1/playbooks/{}", url_encode_path_segment(playbook_id));
+        if self
+            .get_json_optional::<crate::PlaybookView>(&path)
+            .await?
+            .is_some_and(|view| {
+                view.versions
+                    .iter()
+                    .any(|candidate| candidate.version == *version)
+            })
+        {
+            bail!("playbook {playbook_id}@{version} already exists");
+        }
+        self.post_json("/v1/playbooks", request).await
+    }
+}
+
+pub(crate) struct StateStackControlPlane<M> {
+    state: Arc<crate::DaemonState<M>>,
+}
+
+impl<M> StateStackControlPlane<M>
+where
+    M: kheish_core::ModelDriver + Send + Sync + 'static,
+{
+    pub(crate) fn new(state: Arc<crate::DaemonState<M>>) -> Self {
+        Self { state }
+    }
+}
+
+#[async_trait::async_trait]
+impl<M> StackControlPlane for StateStackControlPlane<M>
+where
+    M: kheish_core::ModelDriver + Send + Sync + 'static,
+{
+    async fn get_json<T>(&self, path: &str) -> Result<T>
+    where
+        T: DeserializeOwned + Send,
+    {
+        let segments = decoded_path_segments(path)?;
+        let parts = segments.iter().map(String::as_str).collect::<Vec<_>>();
+        match parts.as_slice() {
+            ["v1", "runtime"] => encode_response(self.state.runtime_settings().await),
+            ["v1", "runtime", "secrets", slot] => {
+                encode_response(self.state.auth_status(slot).await?)
+            }
+            ["v1", "runtime", "connectors", kind, name] => {
+                let view = self
+                    .state
+                    .connector(kind, name)
+                    .await
+                    .map(crate::ConnectorView::from)
+                    .ok_or_else(|| anyhow!("unknown connector {kind}/{name}"))?;
+                encode_response(view)
+            }
+            ["v1", "personas", persona_id] => encode_response(crate::PersonaView::from(
+                self.state.get_persona_record(persona_id).await?,
+            )),
+            ["v1", "sessions", session_id] => {
+                let agent_id = self.state.agent_id_for_session(session_id).await?;
+                encode_response(self.state.session_view(session_id, &agent_id).await?)
+            }
+            ["v1", "schedules"] => encode_response(self.state.list_schedules(None).await?),
+            ["v1", "playbooks", playbook_id] => {
+                encode_response(self.state.get_playbook(playbook_id, None).await?)
+            }
+            _ => bail!("unsupported stack control-plane GET path {path}"),
+        }
+    }
+
+    async fn get_json_optional<T>(&self, path: &str) -> Result<Option<T>>
+    where
+        T: DeserializeOwned + Send,
+    {
+        let segments = decoded_path_segments(path)?;
+        let parts = segments.iter().map(String::as_str).collect::<Vec<_>>();
+        match parts.as_slice() {
+            ["v1", "runtime", "secrets", slot] => {
+                let status = self
+                    .state
+                    .auth_manager()
+                    .status(&kheish_auth::AuthSlotId::new((*slot).to_string()))
+                    .await?;
+                status.map(encode_response).transpose()
+            }
+            ["v1", "runtime", "connectors", kind, name] => self
+                .state
+                .connector(kind, name)
+                .await
+                .map(crate::ConnectorView::from)
+                .map(encode_response)
+                .transpose(),
+            ["v1", "personas", persona_id] => match self.state.get_persona_record(persona_id).await
+            {
+                Ok(record) => encode_response(crate::PersonaView::from(record)).map(Some),
+                Err(error) if error.to_string().contains("unknown persona") => Ok(None),
+                Err(error) => Err(error),
+            },
+            ["v1", "sessions", session_id] => {
+                match self.state.agent_id_for_session(session_id).await {
+                    Ok(agent_id) => {
+                        encode_response(self.state.session_view(session_id, &agent_id).await?)
+                            .map(Some)
+                    }
+                    Err(error) if error.to_string().contains("unknown session") => Ok(None),
+                    Err(error) => Err(error),
+                }
+            }
+            ["v1", "playbooks", playbook_id] => {
+                match self.state.get_playbook(playbook_id, None).await {
+                    Ok(view) => encode_response(view).map(Some),
+                    Err(error) if error.to_string().contains("unknown playbook") => Ok(None),
+                    Err(error) => Err(error),
+                }
+            }
+            _ => self.get_json(path).await.map(Some),
+        }
+    }
+
+    async fn post_json<B, T>(&self, path: &str, body: &B) -> Result<T>
+    where
+        B: Serialize + Sync + ?Sized,
+        T: DeserializeOwned + Send,
+    {
+        let segments = decoded_path_segments(path)?;
+        let body = serde_json::to_value(body)?;
+        let parts = segments.iter().map(String::as_str).collect::<Vec<_>>();
+        match parts.as_slice() {
+            ["v1", "playbooks", "validate"] => {
+                let request = serde_json::from_value::<crate::ValidatePlaybookRequest>(body)?;
+                encode_response(self.state.validate_playbook(request))
+            }
+            ["v1", "runtime", "secrets"] => {
+                let request = serde_json::from_value::<kheish_auth::AuthSlotRecord>(body)?;
+                encode_response(self.state.put_auth_record(request).await?)
+            }
+            ["v1", "runtime", "permission-mode"] => {
+                let request = serde_json::from_value::<crate::SetPermissionModeRequest>(body)?;
+                encode_response(
+                    self.state
+                        .set_permission_mode(request.mode, request.expected_revision)
+                        .await?,
+                )
+            }
+            ["v1", "runtime", "debug-level"] => {
+                let request = serde_json::from_value::<crate::SetDebugLevelRequest>(body)?;
+                encode_response(
+                    self.state
+                        .set_debug_level(request.level, request.expected_revision)
+                        .await?,
+                )
+            }
+            ["v1", "personas"] => {
+                let request = serde_json::from_value::<crate::CreatePersonaRequest>(body)?;
+                encode_response(crate::PersonaView::from(
+                    self.state
+                        .create_persona_record(
+                            request.persona_id,
+                            request.display_name,
+                            request.soul,
+                            request.capability_scope.unwrap_or_default(),
+                            request.default_skills.unwrap_or_default(),
+                            request.metadata.unwrap_or(Value::Null),
+                        )
+                        .await?,
+                ))
+            }
+            ["v1", "sessions"] => {
+                let request = serde_json::from_value::<crate::CreateSessionRequest>(body)?;
+                encode_response(self.state.create_session(request).await?)
+            }
+            ["v1", "sessions", session_id, "persona"] => {
+                let request = serde_json::from_value::<crate::SetSessionPersonaRequest>(body)?;
+                encode_response(
+                    self.state
+                        .set_session_persona_view(session_id, &request.persona_id)
+                        .await?,
+                )
+            }
+            ["v1", "sessions", session_id, "capability-scope"] => {
+                let request =
+                    serde_json::from_value::<crate::SetSessionCapabilityScopeRequest>(body)?;
+                encode_response(
+                    self.state
+                        .set_session_capability_scope(session_id, request.capability_scope)
+                        .await?,
+                )
+            }
+            ["v1", "sessions", session_id, "credential-scope"] => {
+                let request =
+                    serde_json::from_value::<crate::SetSessionCredentialScopeRequest>(body)?;
+                encode_response(
+                    self.state
+                        .set_session_credential_scope(session_id, request.credential_scope)
+                        .await?,
+                )
+            }
+            ["v1", "sessions", session_id, "route-policy"] => {
+                let request = serde_json::from_value::<crate::SetSessionRoutePolicyRequest>(body)?;
+                encode_response(
+                    self.state
+                        .set_session_route_policy(session_id, request.route_policy)
+                        .await?,
+                )
+            }
+            ["v1", "sessions", session_id, "reply-targets"] => {
+                let request = serde_json::from_value::<crate::SetSessionReplyTargetsRequest>(body)?;
+                let reply_targets = request
+                    .reply_targets
+                    .into_iter()
+                    .map(crate::SessionReplyTargetRequest::into_reply_handle)
+                    .collect::<Vec<_>>();
+                self.state
+                    .validate_persisted_reply_targets(&reply_targets)?;
+                encode_response(
+                    self.state
+                        .set_session_reply_targets(session_id, reply_targets)
+                        .await?,
+                )
+            }
+            ["v1", "schedules"] => {
+                let request = serde_json::from_value::<crate::ScheduleCreateRequest>(body)?;
+                encode_response(self.state.create_schedule(request).await?)
+            }
+            ["v1", "schedules", schedule_id, "cancel"] => {
+                encode_response(crate::ScheduleMutationResponse {
+                    schedule: self.state.cancel_schedule(schedule_id).await?,
+                })
+            }
+            ["v1", "playbooks"] => {
+                let request = serde_json::from_value::<crate::CreatePlaybookRequest>(body)?;
+                encode_response(self.state.create_playbook(request).await?)
+            }
+            ["v1", "playbooks", playbook_id, "publish"] => {
+                let request = serde_json::from_value::<crate::PublishPlaybookRequest>(body)?;
+                encode_response(self.state.publish_playbook(playbook_id, request).await?)
+            }
+            ["v1", "sessions", session_id, "end"] => {
+                let request = serde_json::from_value::<crate::EndSessionRequest>(body)?;
+                encode_response(self.state.end_session(session_id, request.reason).await?)
+            }
+            _ => bail!("unsupported stack control-plane POST path {path}"),
+        }
+    }
+
+    async fn put_json<B, T>(&self, path: &str, body: &B) -> Result<T>
+    where
+        B: Serialize + Sync + ?Sized,
+        T: DeserializeOwned + Send,
+    {
+        let segments = decoded_path_segments(path)?;
+        let body = serde_json::to_value(body)?;
+        let parts = segments.iter().map(String::as_str).collect::<Vec<_>>();
+        match parts.as_slice() {
+            ["v1", "runtime", "connectors", kind, name] if *kind == "http" => {
+                let request = serde_json::from_value::<crate::PutHttpConnectorRequest>(body)?;
+                let config =
+                    build_stack_http_connector_config(self.state.as_ref(), name, request).await?;
+                self.state.put_http_connector(config).await?;
+                let view = self
+                    .state
+                    .connector(kind, name)
+                    .await
+                    .map(crate::ConnectorView::from)
+                    .ok_or_else(|| anyhow!("unknown connector {kind}/{name}"))?;
+                encode_response(view)
+            }
+            ["v1", "personas", persona_id] => {
+                let request = serde_json::from_value::<crate::UpdatePersonaRequest>(body)?;
+                encode_response(crate::PersonaView::from(
+                    self.state
+                        .update_persona_record(
+                            persona_id,
+                            request.display_name,
+                            request.soul,
+                            request.capability_scope,
+                            request.default_skills,
+                            request.metadata,
+                        )
+                        .await?,
+                ))
+            }
+            ["v1", "runtime", "connectors", kind, _] => {
+                bail!(
+                    "KheishStack v1alpha1 does not support daemon apply for connector kind `{kind}`"
+                )
+            }
+            _ => bail!("unsupported stack control-plane PUT path {path}"),
+        }
+    }
+
+    async fn delete_json<T>(&self, path: &str) -> Result<T>
+    where
+        T: DeserializeOwned + Send,
+    {
+        let segments = decoded_path_segments(path)?;
+        let parts = segments.iter().map(String::as_str).collect::<Vec<_>>();
+        match parts.as_slice() {
+            ["v1", "runtime", "connectors", kind, name] => {
+                let deleted = self.state.delete_connector(kind, name).await?;
+                encode_response(json!({ "accepted": deleted }))
+            }
+            ["v1", "runtime", "secrets", slot] => {
+                let deleted = self.state.delete_auth_slot(slot).await?;
+                encode_response(json!({ "accepted": deleted }))
+            }
+            _ => bail!("unsupported stack control-plane DELETE path {path}"),
+        }
+    }
+
+    async fn create_secret_if_absent(
+        &self,
+        _slot: &str,
+        record: &kheish_auth::AuthSlotRecord,
+    ) -> Result<kheish_auth::AuthSlotStatus> {
+        self.state.put_auth_record_if_absent(record.clone()).await
+    }
+
+    async fn put_connector_if_absent(
+        &self,
+        kind: &str,
+        name: &str,
+        spec: &Value,
+    ) -> Result<crate::ConnectorView> {
+        match kind {
+            "http" => {
+                let request =
+                    serde_json::from_value::<crate::PutHttpConnectorRequest>(spec.clone())?;
+                let config =
+                    build_stack_http_connector_config(self.state.as_ref(), name, request).await?;
+                self.state.put_http_connector_if_absent(config).await?;
+                let view = self
+                    .state
+                    .connector(kind, name)
+                    .await
+                    .map(crate::ConnectorView::from)
+                    .ok_or_else(|| anyhow!("unknown connector {kind}/{name}"))?;
+                Ok(view)
+            }
+            _ => bail!(
+                "KheishStack v1alpha1 does not support daemon apply for connector kind `{kind}`"
+            ),
+        }
+    }
+
+    async fn create_persona_if_absent(
+        &self,
+        request: &crate::CreatePersonaRequest,
+    ) -> Result<crate::PersonaView> {
+        encode_response(crate::PersonaView::from(
+            self.state
+                .create_persona_record(
+                    request.persona_id.clone(),
+                    request.display_name.clone(),
+                    request.soul.clone(),
+                    request.capability_scope.clone().unwrap_or_default(),
+                    request.default_skills.clone().unwrap_or_default(),
+                    request.metadata.clone().unwrap_or(Value::Null),
+                )
+                .await?,
+        ))
+    }
+
+    async fn create_session_if_absent(
+        &self,
+        request: &crate::CreateSessionRequest,
+    ) -> Result<crate::SessionView> {
+        encode_response(self.state.create_session_if_absent(request.clone()).await?)
+    }
+
+    async fn create_schedule_if_absent(
+        &self,
+        request: &crate::ScheduleCreateRequest,
+    ) -> Result<crate::ScheduleView> {
+        encode_response(
+            self.state
+                .create_schedule_if_name_absent(request.clone())
+                .await?,
+        )
+    }
+
+    async fn create_playbook_version_if_absent(
+        &self,
+        request: &crate::CreatePlaybookRequest,
+    ) -> Result<crate::PlaybookView> {
+        encode_response(
+            self.state
+                .create_playbook_if_version_absent(request.clone())
+                .await?,
+        )
+    }
+}
+
+fn encode_response<T, S>(value: S) -> Result<T>
+where
+    T: DeserializeOwned,
+    S: Serialize,
+{
+    serde_json::from_value(serde_json::to_value(value)?).context("failed to encode stack response")
+}
+
+fn decoded_path_segments(path: &str) -> Result<Vec<String>> {
+    path.trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| {
+            urlencoding::decode(segment)
+                .map(|decoded| decoded.into_owned())
+                .with_context(|| format!("failed to decode path segment `{segment}`"))
+        })
+        .collect()
+}
+
+async fn build_stack_http_connector_config<M>(
+    state: &crate::DaemonState<M>,
+    name: &str,
+    request: crate::PutHttpConnectorRequest,
+) -> Result<crate::HttpInputConnectorConfig>
+where
+    M: kheish_core::ModelDriver + Send + Sync + 'static,
+{
+    let session_policy = request.session_policy.unwrap_or_default().normalized();
+    if let Some(persona_id) = session_policy.persona_id.as_deref() {
+        state.get_persona_record(persona_id).await?;
+    }
+    let bearer_token = request.bearer_token.unwrap_or_default();
+    let hmac_secret = request.hmac_secret.unwrap_or_default();
+    let default_reply_targets = request.default_reply_targets.unwrap_or_default();
+    state.validate_persisted_reply_targets(&default_reply_targets)?;
+    Ok(crate::HttpInputConnectorConfig {
+        name: name.to_string(),
+        fixed_session_id: normalized_optional_string(request.fixed_session_id, "fixed_session_id")?,
+        actor_id: normalized_optional_string(request.actor_id, "actor_id")?,
+        bearer_token: normalized_optional_string(bearer_token.value, "bearer_token.value")?,
+        bearer_token_env: normalized_optional_string(bearer_token.env, "bearer_token.env")?,
+        bearer_token_secret_ref: normalized_optional_string(
+            bearer_token.secret_ref,
+            "bearer_token.secret_ref",
+        )?,
+        hmac_secret: normalized_optional_string(hmac_secret.value, "hmac_secret.value")?,
+        hmac_secret_env: normalized_optional_string(hmac_secret.env, "hmac_secret.env")?,
+        hmac_secret_secret_ref: normalized_optional_string(
+            hmac_secret.secret_ref,
+            "hmac_secret.secret_ref",
+        )?,
+        allow_unauthenticated_ingress: request.allow_unauthenticated_ingress.unwrap_or(false),
+        require_hmac_signature: request.require_hmac_signature.unwrap_or(false),
+        signature_max_age_secs: request
+            .signature_max_age_secs
+            .unwrap_or_else(crate::connectors::http_default_signature_max_age_secs),
+        require_idempotency_key: request.require_idempotency_key.unwrap_or(true),
+        ingress_events_per_second: request
+            .ingress_events_per_second
+            .unwrap_or_else(crate::connectors::http_default_ingress_events_per_second),
+        allow_payload_reply_targets: request.allow_payload_reply_targets.unwrap_or(false),
+        default_reply_targets,
+        default_binding_keys: request.default_binding_keys.unwrap_or_default(),
+        session_policy,
+    })
+}
+
+fn normalized_optional_string(value: Option<String>, field: &str) -> Result<Option<String>> {
+    value
+        .map(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                bail!("{field} cannot be empty");
+            }
+            Ok(trimmed.to_string())
+        })
+        .transpose()
+}
+
+pub fn generic_stack_template(name: &str) -> String {
+    render_generic_stack_template(name)
+}
+
+pub(crate) fn stack_ledger_path(state_root: &Path) -> PathBuf {
+    state_root.join(LEDGER_DIR).join(LEDGER_FILE)
+}
+
+fn render_generic_stack_template(name: &str) -> String {
+    format!(
+        r#"apiVersion: {STACK_API_VERSION}
+kind: {STACK_KIND}
+metadata:
+  name: {name}
+spec:
+  apply:
+    strict_scopes: true
+    restart_policy: plan_only
+  requires:
+    secrets: []
+  runtime: {{}}
+  connectors: []
+  personas: []
+  sessions: []
+  schedules: []
+  playbooks: []
+  verification: []
+"#
+    )
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StackApplyOptions {
+    pub(crate) dry_run: bool,
+    pub(crate) force_restart: bool,
+    pub(crate) allow_secret_env: bool,
+    pub(crate) prune: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StackImportOptions {
+    pub(crate) resources: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StackDownOptions {
+    pub(crate) yes: bool,
+}
+
+pub(crate) async fn validate_stack_context(context: &StackContext) -> Result<StackValidation> {
+    let mut validation = validate_stack(context)?;
+    if let Err(error) = ResolvedStack::from_context(context).await {
+        validation.errors.push(error.to_string());
+        validation.valid = false;
+    }
+    Ok(validation)
+}
+
+pub(crate) async fn plan_stack<C>(
+    client: &C,
+    context: &StackContext,
+    only_changes: bool,
+    allow_secret_env: bool,
+) -> Result<StackPlan>
+where
+    C: StackControlPlane + Sync,
+{
+    build_plan(client, context, only_changes, allow_secret_env).await
+}
+
+pub(crate) async fn apply_stack<C>(
+    client: &C,
+    context: StackContext,
+    options: StackApplyOptions,
+) -> Result<StackApplyReport>
+where
+    C: StackControlPlane + Sync,
+{
+    validate_self_contained_api_manifest(&context)?;
+    let ledger_path = resolve_ledger_path(client, context.state_root_override.as_deref()).await?;
+    let _ledger_lock = if options.dry_run {
+        None
+    } else {
+        Some(LedgerLock::acquire(&ledger_path)?)
+    };
+    let mut plan = build_plan(client, &context, false, options.allow_secret_env).await?;
+    let blocked_code = "stack_apply_blocked";
+    let ledger_for_plan = ApplyLedger::load_or_new(&ledger_path).await?;
+    let resolved = ResolvedStack::from_context(&context).await?;
+    if options.force_restart && plan.restart_required {
+        plan.warnings.push(
+            "--force-restart was requested, but the daemon Stack API cannot restart or reload startup-only config; startup drift remains blocked".to_string(),
+        );
+    }
+    if options.prune || context.document.spec.apply.prune {
+        let prune_actions = plan_prune(&context, &resolved, &ledger_for_plan);
+        plan.actions.extend(prune_actions);
+        plan.summary = StackPlanSummary::from_actions(&plan.actions);
+        plan.valid = plan.errors.is_empty();
+    }
+    if options.dry_run {
+        return Ok(StackApplyReport::dry_run(plan));
+    }
+    if !plan.errors.is_empty() {
+        return Err(crate::problems::DaemonProblem::unprocessable(
+            "stacks",
+            blocked_code,
+            "KheishStack apply refused because the plan contains errors",
+        )
+        .into());
+    }
+
+    let mut ledger = ApplyLedger::load_or_new(&ledger_path).await?;
+    ledger.save(&ledger_path).await?;
+    let mut report = StackApplyReport {
+        stack: context.document.metadata.name.clone(),
+        ownership_id: context.ownership_id(),
+        ledger_path: ledger_path.display().to_string(),
+        applied: Vec::new(),
+        verification: None,
+        warnings: plan.warnings.clone(),
+        plan: Some(plan.clone()),
+    };
+    enforce_desired_resource_ownership(&ledger, &context.ownership_id(), &resolved)?;
+
+    apply_secrets(
+        client,
+        &context,
+        &resolved,
+        &ledger_path,
+        &mut ledger,
+        options.allow_secret_env,
+        &mut report,
+    )
+    .await?;
+    apply_runtime(
+        client,
+        &context,
+        &resolved,
+        &ledger_path,
+        &mut ledger,
+        &mut report,
+    )
+    .await?;
+    apply_personas(
+        client,
+        &context,
+        &resolved,
+        &ledger_path,
+        &mut ledger,
+        &mut report,
+    )
+    .await?;
+    apply_connectors(
+        client,
+        &context,
+        &resolved,
+        &ledger_path,
+        &mut ledger,
+        &mut report,
+    )
+    .await?;
+    apply_sessions(
+        client,
+        &context,
+        &resolved,
+        &ledger_path,
+        &mut ledger,
+        &mut report,
+    )
+    .await?;
+    apply_schedules(
+        client,
+        &context,
+        &resolved,
+        &ledger_path,
+        &mut ledger,
+        &mut report,
+    )
+    .await?;
+    apply_playbooks(
+        client,
+        &context,
+        &resolved,
+        &ledger_path,
+        &mut ledger,
+        &mut report,
+    )
+    .await?;
+
+    if options.prune || context.document.spec.apply.prune {
+        let prune_actions = plan_prune(&context, &resolved, &ledger);
+        execute_down(client, &context, &prune_actions, &mut ledger, &ledger_path).await?;
+        report.applied.extend(
+            prune_actions
+                .into_iter()
+                .filter(|action| action.operation != "blocked"),
+        );
+    }
+
+    let verification = verify_stack(client, &context).await?;
+    let verification_valid = verification.valid;
+    report.verification = Some(verification);
+    if verification_valid {
+        Ok(report)
+    } else {
+        bail!("KheishStack apply completed but verification failed")
+    }
+}
+
+pub(crate) async fn import_stack<C>(
+    client: &C,
+    context: StackContext,
+    options: StackImportOptions,
+) -> Result<StackImportReport>
+where
+    C: StackControlPlane + Sync,
+{
+    if options.resources.len() > STACK_MAX_RESOURCE_COUNT {
+        return Err(crate::problems::DaemonProblem::unprocessable(
+            "stacks",
+            "stack_import_blocked",
+            format!(
+                "KheishStack import declares {} explicit resources, exceeding the {STACK_MAX_RESOURCE_COUNT} resource limit",
+                options.resources.len()
+            ),
+        )
+        .into());
+    }
+    let validation = validate_stack_context(&context).await?;
+    if !validation.valid {
+        return Err(crate::problems::DaemonProblem::unprocessable(
+            "stacks",
+            "stack_import_blocked",
+            format!(
+                "KheishStack import refused because validation failed: {}",
+                validation.errors.join("; ")
+            ),
+        )
+        .into());
+    }
+    let declared_resources = ResolvedStack::from_context(&context)
+        .await?
+        .desired_resource_keys();
+    let resources = import_resources_from_manifest(&declared_resources, options.resources)?;
+    let ledger_path = resolve_ledger_path(client, context.state_root_override.as_deref()).await?;
+    let _ledger_lock = LedgerLock::acquire(&ledger_path)?;
+    let mut ledger = ApplyLedger::load_or_new(&ledger_path).await?;
+    let mut adopted = Vec::new();
+    for resource in resources {
+        let key = ResourceKey::parse(&resource)?;
+        let live = fetch_live_resource_value(client, &key).await?;
+        let digest = digest_json(&live)?;
+        if let Some(owner) = ledger.owner_of_resource(&key)
+            && owner != context.ownership_id()
+        {
+            return Err(crate::problems::DaemonProblem::conflict(
+                "stacks",
+                "stack_ownership_conflict",
+                format!("resource {key} is already owned by stack `{owner}`"),
+            )
+            .into());
+        }
+        ledger.record_resource(&context.ownership_id(), &key, digest);
+        adopted.push(StackAction::new(
+            "import",
+            key.kind,
+            key.id,
+            "adopt",
+            "resource exists and is now owned by this stack ledger",
+        ));
+    }
+    ledger.save(&ledger_path).await?;
+    Ok(StackImportReport {
+        stack: context.document.metadata.name.clone(),
+        ownership_id: context.ownership_id(),
+        ledger_path: ledger_path.display().to_string(),
+        adopted,
+    })
+}
+
+fn import_resources_from_manifest(
+    declared_resources: &[String],
+    explicit_resources: Vec<String>,
+) -> Result<Vec<String>> {
+    if explicit_resources.is_empty() {
+        return Ok(declared_resources.to_vec());
+    }
+    let declared = declared_resources.iter().collect::<BTreeSet<_>>();
+    let mut resources = Vec::new();
+    for resource in explicit_resources {
+        let key = ResourceKey::parse(&resource).map_err(|error| {
+            crate::problems::DaemonProblem::unprocessable(
+                "stacks",
+                "stack_import_blocked",
+                format!("invalid stack import resource `{resource}`: {error}"),
+            )
+        })?;
+        let normalized = key.to_string();
+        if !declared.contains(&normalized) {
+            return Err(crate::problems::DaemonProblem::unprocessable(
+                "stacks",
+                "stack_import_blocked",
+                format!(
+                    "stack import resource `{normalized}` is not declared in this KheishStack manifest"
+                ),
+            )
+            .into());
+        }
+        resources.push(normalized);
+    }
+    Ok(resources)
+}
+
+pub(crate) async fn down_stack<C>(
+    client: &C,
+    context: StackContext,
+    options: StackDownOptions,
+) -> Result<StackDownReport>
+where
+    C: StackControlPlane + Sync,
+{
+    validate_self_contained_api_manifest(&context)?;
+    let ledger_path = resolve_ledger_path(client, context.state_root_override.as_deref()).await?;
+    let _ledger_lock = LedgerLock::acquire(&ledger_path)?;
+    let mut ledger = ApplyLedger::load_or_new(&ledger_path).await?;
+    let actions = plan_down(&context, &ledger);
+    if options.yes {
+        execute_down(client, &context, &actions, &mut ledger, &ledger_path).await?;
+    }
+    Ok(StackDownReport {
+        stack: context.document.metadata.name.clone(),
+        ownership_id: context.ownership_id(),
+        ledger_path: ledger_path.display().to_string(),
+        executed: options.yes,
+        actions,
+    })
+}
+
+async fn build_plan<C>(
+    client: &C,
+    context: &StackContext,
+    only_changes: bool,
+    allow_secret_env: bool,
+) -> Result<StackPlan>
+where
+    C: StackControlPlane + Sync,
+{
+    let mut validation = validate_stack(context)?;
+    let ledger_path = resolve_ledger_path(client, context.state_root_override.as_deref()).await?;
+    let ledger = ApplyLedger::load_or_new(&ledger_path).await?;
+    let resolved = ResolvedStack::from_context(context).await?;
+    let mut plan = StackPlan {
+        stack: context.document.metadata.name.clone(),
+        ownership_id: context.ownership_id(),
+        ledger_path: ledger_path.display().to_string(),
+        valid: validation.valid,
+        restart_required: false,
+        actions: Vec::new(),
+        errors: std::mem::take(&mut validation.errors),
+        warnings: std::mem::take(&mut validation.warnings),
+        summary: StackPlanSummary::default(),
+    };
+
+    add_startup_actions(context, &resolved, &mut plan);
+    add_secret_actions(
+        client,
+        context,
+        &resolved,
+        &ledger,
+        allow_secret_env,
+        &mut plan,
+    )
+    .await?;
+    add_runtime_actions(client, context, &resolved, &ledger, &mut plan).await?;
+    add_persona_actions(client, &resolved, &mut plan).await?;
+    add_connector_actions(client, context, &resolved, &ledger, &mut plan).await?;
+    add_session_actions(client, &resolved, &mut plan).await?;
+    add_schedule_actions(client, context, &resolved, &ledger, &mut plan).await?;
+    add_playbook_actions(client, &resolved, &mut plan).await?;
+    add_verification_actions(&resolved, &mut plan);
+    add_ownership_diagnostics(&ledger, &context.ownership_id(), &mut plan);
+    plan.summary = StackPlanSummary::from_actions(&plan.actions);
+    if only_changes {
+        plan.actions
+            .retain(|action| action.operation != "noop" && action.operation != "verify");
+        plan.summary = StackPlanSummary::from_actions(&plan.actions);
+    }
+    plan.valid = plan.errors.is_empty();
+    Ok(plan)
+}
+
+fn validate_self_contained_api_manifest(context: &StackContext) -> Result<()> {
+    if context.allow_file_refs {
+        return Ok(());
+    }
+    let mut file_refs = Vec::new();
+    for persona in &context.document.spec.personas {
+        if persona.soul_file.is_some() {
+            file_refs.push(format!("spec.personas[{}].soul_file", persona.persona_id));
+        }
+    }
+    for schedule in &context.document.spec.schedules {
+        if schedule
+            .request
+            .as_ref()
+            .and_then(|request| request.content_file.as_ref())
+            .is_some()
+        {
+            file_refs.push(format!(
+                "spec.schedules[{}].request.content_file",
+                schedule.name
+            ));
+        }
+    }
+    for (index, playbook) in context.document.spec.playbooks.iter().enumerate() {
+        if playbook.manifest_file.is_some() {
+            file_refs.push(format!("spec.playbooks[{index}].manifest_file"));
+        }
+    }
+    if !file_refs.is_empty() {
+        bail!(
+            "file references are not allowed through the daemon Stack API; submit a self-contained manifest: {}",
+            file_refs.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn validate_stack(context: &StackContext) -> Result<StackValidation> {
+    let mut validation = StackValidation {
+        stack: context.document.metadata.name.clone(),
+        valid: true,
+        errors: Vec::new(),
+        warnings: Vec::new(),
+    };
+    let document = &context.document;
+    if document.api_version != STACK_API_VERSION {
+        validation.errors.push(format!(
+            "apiVersion must be {STACK_API_VERSION}, got {}",
+            document.api_version
+        ));
+    }
+    if document.kind != STACK_KIND {
+        validation
+            .errors
+            .push(format!("kind must be {STACK_KIND}, got {}", document.kind));
+    }
+    if document.metadata.name.trim().is_empty() {
+        validation
+            .errors
+            .push("metadata.name is required".to_string());
+    }
+    for (key, value) in &document.metadata.labels {
+        if key.trim().is_empty() || value.trim().is_empty() {
+            validation
+                .errors
+                .push("metadata.labels cannot contain empty keys or values".to_string());
+        }
+    }
+    validate_resource_count(document, &mut validation);
+    validate_unique(
+        "spec.personas[].persona_id",
+        document
+            .spec
+            .personas
+            .iter()
+            .map(|persona| persona.persona_id.as_str()),
+        &mut validation,
+    );
+    validate_unique(
+        "spec.sessions[].session_id",
+        document
+            .spec
+            .sessions
+            .iter()
+            .map(|session| session.session_id.as_str()),
+        &mut validation,
+    );
+    validate_unique(
+        "spec.schedules[].name",
+        document
+            .spec
+            .schedules
+            .iter()
+            .map(|schedule| schedule.name.as_str()),
+        &mut validation,
+    );
+    validate_unique(
+        "spec.playbooks[] playbook_id/version",
+        document.spec.playbooks.iter().filter_map(|playbook| {
+            playbook
+                .manifest
+                .as_ref()
+                .map(|manifest| format!("{}/{}", manifest.playbook_id, manifest.version))
+        }),
+        &mut validation,
+    );
+    if !document.spec.agent_templates.is_empty() {
+        validation.errors.push(
+            "spec.agent_templates is not supported by KheishStack v1alpha1; use built-in profiles or add a daemon store/API first".to_string(),
+        );
+    }
+    for connector in &document.spec.connectors {
+        if connector.kind != "http" {
+            validation.errors.push(format!(
+                "spec.connectors[{}] uses kind `{}`; KheishStack v1alpha1 supports only kind `http` until every connector kind has live drift comparison",
+                connector.name, connector.kind
+            ));
+        } else if let Err(error) = parse_http_connector_request(&connector.name, &connector.spec) {
+            validation.errors.push(format!(
+                "spec.connectors[{}].spec is not a valid http connector payload: {error}",
+                connector.name
+            ));
+        }
+    }
+    if !document.spec.verification.is_empty() {
+        validation.warnings.push(
+            "spec.verification currently supports existence probes only; runtime tool-deny probes require a future probe runner".to_string(),
+        );
+    }
+    if context.strict_scopes() {
+        validate_strict_scopes(context, &mut validation);
+    }
+    validation.valid = validation.errors.is_empty();
+    Ok(validation)
+}
+
+fn validate_resource_count(document: &StackDocument, validation: &mut StackValidation) {
+    let resource_count = document.spec.requires.secrets.len()
+        + usize::from(document.spec.startup.routes.is_some())
+        + usize::from(document.spec.startup.connectors_config.is_some())
+        + document.spec.startup.mcp_profiles.len()
+        + usize::from(document.spec.runtime.permission_mode.is_some())
+        + usize::from(document.spec.runtime.debug_level.is_some())
+        + document.spec.connectors.len()
+        + document.spec.personas.len()
+        + document.spec.sessions.len()
+        + document.spec.schedules.len()
+        + document.spec.playbooks.len()
+        + document.spec.verification.len()
+        + document.spec.agent_templates.len();
+    if resource_count > STACK_MAX_RESOURCE_COUNT {
+        validation.errors.push(format!(
+            "KheishStack declares {resource_count} resources, exceeding the {STACK_MAX_RESOURCE_COUNT} resource limit"
+        ));
+    }
+}
+
+fn validate_unique<'a, I, S>(path: &str, values: I, validation: &mut StackValidation)
+where
+    I: IntoIterator<Item = S>,
+    S: Into<std::borrow::Cow<'a, str>>,
+{
+    let mut seen = BTreeSet::new();
+    for value in values {
+        let value = value.into();
+        if value.trim().is_empty() {
+            validation.errors.push(format!("{path} cannot be empty"));
+            continue;
+        }
+        if !seen.insert(value.to_string()) {
+            validation
+                .errors
+                .push(format!("{path} contains duplicate value {value}"));
+        }
+    }
+}
+
+fn parse_http_connector_request(
+    name: &str,
+    spec: &Value,
+) -> Result<crate::PutHttpConnectorRequest> {
+    validate_http_connector_spec_shape(name, spec)?;
+    serde_json::from_value::<crate::PutHttpConnectorRequest>(spec.clone())
+        .context("failed to decode http connector spec")
+}
+
+fn validate_http_connector_spec_shape(name: &str, spec: &Value) -> Result<()> {
+    let path = format!("spec.connectors[{name}].spec");
+    validate_object_fields(
+        spec,
+        &path,
+        &[
+            "actor_id",
+            "fixed_session_id",
+            "bearer_token",
+            "hmac_secret",
+            "allow_unauthenticated_ingress",
+            "require_hmac_signature",
+            "signature_max_age_secs",
+            "require_idempotency_key",
+            "ingress_events_per_second",
+            "allow_payload_reply_targets",
+            "default_reply_targets",
+            "default_binding_keys",
+            "session_policy",
+        ],
+    )?;
+    let Some(object) = spec.as_object() else {
+        return Ok(());
+    };
+    for field in ["bearer_token", "hmac_secret"] {
+        if let Some(value) = object.get(field) {
+            validate_connector_secret_input_shape(value, &format!("{path}.{field}"))?;
+        }
+    }
+    if let Some(value) = object.get("session_policy") {
+        validate_connector_session_policy_shape(value, &format!("{path}.session_policy"))?;
+    }
+    Ok(())
+}
+
+fn validate_connector_secret_input_shape(value: &Value, path: &str) -> Result<()> {
+    validate_object_fields(value, path, &["secret_ref", "value", "env"])?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("{path} must be an object"))?;
+    let configured = ["secret_ref", "value", "env"]
+        .into_iter()
+        .filter(|field| object.get(*field).is_some_and(|value| !value.is_null()))
+        .count();
+    if configured != 1 {
+        bail!("{path} must set exactly one of secret_ref, value, or env");
+    }
+    if object.get("value").is_some_and(|value| !value.is_null()) {
+        bail!(
+            "{path}.value is not supported in KheishStack; use secret_ref or env so drift can be compared without reading secret values"
+        );
+    }
+    Ok(())
+}
+
+fn validate_connector_session_policy_shape(value: &Value, path: &str) -> Result<()> {
+    validate_object_fields(
+        value,
+        path,
+        &[
+            "create_if_missing",
+            "persona_id",
+            "capability_scope",
+            "credential_scope",
+        ],
+    )?;
+    let Some(object) = value.as_object() else {
+        return Ok(());
+    };
+    if let Some(scope) = object.get("capability_scope") {
+        validate_object_fields(
+            scope,
+            &format!("{path}.capability_scope"),
+            &[
+                "skill_allow",
+                "skill_deny",
+                "mcp_server_allow",
+                "mcp_server_deny",
+                "mcp_tool_allow",
+                "mcp_tool_deny",
+            ],
+        )?;
+    }
+    if let Some(scope) = object.get("credential_scope") {
+        validate_object_fields(
+            scope,
+            &format!("{path}.credential_scope"),
+            &[
+                "route_allow",
+                "route_deny",
+                "connector_allow",
+                "connector_deny",
+                "connector_credential_allow",
+                "connector_credential_deny",
+                "mcp_server_allow",
+                "mcp_server_deny",
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_object_fields(value: &Value, path: &str, allowed: &[&str]) -> Result<()> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("{path} must be an object"))?;
+    for key in object.keys() {
+        if !allowed.contains(&key.as_str()) {
+            bail!("{path}.{key} is not supported");
+        }
+    }
+    Ok(())
+}
+
+fn validate_strict_scopes(context: &StackContext, validation: &mut StackValidation) {
+    let allow_wildcards = context.document.spec.apply.allow_wildcard_scopes;
+    for connector in &context.document.spec.connectors {
+        validate_connector_session_policy(context, connector, allow_wildcards, validation);
+    }
+    for persona in &context.document.spec.personas {
+        let path = format!("spec.personas[{}].capability_scope", persona.persona_id);
+        validate_capability_scope(
+            persona.capability_scope.as_ref(),
+            &path,
+            allow_wildcards,
+            validation,
+        );
+    }
+    for session in &context.document.spec.sessions {
+        let capability_path = format!("spec.sessions[{}].capability_scope", session.session_id);
+        validate_capability_scope(
+            session.capability_scope.as_ref(),
+            &capability_path,
+            allow_wildcards,
+            validation,
+        );
+        let credential_path = format!("spec.sessions[{}].credential_scope", session.session_id);
+        validate_credential_scope(
+            session.credential_scope.as_ref(),
+            &credential_path,
+            allow_wildcards,
+            validation,
+        );
+        let session_provider = session
+            .route_policy
+            .as_ref()
+            .and_then(|policy| policy.provider.as_deref());
+        if let Some(provider) = session_provider
+            && let Some(scope) = session.credential_scope.as_ref()
+            && !scope.normalized().allows_route(provider)
+        {
+            validation.errors.push(format!(
+                "spec.sessions[{}].route_policy.provider `{provider}` is not allowed by credential_scope.route_*",
+                session.session_id
+            ));
+        }
+        if let Some(persona_id) = session.persona_id.as_deref() {
+            let Some(persona) = context
+                .document
+                .spec
+                .personas
+                .iter()
+                .find(|candidate| candidate.persona_id == persona_id)
+            else {
+                validation.errors.push(format!(
+                    "spec.sessions[{}].persona_id `{persona_id}` must reference a persona declared in this stack so strict capability intersections can be validated",
+                    session.session_id
+                ));
+                continue;
+            };
+            if let (Some(persona_scope), Some(session_scope)) = (
+                persona.capability_scope.as_ref(),
+                session.capability_scope.as_ref(),
+            ) {
+                validate_capability_intersections(
+                    persona_scope,
+                    session_scope,
+                    &format!(
+                        "spec.sessions[{}] restricts persona {}",
+                        session.session_id, persona_id
+                    ),
+                    validation,
+                );
+            }
+        }
+    }
+    for schedule in &context.document.spec.schedules {
+        let Some(session) = context
+            .document
+            .spec
+            .sessions
+            .iter()
+            .find(|candidate| candidate.session_id == schedule.target_session_id)
+        else {
+            validation.errors.push(format!(
+                "spec.schedules[{}].target_session_id `{}` must reference a session declared in this stack so scheduled runs cannot target external fail-open sessions",
+                schedule.name, schedule.target_session_id
+            ));
+            continue;
+        };
+        if let Some(observation_materialization) = schedule.observation_materialization.as_ref()
+            && observation_materialization.target_session_id != schedule.target_session_id
+        {
+            validation.errors.push(format!(
+                "spec.schedules[{}].observation_materialization.target_session_id must match target_session_id `{}`",
+                schedule.name, schedule.target_session_id
+            ));
+        }
+        if let Some(request) = schedule.request.as_ref() {
+            validate_scheduled_request_route(
+                &format!("spec.schedules[{}].request", schedule.name),
+                request.provider.as_deref(),
+                request.generation.as_ref(),
+                session,
+                validation,
+            );
+        }
+        if let Some(observation) = schedule.observation_materialization.as_ref() {
+            validate_scheduled_request_route(
+                &format!(
+                    "spec.schedules[{}].observation_materialization.request",
+                    schedule.name
+                ),
+                observation.request.provider.as_deref(),
+                observation.request.generation.as_ref(),
+                session,
+                validation,
+            );
+        }
+    }
+}
+
+fn validate_scheduled_request_route(
+    path: &str,
+    provider: Option<&str>,
+    generation: Option<&kheish_runtime::ModelGenerationConfig>,
+    session: &StackSessionSpec,
+    validation: &mut StackValidation,
+) {
+    let Some(scope) = session.credential_scope.as_ref() else {
+        return;
+    };
+    let Some(provider) = provider.or_else(|| {
+        generation
+            .and_then(|generation| generation.model.as_deref())
+            .is_none()
+            .then(|| {
+                session
+                    .route_policy
+                    .as_ref()
+                    .and_then(|policy| policy.provider.as_deref())
+            })
+            .flatten()
+    }) else {
+        return;
+    };
+    if !scope.normalized().allows_route(provider) {
+        validation.errors.push(format!(
+            "{path}.provider `{provider}` is not allowed by target session credential_scope.route_*"
+        ));
+    }
+}
+
+fn validate_connector_session_policy(
+    context: &StackContext,
+    connector: &StackConnectorSpec,
+    allow_wildcards: bool,
+    validation: &mut StackValidation,
+) {
+    if connector.kind != "http" {
+        return;
+    }
+    let Ok(request) = parse_http_connector_request(&connector.name, &connector.spec) else {
+        return;
+    };
+    if let Some(fixed_session_id) = request.fixed_session_id.as_deref()
+        && !context
+            .document
+            .spec
+            .sessions
+            .iter()
+            .any(|session| session.session_id == fixed_session_id)
+    {
+        validation.errors.push(format!(
+            "spec.connectors[{}].spec.fixed_session_id `{fixed_session_id}` must reference a session declared in this stack",
+            connector.name
+        ));
+    }
+    let Some(policy) = request.session_policy else {
+        if request.fixed_session_id.is_none() {
+            validation.errors.push(format!(
+                "spec.connectors[{}].spec must set fixed_session_id or a fail-closed session_policy",
+                connector.name
+            ));
+        }
+        return;
+    };
+    if policy.is_empty() {
+        if request.fixed_session_id.is_none() {
+            validation.errors.push(format!(
+                "spec.connectors[{}].spec.session_policy must be non-empty when fixed_session_id is omitted",
+                connector.name
+            ));
+        }
+        return;
+    }
+    let policy = policy.normalized();
+    let capability_path = format!(
+        "spec.connectors[{}].spec.session_policy.capability_scope",
+        connector.name
+    );
+    validate_capability_scope(
+        Some(&policy.capability_scope),
+        &capability_path,
+        allow_wildcards,
+        validation,
+    );
+    let credential_path = format!(
+        "spec.connectors[{}].spec.session_policy.credential_scope",
+        connector.name
+    );
+    validate_credential_scope(
+        Some(&policy.credential_scope),
+        &credential_path,
+        allow_wildcards,
+        validation,
+    );
+    if let Some(persona_id) = policy.persona_id.as_deref() {
+        let Some(persona) = context
+            .document
+            .spec
+            .personas
+            .iter()
+            .find(|candidate| candidate.persona_id == persona_id)
+        else {
+            validation.errors.push(format!(
+                "spec.connectors[{}].spec.session_policy.persona_id `{persona_id}` must reference a persona declared in this stack so strict capability intersections can be validated",
+                connector.name
+            ));
+            return;
+        };
+        if let Some(persona_scope) = persona.capability_scope.as_ref() {
+            validate_capability_intersections(
+                persona_scope,
+                &policy.capability_scope,
+                &format!(
+                    "spec.connectors[{}].spec.session_policy restricts persona {}",
+                    connector.name, persona_id
+                ),
+                validation,
+            );
+        }
+    }
+}
+
+fn validate_capability_scope(
+    scope: Option<&kheish_types::CapabilityScope>,
+    path: &str,
+    allow_wildcards: bool,
+    validation: &mut StackValidation,
+) {
+    let Some(scope) = scope else {
+        validation.errors.push(format!(
+            "{path} is required because omitted capability scopes are fail-open"
+        ));
+        return;
+    };
+    let scope = scope.normalized();
+    validate_scope_family(
+        &scope.skill_allow,
+        &scope.skill_deny,
+        &format!("{path}.skill"),
+        allow_wildcards,
+        validation,
+    );
+    validate_scope_family(
+        &scope.mcp_server_allow,
+        &scope.mcp_server_deny,
+        &format!("{path}.mcp_server"),
+        allow_wildcards,
+        validation,
+    );
+    validate_scope_family(
+        &scope.mcp_tool_allow,
+        &scope.mcp_tool_deny,
+        &format!("{path}.mcp_tool"),
+        allow_wildcards,
+        validation,
+    );
+}
+
+fn validate_credential_scope(
+    scope: Option<&kheish_types::CredentialScope>,
+    path: &str,
+    allow_wildcards: bool,
+    validation: &mut StackValidation,
+) {
+    let Some(scope) = scope else {
+        validation.errors.push(format!(
+            "{path} is required because omitted credential scopes are fail-open"
+        ));
+        return;
+    };
+    let scope = scope.normalized();
+    validate_scope_family(
+        &scope.route_allow,
+        &scope.route_deny,
+        &format!("{path}.route"),
+        allow_wildcards,
+        validation,
+    );
+    validate_scope_family(
+        &scope.connector_allow,
+        &scope.connector_deny,
+        &format!("{path}.connector"),
+        allow_wildcards,
+        validation,
+    );
+    validate_scope_family(
+        &scope.connector_credential_allow,
+        &scope.connector_credential_deny,
+        &format!("{path}.connector_credential"),
+        allow_wildcards,
+        validation,
+    );
+    validate_scope_family(
+        &scope.mcp_server_allow,
+        &scope.mcp_server_deny,
+        &format!("{path}.mcp_server"),
+        allow_wildcards,
+        validation,
+    );
+}
+
+fn validate_scope_family(
+    allow: &[String],
+    deny: &[String],
+    path: &str,
+    allow_wildcards: bool,
+    validation: &mut StackValidation,
+) {
+    if allow.is_empty() && deny.is_empty() {
+        validation.errors.push(format!(
+            "{path} must set an allow or deny list; empty lists are fail-open in the daemon"
+        ));
+    }
+    if allow.is_empty() && !deny.is_empty() && !deny.iter().any(|entry| entry == "*") {
+        validation.errors.push(format!(
+            "{path}_deny must contain `*` when {path}_allow is empty; partial deny-lists are still fail-open in the daemon"
+        ));
+    }
+    if !allow_wildcards && allow.iter().any(|entry| entry == "*") {
+        validation.errors.push(format!(
+            "{path}_allow uses `*`; set spec.apply.allow_wildcard_scopes=true only for intentional allow-all"
+        ));
+    }
+}
+
+fn validate_capability_intersections(
+    persona_scope: &kheish_types::CapabilityScope,
+    session_scope: &kheish_types::CapabilityScope,
+    path: &str,
+    validation: &mut StackValidation,
+) {
+    validate_allow_intersection(
+        &persona_scope.normalized().skill_allow,
+        &session_scope.normalized().skill_allow,
+        &format!("{path}.skill_allow"),
+        validation,
+    );
+    validate_allow_intersection(
+        &persona_scope.normalized().mcp_server_allow,
+        &session_scope.normalized().mcp_server_allow,
+        &format!("{path}.mcp_server_allow"),
+        validation,
+    );
+    validate_allow_intersection(
+        &persona_scope.normalized().mcp_tool_allow,
+        &session_scope.normalized().mcp_tool_allow,
+        &format!("{path}.mcp_tool_allow"),
+        validation,
+    );
+}
+
+fn validate_allow_intersection(
+    left: &[String],
+    right: &[String],
+    path: &str,
+    validation: &mut StackValidation,
+) {
+    if left.is_empty()
+        || right.is_empty()
+        || left.iter().any(|entry| entry == "*")
+        || right.iter().any(|entry| entry == "*")
+    {
+        return;
+    }
+    let right = right.iter().collect::<BTreeSet<_>>();
+    if !left.iter().any(|entry| right.contains(entry)) {
+        validation.errors.push(format!(
+            "{path} has disjoint allow-lists; daemon restrict_with would collapse to an empty allow-list that becomes fail-open"
+        ));
+    }
+}
+
+async fn resolve_ledger_path<C>(client: &C, state_root_override: Option<&Path>) -> Result<PathBuf>
+where
+    C: StackControlPlane + Sync,
+{
+    if let Some(state_root) = state_root_override {
+        return Ok(state_root.join(LEDGER_DIR).join(LEDGER_FILE));
+    }
+    let runtime = client
+        .get_json::<crate::RuntimeSettingsView>("/v1/runtime")
+        .await?;
+    if let Some(state_root) = runtime.state_root {
+        return Ok(PathBuf::from(state_root).join(LEDGER_DIR).join(LEDGER_FILE));
+    }
+    if let Some(store_path) = runtime.config.store_path
+        && let Some(parent) = Path::new(&store_path).parent()
+    {
+        return Ok(parent.join(LEDGER_DIR).join(LEDGER_FILE));
+    }
+    Ok(PathBuf::from(".kheish-daemon")
+        .join(LEDGER_DIR)
+        .join(LEDGER_FILE))
+}
+
+fn add_startup_actions(context: &StackContext, resolved: &ResolvedStack, plan: &mut StackPlan) {
+    if resolved.startup_digest.is_none() {
+        return;
+    }
+    plan.restart_required = true;
+    let _restart_policy = context.document.spec.apply.restart_policy;
+    plan.errors.push(
+        "startup-only configuration is loaded at serve time and cannot be reconciled by the daemon Stack API; restart the daemon with that config outside apply".to_string(),
+    );
+    plan.actions.push(StackAction::new(
+        "startup",
+        "daemon",
+        "serve_config",
+        "blocked",
+        "startup-only config is not hot-reloaded by the daemon",
+    ));
+}
+
+async fn add_secret_actions<C>(
+    client: &C,
+    context: &StackContext,
+    resolved: &ResolvedStack,
+    ledger: &ApplyLedger,
+    allow_secret_env: bool,
+    plan: &mut StackPlan,
+) -> Result<()>
+where
+    C: StackControlPlane + Sync,
+{
+    for secret in &resolved.secrets {
+        let encoded = url_encode_path_segment(&secret.slot);
+        let live = client
+            .get_json_optional::<kheish_auth::AuthSlotStatus>(&format!(
+                "/v1/runtime/secrets/{encoded}"
+            ))
+            .await?;
+        let key = ResourceKey::new("secret", &secret.slot);
+        let desired_fingerprint = if let Some(env_name) = secret.value_env.as_deref() {
+            if allow_secret_env {
+                match secret_fingerprint(&ledger.ledger_salt, &secret.slot, env_name) {
+                    Ok(fingerprint) => Some(fingerprint),
+                    Err(error) => {
+                        plan.errors.push(error.to_string());
+                        None
+                    }
+                }
+            } else {
+                plan.errors.push(format!(
+                    "secret {} uses value_env={env_name}; pass allow_secret_env=true to read the daemon environment for planning/apply",
+                    secret.slot
+                ));
+                None
+            }
+        } else {
+            None
+        };
+        let operation = if live.is_none() {
+            if secret.value_env.is_some() {
+                "create"
+            } else {
+                plan.errors.push(format!(
+                    "required secret {} is missing and has no value_env source",
+                    secret.slot
+                ));
+                "blocked"
+            }
+        } else if let Some(fingerprint) = desired_fingerprint.as_deref() {
+            if ledger
+                .secret_fingerprint(&context.ownership_id(), &secret.slot)
+                .is_some_and(|stored| stored == fingerprint)
+            {
+                "noop"
+            } else {
+                "update"
+            }
+        } else {
+            "noop"
+        };
+        plan.actions.push(StackAction::new(
+            "secrets",
+            key.kind,
+            key.id,
+            operation,
+            "secret values are not read back; drift is tracked by ledger fingerprints when value_env is provided",
+        ));
+    }
+    Ok(())
+}
+
+async fn add_runtime_actions<C>(
+    client: &C,
+    context: &StackContext,
+    resolved: &ResolvedStack,
+    ledger: &ApplyLedger,
+    plan: &mut StackPlan,
+) -> Result<()>
+where
+    C: StackControlPlane + Sync,
+{
+    if resolved.runtime_digest.is_none() {
+        return Ok(());
+    }
+    let runtime = client
+        .get_json::<crate::RuntimeSettingsView>("/v1/runtime")
+        .await?;
+    if let Some(permission_mode) = resolved.runtime.permission_mode.as_ref() {
+        let operation = if runtime.permission_mode == *permission_mode {
+            "noop"
+        } else {
+            "update"
+        };
+        plan.actions.push(StackAction::new(
+            "runtime",
+            "runtime",
+            "permission_mode",
+            operation,
+            "runtime singleton uses daemon revision compare-and-swap on apply",
+        ));
+    }
+    if let Some(debug_level) = resolved.runtime.debug_level {
+        let operation = if runtime.debug_level == debug_level {
+            "noop"
+        } else {
+            "update"
+        };
+        plan.actions.push(StackAction::new(
+            "runtime",
+            "runtime",
+            "debug_level",
+            operation,
+            "runtime singleton uses daemon revision compare-and-swap on apply",
+        ));
+    }
+    if let Some(digest) = resolved.runtime_digest.as_deref() {
+        let key = ResourceKey::new("runtime", "settings");
+        if ledger.resource_digest(&context.ownership_id(), &key) != Some(digest) {
+            plan.warnings.push(
+                "runtime settings are daemon-owned singletons; concurrent manual changes are guarded by expected_revision during apply".to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn add_connector_actions<C>(
+    client: &C,
+    _context: &StackContext,
+    resolved: &ResolvedStack,
+    _ledger: &ApplyLedger,
+    plan: &mut StackPlan,
+) -> Result<()>
+where
+    C: StackControlPlane + Sync,
+{
+    for connector in &resolved.connectors {
+        let key = ResourceKey::new(
+            "connector",
+            &format!("{}/{}", connector.kind, connector.name),
+        );
+        let path = format!(
+            "/v1/runtime/connectors/{}/{}",
+            url_encode_path_segment(&connector.kind),
+            url_encode_path_segment(&connector.name)
+        );
+        let live = client
+            .get_json_optional::<crate::ConnectorView>(&path)
+            .await?;
+        let operation = if live.is_none() {
+            "create"
+        } else if live
+            .as_ref()
+            .is_some_and(|live| connector_matches(live, connector))
+        {
+            "noop"
+        } else {
+            "update"
+        };
+        plan.actions.push(StackAction::new(
+            "connectors",
+            key.kind,
+            key.id,
+            operation,
+            "connector request payload is applied through the runtime connector API",
+        ));
+    }
+    Ok(())
+}
+
+async fn add_persona_actions<C>(
+    client: &C,
+    resolved: &ResolvedStack,
+    plan: &mut StackPlan,
+) -> Result<()>
+where
+    C: StackControlPlane + Sync,
+{
+    for persona in &resolved.personas {
+        let encoded = url_encode_path_segment(&persona.persona_id);
+        let live = client
+            .get_json_optional::<crate::PersonaView>(&format!("/v1/personas/{encoded}"))
+            .await?;
+        let operation = match live.as_ref() {
+            None => "create",
+            Some(live) if persona_matches(live, persona) => "noop",
+            Some(_) => "update",
+        };
+        plan.actions.push(StackAction::new(
+            "personas",
+            "persona",
+            persona.persona_id.clone(),
+            operation,
+            "persona state is compared through daemon readback",
+        ));
+    }
+    Ok(())
+}
+
+async fn add_session_actions<C>(
+    client: &C,
+    resolved: &ResolvedStack,
+    plan: &mut StackPlan,
+) -> Result<()>
+where
+    C: StackControlPlane + Sync,
+{
+    for session in &resolved.sessions {
+        let encoded = url_encode_path_segment(&session.session_id);
+        let live = client
+            .get_json_optional::<crate::SessionView>(&format!("/v1/sessions/{encoded}"))
+            .await?;
+        let operation = match live.as_ref() {
+            None => "create",
+            Some(live) if session_matches(live, session) => "noop",
+            Some(live) if session.persona_id.is_none() && live.persona.as_ref().is_some() => {
+                plan.errors.push(format!(
+                    "session {} has a live persona but the desired stack omits persona_id; the current daemon API cannot clear a session persona",
+                    session.session_id
+                ));
+                "blocked"
+            }
+            Some(_) => "update",
+        };
+        plan.actions.push(StackAction::new(
+            "sessions",
+            "session",
+            session.session_id.clone(),
+            operation,
+            "session persona, scopes, route policy, and reply targets are reconciled through daemon APIs",
+        ));
+    }
+    Ok(())
+}
+
+async fn add_schedule_actions<C>(
+    client: &C,
+    _context: &StackContext,
+    resolved: &ResolvedStack,
+    _ledger: &ApplyLedger,
+    plan: &mut StackPlan,
+) -> Result<()>
+where
+    C: StackControlPlane + Sync,
+{
+    let live = client
+        .get_json::<Vec<crate::ScheduleView>>("/v1/schedules")
+        .await?;
+    for schedule in &resolved.schedules {
+        let found = live
+            .iter()
+            .find(|candidate| candidate.name == schedule.name);
+        let key = ResourceKey::new("schedule", &schedule.name);
+        let operation = match found {
+            None => "create",
+            Some(found) if schedule_view_matches(found, &schedule.request) => "noop",
+            Some(_) => {
+                plan.errors.push(format!(
+                    "schedule {} exists with drift; schedules are immutable through the current API, use stack down on a ledger-owned schedule or create a new name",
+                    schedule.name
+                ));
+                "blocked"
+            }
+        };
+        plan.actions.push(StackAction::new(
+            "schedules",
+            key.kind,
+            key.id,
+            operation,
+            "schedule identity is name-based in KheishStack and create-only in the daemon API",
+        ));
+    }
+    Ok(())
+}
+
+async fn add_playbook_actions<C>(
+    client: &C,
+    resolved: &ResolvedStack,
+    plan: &mut StackPlan,
+) -> Result<()>
+where
+    C: StackControlPlane + Sync,
+{
+    for playbook in &resolved.playbooks {
+        let validation = client
+            .post_json::<_, crate::PlaybookValidationResult>(
+                "/v1/playbooks/validate",
+                &crate::ValidatePlaybookRequest {
+                    manifest: playbook.manifest.clone(),
+                },
+            )
+            .await?;
+        if !validation.valid {
+            plan.errors.extend(validation.errors);
+        }
+        plan.warnings.extend(validation.warnings);
+        let digest = validation.digest.unwrap_or_else(|| playbook.digest.clone());
+        let encoded = url_encode_path_segment(&playbook.manifest.playbook_id);
+        let live = client
+            .get_json_optional::<crate::PlaybookView>(&format!("/v1/playbooks/{encoded}"))
+            .await?;
+        let live_version = live
+            .as_ref()
+            .and_then(|view| {
+                view.versions
+                    .iter()
+                    .find(|version| version.version == playbook.manifest.version)
+            })
+            .cloned();
+        let has_version = live_version
+            .as_ref()
+            .is_some_and(|version| version.digest == digest);
+        let operation = if has_version { "noop" } else { "create" };
+        plan.actions.push(StackAction::new(
+            "playbooks",
+            "playbook",
+            format!(
+                "{}/{}",
+                playbook.manifest.playbook_id, playbook.manifest.version
+            ),
+            operation,
+            "playbook create is idempotent by manifest digest",
+        ));
+        if let Some(publish) = &playbook.publish {
+            let release_matches = live_version.as_ref().is_some_and(|version| {
+                version.status == publish.status && version.evidence_refs == publish.evidence_refs
+            });
+            plan.actions.push(StackAction::new(
+                "playbooks",
+                "playbook_release",
+                format!(
+                    "{}/{}",
+                    playbook.manifest.playbook_id, playbook.manifest.version
+                ),
+                if publish.status == crate::PlaybookReleaseStatus::Draft || release_matches {
+                    "noop"
+                } else {
+                    "update"
+                },
+                "release metadata is mutable and daemon-validated with expected digest",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn add_verification_actions(resolved: &ResolvedStack, plan: &mut StackPlan) {
+    for probe in &resolved.verification {
+        plan.actions.push(StackAction::new(
+            "verification",
+            "probe",
+            probe.name.clone(),
+            "verify",
+            "existence probe runs after apply",
+        ));
+    }
+}
+
+fn add_ownership_diagnostics(ledger: &ApplyLedger, ownership_id: &str, plan: &mut StackPlan) {
+    for action in &plan.actions {
+        let Some(key) = resource_key_for_action(action) else {
+            continue;
+        };
+        match ledger.owner_of_resource(&key) {
+            Some(owner) if owner != ownership_id => plan.errors.push(format!(
+                "resource {key} is already owned by stack `{owner}`; import or down that ownership before applying `{ownership_id}`"
+            )),
+            None if requires_existing_resource_ownership(action) => plan.errors.push(format!(
+                "resource {key} already exists but is not owned by stack `{ownership_id}`; run stack import before applying"
+            )),
+            _ => {}
+        }
+    }
+}
+
+fn resource_key_for_action(action: &StackAction) -> Option<ResourceKey> {
+    match action.resource_type.as_str() {
+        "connector" | "persona" | "secret" | "session" | "schedule" | "playbook" => {
+            Some(ResourceKey::new(&action.resource_type, &action.resource_id))
+        }
+        "runtime" => Some(ResourceKey::new("runtime", "settings")),
+        _ => None,
+    }
+}
+
+fn requires_existing_resource_ownership(action: &StackAction) -> bool {
+    matches!(action.operation.as_str(), "noop" | "update" | "apply")
+}
+
+fn enforce_desired_resource_ownership(
+    ledger: &ApplyLedger,
+    ownership_id: &str,
+    resolved: &ResolvedStack,
+) -> Result<()> {
+    for key in resolved
+        .desired_resource_keys()
+        .into_iter()
+        .filter_map(|key| ResourceKey::parse(&key).ok())
+    {
+        if let Some(owner) = ledger.owner_of_resource(&key)
+            && owner != ownership_id
+        {
+            return Err(crate::problems::DaemonProblem::conflict(
+                "stacks",
+                "stack_ownership_conflict",
+                format!("resource {key} is already owned by stack `{owner}`"),
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+async fn apply_secrets<C>(
+    client: &C,
+    context: &StackContext,
+    resolved: &ResolvedStack,
+    ledger_path: &Path,
+    ledger: &mut ApplyLedger,
+    allow_secret_env: bool,
+    report: &mut StackApplyReport,
+) -> Result<()>
+where
+    C: StackControlPlane + Sync,
+{
+    for secret in &resolved.secrets {
+        let encoded = url_encode_path_segment(&secret.slot);
+        let live = client
+            .get_json_optional::<kheish_auth::AuthSlotStatus>(&format!(
+                "/v1/runtime/secrets/{encoded}"
+            ))
+            .await?;
+        if let Some(env_name) = secret.value_env.as_deref() {
+            if !allow_secret_env {
+                bail!(
+                    "secret {} uses value_env={}; pass --allow-secret-env to import and fingerprint it",
+                    secret.slot,
+                    env_name
+                );
+            }
+            let key = ResourceKey::new("secret", &secret.slot);
+            if live.is_some() {
+                ensure_existing_resource_owned(ledger, &context.ownership_id(), &key)?;
+            }
+            let fingerprint = secret_fingerprint(&ledger.ledger_salt, &secret.slot, env_name)?;
+            if live.is_some()
+                && ledger
+                    .secret_fingerprint(&context.ownership_id(), &secret.slot)
+                    .is_some_and(|stored| stored == fingerprint)
+            {
+                continue;
+            }
+            if live.is_none() {
+                claim_resource_for_create(
+                    ledger_path,
+                    ledger,
+                    &context.ownership_id(),
+                    &key,
+                    fingerprint.clone(),
+                )
+                .await?;
+            }
+            let value = std::env::var(env_name)
+                .with_context(|| format!("failed to read environment variable {env_name}"))?;
+            let record = build_secret_record(secret, value)?;
+            let write_result = if live.is_none() {
+                client.create_secret_if_absent(&secret.slot, &record).await
+            } else {
+                client.post_json("/v1/runtime/secrets", &record).await
+            };
+            if let Err(error) = write_result {
+                if live.is_none() {
+                    let live_probe = client
+                        .get_json_optional::<kheish_auth::AuthSlotStatus>(&format!(
+                            "/v1/runtime/secrets/{encoded}"
+                        ))
+                        .await
+                        .map(|status| status.is_some());
+                    return rollback_or_preserve_failed_create_claim(
+                        ledger_path,
+                        ledger,
+                        &context.ownership_id(),
+                        &key,
+                        error,
+                        live_probe,
+                    )
+                    .await;
+                }
+                return Err(error);
+            }
+            let resource_digest = fingerprint.clone();
+            ledger.record_secret(&context.ownership_id(), &secret.slot, fingerprint);
+            ledger.record_resource(&context.ownership_id(), &key, resource_digest);
+            ledger.save(ledger_path).await?;
+            report.applied.push(StackAction::new(
+                "secrets",
+                "secret",
+                secret.slot.clone(),
+                if live.is_some() { "update" } else { "create" },
+                "secret was written through the daemon secret API; value is represented only by ledger fingerprint",
+            ));
+        } else if live.is_none() {
+            bail!(
+                "required secret {} is missing and no value_env was provided",
+                secret.slot
+            );
+        }
+    }
+    Ok(())
+}
+
+fn ensure_existing_resource_owned(
+    ledger: &ApplyLedger,
+    ownership_id: &str,
+    key: &ResourceKey,
+) -> Result<()> {
+    match ledger.owner_of_resource(key) {
+        Some(owner) if owner == ownership_id => Ok(()),
+        Some(owner) => Err(crate::problems::DaemonProblem::conflict(
+            "stacks",
+            "stack_ownership_conflict",
+            format!("resource {key} is already owned by stack `{owner}`"),
+        )
+        .into()),
+        None => Err(crate::problems::DaemonProblem::conflict(
+            "stacks",
+            "stack_ownership_required",
+            format!(
+                "resource {key} already exists but is not owned by stack `{ownership_id}`; run stack import before applying"
+            ),
+        )
+        .into()),
+    }
+}
+
+async fn claim_resource_for_create(
+    ledger_path: &Path,
+    ledger: &mut ApplyLedger,
+    ownership_id: &str,
+    key: &ResourceKey,
+    desired_digest: String,
+) -> Result<()> {
+    if ledger.claim_resource(ownership_id, key, desired_digest)? {
+        ledger.save(ledger_path).await?;
+    }
+    Ok(())
+}
+
+async fn rollback_resource_claim(
+    ledger_path: &Path,
+    ledger: &mut ApplyLedger,
+    ownership_id: &str,
+    key: &ResourceKey,
+) {
+    if ledger.remove_resource_claim(ownership_id, key) {
+        let _ = ledger.save(ledger_path).await;
+    }
+}
+
+async fn rollback_or_preserve_failed_create_claim(
+    ledger_path: &Path,
+    ledger: &mut ApplyLedger,
+    ownership_id: &str,
+    key: &ResourceKey,
+    error: anyhow::Error,
+    live_probe: Result<bool>,
+) -> Result<()> {
+    let preserve_context = if create_error_confirms_existing_resource(&error) {
+        None
+    } else {
+        match live_probe {
+            Ok(true) => Some(format!(
+                "{key} became visible after create failed; preserved pending stack ownership claim for retry recovery"
+            )),
+            Ok(false) => None,
+            Err(probe_error) => Some(format!(
+                "could not verify whether {key} was created after create failed: {probe_error}; preserved pending stack ownership claim for retry recovery"
+            )),
+        }
+    };
+
+    if let Some(context) = preserve_context {
+        return Err(error.context(context));
+    }
+
+    rollback_resource_claim(ledger_path, ledger, ownership_id, key).await;
+    Err(error)
+}
+
+fn create_error_confirms_existing_resource(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("already exists"))
+}
+
+async fn promote_pending_resource_if_present(
+    ledger_path: &Path,
+    ledger: &mut ApplyLedger,
+    ownership_id: &str,
+    key: &ResourceKey,
+    desired_digest: String,
+) -> Result<()> {
+    if ledger.has_pending_resource(ownership_id, key) {
+        ledger.record_resource(ownership_id, key, desired_digest);
+        ledger.save(ledger_path).await?;
+    }
+    Ok(())
+}
+
+fn build_secret_record(
+    secret: &ResolvedSecret,
+    value: String,
+) -> Result<kheish_auth::AuthSlotRecord> {
+    let slot = kheish_auth::AuthSlotId::new(secret.slot.clone());
+    let record = match secret.provider {
+        kheish_auth::AuthProvider::Generic => {
+            kheish_auth::GenericAuthBackend::static_secret_record(slot, &value)?
+        }
+        kheish_auth::AuthProvider::OpenAi => {
+            kheish_auth::OpenAiAuthBackend::static_api_key_record(slot, &value, None, None)?
+        }
+        kheish_auth::AuthProvider::Anthropic => {
+            kheish_auth::AnthropicAuthBackend::static_api_key_record(slot, &value)?
+        }
+        kheish_auth::AuthProvider::Google => {
+            kheish_auth::GoogleAuthBackend::static_api_key_record(slot, &value)?
+        }
+        kheish_auth::AuthProvider::OpenRouter => {
+            kheish_auth::OpenRouterAuthBackend::static_api_key_record(slot, &value)?
+        }
+        kheish_auth::AuthProvider::XAi => {
+            kheish_auth::XAiAuthBackend::static_api_key_record(slot, &value)?
+        }
+        kheish_auth::AuthProvider::McpOAuth => {
+            bail!(
+                "value_env cannot create MCP OAuth records; import that account with `secrets import-codex` or an MCP OAuth flow first"
+            )
+        }
+    };
+    ensure_connector_secret_slot_record_allowed(&record)?;
+    Ok(record)
+}
+
+async fn apply_runtime<C>(
+    client: &C,
+    context: &StackContext,
+    resolved: &ResolvedStack,
+    ledger_path: &Path,
+    ledger: &mut ApplyLedger,
+    report: &mut StackApplyReport,
+) -> Result<()>
+where
+    C: StackControlPlane + Sync,
+{
+    let Some(digest) = resolved.runtime_digest.as_deref() else {
+        return Ok(());
+    };
+    let mut runtime = client
+        .get_json::<crate::RuntimeSettingsView>("/v1/runtime")
+        .await?;
+    if let Some(permission_mode) = resolved.runtime.permission_mode.as_ref()
+        && runtime.permission_mode != *permission_mode
+    {
+        runtime = client
+            .post_json::<_, crate::RuntimeSettingsView>(
+                "/v1/runtime/permission-mode",
+                &crate::SetPermissionModeRequest {
+                    mode: permission_mode.clone(),
+                    expected_revision: Some(runtime.config.revision),
+                },
+            )
+            .await?;
+        report.applied.push(StackAction::new(
+            "runtime",
+            "runtime",
+            "permission_mode",
+            "update",
+            "updated with expected_revision",
+        ));
+    }
+    if let Some(debug_level) = resolved.runtime.debug_level
+        && runtime.debug_level != debug_level
+    {
+        client
+            .post_json::<_, crate::RuntimeSettingsView>(
+                "/v1/runtime/debug-level",
+                &crate::SetDebugLevelRequest {
+                    level: debug_level,
+                    expected_revision: Some(runtime.config.revision),
+                },
+            )
+            .await?;
+        report.applied.push(StackAction::new(
+            "runtime",
+            "runtime",
+            "debug_level",
+            "update",
+            "updated with expected_revision",
+        ));
+    }
+    ledger.record_resource(
+        &context.ownership_id(),
+        &ResourceKey::new("runtime", "settings"),
+        digest.to_string(),
+    );
+    ledger.save(ledger_path).await?;
+    Ok(())
+}
+
+async fn apply_connectors<C>(
+    client: &C,
+    context: &StackContext,
+    resolved: &ResolvedStack,
+    ledger_path: &Path,
+    ledger: &mut ApplyLedger,
+    report: &mut StackApplyReport,
+) -> Result<()>
+where
+    C: StackControlPlane + Sync,
+{
+    for connector in &resolved.connectors {
+        let path = format!(
+            "/v1/runtime/connectors/{}/{}",
+            url_encode_path_segment(&connector.kind),
+            url_encode_path_segment(&connector.name)
+        );
+        let live = client
+            .get_json_optional::<crate::ConnectorView>(&path)
+            .await?;
+        let key = ResourceKey::new(
+            "connector",
+            &format!("{}/{}", connector.kind, connector.name),
+        );
+        if live.is_some() {
+            ensure_existing_resource_owned(ledger, &context.ownership_id(), &key)?;
+        }
+        if live
+            .as_ref()
+            .is_some_and(|live| connector_matches(live, connector))
+        {
+            promote_pending_resource_if_present(
+                ledger_path,
+                ledger,
+                &context.ownership_id(),
+                &key,
+                connector.digest.clone(),
+            )
+            .await?;
+            continue;
+        }
+        if live.is_none() {
+            claim_resource_for_create(
+                ledger_path,
+                ledger,
+                &context.ownership_id(),
+                &key,
+                connector.digest.clone(),
+            )
+            .await?;
+        }
+        let write_result = if live.is_none() {
+            client
+                .put_connector_if_absent(&connector.kind, &connector.name, &connector.spec)
+                .await
+        } else {
+            client.put_json(&path, &connector.spec).await
+        };
+        if let Err(error) = write_result {
+            if live.is_none() {
+                let live_probe = client
+                    .get_json_optional::<crate::ConnectorView>(&path)
+                    .await
+                    .map(|view| view.is_some());
+                return rollback_or_preserve_failed_create_claim(
+                    ledger_path,
+                    ledger,
+                    &context.ownership_id(),
+                    &key,
+                    error,
+                    live_probe,
+                )
+                .await;
+            }
+            return Err(error);
+        }
+        ledger.record_resource(&context.ownership_id(), &key, connector.digest.clone());
+        ledger.save(ledger_path).await?;
+        report.applied.push(StackAction::new(
+            "connectors",
+            key.kind,
+            key.id,
+            "apply",
+            "connector payload written through runtime connector API",
+        ));
+    }
+    Ok(())
+}
+
+async fn apply_personas<C>(
+    client: &C,
+    context: &StackContext,
+    resolved: &ResolvedStack,
+    ledger_path: &Path,
+    ledger: &mut ApplyLedger,
+    report: &mut StackApplyReport,
+) -> Result<()>
+where
+    C: StackControlPlane + Sync,
+{
+    for persona in &resolved.personas {
+        let encoded = url_encode_path_segment(&persona.persona_id);
+        let live = client
+            .get_json_optional::<crate::PersonaView>(&format!("/v1/personas/{encoded}"))
+            .await?;
+        let key = ResourceKey::new("persona", &persona.persona_id);
+        if live.is_some() {
+            ensure_existing_resource_owned(ledger, &context.ownership_id(), &key)?;
+        }
+        if live
+            .as_ref()
+            .is_some_and(|live| persona_matches(live, persona))
+        {
+            promote_pending_resource_if_present(
+                ledger_path,
+                ledger,
+                &context.ownership_id(),
+                &key,
+                persona.digest.clone(),
+            )
+            .await?;
+            continue;
+        }
+        if live.is_some() {
+            client
+                .put_json::<_, crate::PersonaView>(
+                    &format!("/v1/personas/{encoded}"),
+                    &crate::UpdatePersonaRequest {
+                        display_name: Some(persona.display_name.clone()),
+                        soul: Some(persona.soul.clone()),
+                        metadata: Some(persona.metadata.clone()),
+                        capability_scope: persona.capability_scope.clone(),
+                        default_skills: Some(persona.default_skills.clone()),
+                    },
+                )
+                .await?;
+        } else {
+            claim_resource_for_create(
+                ledger_path,
+                ledger,
+                &context.ownership_id(),
+                &key,
+                persona.digest.clone(),
+            )
+            .await?;
+            let request = crate::CreatePersonaRequest {
+                persona_id: Some(persona.persona_id.clone()),
+                display_name: persona.display_name.clone(),
+                soul: persona.soul.clone(),
+                metadata: Some(persona.metadata.clone()),
+                capability_scope: persona.capability_scope.clone(),
+                default_skills: Some(persona.default_skills.clone()),
+            };
+            if let Err(error) = client.create_persona_if_absent(&request).await {
+                let live_probe = client
+                    .get_json_optional::<crate::PersonaView>(&format!("/v1/personas/{encoded}"))
+                    .await
+                    .map(|view| view.is_some());
+                return rollback_or_preserve_failed_create_claim(
+                    ledger_path,
+                    ledger,
+                    &context.ownership_id(),
+                    &key,
+                    error,
+                    live_probe,
+                )
+                .await;
+            }
+        }
+        ledger.record_resource(&context.ownership_id(), &key, persona.digest.clone());
+        ledger.save(ledger_path).await?;
+        report.applied.push(StackAction::new(
+            "personas",
+            "persona",
+            persona.persona_id.clone(),
+            if live.is_some() { "update" } else { "create" },
+            "persona reconciled through daemon API",
+        ));
+    }
+    Ok(())
+}
+
+async fn apply_sessions<C>(
+    client: &C,
+    context: &StackContext,
+    resolved: &ResolvedStack,
+    ledger_path: &Path,
+    ledger: &mut ApplyLedger,
+    report: &mut StackApplyReport,
+) -> Result<()>
+where
+    C: StackControlPlane + Sync,
+{
+    for session in &resolved.sessions {
+        let encoded = url_encode_path_segment(&session.session_id);
+        let live = client
+            .get_json_optional::<crate::SessionView>(&format!("/v1/sessions/{encoded}"))
+            .await?;
+        let key = ResourceKey::new("session", &session.session_id);
+        if live.is_some() {
+            ensure_existing_resource_owned(ledger, &context.ownership_id(), &key)?;
+        }
+        if live
+            .as_ref()
+            .is_some_and(|live| session_matches(live, session))
+        {
+            promote_pending_resource_if_present(
+                ledger_path,
+                ledger,
+                &context.ownership_id(),
+                &key,
+                session.digest.clone(),
+            )
+            .await?;
+            continue;
+        }
+        if live.is_none() {
+            claim_resource_for_create(
+                ledger_path,
+                ledger,
+                &context.ownership_id(),
+                &key,
+                session.digest.clone(),
+            )
+            .await?;
+            let request = crate::CreateSessionRequest {
+                session_id: Some(session.session_id.clone()),
+                thread_id: session.thread_id.clone(),
+                persona_id: session.persona_id.clone(),
+                capability_scope: session.capability_scope.clone(),
+                credential_scope: session.credential_scope.clone(),
+            };
+            if let Err(error) = client.create_session_if_absent(&request).await {
+                let live_probe = client
+                    .get_json_optional::<crate::SessionView>(&format!("/v1/sessions/{encoded}"))
+                    .await
+                    .map(|view| view.is_some());
+                return rollback_or_preserve_failed_create_claim(
+                    ledger_path,
+                    ledger,
+                    &context.ownership_id(),
+                    &key,
+                    error,
+                    live_probe,
+                )
+                .await;
+            }
+            ledger.record_resource(&context.ownership_id(), &key, session.digest.clone());
+            ledger.save(ledger_path).await?;
+        } else {
+            if let Some(persona_id) = session.persona_id.clone() {
+                client
+                    .post_json::<_, crate::SessionView>(
+                        &format!("/v1/sessions/{encoded}/persona"),
+                        &crate::SetSessionPersonaRequest { persona_id },
+                    )
+                    .await?;
+            }
+            client
+                .post_json::<_, crate::SessionView>(
+                    &format!("/v1/sessions/{encoded}/capability-scope"),
+                    &crate::SetSessionCapabilityScopeRequest {
+                        capability_scope: session.capability_scope.clone(),
+                    },
+                )
+                .await?;
+            client
+                .post_json::<_, crate::SessionView>(
+                    &format!("/v1/sessions/{encoded}/credential-scope"),
+                    &crate::SetSessionCredentialScopeRequest {
+                        credential_scope: session.credential_scope.clone(),
+                    },
+                )
+                .await?;
+        }
+        client
+            .post_json::<_, crate::SessionView>(
+                &format!("/v1/sessions/{encoded}/route-policy"),
+                &crate::SetSessionRoutePolicyRequest {
+                    route_policy: session.route_policy.clone(),
+                },
+            )
+            .await?;
+        client
+            .post_json::<_, crate::SessionView>(
+                &format!("/v1/sessions/{encoded}/reply-targets"),
+                &crate::SetSessionReplyTargetsRequest {
+                    reply_targets: session.reply_targets.clone().unwrap_or_default(),
+                },
+            )
+            .await?;
+        ledger.record_resource(&context.ownership_id(), &key, session.digest.clone());
+        ledger.save(ledger_path).await?;
+        report.applied.push(StackAction::new(
+            "sessions",
+            "session",
+            session.session_id.clone(),
+            if live.is_some() { "update" } else { "create" },
+            "session reconciled through daemon API",
+        ));
+    }
+    Ok(())
+}
+
+async fn apply_schedules<C>(
+    client: &C,
+    context: &StackContext,
+    resolved: &ResolvedStack,
+    ledger_path: &Path,
+    ledger: &mut ApplyLedger,
+    report: &mut StackApplyReport,
+) -> Result<()>
+where
+    C: StackControlPlane + Sync,
+{
+    let live = client
+        .get_json::<Vec<crate::ScheduleView>>("/v1/schedules")
+        .await?;
+    for schedule in &resolved.schedules {
+        if let Some(existing) = live
+            .iter()
+            .find(|candidate| candidate.name == schedule.name)
+        {
+            let key = ResourceKey::new("schedule", &schedule.name);
+            ensure_existing_resource_owned(ledger, &context.ownership_id(), &key)?;
+            if schedule_view_matches(existing, &schedule.request) {
+                promote_pending_resource_if_present(
+                    ledger_path,
+                    ledger,
+                    &context.ownership_id(),
+                    &key,
+                    schedule.digest.clone(),
+                )
+                .await?;
+                continue;
+            }
+            bail!(
+                "schedule {} exists with drift; schedules are immutable through the current API",
+                schedule.name
+            );
+        }
+        let key = ResourceKey::new("schedule", &schedule.name);
+        claim_resource_for_create(
+            ledger_path,
+            ledger,
+            &context.ownership_id(),
+            &key,
+            schedule.digest.clone(),
+        )
+        .await?;
+        if let Err(error) = client.create_schedule_if_absent(&schedule.request).await {
+            let live_probe = client
+                .get_json::<Vec<crate::ScheduleView>>("/v1/schedules")
+                .await
+                .map(|schedules| {
+                    schedules
+                        .iter()
+                        .any(|candidate| candidate.name == schedule.name)
+                });
+            return rollback_or_preserve_failed_create_claim(
+                ledger_path,
+                ledger,
+                &context.ownership_id(),
+                &key,
+                error,
+                live_probe,
+            )
+            .await;
+        }
+        ledger.record_resource(&context.ownership_id(), &key, schedule.digest.clone());
+        ledger.save(ledger_path).await?;
+        report.applied.push(StackAction::new(
+            "schedules",
+            key.kind,
+            key.id,
+            "create",
+            "schedule created through daemon API",
+        ));
+    }
+    Ok(())
+}
+
+async fn apply_playbooks<C>(
+    client: &C,
+    context: &StackContext,
+    resolved: &ResolvedStack,
+    ledger_path: &Path,
+    ledger: &mut ApplyLedger,
+    report: &mut StackApplyReport,
+) -> Result<()>
+where
+    C: StackControlPlane + Sync,
+{
+    for playbook in &resolved.playbooks {
+        let encoded_playbook_id = url_encode_path_segment(&playbook.manifest.playbook_id);
+        let live = client
+            .get_json_optional::<crate::PlaybookView>(&format!(
+                "/v1/playbooks/{encoded_playbook_id}"
+            ))
+            .await?;
+        let live_version = live.as_ref().and_then(|view| {
+            view.versions
+                .iter()
+                .find(|version| version.version == playbook.manifest.version)
+        });
+        let key = ResourceKey::new(
+            "playbook",
+            &format!(
+                "{}/{}",
+                playbook.manifest.playbook_id, playbook.manifest.version
+            ),
+        );
+        if live_version.is_some() {
+            ensure_existing_resource_owned(ledger, &context.ownership_id(), &key)?;
+        }
+        let already_stored = live_version.is_some_and(|version| version.digest == playbook.digest);
+        let digest = if already_stored {
+            promote_pending_resource_if_present(
+                ledger_path,
+                ledger,
+                &context.ownership_id(),
+                &key,
+                playbook.digest.clone(),
+            )
+            .await?;
+            playbook.digest.clone()
+        } else {
+            if live_version.is_none() {
+                claim_resource_for_create(
+                    ledger_path,
+                    ledger,
+                    &context.ownership_id(),
+                    &key,
+                    playbook.digest.clone(),
+                )
+                .await?;
+            }
+            let request = crate::CreatePlaybookRequest {
+                manifest: playbook.manifest.clone(),
+            };
+            let created = match client.create_playbook_version_if_absent(&request).await {
+                Ok(created) => created,
+                Err(error) => {
+                    if live_version.is_none() {
+                        let live_probe = client
+                            .get_json_optional::<crate::PlaybookView>(&format!(
+                                "/v1/playbooks/{encoded_playbook_id}"
+                            ))
+                            .await
+                            .map(|view| {
+                                view.is_some_and(|view| {
+                                    view.versions.iter().any(|version| {
+                                        version.version == playbook.manifest.version
+                                    })
+                                })
+                            });
+                        return rollback_or_preserve_failed_create_claim(
+                            ledger_path,
+                            ledger,
+                            &context.ownership_id(),
+                            &key,
+                            error,
+                            live_probe,
+                        )
+                        .await;
+                    }
+                    return Err(error);
+                }
+            };
+            created
+                .versions
+                .iter()
+                .find(|version| version.version == playbook.manifest.version)
+                .map(|version| version.digest.clone())
+                .unwrap_or_else(|| playbook.digest.clone())
+        };
+        if let Some(publish) = &playbook.publish
+            && publish.status != crate::PlaybookReleaseStatus::Draft
+        {
+            let release_matches = live_version.is_some_and(|version| {
+                version.status == publish.status && version.evidence_refs == publish.evidence_refs
+            });
+            if !release_matches {
+                client
+                    .post_json::<_, crate::PlaybookView>(
+                        &format!("/v1/playbooks/{encoded_playbook_id}/publish"),
+                        &crate::PublishPlaybookRequest {
+                            version: playbook.manifest.version.clone(),
+                            digest: digest.clone(),
+                            status: Some(publish.status.clone()),
+                            evidence_refs: publish.evidence_refs.clone(),
+                        },
+                    )
+                    .await?;
+            }
+        }
+        ledger.record_resource(&context.ownership_id(), &key, digest);
+        ledger.save(ledger_path).await?;
+        if !already_stored {
+            report.applied.push(StackAction::new(
+                "playbooks",
+                key.kind,
+                key.id,
+                "apply",
+                "playbook manifest stored idempotently by daemon digest",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn verify_stack<C>(
+    client: &C,
+    context: &StackContext,
+) -> Result<StackVerificationReport>
+where
+    C: StackControlPlane + Sync,
+{
+    let validation = validate_stack(context)?;
+    let resolved = ResolvedStack::from_context(context).await?;
+    let mut checks = Vec::new();
+    checks.extend(
+        validation
+            .errors
+            .iter()
+            .map(|error| StackVerificationCheck::failed("validate", error)),
+    );
+    if resolved.runtime_digest.is_some() {
+        let live = client
+            .get_json::<crate::RuntimeSettingsView>("/v1/runtime")
+            .await?;
+        checks.push(StackVerificationCheck::new(
+            "runtime",
+            "settings",
+            runtime_matches(&live, &resolved.runtime),
+            "runtime settings match desired fields",
+        ));
+    }
+    for secret in &resolved.secrets {
+        let encoded = url_encode_path_segment(&secret.slot);
+        let live = client
+            .get_json_optional::<kheish_auth::AuthSlotStatus>(&format!(
+                "/v1/runtime/secrets/{encoded}"
+            ))
+            .await?;
+        checks.push(StackVerificationCheck::new(
+            "secret",
+            &secret.slot,
+            live.is_some(),
+            "required secret exists",
+        ));
+    }
+    for connector in &resolved.connectors {
+        let path = format!(
+            "/v1/runtime/connectors/{}/{}",
+            url_encode_path_segment(&connector.kind),
+            url_encode_path_segment(&connector.name)
+        );
+        let live = client
+            .get_json_optional::<crate::ConnectorView>(&path)
+            .await?;
+        checks.push(StackVerificationCheck::new(
+            "connector",
+            &format!("{}/{}", connector.kind, connector.name),
+            live.as_ref()
+                .is_some_and(|live| connector_matches(live, connector)),
+            "connector exists and matches desired fields",
+        ));
+    }
+    for persona in &resolved.personas {
+        let encoded = url_encode_path_segment(&persona.persona_id);
+        let live = client
+            .get_json_optional::<crate::PersonaView>(&format!("/v1/personas/{encoded}"))
+            .await?;
+        checks.push(StackVerificationCheck::new(
+            "persona",
+            &persona.persona_id,
+            live.as_ref()
+                .is_some_and(|live| persona_matches(live, persona)),
+            "persona exists and matches desired fields",
+        ));
+    }
+    for session in &resolved.sessions {
+        let encoded = url_encode_path_segment(&session.session_id);
+        let live = client
+            .get_json_optional::<crate::SessionView>(&format!("/v1/sessions/{encoded}"))
+            .await?;
+        checks.push(StackVerificationCheck::new(
+            "session",
+            &session.session_id,
+            live.as_ref()
+                .is_some_and(|live| session_matches(live, session)),
+            "session exists and matches desired fields",
+        ));
+    }
+    let schedules = client
+        .get_json::<Vec<crate::ScheduleView>>("/v1/schedules")
+        .await?;
+    for schedule in &resolved.schedules {
+        checks.push(StackVerificationCheck::new(
+            "schedule",
+            &schedule.name,
+            schedules.iter().any(|live| {
+                live.name == schedule.name && schedule_view_matches(live, &schedule.request)
+            }),
+            "schedule exists and matches immutable fields",
+        ));
+    }
+    for playbook in &resolved.playbooks {
+        let encoded = url_encode_path_segment(&playbook.manifest.playbook_id);
+        let live = client
+            .get_json_optional::<crate::PlaybookView>(&format!("/v1/playbooks/{encoded}"))
+            .await?;
+        checks.push(StackVerificationCheck::new(
+            "playbook",
+            &format!(
+                "{}/{}",
+                playbook.manifest.playbook_id, playbook.manifest.version
+            ),
+            live.as_ref().is_some_and(|view| {
+                view.versions.iter().any(|version| {
+                    version.version == playbook.manifest.version
+                        && version.digest == playbook.digest
+                        && playbook.publish.as_ref().is_none_or(|publish| {
+                            publish.status == crate::PlaybookReleaseStatus::Draft
+                                || (version.status == publish.status
+                                    && version.evidence_refs == publish.evidence_refs)
+                        })
+                })
+            }),
+            "playbook version, digest, and release metadata match",
+        ));
+    }
+    for probe in &resolved.verification {
+        checks.push(run_probe(client, probe).await?);
+    }
+    let valid = validation.valid && checks.iter().all(|check| check.ok);
+    Ok(StackVerificationReport {
+        stack: context.document.metadata.name.clone(),
+        valid,
+        checks,
+        warnings: validation.warnings,
+    })
+}
+
+async fn run_probe<C>(client: &C, probe: &ResolvedProbe) -> Result<StackVerificationCheck>
+where
+    C: StackControlPlane + Sync,
+{
+    match &probe.kind {
+        ProbeKind::PersonaExists { persona_id } => {
+            let encoded = url_encode_path_segment(persona_id);
+            let live = client
+                .get_json_optional::<crate::PersonaView>(&format!("/v1/personas/{encoded}"))
+                .await?;
+            Ok(StackVerificationCheck::new(
+                "probe",
+                &probe.name,
+                live.is_some(),
+                "persona exists",
+            ))
+        }
+        ProbeKind::SessionExists { session_id } => {
+            let encoded = url_encode_path_segment(session_id);
+            let live = client
+                .get_json_optional::<crate::SessionView>(&format!("/v1/sessions/{encoded}"))
+                .await?;
+            Ok(StackVerificationCheck::new(
+                "probe",
+                &probe.name,
+                live.is_some(),
+                "session exists",
+            ))
+        }
+        ProbeKind::ScheduleExists { name } => {
+            let schedules = client
+                .get_json::<Vec<crate::ScheduleView>>("/v1/schedules")
+                .await?;
+            Ok(StackVerificationCheck::new(
+                "probe",
+                &probe.name,
+                schedules.iter().any(|schedule| schedule.name == *name),
+                "schedule exists by name",
+            ))
+        }
+        ProbeKind::PlaybookVersionExists {
+            playbook_id,
+            version,
+        } => {
+            let encoded = url_encode_path_segment(playbook_id);
+            let live = client
+                .get_json_optional::<crate::PlaybookView>(&format!("/v1/playbooks/{encoded}"))
+                .await?;
+            Ok(StackVerificationCheck::new(
+                "probe",
+                &probe.name,
+                live.as_ref().is_some_and(|view| {
+                    view.versions
+                        .iter()
+                        .any(|candidate| candidate.version == *version)
+                }),
+                "playbook version exists",
+            ))
+        }
+        ProbeKind::SecretExists { slot } => {
+            let encoded = url_encode_path_segment(slot);
+            let live = client
+                .get_json_optional::<kheish_auth::AuthSlotStatus>(&format!(
+                    "/v1/runtime/secrets/{encoded}"
+                ))
+                .await?;
+            Ok(StackVerificationCheck::new(
+                "probe",
+                &probe.name,
+                live.is_some(),
+                "secret exists",
+            ))
+        }
+    }
+}
+
+fn runtime_matches(live: &crate::RuntimeSettingsView, desired: &StackRuntimeSpec) -> bool {
+    desired
+        .permission_mode
+        .as_ref()
+        .is_none_or(|mode| live.permission_mode == *mode)
+        && desired
+            .debug_level
+            .is_none_or(|debug_level| live.debug_level == debug_level)
+}
+
+fn persona_matches(live: &crate::PersonaView, desired: &ResolvedPersona) -> bool {
+    live.display_name == desired.display_name
+        && live.soul == desired.soul
+        && live.metadata == desired.metadata
+        && live.capability_scope == desired.capability_scope.clone().unwrap_or_default()
+        && live.default_skills == desired.default_skills
+}
+
+fn connector_matches(live: &crate::ConnectorView, desired: &ResolvedConnector) -> bool {
+    match (desired.kind.as_str(), live) {
+        ("http", crate::ConnectorView::Http(live)) => {
+            let Ok(request) = parse_http_connector_request(&desired.name, &desired.spec) else {
+                return false;
+            };
+            live.name == desired.name
+                && live.actor_id == request.actor_id
+                && live.fixed_session_id == request.fixed_session_id
+                && connector_secret_matches(&live.bearer_token, request.bearer_token.as_ref())
+                && connector_secret_matches(&live.hmac_secret, request.hmac_secret.as_ref())
+                && live.allow_unauthenticated_ingress
+                    == request.allow_unauthenticated_ingress.unwrap_or(false)
+                && live.require_hmac_signature == request.require_hmac_signature.unwrap_or(false)
+                && live.signature_max_age_secs == request.signature_max_age_secs.unwrap_or(300)
+                && live.require_idempotency_key == request.require_idempotency_key.unwrap_or(true)
+                && live.ingress_events_per_second == request.ingress_events_per_second.unwrap_or(60)
+                && live.allow_payload_reply_targets
+                    == request.allow_payload_reply_targets.unwrap_or(false)
+                && live.default_reply_targets == request.default_reply_targets.unwrap_or_default()
+                && live.default_binding_keys == request.default_binding_keys.unwrap_or_default()
+                && live.session_policy == request.session_policy.unwrap_or_default()
+        }
+        _ => false,
+    }
+}
+
+fn connector_secret_matches(
+    live: &crate::ConnectorSecretView,
+    desired: Option<&crate::ConnectorSecretInput>,
+) -> bool {
+    let Some(desired) = desired else {
+        return !live.configured;
+    };
+    if let Some(secret_ref) = desired.secret_ref.as_deref() {
+        return live.configured
+            && live.source.as_deref() == Some("secret_ref")
+            && live.secret_ref.as_deref() == Some(secret_ref);
+    }
+    if let Some(env) = desired.env.as_deref() {
+        return live.configured
+            && live.source.as_deref() == Some("env")
+            && live.env.as_deref() == Some(env);
+    }
+    if desired.value.is_some() {
+        return false;
+    }
+    !live.configured
+}
+
+fn session_matches(live: &crate::SessionView, desired: &ResolvedSession) -> bool {
+    let live_persona_id = live
+        .persona
+        .as_ref()
+        .map(|persona| persona.persona_id.as_str());
+    let desired_reply_targets = desired
+        .reply_targets
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(crate::SessionReplyTargetRequest::into_reply_handle)
+        .collect::<Vec<_>>();
+    live_persona_id == desired.persona_id.as_deref()
+        && live.capability_scope == desired.capability_scope.clone().unwrap_or_default()
+        && live.credential_scope == desired.credential_scope.clone().unwrap_or_default()
+        && live.route_policy == desired.route_policy.clone().unwrap_or_default()
+        && live.reply_targets == desired_reply_targets
+}
+
+fn schedule_view_matches(
+    live: &crate::ScheduleView,
+    desired: &crate::ScheduleCreateRequest,
+) -> bool {
+    live.name == desired.name
+        && live.target_session_id == desired.target_session_id
+        && desired
+            .target_agent_id
+            .as_ref()
+            .map(|target_agent_id| live.target_agent_id.as_ref() == Some(target_agent_id))
+            .unwrap_or(true)
+        && live.cadence == desired.cadence
+        && live.max_executions == desired.max_executions
+        && live.overlap_policy == desired.overlap_policy
+        && live.misfire_policy == desired.misfire_policy
+        && live.request == crate::summarize_schedule_create_request(desired)
+}
+
+async fn fetch_live_resource_value<C>(client: &C, key: &ResourceKey) -> Result<Value>
+where
+    C: StackControlPlane + Sync,
+{
+    match key.kind.as_str() {
+        "runtime" => client.get_json::<Value>("/v1/runtime").await,
+        "persona" => {
+            let encoded = url_encode_path_segment(&key.id);
+            let value = client
+                .get_json::<Value>(&format!("/v1/personas/{encoded}"))
+                .await?;
+            Ok(value)
+        }
+        "session" => {
+            let encoded = url_encode_path_segment(&key.id);
+            let value = client
+                .get_json::<Value>(&format!("/v1/sessions/{encoded}"))
+                .await?;
+            Ok(value)
+        }
+        "schedule" => {
+            let schedules = client.get_json::<Vec<Value>>("/v1/schedules").await?;
+            schedules
+                .into_iter()
+                .find(|value| value.get("name").and_then(Value::as_str) == Some(key.id.as_str()))
+                .ok_or_else(|| anyhow!("schedule {} not found", key.id))
+        }
+        "playbook" => {
+            let (playbook_id, _) = key
+                .id
+                .split_once('/')
+                .ok_or_else(|| anyhow!("playbook resource id must be playbook_id/version"))?;
+            let encoded = url_encode_path_segment(playbook_id);
+            client
+                .get_json::<Value>(&format!("/v1/playbooks/{encoded}"))
+                .await
+        }
+        "connector" => {
+            let (kind, name) = key
+                .id
+                .split_once('/')
+                .ok_or_else(|| anyhow!("connector resource id must be kind/name"))?;
+            client
+                .get_json::<Value>(&format!(
+                    "/v1/runtime/connectors/{}/{}",
+                    url_encode_path_segment(kind),
+                    url_encode_path_segment(name)
+                ))
+                .await
+        }
+        "secret" => {
+            let encoded = url_encode_path_segment(&key.id);
+            client
+                .get_json::<Value>(&format!("/v1/runtime/secrets/{encoded}"))
+                .await
+        }
+        _ => bail!("unsupported import resource kind {}", key.kind),
+    }
+}
+
+fn plan_prune(
+    context: &StackContext,
+    resolved: &ResolvedStack,
+    ledger: &ApplyLedger,
+) -> Vec<StackAction> {
+    let desired = resolved
+        .desired_resource_keys()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    ledger
+        .stack(&context.ownership_id())
+        .map(|stack| {
+            stack
+                .resources
+                .keys()
+                .filter_map(|key| ResourceKey::parse(key).ok())
+                .filter(|key| !desired.contains(&key.to_string()))
+                .map(|key| down_action_for_key(key, false))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn plan_down(context: &StackContext, ledger: &ApplyLedger) -> Vec<StackAction> {
+    ledger
+        .stack(&context.ownership_id())
+        .map(|stack| {
+            stack
+                .resources
+                .keys()
+                .filter_map(|key| ResourceKey::parse(key).ok())
+                .map(|key| down_action_for_key(key, true))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn down_action_for_key(key: ResourceKey, full_down: bool) -> StackAction {
+    match key.kind.as_str() {
+        "connector" => StackAction::new(
+            "down",
+            key.kind,
+            key.id,
+            "delete",
+            "connectors have a DELETE endpoint",
+        ),
+        "schedule" => StackAction::new(
+            "down",
+            key.kind,
+            key.id,
+            "cancel",
+            "schedules are canceled, not deleted",
+        ),
+        "session" => StackAction::new(
+            "down",
+            key.kind,
+            key.id,
+            "end",
+            "sessions can be ended but not deleted",
+        ),
+        "secret" => StackAction::new(
+            "down",
+            key.kind,
+            key.id,
+            "blocked",
+            if full_down {
+                "secrets are daemon-global credentials; Stack v1alpha1 never deletes them automatically"
+            } else {
+                "secret omitted from desired stack but must be deleted explicitly after dependency review"
+            },
+        ),
+        "persona" | "playbook" | "runtime" => StackAction::new(
+            "down",
+            key.kind,
+            key.id,
+            "blocked",
+            if full_down {
+                "daemon has no hard-delete endpoint for this resource; manual revoke/ignore semantics are required"
+            } else {
+                "resource omitted from desired stack but cannot be pruned automatically"
+            },
+        ),
+        _ => StackAction::new(
+            "down",
+            key.kind,
+            key.id,
+            "blocked",
+            "unknown ledger resource kind",
+        ),
+    }
+}
+
+async fn execute_down<C>(
+    client: &C,
+    context: &StackContext,
+    actions: &[StackAction],
+    ledger: &mut ApplyLedger,
+    ledger_path: &Path,
+) -> Result<()>
+where
+    C: StackControlPlane + Sync,
+{
+    for action in actions {
+        if action.operation == "blocked" {
+            continue;
+        }
+        let key = ResourceKey::new(&action.resource_type, &action.resource_id);
+        match action.resource_type.as_str() {
+            "connector" => {
+                let (kind, name) = action
+                    .resource_id
+                    .split_once('/')
+                    .ok_or_else(|| anyhow!("connector resource id must be kind/name"))?;
+                client
+                    .delete_json::<serde_json::Value>(&format!(
+                        "/v1/runtime/connectors/{}/{}",
+                        url_encode_path_segment(kind),
+                        url_encode_path_segment(name)
+                    ))
+                    .await?;
+            }
+            "schedule" => {
+                let schedules = client
+                    .get_json::<Vec<crate::ScheduleView>>("/v1/schedules")
+                    .await?;
+                if let Some(schedule) = schedules
+                    .iter()
+                    .find(|schedule| schedule.name == action.resource_id)
+                {
+                    client
+                        .post_json::<_, crate::ScheduleMutationResponse>(
+                            &format!(
+                                "/v1/schedules/{}/cancel",
+                                url_encode_path_segment(&schedule.schedule_id)
+                            ),
+                            &json!({}),
+                        )
+                        .await?;
+                }
+            }
+            "session" => {
+                client
+                    .post_json::<_, crate::SessionView>(
+                        &format!(
+                            "/v1/sessions/{}/end",
+                            url_encode_path_segment(&action.resource_id)
+                        ),
+                        &crate::EndSessionRequest {
+                            reason: Some("stack down".to_string()),
+                        },
+                    )
+                    .await?;
+            }
+            "secret" => {
+                bail!(
+                    "Stack down/prune refuses to delete secret `{}` automatically",
+                    action.resource_id
+                );
+            }
+            _ => continue,
+        }
+        ledger.remove_resource(&context.ownership_id(), &key);
+        ledger.save(ledger_path).await?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StackContext {
+    pub(crate) document: StackDocument,
+    root: PathBuf,
+    state_root_override: Option<PathBuf>,
+    strict_scope_override: bool,
+    allow_file_refs: bool,
+}
+
+impl StackContext {
+    pub(crate) fn from_manifest(
+        raw: &str,
+        root: PathBuf,
+        state_root_override: Option<PathBuf>,
+        strict_scope_override: bool,
+    ) -> Result<Self> {
+        validate_stack_manifest_source(raw)?;
+        let document =
+            serde_yaml::from_str::<StackDocument>(raw).context("failed to parse KheishStack")?;
+        Ok(Self {
+            document,
+            root,
+            state_root_override,
+            strict_scope_override,
+            allow_file_refs: false,
+        })
+    }
+
+    pub(crate) fn ownership_id(&self) -> String {
+        self.document
+            .spec
+            .apply
+            .ownership_id
+            .clone()
+            .unwrap_or_else(|| self.document.metadata.name.clone())
+    }
+
+    fn strict_scopes(&self) -> bool {
+        let _deprecated_request_override = self.strict_scope_override;
+        let _deprecated_manifest_switch = self.document.spec.apply.strict_scopes;
+        true
+    }
+
+    fn resolve_path(&self, path: &Path) -> Result<PathBuf> {
+        if !self.allow_file_refs {
+            bail!(
+                "file reference {} is not allowed through the daemon Stack API; submit a self-contained manifest",
+                path.display()
+            );
+        }
+        if path.is_absolute() {
+            bail!(
+                "absolute file reference {} is not allowed in KheishStack manifests",
+                path.display()
+            );
+        }
+        let root = self
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| self.root.clone());
+        let resolved = root.join(path);
+        let canonical = resolved
+            .canonicalize()
+            .with_context(|| format!("failed to resolve {}", resolved.display()))?;
+        if !canonical.starts_with(&root) {
+            bail!(
+                "file reference {} escapes KheishStack file_root {}",
+                path.display(),
+                root.display()
+            );
+        }
+        Ok(canonical)
+    }
+}
+
+pub fn validate_stack_manifest_source(raw: &str) -> Result<()> {
+    if raw.len() > STACK_MANIFEST_BODY_LIMIT_BYTES {
+        bail!(
+            "KheishStack manifest exceeds the {} byte limit",
+            STACK_MANIFEST_BODY_LIMIT_BYTES
+        );
+    }
+    if let Some((line, column, token)) = find_yaml_anchor_or_alias(raw) {
+        bail!(
+            "KheishStack manifest uses YAML anchor/alias token `{token}` at line {line}, column {column}; anchors and aliases are disabled"
+        );
+    }
+    Ok(())
+}
+
+fn find_yaml_anchor_or_alias(raw: &str) -> Option<(usize, usize, char)> {
+    let mut block_scalar_indent: Option<usize> = None;
+    for (line_index, line) in raw.lines().enumerate() {
+        let indent = line
+            .chars()
+            .take_while(|character| *character == ' ')
+            .count();
+        if let Some(block_indent) = block_scalar_indent {
+            if line.trim().is_empty() || indent >= block_indent {
+                continue;
+            }
+            block_scalar_indent = None;
+        }
+        if let Some((column, token)) = find_yaml_anchor_or_alias_in_line(line) {
+            return Some((line_index + 1, column, token));
+        }
+        if let Some(content_indent) = line_block_scalar_indent(line, indent) {
+            block_scalar_indent = Some(content_indent);
+        }
+    }
+    None
+}
+
+fn find_yaml_anchor_or_alias_in_line(line: &str) -> Option<(usize, char)> {
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_single {
+            if byte == b'\'' {
+                if bytes.get(index + 1) == Some(&b'\'') {
+                    index += 2;
+                    continue;
+                }
+                in_single = false;
+            }
+            index += 1;
+            continue;
+        }
+        if in_double {
+            if byte == b'\\' {
+                index = (index + 2).min(bytes.len());
+                continue;
+            }
+            if byte == b'"' {
+                in_double = false;
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'#' => break,
+            b'\'' => in_single = true,
+            b'"' => in_double = true,
+            b'&' | b'*' if is_yaml_anchor_or_alias_candidate(bytes, index) => {
+                return Some((index + 1, byte as char));
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+fn is_yaml_anchor_or_alias_candidate(bytes: &[u8], index: usize) -> bool {
+    let Some(next) = bytes.get(index + 1) else {
+        return false;
+    };
+    if !is_yaml_anchor_name_byte(*next) || !is_yaml_anchor_token_start(bytes, index) {
+        return false;
+    }
+    let mut end = index + 2;
+    while bytes
+        .get(end)
+        .is_some_and(|candidate| is_yaml_anchor_name_byte(*candidate))
+    {
+        end += 1;
+    }
+    bytes
+        .get(end)
+        .is_none_or(|candidate| is_yaml_anchor_token_boundary(*candidate))
+}
+
+fn is_yaml_anchor_token_start(bytes: &[u8], index: usize) -> bool {
+    let Some(previous_index) = previous_non_space(bytes, index) else {
+        return true;
+    };
+    if matches!(
+        bytes[previous_index],
+        b':' | b'-' | b'?' | b'[' | b'{' | b',' | b'('
+    ) {
+        return true;
+    }
+    yaml_tag_token_starts_node(bytes, previous_index)
+}
+
+fn yaml_tag_token_starts_node(bytes: &[u8], previous_index: usize) -> bool {
+    let mut start = previous_index;
+    while start > 0 && !bytes[start - 1].is_ascii_whitespace() {
+        start -= 1;
+    }
+    if bytes.get(start) != Some(&b'!') {
+        return false;
+    }
+    let Some(before_tag) = previous_non_space(bytes, start) else {
+        return true;
+    };
+    matches!(
+        bytes[before_tag],
+        b':' | b'-' | b'?' | b'[' | b'{' | b',' | b'('
+    )
+}
+
+fn previous_non_space(bytes: &[u8], index: usize) -> Option<usize> {
+    let mut cursor = index;
+    while cursor > 0 {
+        cursor -= 1;
+        if !bytes[cursor].is_ascii_whitespace() {
+            return Some(cursor);
+        }
+    }
+    None
+}
+
+fn is_yaml_anchor_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+}
+
+fn is_yaml_anchor_token_boundary(byte: u8) -> bool {
+    byte.is_ascii_whitespace()
+        || matches!(
+            byte,
+            b',' | b']' | b'}' | b':' | b'#' | b'\'' | b'"' | b'(' | b')'
+        )
+}
+
+fn line_block_scalar_indent(line: &str, base_indent: usize) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_single {
+            if byte == b'\'' {
+                if bytes.get(index + 1) == Some(&b'\'') {
+                    index += 2;
+                    continue;
+                }
+                in_single = false;
+            }
+            index += 1;
+            continue;
+        }
+        if in_double {
+            if byte == b'\\' {
+                index = (index + 2).min(bytes.len());
+                continue;
+            }
+            if byte == b'"' {
+                in_double = false;
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'#' => break,
+            b'\'' => in_single = true,
+            b'"' => in_double = true,
+            b'|' | b'>'
+                if is_yaml_anchor_token_start(bytes, index)
+                    && is_yaml_block_scalar_header_tail(bytes, index + 1).is_some() =>
+            {
+                let explicit_indent = is_yaml_block_scalar_header_tail(bytes, index + 1)
+                    .expect("block scalar tail was just validated");
+                return Some(yaml_block_scalar_content_indent(
+                    bytes,
+                    base_indent,
+                    index,
+                    explicit_indent,
+                ));
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+fn is_yaml_block_scalar_header_tail(bytes: &[u8], mut index: usize) -> Option<Option<usize>> {
+    let mut seen_chomp = false;
+    let mut indent = None;
+    while let Some(byte) = bytes.get(index).copied() {
+        match byte {
+            b'+' | b'-' if !seen_chomp => {
+                seen_chomp = true;
+                index += 1;
+            }
+            b'1'..=b'9' if indent.is_none() => {
+                indent = Some((byte - b'0') as usize);
+                index += 1;
+            }
+            b' ' | b'\t' => return Some(indent),
+            b'#' => return Some(indent),
+            _ => return None,
+        }
+    }
+    Some(indent)
+}
+
+fn yaml_block_scalar_content_indent(
+    bytes: &[u8],
+    base_indent: usize,
+    scalar_index: usize,
+    explicit_indent: Option<usize>,
+) -> usize {
+    let mut node_indent = base_indent;
+    if bytes.get(base_indent) == Some(&b'-')
+        && bytes
+            .get(base_indent + 1)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        && base_indent < scalar_index
+    {
+        let mut cursor = base_indent + 1;
+        while cursor < scalar_index
+            && bytes
+                .get(cursor)
+                .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            cursor += 1;
+        }
+        node_indent = cursor;
+    }
+    node_indent + explicit_indent.unwrap_or(1)
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StackDocument {
+    #[serde(rename = "apiVersion", alias = "api_version")]
+    pub(crate) api_version: String,
+    pub(crate) kind: String,
+    pub(crate) metadata: StackMetadata,
+    #[serde(default)]
+    pub(crate) spec: StackSpec,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StackMetadata {
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) labels: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StackSpec {
+    #[serde(default)]
+    apply: StackApplyPolicy,
+    #[serde(default)]
+    requires: StackRequires,
+    #[serde(default)]
+    startup: StackStartupSpec,
+    #[serde(default)]
+    runtime: StackRuntimeSpec,
+    #[serde(default)]
+    connectors: Vec<StackConnectorSpec>,
+    #[serde(default)]
+    personas: Vec<StackPersonaSpec>,
+    #[serde(default)]
+    sessions: Vec<StackSessionSpec>,
+    #[serde(default)]
+    schedules: Vec<StackScheduleSpec>,
+    #[serde(default)]
+    playbooks: Vec<StackPlaybookSpec>,
+    #[serde(default)]
+    verification: Vec<StackProbeSpec>,
+    #[serde(default)]
+    agent_templates: Vec<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StackApplyPolicy {
+    #[serde(default)]
+    ownership_id: Option<String>,
+    #[serde(default = "default_true")]
+    strict_scopes: bool,
+    #[serde(default)]
+    allow_wildcard_scopes: bool,
+    #[serde(default)]
+    prune: bool,
+    #[serde(default)]
+    restart_policy: RestartPolicy,
+}
+
+impl Default for StackApplyPolicy {
+    fn default() -> Self {
+        Self {
+            ownership_id: None,
+            strict_scopes: true,
+            allow_wildcard_scopes: false,
+            prune: false,
+            restart_policy: RestartPolicy::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RestartPolicy {
+    #[default]
+    PlanOnly,
+    Forbid,
+    Allow,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StackRequires {
+    #[serde(default)]
+    secrets: Vec<StackSecretRequirement>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StackSecretRequirement {
+    #[serde(rename = "ref", alias = "slot")]
+    slot: String,
+    #[serde(default = "default_auth_provider")]
+    provider: kheish_auth::AuthProvider,
+    #[serde(default)]
+    value_env: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StackStartupSpec {
+    #[serde(default)]
+    routes: Option<Value>,
+    #[serde(default)]
+    connectors_config: Option<Value>,
+    #[serde(default)]
+    mcp_profiles: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StackRuntimeSpec {
+    #[serde(default)]
+    permission_mode: Option<kheish_runtime::PermissionMode>,
+    #[serde(default)]
+    debug_level: Option<kheish_runtime::DebugCaptureLevel>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StackConnectorSpec {
+    kind: String,
+    name: String,
+    spec: Value,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StackPersonaSpec {
+    persona_id: String,
+    display_name: String,
+    #[serde(default)]
+    soul: Option<String>,
+    #[serde(default)]
+    soul_file: Option<PathBuf>,
+    #[serde(default)]
+    metadata: Option<Value>,
+    #[serde(default)]
+    capability_scope: Option<kheish_types::CapabilityScope>,
+    #[serde(default)]
+    default_skills: Vec<kheish_types::PersonaSkillAssignment>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StackSessionSpec {
+    session_id: String,
+    #[serde(default)]
+    thread_id: Option<String>,
+    #[serde(default)]
+    persona_id: Option<String>,
+    #[serde(default)]
+    capability_scope: Option<kheish_types::CapabilityScope>,
+    #[serde(default)]
+    credential_scope: Option<kheish_types::CredentialScope>,
+    #[serde(default)]
+    route_policy: Option<kheish_types::SessionRoutePolicy>,
+    #[serde(default)]
+    reply_targets: Option<Vec<crate::SessionReplyTargetRequest>>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StackScheduleSpec {
+    name: String,
+    target_session_id: String,
+    #[serde(default)]
+    target_agent_id: Option<String>,
+    cadence: crate::ScheduleCadence,
+    #[serde(default)]
+    max_executions: Option<u64>,
+    #[serde(default)]
+    overlap_policy: crate::ScheduleOverlapPolicy,
+    #[serde(default)]
+    misfire_policy: crate::ScheduleMisfirePolicy,
+    #[serde(default)]
+    request: Option<StackRunRequestSpec>,
+    #[serde(default)]
+    observation_materialization: Option<crate::ObservationMaterializationRequest>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StackRunRequestSpec {
+    #[serde(default, alias = "route_id")]
+    provider: Option<String>,
+    #[serde(default)]
+    source_plugin: Option<String>,
+    #[serde(default)]
+    source_kind: Option<String>,
+    #[serde(default)]
+    actor_id: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    content_file: Option<PathBuf>,
+    #[serde(default)]
+    generation: Option<kheish_runtime::ModelGenerationConfig>,
+    #[serde(default)]
+    metadata: Option<Value>,
+    #[serde(default)]
+    binding_keys: Vec<String>,
+    #[serde(default)]
+    reply_plugin: Option<String>,
+    #[serde(default)]
+    reply_address: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StackPlaybookSpec {
+    #[serde(default)]
+    manifest: Option<crate::PlaybookManifest>,
+    #[serde(default)]
+    manifest_file: Option<PathBuf>,
+    #[serde(default)]
+    publish: Option<StackPlaybookPublishSpec>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StackPlaybookPublishSpec {
+    status: crate::PlaybookReleaseStatus,
+    #[serde(default)]
+    evidence_refs: Vec<crate::FlowEvidenceRef>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum StackProbeSpec {
+    PersonaExists {
+        name: String,
+        persona_id: String,
+    },
+    SessionExists {
+        name: String,
+        session_id: String,
+    },
+    ScheduleExists {
+        name: String,
+        schedule_name: String,
+    },
+    PlaybookVersionExists {
+        name: String,
+        playbook_id: String,
+        version: String,
+    },
+    SecretExists {
+        name: String,
+        slot: String,
+    },
+}
+
+impl StackProbeSpec {
+    fn name(&self) -> &str {
+        match self {
+            Self::PersonaExists { name, .. }
+            | Self::SessionExists { name, .. }
+            | Self::ScheduleExists { name, .. }
+            | Self::PlaybookVersionExists { name, .. }
+            | Self::SecretExists { name, .. } => name,
+        }
+    }
+
+    fn kind(&self) -> ProbeKind {
+        match self {
+            Self::PersonaExists { persona_id, .. } => ProbeKind::PersonaExists {
+                persona_id: persona_id.clone(),
+            },
+            Self::SessionExists { session_id, .. } => ProbeKind::SessionExists {
+                session_id: session_id.clone(),
+            },
+            Self::ScheduleExists { schedule_name, .. } => ProbeKind::ScheduleExists {
+                name: schedule_name.clone(),
+            },
+            Self::PlaybookVersionExists {
+                playbook_id,
+                version,
+                ..
+            } => ProbeKind::PlaybookVersionExists {
+                playbook_id: playbook_id.clone(),
+                version: version.clone(),
+            },
+            Self::SecretExists { slot, .. } => ProbeKind::SecretExists { slot: slot.clone() },
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum ProbeKind {
+    PersonaExists {
+        persona_id: String,
+    },
+    SessionExists {
+        session_id: String,
+    },
+    ScheduleExists {
+        name: String,
+    },
+    PlaybookVersionExists {
+        playbook_id: String,
+        version: String,
+    },
+    SecretExists {
+        slot: String,
+    },
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_auth_provider() -> kheish_auth::AuthProvider {
+    kheish_auth::AuthProvider::Generic
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedStack {
+    startup_digest: Option<String>,
+    runtime: StackRuntimeSpec,
+    runtime_digest: Option<String>,
+    secrets: Vec<ResolvedSecret>,
+    connectors: Vec<ResolvedConnector>,
+    personas: Vec<ResolvedPersona>,
+    sessions: Vec<ResolvedSession>,
+    schedules: Vec<ResolvedSchedule>,
+    playbooks: Vec<ResolvedPlaybook>,
+    verification: Vec<ResolvedProbe>,
+}
+
+impl ResolvedStack {
+    async fn from_context(context: &StackContext) -> Result<Self> {
+        let startup_digest = if context.document.spec.startup.routes.is_some()
+            || context.document.spec.startup.connectors_config.is_some()
+            || !context.document.spec.startup.mcp_profiles.is_empty()
+        {
+            Some(digest_serializable(&context.document.spec.startup)?)
+        } else {
+            None
+        };
+        let runtime_digest = if context.document.spec.runtime.permission_mode.is_some()
+            || context.document.spec.runtime.debug_level.is_some()
+        {
+            Some(digest_serializable(&context.document.spec.runtime)?)
+        } else {
+            None
+        };
+        let mut secrets = Vec::new();
+        for secret in &context.document.spec.requires.secrets {
+            secrets.push(ResolvedSecret {
+                slot: secret.slot.clone(),
+                provider: secret.provider,
+                value_env: secret.value_env.clone(),
+            });
+        }
+        let connectors = context
+            .document
+            .spec
+            .connectors
+            .iter()
+            .map(|connector| {
+                Ok(ResolvedConnector {
+                    kind: connector.kind.clone(),
+                    name: connector.name.clone(),
+                    spec: connector.spec.clone(),
+                    digest: digest_serializable(connector)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut personas = Vec::new();
+        for persona in &context.document.spec.personas {
+            let soul = match (&persona.soul, &persona.soul_file) {
+                (Some(_), Some(_)) => {
+                    bail!(
+                        "persona {} must use either soul or soul_file, not both",
+                        persona.persona_id
+                    )
+                }
+                (Some(soul), None) => soul.clone(),
+                (None, Some(path)) => {
+                    let path = context.resolve_path(path)?;
+                    read_stack_text_file(&path).await?
+                }
+                (None, None) => bail!("persona {} requires soul or soul_file", persona.persona_id),
+            };
+            let resolved = ResolvedPersona {
+                persona_id: persona.persona_id.clone(),
+                display_name: persona.display_name.clone(),
+                soul,
+                metadata: persona.metadata.clone().unwrap_or(Value::Null),
+                capability_scope: persona
+                    .capability_scope
+                    .clone()
+                    .map(|scope| scope.normalized()),
+                default_skills: persona.default_skills.clone(),
+                digest: String::new(),
+            };
+            let digest = digest_serializable(&resolved.desired_value())?;
+            personas.push(ResolvedPersona { digest, ..resolved });
+        }
+        let sessions = context
+            .document
+            .spec
+            .sessions
+            .iter()
+            .map(|session| {
+                let resolved = ResolvedSession {
+                    session_id: session.session_id.clone(),
+                    thread_id: session.thread_id.clone(),
+                    persona_id: session.persona_id.clone(),
+                    capability_scope: session
+                        .capability_scope
+                        .clone()
+                        .map(|scope| scope.normalized()),
+                    credential_scope: session
+                        .credential_scope
+                        .clone()
+                        .map(|scope| scope.normalized()),
+                    route_policy: session.route_policy.clone(),
+                    reply_targets: session.reply_targets.clone(),
+                    digest: String::new(),
+                };
+                let digest = digest_serializable(&resolved.desired_value())?;
+                Ok(ResolvedSession { digest, ..resolved })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut schedules = Vec::new();
+        for schedule in &context.document.spec.schedules {
+            match (
+                schedule.request.as_ref(),
+                schedule.observation_materialization.as_ref(),
+            ) {
+                (Some(_), None) | (None, Some(_)) => {}
+                (Some(_), Some(_)) => bail!(
+                    "schedule {} must define request or observation_materialization, not both",
+                    schedule.name
+                ),
+                (None, None) => bail!(
+                    "schedule {} must define request or observation_materialization",
+                    schedule.name
+                ),
+            }
+            let request = if let Some(request) = &schedule.request {
+                Some(resolve_run_request(context, request).await?)
+            } else {
+                None
+            };
+            let create = crate::ScheduleCreateRequest {
+                name: schedule.name.clone(),
+                target_session_id: schedule.target_session_id.clone(),
+                target_agent_id: schedule.target_agent_id.clone(),
+                owner_session_id: None,
+                owner_agent_id: None,
+                created_by_run_id: None,
+                cadence: schedule.cadence.clone(),
+                max_executions: schedule.max_executions,
+                overlap_policy: schedule.overlap_policy.clone(),
+                misfire_policy: schedule.misfire_policy.clone(),
+                request,
+                observation_materialization: schedule.observation_materialization.clone(),
+            };
+            let digest = digest_serializable(&create)?;
+            schedules.push(ResolvedSchedule {
+                name: schedule.name.clone(),
+                request: create,
+                digest,
+            });
+        }
+        let mut playbooks = Vec::new();
+        for playbook in &context.document.spec.playbooks {
+            let manifest = match (&playbook.manifest, &playbook.manifest_file) {
+                (Some(_), Some(_)) => bail!("playbook must use either manifest or manifest_file"),
+                (Some(manifest), None) => manifest.clone(),
+                (None, Some(path)) => {
+                    let path = context.resolve_path(path)?;
+                    let raw = read_stack_text_file(&path).await?;
+                    if path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+                    {
+                        serde_json::from_str(&raw)
+                            .with_context(|| format!("failed to parse {}", path.display()))?
+                    } else {
+                        validate_stack_manifest_source(&raw)?;
+                        serde_yaml::from_str(&raw)
+                            .with_context(|| format!("failed to parse {}", path.display()))?
+                    }
+                }
+                (None, None) => bail!("playbook requires manifest or manifest_file"),
+            };
+            let digest = digest_serializable(&manifest)?;
+            playbooks.push(ResolvedPlaybook {
+                manifest,
+                publish: playbook.publish.clone(),
+                digest,
+            });
+        }
+        let verification = context
+            .document
+            .spec
+            .verification
+            .iter()
+            .map(|probe| ResolvedProbe {
+                name: probe.name().to_string(),
+                kind: probe.kind(),
+            })
+            .collect();
+        Ok(Self {
+            startup_digest,
+            runtime: context.document.spec.runtime.clone(),
+            runtime_digest,
+            secrets,
+            connectors,
+            personas,
+            sessions,
+            schedules,
+            playbooks,
+            verification,
+        })
+    }
+
+    fn desired_resource_keys(&self) -> Vec<String> {
+        let mut keys = Vec::new();
+        if self.runtime_digest.is_some() {
+            keys.push(ResourceKey::new("runtime", "settings").to_string());
+        }
+        keys.extend(
+            self.secrets
+                .iter()
+                .map(|secret| ResourceKey::new("secret", &secret.slot).to_string()),
+        );
+        keys.extend(self.connectors.iter().map(|connector| {
+            ResourceKey::new(
+                "connector",
+                &format!("{}/{}", connector.kind, connector.name),
+            )
+            .to_string()
+        }));
+        keys.extend(
+            self.personas
+                .iter()
+                .map(|persona| ResourceKey::new("persona", &persona.persona_id).to_string()),
+        );
+        keys.extend(
+            self.sessions
+                .iter()
+                .map(|session| ResourceKey::new("session", &session.session_id).to_string()),
+        );
+        keys.extend(
+            self.schedules
+                .iter()
+                .map(|schedule| ResourceKey::new("schedule", &schedule.name).to_string()),
+        );
+        keys.extend(self.playbooks.iter().map(|playbook| {
+            ResourceKey::new(
+                "playbook",
+                &format!(
+                    "{}/{}",
+                    playbook.manifest.playbook_id, playbook.manifest.version
+                ),
+            )
+            .to_string()
+        }));
+        keys
+    }
+}
+
+async fn resolve_run_request(
+    context: &StackContext,
+    request: &StackRunRequestSpec,
+) -> Result<crate::SubmitInputRequest> {
+    let content = match (&request.content, &request.content_file) {
+        (Some(_), Some(_)) => bail!("schedule request must use either content or content_file"),
+        (Some(content), None) => content.clone(),
+        (None, Some(path)) => {
+            let path = context.resolve_path(path)?;
+            read_stack_text_file(&path).await?
+        }
+        (None, None) => String::new(),
+    };
+    Ok(crate::SubmitInputRequest {
+        provider: request.provider.clone(),
+        source_plugin: request.source_plugin.clone(),
+        source_kind: request.source_kind.clone(),
+        actor_id: request.actor_id.clone(),
+        content,
+        input_items: Vec::new(),
+        attachments: Vec::new(),
+        generation: request.generation.clone(),
+        completion_requirements: None,
+        metadata: Some(request.metadata.clone().unwrap_or(Value::Null)),
+        binding_keys: request.binding_keys.clone(),
+        reply_targets: Vec::new(),
+        reply_plugin: request.reply_plugin.clone(),
+        reply_address: request.reply_address.clone(),
+    })
+}
+
+async fn read_stack_text_file(path: &Path) -> Result<String> {
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("failed to stat {}", path.display()))?;
+    if metadata.len() > STACK_MANIFEST_BODY_LIMIT_BYTES as u64 {
+        bail!(
+            "{} exceeds the {} byte KheishStack file limit",
+            path.display(),
+            STACK_MANIFEST_BODY_LIMIT_BYTES
+        );
+    }
+    let raw = tokio::fs::read_to_string(path)
+        .await
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    if raw.len() > STACK_MANIFEST_BODY_LIMIT_BYTES {
+        bail!(
+            "{} exceeds the {} byte KheishStack file limit",
+            path.display(),
+            STACK_MANIFEST_BODY_LIMIT_BYTES
+        );
+    }
+    Ok(raw)
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedSecret {
+    slot: String,
+    provider: kheish_auth::AuthProvider,
+    value_env: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedConnector {
+    kind: String,
+    name: String,
+    spec: Value,
+    digest: String,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedPersona {
+    persona_id: String,
+    display_name: String,
+    soul: String,
+    metadata: Value,
+    capability_scope: Option<kheish_types::CapabilityScope>,
+    default_skills: Vec<kheish_types::PersonaSkillAssignment>,
+    digest: String,
+}
+
+impl ResolvedPersona {
+    fn desired_value(&self) -> Value {
+        json!({
+            "persona_id": self.persona_id,
+            "display_name": self.display_name,
+            "soul": self.soul,
+            "metadata": self.metadata,
+            "capability_scope": self.capability_scope,
+            "default_skills": self.default_skills,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedSession {
+    session_id: String,
+    thread_id: Option<String>,
+    persona_id: Option<String>,
+    capability_scope: Option<kheish_types::CapabilityScope>,
+    credential_scope: Option<kheish_types::CredentialScope>,
+    route_policy: Option<kheish_types::SessionRoutePolicy>,
+    reply_targets: Option<Vec<crate::SessionReplyTargetRequest>>,
+    digest: String,
+}
+
+impl ResolvedSession {
+    fn desired_value(&self) -> Value {
+        json!({
+            "session_id": self.session_id,
+            "thread_id": self.thread_id,
+            "persona_id": self.persona_id,
+            "capability_scope": self.capability_scope,
+            "credential_scope": self.credential_scope,
+            "route_policy": self.route_policy,
+            "reply_targets": self.reply_targets,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedSchedule {
+    name: String,
+    request: crate::ScheduleCreateRequest,
+    digest: String,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedPlaybook {
+    manifest: crate::PlaybookManifest,
+    publish: Option<StackPlaybookPublishSpec>,
+    digest: String,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedProbe {
+    name: String,
+    kind: ProbeKind,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StackValidation {
+    pub stack: String,
+    pub valid: bool,
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StackPlan {
+    pub stack: String,
+    pub ownership_id: String,
+    pub ledger_path: String,
+    pub valid: bool,
+    pub restart_required: bool,
+    pub actions: Vec<StackAction>,
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+    pub summary: StackPlanSummary,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct StackPlanSummary {
+    pub total: usize,
+    pub create: usize,
+    pub update: usize,
+    pub noop: usize,
+    pub blocked: usize,
+    pub verify: usize,
+}
+
+impl StackPlanSummary {
+    fn from_actions(actions: &[StackAction]) -> Self {
+        let mut summary = StackPlanSummary {
+            total: actions.len(),
+            ..Self::default()
+        };
+        for action in actions {
+            match action.operation.as_str() {
+                "create" => summary.create += 1,
+                "update" | "apply" => summary.update += 1,
+                "noop" => summary.noop += 1,
+                "blocked" => summary.blocked += 1,
+                "verify" => summary.verify += 1,
+                _ => {}
+            }
+        }
+        summary
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StackAction {
+    pub phase: String,
+    pub resource_type: String,
+    pub resource_id: String,
+    pub operation: String,
+    pub reason: String,
+}
+
+impl StackAction {
+    fn new(
+        phase: impl Into<String>,
+        resource_type: impl Into<String>,
+        resource_id: impl Into<String>,
+        operation: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            phase: phase.into(),
+            resource_type: resource_type.into(),
+            resource_id: resource_id.into(),
+            operation: operation.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StackApplyReport {
+    pub stack: String,
+    pub ownership_id: String,
+    pub ledger_path: String,
+    pub applied: Vec<StackAction>,
+    pub verification: Option<StackVerificationReport>,
+    pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<StackPlan>,
+}
+
+impl StackApplyReport {
+    fn dry_run(plan: StackPlan) -> Self {
+        Self {
+            stack: plan.stack.clone(),
+            ownership_id: plan.ownership_id.clone(),
+            ledger_path: plan.ledger_path.clone(),
+            applied: Vec::new(),
+            verification: None,
+            warnings: plan.warnings.clone(),
+            plan: Some(plan),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StackImportReport {
+    pub stack: String,
+    pub ownership_id: String,
+    pub ledger_path: String,
+    pub adopted: Vec<StackAction>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StackDownReport {
+    pub stack: String,
+    pub ownership_id: String,
+    pub ledger_path: String,
+    pub executed: bool,
+    pub actions: Vec<StackAction>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StackVerificationReport {
+    pub stack: String,
+    pub valid: bool,
+    pub checks: Vec<StackVerificationCheck>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StackVerificationCheck {
+    pub kind: String,
+    pub target: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+impl StackVerificationCheck {
+    fn new(kind: &str, target: &str, ok: bool, detail: &str) -> Self {
+        Self {
+            kind: kind.to_string(),
+            target: target.to_string(),
+            ok,
+            detail: detail.to_string(),
+        }
+    }
+
+    fn failed(kind: &str, detail: &str) -> Self {
+        Self::new(kind, "stack", false, detail)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct ResourceKey {
+    kind: String,
+    id: String,
+}
+
+impl ResourceKey {
+    fn new(kind: impl Into<String>, id: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            id: id.into(),
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        let (kind, id) = value
+            .split_once('/')
+            .ok_or_else(|| anyhow!("resource must be formatted as kind/id, got {value}"))?;
+        if kind.trim().is_empty() || id.trim().is_empty() {
+            bail!("resource must be formatted as kind/id, got {value}");
+        }
+        Ok(Self::new(kind, id))
+    }
+}
+
+impl std::fmt::Display for ResourceKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}/{}", self.kind, self.id)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ApplyLedger {
+    version: u32,
+    ledger_salt: String,
+    #[serde(default)]
+    stacks: BTreeMap<String, LedgerStack>,
+}
+
+impl ApplyLedger {
+    async fn load_or_new(path: &Path) -> Result<Self> {
+        match tokio::fs::read(path).await {
+            Ok(bytes) => {
+                let ledger = serde_json::from_slice::<ApplyLedger>(&bytes)
+                    .with_context(|| format!("failed to parse {}", path.display()))?;
+                if ledger.version != LEDGER_VERSION {
+                    bail!(
+                        "unsupported apply ledger version {} in {}",
+                        ledger.version,
+                        path.display()
+                    );
+                }
+                Ok(ledger)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::new()),
+            Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+        }
+    }
+
+    fn new() -> Self {
+        let mut salt = [0_u8; 32];
+        rand::thread_rng().fill_bytes(&mut salt);
+        Self {
+            version: LEDGER_VERSION,
+            ledger_salt: base64::engine::general_purpose::STANDARD_NO_PAD.encode(salt),
+            stacks: BTreeMap::new(),
+        }
+    }
+
+    async fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let bytes = serde_json::to_vec_pretty(self)?;
+        let tmp = ledger_tmp_path(path);
+        if let Err(error) = write_private_file(&tmp, &bytes) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error).with_context(|| format!("failed to write {}", tmp.display()));
+        }
+        if let Err(error) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error).with_context(|| format!("failed to replace {}", path.display()));
+        }
+        Ok(())
+    }
+
+    fn stack(&self, ownership_id: &str) -> Option<&LedgerStack> {
+        self.stacks.get(ownership_id)
+    }
+
+    fn stack_mut(&mut self, ownership_id: &str) -> &mut LedgerStack {
+        self.stacks.entry(ownership_id.to_string()).or_default()
+    }
+
+    fn owner_of_resource(&self, key: &ResourceKey) -> Option<&str> {
+        let resource_key = key.to_string();
+        self.stacks.iter().find_map(|(owner, stack)| {
+            (stack.resources.contains_key(&resource_key)
+                || stack.pending_resources.contains_key(&resource_key)
+                || (key.kind == "secret" && stack.secrets.contains_key(&key.id)))
+            .then_some(owner.as_str())
+        })
+    }
+
+    fn claim_resource(
+        &mut self,
+        ownership_id: &str,
+        key: &ResourceKey,
+        desired_digest: String,
+    ) -> Result<bool> {
+        match self.owner_of_resource(key) {
+            Some(owner) if owner == ownership_id => return Ok(false),
+            Some(owner) => {
+                return Err(crate::problems::DaemonProblem::conflict(
+                    "stacks",
+                    "stack_ownership_conflict",
+                    format!("resource {key} is already owned by stack `{owner}`"),
+                )
+                .into());
+            }
+            None => {}
+        }
+        self.stack_mut(ownership_id).append_operation(
+            "claim_resource",
+            &key.to_string(),
+            Some(desired_digest.clone()),
+        );
+        self.stack_mut(ownership_id).pending_resources.insert(
+            key.to_string(),
+            LedgerResource {
+                desired_digest,
+                last_applied_at_ms: crate::now_ms(),
+            },
+        );
+        Ok(true)
+    }
+
+    fn record_resource(&mut self, ownership_id: &str, key: &ResourceKey, desired_digest: String) {
+        self.stack_mut(ownership_id).append_operation(
+            "record_resource",
+            &key.to_string(),
+            Some(desired_digest.clone()),
+        );
+        self.stack_mut(ownership_id)
+            .pending_resources
+            .remove(&key.to_string());
+        self.stack_mut(ownership_id).resources.insert(
+            key.to_string(),
+            LedgerResource {
+                desired_digest,
+                last_applied_at_ms: crate::now_ms(),
+            },
+        );
+    }
+
+    fn remove_resource(&mut self, ownership_id: &str, key: &ResourceKey) {
+        if let Some(stack) = self.stacks.get_mut(ownership_id) {
+            stack.resources.remove(&key.to_string());
+            stack.pending_resources.remove(&key.to_string());
+            stack.append_operation("remove_resource", &key.to_string(), None);
+        }
+    }
+
+    fn remove_resource_claim(&mut self, ownership_id: &str, key: &ResourceKey) -> bool {
+        if let Some(stack) = self.stacks.get_mut(ownership_id)
+            && stack.pending_resources.remove(&key.to_string()).is_some()
+        {
+            stack.append_operation("remove_resource_claim", &key.to_string(), None);
+            return true;
+        }
+        false
+    }
+
+    fn has_pending_resource(&self, ownership_id: &str, key: &ResourceKey) -> bool {
+        self.stacks
+            .get(ownership_id)
+            .is_some_and(|stack| stack.pending_resources.contains_key(&key.to_string()))
+    }
+
+    fn resource_digest(&self, ownership_id: &str, key: &ResourceKey) -> Option<&str> {
+        self.stacks
+            .get(ownership_id)?
+            .resources
+            .get(&key.to_string())
+            .map(|resource| resource.desired_digest.as_str())
+    }
+
+    fn record_secret(&mut self, ownership_id: &str, slot: &str, fingerprint: String) {
+        self.stack_mut(ownership_id).append_operation(
+            "record_secret",
+            &ResourceKey::new("secret", slot).to_string(),
+            Some(fingerprint.clone()),
+        );
+        self.stack_mut(ownership_id).secrets.insert(
+            slot.to_string(),
+            LedgerSecret {
+                fingerprint,
+                last_seen_at_ms: crate::now_ms(),
+            },
+        );
+    }
+
+    fn secret_fingerprint(&self, ownership_id: &str, slot: &str) -> Option<&str> {
+        self.stacks
+            .get(ownership_id)?
+            .secrets
+            .get(slot)
+            .map(|secret| secret.fingerprint.as_str())
+    }
+}
+
+#[derive(Debug)]
+struct LedgerLock {
+    #[cfg(unix)]
+    file: std::fs::File,
+    #[cfg(not(unix))]
+    path: PathBuf,
+}
+
+impl LedgerLock {
+    fn acquire(ledger_path: &Path) -> Result<Self> {
+        let lock_path = ledger_path.with_extension("lock");
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::io::{Seek as _, Write as _};
+            use std::os::fd::AsRawFd as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .mode(0o600)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                .open(&lock_path)
+                .with_context(|| format!("failed to open {}", lock_path.display()))?;
+            // SAFETY: flock only operates on this process-owned file descriptor.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    return Err(crate::problems::DaemonProblem::conflict(
+                        "stacks",
+                        "stack_ledger_locked",
+                        format!(
+                            "apply ledger is locked at {}; another stack operation may be running",
+                            lock_path.display()
+                        ),
+                    )
+                    .into());
+                }
+                return Err(error)
+                    .with_context(|| format!("failed to lock {}", lock_path.display()));
+            }
+
+            let payload = format!(
+                "pid={}\ncreated_at_ms={}\n",
+                std::process::id(),
+                crate::now_ms()
+            );
+            file.set_len(0)
+                .with_context(|| format!("failed to truncate {}", lock_path.display()))?;
+            file.seek(std::io::SeekFrom::Start(0))
+                .with_context(|| format!("failed to seek {}", lock_path.display()))?;
+            file.write_all(payload.as_bytes())
+                .with_context(|| format!("failed to write {}", lock_path.display()))?;
+            file.sync_all()
+                .with_context(|| format!("failed to sync {}", lock_path.display()))?;
+            Ok(Self { file })
+        }
+
+        #[cfg(not(unix))]
+        {
+            use std::io::Write as _;
+
+            let payload = format!(
+                "pid={}\ncreated_at_ms={}\n",
+                std::process::id(),
+                crate::now_ms()
+            );
+            let mut file = match std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&lock_path)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(crate::problems::DaemonProblem::conflict(
+                        "stacks",
+                        "stack_ledger_locked",
+                        format!(
+                            "apply ledger is locked at {}; another stack operation may be running",
+                            lock_path.display()
+                        ),
+                    )
+                    .into());
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to create {}", lock_path.display()));
+                }
+            };
+            file.write_all(payload.as_bytes())
+                .with_context(|| format!("failed to write {}", lock_path.display()))?;
+            file.sync_all()
+                .with_context(|| format!("failed to sync {}", lock_path.display()))?;
+            Ok(Self { path: lock_path })
+        }
+    }
+}
+
+impl Drop for LedgerLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            // SAFETY: flock only operates on this process-owned file descriptor.
+            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct LedgerStack {
+    #[serde(default)]
+    resources: BTreeMap<String, LedgerResource>,
+    #[serde(default)]
+    pending_resources: BTreeMap<String, LedgerResource>,
+    #[serde(default)]
+    secrets: BTreeMap<String, LedgerSecret>,
+    #[serde(default)]
+    operations: Vec<LedgerOperation>,
+}
+
+impl LedgerStack {
+    fn append_operation(
+        &mut self,
+        action: impl Into<String>,
+        resource_key: &str,
+        desired_digest: Option<String>,
+    ) {
+        let index = self.operations.len() as u64;
+        let at_ms = crate::now_ms();
+        let previous_hash = self
+            .operations
+            .last()
+            .map(|operation| operation.hash.clone());
+        let action = action.into();
+        let hash = ledger_operation_hash(
+            index,
+            at_ms,
+            &action,
+            resource_key,
+            desired_digest.as_deref(),
+            previous_hash.as_deref(),
+        );
+        self.operations.push(LedgerOperation {
+            index,
+            at_ms,
+            action,
+            resource_key: resource_key.to_string(),
+            desired_digest,
+            previous_hash,
+            hash,
+        });
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LedgerResource {
+    desired_digest: String,
+    last_applied_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LedgerSecret {
+    fingerprint: String,
+    last_seen_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LedgerOperation {
+    index: u64,
+    at_ms: u64,
+    action: String,
+    resource_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    desired_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_hash: Option<String>,
+    hash: String,
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    }
+}
+
+fn ledger_tmp_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(LEDGER_FILE);
+    let nonce = rand::thread_rng().next_u64();
+    path.with_file_name(format!(
+        "{file_name}.tmp-{}-{nonce:016x}",
+        std::process::id()
+    ))
+}
+
+fn digest_serializable<T>(value: &T) -> Result<String>
+where
+    T: Serialize,
+{
+    digest_bytes(&serde_json::to_vec(value)?)
+}
+
+fn digest_json(value: &Value) -> Result<String> {
+    digest_bytes(&serde_json::to_vec(value)?)
+}
+
+fn digest_bytes(bytes: &[u8]) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn url_encode_path_segment(segment: &str) -> String {
+    urlencoding::encode(segment).into_owned()
+}
+
+fn ensure_connector_secret_slot_record_allowed(record: &kheish_auth::AuthSlotRecord) -> Result<()> {
+    if (record.slot_id.0.starts_with("connectors.") || record.slot_id.0.starts_with("mcp."))
+        && !matches!(
+            record.provider,
+            kheish_auth::AuthProvider::Generic | kheish_auth::AuthProvider::McpOAuth
+        )
+    {
+        bail!("connector and MCP secret slots must use generic opaque or MCP OAuth records");
+    }
+    if record.provider == kheish_auth::AuthProvider::McpOAuth
+        && !record.slot_id.0.starts_with("mcp.oauth.")
+    {
+        bail!("MCP OAuth account slots must use the `mcp.oauth.` namespace");
+    }
+    Ok(())
+}
+
+fn ledger_operation_hash(
+    index: u64,
+    at_ms: u64,
+    action: &str,
+    resource_key: &str,
+    desired_digest: Option<&str>,
+    previous_hash: Option<&str>,
+) -> String {
+    let payload = json!({
+        "index": index,
+        "at_ms": at_ms,
+        "action": action,
+        "resource_key": resource_key,
+        "desired_digest": desired_digest,
+        "previous_hash": previous_hash,
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(
+        serde_json::to_vec(&payload)
+            .expect("ledger operation hash payload should serialize deterministically"),
+    );
+    hex::encode(hasher.finalize())
+}
+
+fn secret_fingerprint(salt: &str, slot: &str, env_name: &str) -> Result<String> {
+    let value = std::env::var(env_name)
+        .with_context(|| format!("failed to read environment variable {env_name}"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(salt.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(slot.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(value.as_bytes());
+    Ok(hex::encode(hasher.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context(raw: &str) -> StackContext {
+        StackContext::from_manifest(raw, PathBuf::from("."), None, true).unwrap()
+    }
+
+    fn errors_contain(validation: &StackValidation, needle: &str) -> bool {
+        validation.errors.iter().any(|error| error.contains(needle))
+    }
+
+    struct EmptyControlPlane;
+
+    #[async_trait::async_trait]
+    impl StackControlPlane for EmptyControlPlane {
+        async fn get_json<T>(&self, path: &str) -> Result<T>
+        where
+            T: DeserializeOwned + Send,
+        {
+            if path == "/v1/schedules" {
+                return encode_response(Vec::<crate::ScheduleView>::new());
+            }
+            bail!("unexpected GET {path}")
+        }
+
+        async fn get_json_optional<T>(&self, _path: &str) -> Result<Option<T>>
+        where
+            T: DeserializeOwned + Send,
+        {
+            Ok(None)
+        }
+
+        async fn post_json<B, T>(&self, path: &str, _body: &B) -> Result<T>
+        where
+            B: Serialize + Sync + ?Sized,
+            T: DeserializeOwned + Send,
+        {
+            bail!("unexpected POST {path}")
+        }
+
+        async fn put_json<B, T>(&self, path: &str, _body: &B) -> Result<T>
+        where
+            B: Serialize + Sync + ?Sized,
+            T: DeserializeOwned + Send,
+        {
+            bail!("unexpected PUT {path}")
+        }
+
+        async fn delete_json<T>(&self, path: &str) -> Result<T>
+        where
+            T: DeserializeOwned + Send,
+        {
+            bail!("unexpected DELETE {path}")
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingControlPlane {
+        deletes: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl StackControlPlane for RecordingControlPlane {
+        async fn get_json<T>(&self, path: &str) -> Result<T>
+        where
+            T: DeserializeOwned + Send,
+        {
+            if path == "/v1/schedules" {
+                return encode_response(Vec::<crate::ScheduleView>::new());
+            }
+            bail!("unexpected GET {path}")
+        }
+
+        async fn get_json_optional<T>(&self, _path: &str) -> Result<Option<T>>
+        where
+            T: DeserializeOwned + Send,
+        {
+            Ok(None)
+        }
+
+        async fn post_json<B, T>(&self, path: &str, _body: &B) -> Result<T>
+        where
+            B: Serialize + Sync + ?Sized,
+            T: DeserializeOwned + Send,
+        {
+            bail!("unexpected POST {path}")
+        }
+
+        async fn put_json<B, T>(&self, path: &str, _body: &B) -> Result<T>
+        where
+            B: Serialize + Sync + ?Sized,
+            T: DeserializeOwned + Send,
+        {
+            bail!("unexpected PUT {path}")
+        }
+
+        async fn delete_json<T>(&self, path: &str) -> Result<T>
+        where
+            T: DeserializeOwned + Send,
+        {
+            self.deletes.lock().unwrap().push(path.to_string());
+            encode_response(json!({ "accepted": true }))
+        }
+    }
+
+    #[derive(Default)]
+    struct LiveSecretControlPlane {
+        posts: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl StackControlPlane for LiveSecretControlPlane {
+        async fn get_json<T>(&self, path: &str) -> Result<T>
+        where
+            T: DeserializeOwned + Send,
+        {
+            if path == "/v1/schedules" {
+                return encode_response(Vec::<crate::ScheduleView>::new());
+            }
+            bail!("unexpected GET {path}")
+        }
+
+        async fn get_json_optional<T>(&self, path: &str) -> Result<Option<T>>
+        where
+            T: DeserializeOwned + Send,
+        {
+            if path.starts_with("/v1/runtime/secrets/") {
+                let status = kheish_auth::AuthSlotStatus {
+                    slot_id: kheish_auth::AuthSlotId::new("stack.test.LIVE_SECRET"),
+                    provider: kheish_auth::AuthProvider::Generic,
+                    mode: kheish_auth::AuthMode::OpaqueSecret,
+                    summary: "configured".to_string(),
+                    updated_at_ms: 1,
+                    details: BTreeMap::new(),
+                };
+                return encode_response(Some(status));
+            }
+            Ok(None)
+        }
+
+        async fn post_json<B, T>(&self, path: &str, _body: &B) -> Result<T>
+        where
+            B: Serialize + Sync + ?Sized,
+            T: DeserializeOwned + Send,
+        {
+            self.posts.lock().unwrap().push(path.to_string());
+            bail!("unexpected POST {path}")
+        }
+
+        async fn put_json<B, T>(&self, path: &str, _body: &B) -> Result<T>
+        where
+            B: Serialize + Sync + ?Sized,
+            T: DeserializeOwned + Send,
+        {
+            bail!("unexpected PUT {path}")
+        }
+
+        async fn delete_json<T>(&self, path: &str) -> Result<T>
+        where
+            T: DeserializeOwned + Send,
+        {
+            bail!("unexpected DELETE {path}")
+        }
+    }
+
+    #[derive(Default)]
+    struct RacePersonaControlPlane {
+        persona_gets: std::sync::Mutex<usize>,
+        writes: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl StackControlPlane for RacePersonaControlPlane {
+        async fn get_json<T>(&self, path: &str) -> Result<T>
+        where
+            T: DeserializeOwned + Send,
+        {
+            if path == "/v1/schedules" {
+                return encode_response(Vec::<crate::ScheduleView>::new());
+            }
+            bail!("unexpected GET {path}")
+        }
+
+        async fn get_json_optional<T>(&self, path: &str) -> Result<Option<T>>
+        where
+            T: DeserializeOwned + Send,
+        {
+            if path == "/v1/personas/race-persona" {
+                let mut gets = self.persona_gets.lock().unwrap();
+                *gets += 1;
+                if *gets == 1 {
+                    return Ok(None);
+                }
+                let live = crate::PersonaView {
+                    persona_id: "race-persona".to_string(),
+                    display_name: "External Persona".to_string(),
+                    soul: "Created outside stack.".to_string(),
+                    version: 1,
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                    capability_scope: kheish_types::CapabilityScope::default(),
+                    default_skills: Vec::new(),
+                    metadata: Value::Null,
+                };
+                return encode_response(Some(live));
+            }
+            Ok(None)
+        }
+
+        async fn post_json<B, T>(&self, path: &str, _body: &B) -> Result<T>
+        where
+            B: Serialize + Sync + ?Sized,
+            T: DeserializeOwned + Send,
+        {
+            self.writes.lock().unwrap().push(path.to_string());
+            bail!("unexpected POST {path}")
+        }
+
+        async fn put_json<B, T>(&self, path: &str, _body: &B) -> Result<T>
+        where
+            B: Serialize + Sync + ?Sized,
+            T: DeserializeOwned + Send,
+        {
+            self.writes.lock().unwrap().push(path.to_string());
+            bail!("unexpected PUT {path}")
+        }
+
+        async fn delete_json<T>(&self, path: &str) -> Result<T>
+        where
+            T: DeserializeOwned + Send,
+        {
+            bail!("unexpected DELETE {path}")
+        }
+    }
+
+    struct ClaimObservedConnectorControlPlane {
+        ledger_path: PathBuf,
+        observed_pending_claim: std::sync::Mutex<bool>,
+        created: std::sync::Mutex<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl StackControlPlane for ClaimObservedConnectorControlPlane {
+        async fn get_json<T>(&self, path: &str) -> Result<T>
+        where
+            T: DeserializeOwned + Send,
+        {
+            if path == "/v1/schedules" {
+                return encode_response(Vec::<crate::ScheduleView>::new());
+            }
+            bail!("unexpected GET {path}")
+        }
+
+        async fn get_json_optional<T>(&self, path: &str) -> Result<Option<T>>
+        where
+            T: DeserializeOwned + Send,
+        {
+            if path == "/v1/runtime/connectors/http/claimed" {
+                if *self.created.lock().unwrap() {
+                    return encode_response(Some(test_http_connector_view()));
+                }
+                return Ok(None);
+            }
+            Ok(None)
+        }
+
+        async fn post_json<B, T>(&self, path: &str, _body: &B) -> Result<T>
+        where
+            B: Serialize + Sync + ?Sized,
+            T: DeserializeOwned + Send,
+        {
+            bail!("unexpected POST {path}")
+        }
+
+        async fn put_json<B, T>(&self, path: &str, _body: &B) -> Result<T>
+        where
+            B: Serialize + Sync + ?Sized,
+            T: DeserializeOwned + Send,
+        {
+            if path != "/v1/runtime/connectors/http/claimed" {
+                bail!("unexpected PUT {path}");
+            }
+            let ledger = ApplyLedger::load_or_new(&self.ledger_path).await?;
+            let key = ResourceKey::new("connector", "http/claimed");
+            let stack = ledger
+                .stack("connector-claim")
+                .ok_or_else(|| anyhow!("missing connector-claim stack ledger"))?;
+            if !stack.pending_resources.contains_key(&key.to_string()) {
+                bail!("connector write happened before pending ledger claim was persisted");
+            }
+            *self.observed_pending_claim.lock().unwrap() = true;
+            *self.created.lock().unwrap() = true;
+            encode_response(test_http_connector_view())
+        }
+
+        async fn delete_json<T>(&self, path: &str) -> Result<T>
+        where
+            T: DeserializeOwned + Send,
+        {
+            bail!("unexpected DELETE {path}")
+        }
+    }
+
+    struct RaceConnectorCreateControlPlane {
+        ledger_path: PathBuf,
+        observed_pending_claim: std::sync::Mutex<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl StackControlPlane for RaceConnectorCreateControlPlane {
+        async fn get_json<T>(&self, path: &str) -> Result<T>
+        where
+            T: DeserializeOwned + Send,
+        {
+            if path == "/v1/schedules" {
+                return encode_response(Vec::<crate::ScheduleView>::new());
+            }
+            bail!("unexpected GET {path}")
+        }
+
+        async fn get_json_optional<T>(&self, path: &str) -> Result<Option<T>>
+        where
+            T: DeserializeOwned + Send,
+        {
+            if path == "/v1/runtime/connectors/http/race" {
+                return Ok(None);
+            }
+            Ok(None)
+        }
+
+        async fn post_json<B, T>(&self, path: &str, _body: &B) -> Result<T>
+        where
+            B: Serialize + Sync + ?Sized,
+            T: DeserializeOwned + Send,
+        {
+            bail!("unexpected POST {path}")
+        }
+
+        async fn put_json<B, T>(&self, path: &str, _body: &B) -> Result<T>
+        where
+            B: Serialize + Sync + ?Sized,
+            T: DeserializeOwned + Send,
+        {
+            bail!("unexpected PUT {path}")
+        }
+
+        async fn put_connector_if_absent(
+            &self,
+            kind: &str,
+            name: &str,
+            _spec: &Value,
+        ) -> Result<crate::ConnectorView> {
+            if kind != "http" || name != "race" {
+                bail!("unexpected connector create {kind}/{name}");
+            }
+            let ledger = ApplyLedger::load_or_new(&self.ledger_path).await?;
+            let key = ResourceKey::new("connector", "http/race");
+            let stack = ledger
+                .stack("connector-race")
+                .ok_or_else(|| anyhow!("missing connector-race stack ledger"))?;
+            if !stack.pending_resources.contains_key(&key.to_string()) {
+                bail!("connector create-if-absent happened before pending claim was persisted");
+            }
+            *self.observed_pending_claim.lock().unwrap() = true;
+            bail!("http connector race already exists")
+        }
+
+        async fn delete_json<T>(&self, path: &str) -> Result<T>
+        where
+            T: DeserializeOwned + Send,
+        {
+            bail!("unexpected DELETE {path}")
+        }
+    }
+
+    struct CommittedThenErroredConnectorControlPlane {
+        created: std::sync::Mutex<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl StackControlPlane for CommittedThenErroredConnectorControlPlane {
+        async fn get_json<T>(&self, path: &str) -> Result<T>
+        where
+            T: DeserializeOwned + Send,
+        {
+            if path == "/v1/schedules" {
+                return encode_response(Vec::<crate::ScheduleView>::new());
+            }
+            bail!("unexpected GET {path}")
+        }
+
+        async fn get_json_optional<T>(&self, path: &str) -> Result<Option<T>>
+        where
+            T: DeserializeOwned + Send,
+        {
+            if path == "/v1/runtime/connectors/http/committed" {
+                if *self.created.lock().unwrap() {
+                    return encode_response(Some(test_http_connector_view_named("committed")));
+                }
+                return Ok(None);
+            }
+            Ok(None)
+        }
+
+        async fn post_json<B, T>(&self, path: &str, _body: &B) -> Result<T>
+        where
+            B: Serialize + Sync + ?Sized,
+            T: DeserializeOwned + Send,
+        {
+            bail!("unexpected POST {path}")
+        }
+
+        async fn put_json<B, T>(&self, path: &str, _body: &B) -> Result<T>
+        where
+            B: Serialize + Sync + ?Sized,
+            T: DeserializeOwned + Send,
+        {
+            bail!("unexpected PUT {path}")
+        }
+
+        async fn put_connector_if_absent(
+            &self,
+            kind: &str,
+            name: &str,
+            _spec: &Value,
+        ) -> Result<crate::ConnectorView> {
+            if kind != "http" || name != "committed" {
+                bail!("unexpected connector create {kind}/{name}");
+            }
+            *self.created.lock().unwrap() = true;
+            bail!("connector registry reload failed after durable create")
+        }
+
+        async fn delete_json<T>(&self, path: &str) -> Result<T>
+        where
+            T: DeserializeOwned + Send,
+        {
+            bail!("unexpected DELETE {path}")
+        }
+    }
+
+    fn test_http_connector_view() -> crate::ConnectorView {
+        test_http_connector_view_named("claimed")
+    }
+
+    fn test_http_connector_view_named(name: &str) -> crate::ConnectorView {
+        crate::ConnectorView::Http(crate::HttpConnectorView {
+            source: crate::ConnectorSourceView::Daemon,
+            name: name.to_string(),
+            fixed_session_id: None,
+            actor_id: None,
+            bearer_token: crate::ConnectorSecretView::default(),
+            hmac_secret: crate::ConnectorSecretView::default(),
+            allow_unauthenticated_ingress: true,
+            require_hmac_signature: false,
+            signature_max_age_secs: 300,
+            require_idempotency_key: true,
+            ingress_events_per_second: 60,
+            allow_payload_reply_targets: false,
+            default_reply_targets: Vec::new(),
+            default_binding_keys: Vec::new(),
+            session_policy: serde_json::from_value(json!({
+                "create_if_missing": true,
+                "capability_scope": {
+                    "skill_deny": ["*"],
+                    "mcp_server_deny": ["*"],
+                    "mcp_tool_deny": ["*"]
+                },
+                "credential_scope": {
+                    "route_deny": ["*"],
+                    "connector_deny": ["*"],
+                    "connector_credential_deny": ["*"],
+                    "mcp_server_deny": ["*"]
+                }
+            }))
+            .expect("test connector session policy should deserialize"),
+        })
+    }
+
+    fn empty_test_plan(context: &StackContext) -> StackPlan {
+        StackPlan {
+            stack: context.document.metadata.name.clone(),
+            ownership_id: context.ownership_id(),
+            ledger_path: String::new(),
+            valid: true,
+            restart_required: false,
+            actions: Vec::new(),
+            errors: Vec::new(),
+            warnings: Vec::new(),
+            summary: StackPlanSummary::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_fail_open_connector_session_policy_scopes() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: connector-scope-hole
+spec:
+  connectors:
+    - kind: http
+      name: ingress
+      spec:
+        allow_unauthenticated_ingress: true
+        session_policy:
+          create_if_missing: true
+"#;
+
+        let validation = validate_stack_context(&context(raw)).await.unwrap();
+
+        assert!(!validation.valid);
+        assert!(errors_contain(
+            &validation,
+            "spec.connectors[ingress].spec.session_policy.capability_scope.skill"
+        ));
+        assert!(errors_contain(
+            &validation,
+            "spec.connectors[ingress].spec.session_policy.credential_scope.route"
+        ));
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_fail_open_scopes_even_when_manifest_disables_strict_scopes() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: strict-manifest-noop
+spec:
+  apply:
+    strict_scopes: false
+  personas:
+    - persona_id: operator
+      display_name: Operator
+      soul: Must still fail closed.
+      capability_scope:
+        mcp_server_allow: ["linear"]
+"#;
+
+        let validation = validate_stack_context(&context(raw)).await.unwrap();
+
+        assert!(!validation.valid);
+        assert!(errors_contain(
+            &validation,
+            "spec.personas[operator].capability_scope.skill"
+        ));
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_fail_open_scopes_even_when_request_disables_strict_scopes() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: strict-request-noop
+spec:
+  personas:
+    - persona_id: operator
+      display_name: Operator
+      soul: Must still fail closed.
+      capability_scope:
+        mcp_server_allow: ["linear"]
+"#;
+        let context = StackContext::from_manifest(raw, PathBuf::from("."), None, false).unwrap();
+
+        let validation = validate_stack_context(&context).await.unwrap();
+
+        assert!(!validation.valid);
+        assert!(errors_contain(
+            &validation,
+            "spec.personas[operator].capability_scope.skill"
+        ));
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_unknown_connector_spec_fields() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: connector-unknown-field
+spec:
+  connectors:
+    - kind: http
+      name: ingress
+      spec:
+        allow_unauthenticated_ingress: true
+        require_hmac_signatre: true
+        fixed_session_id: ingress-session
+  sessions:
+    - session_id: ingress-session
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_deny: ["*"]
+        mcp_tool_deny: ["*"]
+      credential_scope:
+        route_deny: ["*"]
+        connector_deny: ["*"]
+        connector_credential_deny: ["*"]
+        mcp_server_deny: ["*"]
+"#;
+
+        let validation = validate_stack_context(&context(raw)).await.unwrap();
+
+        assert!(!validation.valid);
+        assert!(errors_contain(
+            &validation,
+            "spec.connectors[ingress].spec.require_hmac_signatre is not supported"
+        ));
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_inline_connector_secret_values() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: connector-inline-secret
+spec:
+  sessions:
+    - session_id: ingress-session
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_deny: ["*"]
+        mcp_tool_deny: ["*"]
+      credential_scope:
+        route_deny: ["*"]
+        connector_deny: ["*"]
+        connector_credential_deny: ["*"]
+        mcp_server_deny: ["*"]
+  connectors:
+    - kind: http
+      name: ingress
+      spec:
+        fixed_session_id: ingress-session
+        bearer_token:
+          value: super-secret
+"#;
+
+        let validation = validate_stack_context(&context(raw)).await.unwrap();
+
+        assert!(!validation.valid);
+        assert!(errors_contain(
+            &validation,
+            "spec.connectors[ingress].spec.bearer_token.value is not supported in KheishStack"
+        ));
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_partial_deny_as_fail_closed_scope() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: partial-deny
+spec:
+  personas:
+    - persona_id: operator
+      display_name: Operator
+      soul: Be constrained.
+      capability_scope:
+        skill_deny: ["bash"]
+        mcp_server_deny: ["*"]
+        mcp_tool_deny: ["*"]
+"#;
+
+        let validation = validate_stack_context(&context(raw)).await.unwrap();
+
+        assert!(!validation.valid);
+        assert!(errors_contain(
+            &validation,
+            "spec.personas[operator].capability_scope.skill_deny must contain `*`"
+        ));
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_connector_without_fixed_session_or_session_policy() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: connector-no-target
+spec:
+  connectors:
+    - kind: http
+      name: ingress
+      spec:
+        allow_unauthenticated_ingress: true
+"#;
+
+        let validation = validate_stack_context(&context(raw)).await.unwrap();
+
+        assert!(!validation.valid);
+        assert!(errors_contain(
+            &validation,
+            "spec.connectors[ingress].spec must set fixed_session_id or a fail-closed session_policy"
+        ));
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_fail_closed_connector_session_policy_scopes() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: connector-scoped
+spec:
+  connectors:
+    - kind: http
+      name: ingress
+      spec:
+        allow_unauthenticated_ingress: true
+        session_policy:
+          create_if_missing: true
+          capability_scope:
+            skill_deny: ["*"]
+            mcp_server_deny: ["*"]
+            mcp_tool_deny: ["*"]
+          credential_scope:
+            route_deny: ["*"]
+            connector_deny: ["*"]
+            connector_credential_deny: ["*"]
+            mcp_server_deny: ["*"]
+"#;
+
+        let validation = validate_stack_context(&context(raw)).await.unwrap();
+
+        assert!(validation.valid, "{:?}", validation.errors);
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_fixed_session_id_declared_in_stack() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: connector-fixed-session
+spec:
+  sessions:
+    - session_id: ingress-session
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_deny: ["*"]
+        mcp_tool_deny: ["*"]
+      credential_scope:
+        route_deny: ["*"]
+        connector_deny: ["*"]
+        connector_credential_deny: ["*"]
+        mcp_server_deny: ["*"]
+  connectors:
+    - kind: http
+      name: ingress
+      spec:
+        allow_unauthenticated_ingress: true
+        fixed_session_id: ingress-session
+"#;
+
+        let validation = validate_stack_context(&context(raw)).await.unwrap();
+
+        assert!(validation.valid, "{:?}", validation.errors);
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_external_session_persona_under_strict_scopes() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: external-session-persona
+spec:
+  sessions:
+    - session_id: triage
+      persona_id: external-persona
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_deny: ["*"]
+        mcp_tool_deny: ["*"]
+      credential_scope:
+        route_deny: ["*"]
+        connector_deny: ["*"]
+        connector_credential_deny: ["*"]
+        mcp_server_deny: ["*"]
+"#;
+
+        let validation = validate_stack_context(&context(raw)).await.unwrap();
+
+        assert!(!validation.valid);
+        assert!(errors_contain(
+            &validation,
+            "spec.sessions[triage].persona_id `external-persona` must reference a persona declared in this stack"
+        ));
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_external_connector_policy_persona_under_strict_scopes() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: external-connector-persona
+spec:
+  connectors:
+    - kind: http
+      name: ingress
+      spec:
+        allow_unauthenticated_ingress: true
+        session_policy:
+          create_if_missing: true
+          persona_id: external-persona
+          capability_scope:
+            skill_deny: ["*"]
+            mcp_server_deny: ["*"]
+            mcp_tool_deny: ["*"]
+          credential_scope:
+            route_deny: ["*"]
+            connector_deny: ["*"]
+            connector_credential_deny: ["*"]
+            mcp_server_deny: ["*"]
+"#;
+
+        let validation = validate_stack_context(&context(raw)).await.unwrap();
+
+        assert!(!validation.valid);
+        assert!(errors_contain(
+            &validation,
+            "spec.connectors[ingress].spec.session_policy.persona_id `external-persona` must reference a persona declared in this stack"
+        ));
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_schedule_targeting_external_session_without_provider() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: external-schedule-target
+spec:
+  schedules:
+    - name: external-session-schedule
+      target_session_id: external-session
+      cadence:
+        type: interval
+        every_seconds: 60
+      request:
+        content: run on external session
+"#;
+
+        let validation = validate_stack_context(&context(raw)).await.unwrap();
+
+        assert!(!validation.valid);
+        assert!(errors_contain(
+            &validation,
+            "spec.schedules[external-session-schedule].target_session_id `external-session` must reference a session declared in this stack"
+        ));
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_observation_schedule_target_mismatch() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: observation-schedule-target
+spec:
+  sessions:
+    - session_id: declared-session
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_deny: ["*"]
+        mcp_tool_deny: ["*"]
+      credential_scope:
+        route_deny: ["*"]
+        connector_deny: ["*"]
+        connector_credential_deny: ["*"]
+        mcp_server_deny: ["*"]
+  schedules:
+    - name: observation-schedule
+      target_session_id: declared-session
+      cadence:
+        type: interval
+        every_seconds: 60
+      observation_materialization:
+        target_session_id: external-session
+        selection:
+          type: observation_ids
+          observation_ids: ["obs-1"]
+        request:
+          content: summarize observation
+"#;
+
+        let validation = validate_stack_context(&context(raw)).await.unwrap();
+
+        assert!(!validation.valid);
+        assert!(errors_contain(
+            &validation,
+            "spec.schedules[observation-schedule].observation_materialization.target_session_id must match target_session_id `declared-session`"
+        ));
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_observation_schedule_provider_outside_session_scope() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: observation-provider-scope
+spec:
+  sessions:
+    - session_id: declared-session
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_deny: ["*"]
+        mcp_tool_deny: ["*"]
+      credential_scope:
+        route_deny: ["*"]
+        connector_deny: ["*"]
+        connector_credential_deny: ["*"]
+        mcp_server_deny: ["*"]
+  schedules:
+    - name: observation-schedule
+      target_session_id: declared-session
+      cadence:
+        type: interval
+        every_seconds: 60
+      observation_materialization:
+        target_session_id: declared-session
+        selection:
+          type: observation_ids
+          observation_ids: ["obs-1"]
+        request:
+          provider: openai
+          content: summarize observation
+"#;
+
+        let validation = validate_stack_context(&context(raw)).await.unwrap();
+
+        assert!(!validation.valid);
+        assert!(errors_contain(
+            &validation,
+            "spec.schedules[observation-schedule].observation_materialization.request.provider `openai` is not allowed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn import_rejects_invalid_strict_scopes_before_ledger_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: import-external-persona
+spec:
+  sessions:
+    - session_id: triage
+      persona_id: external-persona
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_deny: ["*"]
+        mcp_tool_deny: ["*"]
+      credential_scope:
+        route_deny: ["*"]
+        connector_deny: ["*"]
+        connector_credential_deny: ["*"]
+        mcp_server_deny: ["*"]
+"#;
+        let context = StackContext::from_manifest(
+            raw,
+            PathBuf::from("."),
+            Some(temp.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+
+        let error = import_stack(
+            &EmptyControlPlane,
+            context,
+            StackImportOptions {
+                resources: vec!["session/triage".to_string()],
+            },
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(message.contains("KheishStack import refused"), "{message}");
+        assert!(message.contains("external-persona"), "{message}");
+        assert!(!stack_ledger_path(temp.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn import_rejects_explicit_resource_not_declared_in_manifest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: hijack
+spec: {}
+"#;
+        let context = StackContext::from_manifest(
+            raw,
+            PathBuf::from("."),
+            Some(temp.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+
+        let error = import_stack(
+            &EmptyControlPlane,
+            context,
+            StackImportOptions {
+                resources: vec!["session/victim".to_string()],
+            },
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(
+            message.contains(
+                "stack import resource `session/victim` is not declared in this KheishStack manifest"
+            ),
+            "{message}"
+        );
+        assert!(!stack_ledger_path(temp.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn import_rejects_external_connector_policy_persona_before_ledger_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: import-external-connector-persona
+spec:
+  connectors:
+    - kind: http
+      name: ingress
+      spec:
+        allow_unauthenticated_ingress: true
+        session_policy:
+          create_if_missing: true
+          persona_id: external-persona
+          capability_scope:
+            skill_deny: ["*"]
+            mcp_server_deny: ["*"]
+            mcp_tool_deny: ["*"]
+          credential_scope:
+            route_deny: ["*"]
+            connector_deny: ["*"]
+            connector_credential_deny: ["*"]
+            mcp_server_deny: ["*"]
+"#;
+        let context = StackContext::from_manifest(
+            raw,
+            PathBuf::from("."),
+            Some(temp.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+
+        let error = import_stack(
+            &EmptyControlPlane,
+            context,
+            StackImportOptions {
+                resources: vec!["connector/http/ingress".to_string()],
+            },
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(message.contains("KheishStack import refused"), "{message}");
+        assert!(message.contains("external-persona"), "{message}");
+        assert!(!stack_ledger_path(temp.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn import_rejects_excess_explicit_resources_before_ledger_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: import-resource-cap
+spec: {}
+"#;
+        let context = StackContext::from_manifest(
+            raw,
+            PathBuf::from("."),
+            Some(temp.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+        let resources = (0..=STACK_MAX_RESOURCE_COUNT)
+            .map(|index| format!("session/import-resource-cap-{index}"))
+            .collect();
+
+        let error = import_stack(
+            &EmptyControlPlane,
+            context,
+            StackImportOptions { resources },
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(message.contains("explicit resources"), "{message}");
+        assert!(message.contains("resource limit"), "{message}");
+        assert!(!stack_ledger_path(temp.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_file_refs_through_daemon_api_context() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: self-contained-only
+spec:
+  personas:
+    - persona_id: reviewer
+      display_name: Reviewer
+      soul_file: reviewer.md
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_deny: ["*"]
+        mcp_tool_deny: ["*"]
+"#;
+
+        let validation = validate_stack_context(&context(raw)).await.unwrap();
+
+        assert!(!validation.valid);
+        assert!(errors_contain(
+            &validation,
+            "file reference reviewer.md is not allowed through the daemon Stack API"
+        ));
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_opaque_agent_templates_in_v1alpha1() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: no-opaque-noop
+spec:
+  agent_templates:
+    - name: custom
+"#;
+
+        let validation = validate_stack_context(&context(raw)).await.unwrap();
+
+        assert!(!validation.valid);
+        assert!(errors_contain(
+            &validation,
+            "spec.agent_templates is not supported by KheishStack v1alpha1"
+        ));
+    }
+
+    #[test]
+    fn manifest_source_rejects_yaml_anchor_and_alias_before_parse() {
+        let anchor = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata: &metadata
+  name: anchor-stack
+spec: {}
+"#;
+        let alias = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: alias-stack
+spec:
+  agent_templates: *templates
+"#;
+        let tagged_anchor = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata: !<tag:yaml.org,2002:map> &metadata
+  name: tagged-anchor-stack
+spec: {}
+"#;
+        let sequence_block_scalar_sibling = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: sequence-block-sibling-anchor
+spec:
+  personas:
+    - soul: |
+        harmless markdown
+      persona_id: reviewer
+      display_name: Reviewer
+      capability_scope: &closed
+        skill_deny: ["*"]
+        mcp_server_deny: ["*"]
+        mcp_tool_deny: ["*"]
+      metadata: *closed
+"#;
+
+        for raw in [anchor, alias, tagged_anchor, sequence_block_scalar_sibling] {
+            let error = StackContext::from_manifest(raw, PathBuf::from("."), None, true)
+                .expect_err("anchor/alias should be rejected before serde_yaml parse");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("anchors and aliases are disabled"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_source_allows_anchor_like_text_inside_strings_and_block_scalars() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: prose-stack
+  labels:
+    glob: "*quoted"
+    note: see *literal as prose
+spec:
+  personas:
+    - persona_id: prose
+      display_name: Prose
+      soul: |2
+          * This is markdown, not a YAML alias.
+          & This is prose, not a YAML anchor.
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_deny: ["*"]
+        mcp_tool_deny: ["*"]
+"#;
+
+        StackContext::from_manifest(raw, PathBuf::from("."), None, true)
+            .expect("quoted and block-scalar anchor-like prose should be allowed");
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_excess_stack_resources() {
+        let mut raw = String::from(
+            r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: resource-cap
+spec:
+  verification:
+"#,
+        );
+        for index in 0..=STACK_MAX_RESOURCE_COUNT {
+            raw.push_str(&format!(
+                "    - name: secret-{index}\n      type: secret_exists\n      slot: stack.secret.{index}\n"
+            ));
+        }
+
+        let validation = validate_stack_context(&context(&raw)).await.unwrap();
+
+        assert!(!validation.valid);
+        assert!(errors_contain(&validation, "resource limit"));
+    }
+
+    #[tokio::test]
+    async fn resolved_stack_rejects_oversized_file_refs_when_enabled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            temp.path().join("soul.md"),
+            "x".repeat(STACK_MANIFEST_BODY_LIMIT_BYTES + 1),
+        )
+        .expect("write soul");
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: oversized-file-ref
+spec:
+  personas:
+    - persona_id: oversized
+      display_name: Oversized
+      soul_file: soul.md
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_deny: ["*"]
+        mcp_tool_deny: ["*"]
+"#;
+        let mut context =
+            StackContext::from_manifest(raw, temp.path().to_path_buf(), None, true).unwrap();
+        context.allow_file_refs = true;
+
+        let error = ResolvedStack::from_context(&context).await.unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(message.contains("KheishStack file limit"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn resolved_stack_rejects_playbook_manifest_file_anchors_when_enabled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            temp.path().join("playbook.yaml"),
+            r#"
+playbook_id: anchored
+version: "1.0.0"
+title: &title Anchored
+description: Demo
+steps: []
+"#,
+        )
+        .expect("write playbook");
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: anchored-playbook-ref
+spec:
+  playbooks:
+    - manifest_file: playbook.yaml
+"#;
+        let mut context =
+            StackContext::from_manifest(raw, temp.path().to_path_buf(), None, true).unwrap();
+        context.allow_file_refs = true;
+
+        let error = ResolvedStack::from_context(&context).await.unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(
+            message.contains("anchors and aliases are disabled"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn secret_value_env_is_not_read_without_explicit_plan_permission() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: secret-env-guard
+spec:
+  requires:
+    secrets:
+      - ref: mcp.example.API_KEY
+        value_env: KHEISH_STACK_TEST_ENV_SHOULD_NOT_BE_READ
+"#;
+        let context = context(raw);
+        let resolved = ResolvedStack::from_context(&context).await.unwrap();
+        let ledger = ApplyLedger::new();
+        let mut plan = empty_test_plan(&context);
+
+        add_secret_actions(
+            &EmptyControlPlane,
+            &context,
+            &resolved,
+            &ledger,
+            false,
+            &mut plan,
+        )
+        .await
+        .unwrap();
+
+        assert!(plan.errors.iter().any(|error| error.contains(
+            "pass allow_secret_env=true to read the daemon environment for planning/apply"
+        )));
+        assert!(
+            !plan
+                .errors
+                .iter()
+                .any(|error| error.contains("failed to read environment variable")),
+            "{:?}",
+            plan.errors
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_rejects_value_env_secret_when_live_slot_is_not_imported() {
+        let _guard = crate::debug::debug_capture_env_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let env_name = "KHEISH_STACK_TEST_UNOWNED_LIVE_SECRET_PLAN";
+        unsafe {
+            std::env::set_var(env_name, "new-value");
+        }
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: unowned-live-secret-plan
+spec:
+  requires:
+    secrets:
+      - ref: stack.test.LIVE_SECRET
+        provider: generic
+        value_env: KHEISH_STACK_TEST_UNOWNED_LIVE_SECRET_PLAN
+"#;
+        let context = StackContext::from_manifest(
+            raw,
+            PathBuf::from("."),
+            Some(temp.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+
+        let plan = build_plan(&LiveSecretControlPlane::default(), &context, false, true)
+            .await
+            .unwrap();
+
+        unsafe {
+            std::env::remove_var(env_name);
+        }
+        assert!(!plan.valid);
+        assert!(
+            plan.errors.iter().any(|error| {
+                error.contains(
+                    "resource secret/stack.test.LIVE_SECRET already exists but is not owned",
+                )
+            }),
+            "{:?}",
+            plan.errors
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_rejects_value_env_secret_when_live_slot_is_not_imported_before_write() {
+        let _guard = crate::debug::debug_capture_env_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let env_name = "KHEISH_STACK_TEST_UNOWNED_LIVE_SECRET_APPLY";
+        unsafe {
+            std::env::set_var(env_name, "new-value");
+        }
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: unowned-live-secret-apply
+spec:
+  requires:
+    secrets:
+      - ref: stack.test.LIVE_SECRET
+        provider: generic
+        value_env: KHEISH_STACK_TEST_UNOWNED_LIVE_SECRET_APPLY
+"#;
+        let context = StackContext::from_manifest(
+            raw,
+            PathBuf::from("."),
+            Some(temp.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+        let client = LiveSecretControlPlane::default();
+
+        let error = apply_stack(
+            &client,
+            context,
+            StackApplyOptions {
+                dry_run: false,
+                force_restart: false,
+                allow_secret_env: true,
+                prune: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{error:#}");
+
+        unsafe {
+            std::env::remove_var(env_name);
+        }
+        assert!(
+            message.contains("KheishStack apply refused because the plan contains errors"),
+            "{message}"
+        );
+        assert!(client.posts.lock().unwrap().is_empty());
+        assert!(!stack_ledger_path(temp.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn apply_rejects_live_persona_created_between_plan_and_apply() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: persona-race
+spec:
+  personas:
+    - persona_id: race-persona
+      display_name: Stack Persona
+      soul: Managed by stack.
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_deny: ["*"]
+        mcp_tool_deny: ["*"]
+"#;
+        let context = StackContext::from_manifest(
+            raw,
+            PathBuf::from("."),
+            Some(temp.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+        let client = RacePersonaControlPlane::default();
+
+        let error = apply_stack(
+            &client,
+            context,
+            StackApplyOptions {
+                dry_run: false,
+                force_restart: false,
+                allow_secret_env: false,
+                prune: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(
+            message.contains(
+                "resource persona/race-persona already exists but is not owned by stack `persona-race`"
+            ),
+            "{message}"
+        );
+        assert!(client.writes.lock().unwrap().is_empty());
+        let ledger = ApplyLedger::load_or_new(&stack_ledger_path(temp.path()))
+            .await
+            .unwrap();
+        assert!(
+            ledger
+                .owner_of_resource(&ResourceKey::new("persona", "race-persona"))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_persists_connector_claim_before_create_write() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: connector-claim
+spec:
+  connectors:
+    - kind: http
+      name: claimed
+      spec:
+        allow_unauthenticated_ingress: true
+        session_policy:
+          create_if_missing: true
+          capability_scope:
+            skill_deny: ["*"]
+            mcp_server_deny: ["*"]
+            mcp_tool_deny: ["*"]
+          credential_scope:
+            route_deny: ["*"]
+            connector_deny: ["*"]
+            connector_credential_deny: ["*"]
+            mcp_server_deny: ["*"]
+"#;
+        let context = StackContext::from_manifest(
+            raw,
+            PathBuf::from("."),
+            Some(temp.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+        let ledger_path = stack_ledger_path(temp.path());
+        let client = ClaimObservedConnectorControlPlane {
+            ledger_path: ledger_path.clone(),
+            observed_pending_claim: std::sync::Mutex::new(false),
+            created: std::sync::Mutex::new(false),
+        };
+
+        let report = apply_stack(
+            &client,
+            context,
+            StackApplyOptions {
+                dry_run: false,
+                force_restart: false,
+                allow_secret_env: false,
+                prune: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            *client.observed_pending_claim.lock().unwrap(),
+            "connector PUT did not observe a persisted pending claim"
+        );
+        assert!(
+            report
+                .applied
+                .iter()
+                .any(|action| action.resource_type == "connector"
+                    && action.resource_id == "http/claimed")
+        );
+        let ledger = ApplyLedger::load_or_new(&ledger_path).await.unwrap();
+        let stack = ledger.stack("connector-claim").expect("stack ledger");
+        assert!(
+            stack.pending_resources.is_empty(),
+            "{:?}",
+            stack.pending_resources
+        );
+        assert_eq!(
+            ledger.owner_of_resource(&ResourceKey::new("connector", "http/claimed")),
+            Some("connector-claim")
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_rolls_back_connector_claim_when_create_if_absent_loses_race() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: connector-race
+spec:
+  connectors:
+    - kind: http
+      name: race
+      spec:
+        allow_unauthenticated_ingress: true
+        session_policy:
+          create_if_missing: true
+          capability_scope:
+            skill_deny: ["*"]
+            mcp_server_deny: ["*"]
+            mcp_tool_deny: ["*"]
+          credential_scope:
+            route_deny: ["*"]
+            connector_deny: ["*"]
+            connector_credential_deny: ["*"]
+            mcp_server_deny: ["*"]
+"#;
+        let context = StackContext::from_manifest(
+            raw,
+            PathBuf::from("."),
+            Some(temp.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+        let ledger_path = stack_ledger_path(temp.path());
+        let client = RaceConnectorCreateControlPlane {
+            ledger_path: ledger_path.clone(),
+            observed_pending_claim: std::sync::Mutex::new(false),
+        };
+
+        let error = apply_stack(
+            &client,
+            context,
+            StackApplyOptions {
+                dry_run: false,
+                force_restart: false,
+                allow_secret_env: false,
+                prune: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(
+            *client.observed_pending_claim.lock().unwrap(),
+            "connector create-if-absent did not observe a persisted pending claim"
+        );
+        assert!(
+            message.contains("http connector race already exists"),
+            "{message}"
+        );
+        let ledger = ApplyLedger::load_or_new(&ledger_path).await.unwrap();
+        assert!(
+            ledger
+                .owner_of_resource(&ResourceKey::new("connector", "http/race"))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_preserves_connector_claim_when_create_error_may_have_committed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: connector-committed
+spec:
+  connectors:
+    - kind: http
+      name: committed
+      spec:
+        allow_unauthenticated_ingress: true
+        session_policy:
+          create_if_missing: true
+          capability_scope:
+            skill_deny: ["*"]
+            mcp_server_deny: ["*"]
+            mcp_tool_deny: ["*"]
+          credential_scope:
+            route_deny: ["*"]
+            connector_deny: ["*"]
+            connector_credential_deny: ["*"]
+            mcp_server_deny: ["*"]
+"#;
+        let context = StackContext::from_manifest(
+            raw,
+            PathBuf::from("."),
+            Some(temp.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+        let ledger_path = stack_ledger_path(temp.path());
+        let client = CommittedThenErroredConnectorControlPlane {
+            created: std::sync::Mutex::new(false),
+        };
+
+        let error = apply_stack(
+            &client,
+            context,
+            StackApplyOptions {
+                dry_run: false,
+                force_restart: false,
+                allow_secret_env: false,
+                prune: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(
+            message.contains("preserved pending stack ownership claim"),
+            "{message}"
+        );
+        let ledger = ApplyLedger::load_or_new(&ledger_path).await.unwrap();
+        assert_eq!(
+            ledger.owner_of_resource(&ResourceKey::new("connector", "http/committed")),
+            Some("connector-committed")
+        );
+    }
+
+    #[tokio::test]
+    async fn down_preserves_pending_claims_for_reapply_recovery() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: pending-down
+spec: {}
+"#;
+        let context = StackContext::from_manifest(
+            raw,
+            PathBuf::from("."),
+            Some(temp.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+        let ledger_path = stack_ledger_path(temp.path());
+        let mut ledger = ApplyLedger::new();
+        let key = ResourceKey::new("connector", "http/pending");
+        ledger
+            .claim_resource("pending-down", &key, "digest".to_string())
+            .unwrap();
+        ledger.save(&ledger_path).await.unwrap();
+
+        let report = down_stack(&EmptyControlPlane, context, StackDownOptions { yes: true })
+            .await
+            .unwrap();
+
+        assert!(report.actions.is_empty());
+        let ledger = ApplyLedger::load_or_new(&ledger_path).await.unwrap();
+        assert_eq!(ledger.owner_of_resource(&key), Some("pending-down"));
+        assert!(
+            ledger
+                .stack("pending-down")
+                .expect("stack ledger")
+                .pending_resources
+                .contains_key(&key.to_string())
+        );
+    }
+
+    #[test]
+    fn secret_down_actions_are_blocked() {
+        let full_down = down_action_for_key(ResourceKey::new("secret", "anthropic/api_key"), true);
+        let prune = down_action_for_key(ResourceKey::new("secret", "anthropic/api_key"), false);
+
+        assert_eq!(full_down.operation, "blocked");
+        assert!(full_down.reason.contains("never deletes"));
+        assert_eq!(prune.operation, "blocked");
+        assert!(prune.reason.contains("deleted explicitly"));
+    }
+
+    #[tokio::test]
+    async fn down_executes_deletable_resources_and_retains_blocked_resources() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: partial-down
+spec: {}
+"#;
+        let context = StackContext::from_manifest(
+            raw,
+            PathBuf::from("."),
+            Some(temp.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+        let ledger_path = stack_ledger_path(temp.path());
+        let mut ledger = ApplyLedger::new();
+        ledger.record_resource(
+            "partial-down",
+            &ResourceKey::new("connector", "http/partial-down-webhook"),
+            "connector-digest".to_string(),
+        );
+        ledger.record_resource(
+            "partial-down",
+            &ResourceKey::new("persona", "partial-down-persona"),
+            "persona-digest".to_string(),
+        );
+        ledger.save(&ledger_path).await.unwrap();
+        let client = RecordingControlPlane::default();
+
+        let report = down_stack(&client, context, StackDownOptions { yes: true })
+            .await
+            .unwrap();
+
+        assert!(report.executed);
+        assert!(
+            report.actions.iter().any(|action| {
+                action.resource_type == "persona" && action.operation == "blocked"
+            })
+        );
+        let deletes = client.deletes.lock().unwrap().clone();
+        assert_eq!(
+            deletes,
+            vec!["/v1/runtime/connectors/http/partial-down-webhook".to_string()]
+        );
+        let ledger = ApplyLedger::load_or_new(&ledger_path).await.unwrap();
+        assert!(
+            ledger
+                .owner_of_resource(&ResourceKey::new("connector", "http/partial-down-webhook"))
+                .is_none()
+        );
+        assert_eq!(
+            ledger.owner_of_resource(&ResourceKey::new("persona", "partial-down-persona")),
+            Some("partial-down")
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_executes_deletable_resources_and_retains_blocked_resources() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: partial-prune
+spec: {}
+"#;
+        let context = StackContext::from_manifest(
+            raw,
+            PathBuf::from("."),
+            Some(temp.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+        let ledger_path = stack_ledger_path(temp.path());
+        let mut ledger = ApplyLedger::new();
+        ledger.record_resource(
+            "partial-prune",
+            &ResourceKey::new("connector", "http/partial-prune-webhook"),
+            "connector-digest".to_string(),
+        );
+        ledger.record_resource(
+            "partial-prune",
+            &ResourceKey::new("secret", "stack.e2e.PRUNE_SECRET"),
+            "secret-digest".to_string(),
+        );
+        ledger.save(&ledger_path).await.unwrap();
+        let client = RecordingControlPlane::default();
+
+        let report = apply_stack(
+            &client,
+            context,
+            StackApplyOptions {
+                dry_run: false,
+                force_restart: false,
+                allow_secret_env: false,
+                prune: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            report
+                .applied
+                .iter()
+                .any(|action| action.resource_type == "connector" && action.operation == "delete")
+        );
+        assert!(
+            !report
+                .applied
+                .iter()
+                .any(|action| action.operation == "blocked")
+        );
+        let deletes = client.deletes.lock().unwrap().clone();
+        assert_eq!(
+            deletes,
+            vec!["/v1/runtime/connectors/http/partial-prune-webhook".to_string()]
+        );
+        let ledger = ApplyLedger::load_or_new(&ledger_path).await.unwrap();
+        assert!(
+            ledger
+                .owner_of_resource(&ResourceKey::new("connector", "http/partial-prune-webhook"))
+                .is_none()
+        );
+        assert_eq!(
+            ledger.owner_of_resource(&ResourceKey::new("secret", "stack.e2e.PRUNE_SECRET")),
+            Some("partial-prune")
+        );
+    }
+
+    #[tokio::test]
+    async fn down_rejects_api_manifest_file_refs_without_touching_ledger() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: down-file-ref
+spec:
+  personas:
+    - persona_id: reviewer
+      display_name: Reviewer
+      soul_file: reviewer.md
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_deny: ["*"]
+        mcp_tool_deny: ["*"]
+"#;
+        let context = StackContext::from_manifest(
+            raw,
+            PathBuf::from("."),
+            Some(temp.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+
+        let error = down_stack(&EmptyControlPlane, context, StackDownOptions { yes: true })
+            .await
+            .unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(
+            message.contains("file references are not allowed"),
+            "{message}"
+        );
+        assert!(
+            message.contains("spec.personas[reviewer].soul_file"),
+            "{message}"
+        );
+        assert!(!stack_ledger_path(temp.path()).exists());
+    }
+
+    #[test]
+    fn ledger_lock_can_be_reacquired_after_drop() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger_path = temp.path().join("ledger.json");
+        let lock_path = ledger_path.with_extension("lock");
+
+        {
+            let _lock = LedgerLock::acquire(&ledger_path).expect("acquire ledger lock");
+            assert!(lock_path.exists());
+        }
+
+        let _lock = LedgerLock::acquire(&ledger_path).expect("reacquire ledger lock");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ledger_lock_rejects_concurrent_holder_and_leaves_lock_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger_path = temp.path().join("ledger.json");
+        let lock_path = ledger_path.with_extension("lock");
+        let lock = LedgerLock::acquire(&ledger_path).expect("acquire ledger lock");
+
+        let error =
+            LedgerLock::acquire(&ledger_path).expect_err("second lock holder should be rejected");
+        let message = format!("{error:#}");
+        assert!(message.contains("apply ledger is locked"), "{message}");
+
+        drop(lock);
+        assert!(lock_path.exists());
+        let _reacquired = LedgerLock::acquire(&ledger_path).expect("reacquire after drop");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ledger_lock_rejects_symlink_lock_file_without_truncating_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger_path = temp.path().join("ledger.json");
+        let lock_path = ledger_path.with_extension("lock");
+        let target = temp.path().join("target.txt");
+        std::fs::write(&target, "must stay intact").expect("write target");
+        std::os::unix::fs::symlink(&target, &lock_path).expect("symlink lock");
+
+        let error =
+            LedgerLock::acquire(&ledger_path).expect_err("symlink lockfile should be rejected");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("failed to open"), "{message}");
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read target"),
+            "must stay intact"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_private_file_rejects_symlink_without_truncating_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tmp_path = temp.path().join("ledger.json.tmp-exact");
+        let target = temp.path().join("target.txt");
+        std::fs::write(&target, "must stay intact").expect("write target");
+        std::os::unix::fs::symlink(&target, &tmp_path).expect("symlink tmp");
+
+        let error = write_private_file(&tmp_path, b"new ledger").expect_err("symlink tmp rejected");
+        let message = format!("{error:#}");
+
+        assert!(
+            message.contains("File exists")
+                || message.contains("Too many levels of symbolic links"),
+            "{message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read target"),
+            "must stay intact"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn ledger_save_ignores_stale_fixed_tmp_symlink_without_truncating_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger_path = temp.path().join("ledger.json");
+        let stale_tmp = ledger_path.with_extension("json.tmp");
+        let target = temp.path().join("target.txt");
+        std::fs::write(&target, "must stay intact").expect("write target");
+        std::os::unix::fs::symlink(&target, &stale_tmp).expect("symlink stale tmp");
+
+        let ledger = ApplyLedger::new();
+        ledger.save(&ledger_path).await.expect("save ledger");
+
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read target"),
+            "must stay intact"
+        );
+        assert!(ledger_path.exists());
+        assert!(
+            std::fs::symlink_metadata(&stale_tmp)
+                .expect("stale tmp metadata")
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn connector_secret_match_compares_redacted_sources() {
+        let live_secret_ref = crate::ConnectorSecretView {
+            configured: true,
+            source: Some("secret_ref".to_string()),
+            secret_ref: Some("mcp.example.API_KEY".to_string()),
+            env: None,
+        };
+        let desired_secret_ref = crate::ConnectorSecretInput {
+            secret_ref: Some("mcp.example.API_KEY".to_string()),
+            value: None,
+            env: None,
+        };
+        assert!(connector_secret_matches(
+            &live_secret_ref,
+            Some(&desired_secret_ref)
+        ));
+
+        let live_env = crate::ConnectorSecretView {
+            configured: true,
+            source: Some("env".to_string()),
+            secret_ref: None,
+            env: Some("HTTP_TOKEN".to_string()),
+        };
+        let desired_env = crate::ConnectorSecretInput {
+            secret_ref: None,
+            value: None,
+            env: Some("HTTP_TOKEN".to_string()),
+        };
+        assert!(connector_secret_matches(&live_env, Some(&desired_env)));
+
+        let absent = crate::ConnectorSecretView {
+            configured: false,
+            source: None,
+            secret_ref: None,
+            env: None,
+        };
+        assert!(connector_secret_matches(&absent, None));
+        assert!(!connector_secret_matches(&absent, Some(&desired_env)));
+    }
+
+    #[test]
+    fn ownership_diagnostics_reject_cross_stack_and_unowned_existing_resources() {
+        let mut ledger = ApplyLedger::new();
+        ledger.record_resource(
+            "other-stack",
+            &ResourceKey::new("persona", "owned-elsewhere"),
+            "digest".to_string(),
+        );
+        let mut plan = StackPlan {
+            stack: "current".to_string(),
+            ownership_id: "current-stack".to_string(),
+            ledger_path: String::new(),
+            valid: true,
+            restart_required: false,
+            actions: vec![
+                StackAction::new(
+                    "personas",
+                    "persona",
+                    "owned-elsewhere",
+                    "noop",
+                    "live persona exists",
+                ),
+                StackAction::new(
+                    "personas",
+                    "persona",
+                    "unowned-live",
+                    "update",
+                    "live persona drifted",
+                ),
+                StackAction::new("personas", "persona", "new", "create", "new persona"),
+            ],
+            errors: Vec::new(),
+            warnings: Vec::new(),
+            summary: StackPlanSummary::default(),
+        };
+
+        add_ownership_diagnostics(&ledger, "current-stack", &mut plan);
+
+        assert_eq!(plan.errors.len(), 2, "{:?}", plan.errors);
+        assert!(plan.errors.iter().any(|error| {
+            error.contains(
+                "resource persona/owned-elsewhere is already owned by stack `other-stack`",
+            )
+        }));
+        assert!(plan.errors.iter().any(|error| {
+            error.contains(
+                "resource persona/unowned-live already exists but is not owned by stack `current-stack`",
+            )
+        }));
+    }
+
+    #[test]
+    fn secret_fingerprint_tracks_value_without_storing_value() {
+        let _guard = crate::debug::debug_capture_env_lock();
+        let env_name = "KHEISH_STACK_TEST_SECRET_FINGERPRINT";
+        let ledger = ApplyLedger::new();
+
+        unsafe {
+            std::env::set_var(env_name, "first-value");
+        }
+        let first = secret_fingerprint(&ledger.ledger_salt, "linear/api_key", env_name).unwrap();
+        let repeated = secret_fingerprint(&ledger.ledger_salt, "linear/api_key", env_name).unwrap();
+        assert_eq!(first, repeated);
+
+        unsafe {
+            std::env::set_var(env_name, "rotated-value");
+        }
+        let rotated = secret_fingerprint(&ledger.ledger_salt, "linear/api_key", env_name).unwrap();
+        assert_ne!(first, rotated);
+
+        unsafe {
+            std::env::remove_var(env_name);
+        }
+    }
+
+    #[test]
+    fn owner_of_resource_recognizes_legacy_secret_records() {
+        let mut ledger = ApplyLedger::new();
+        ledger.record_secret(
+            "legacy-stack",
+            "stack.test.LEGACY_SECRET",
+            "fingerprint".to_string(),
+        );
+
+        assert_eq!(
+            ledger.owner_of_resource(&ResourceKey::new("secret", "stack.test.LEGACY_SECRET")),
+            Some("legacy-stack")
+        );
+    }
+}

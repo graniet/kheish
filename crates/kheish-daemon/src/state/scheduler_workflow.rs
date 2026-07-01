@@ -21,7 +21,22 @@ where
 
     pub(crate) async fn create_schedule(
         self: &Arc<Self>,
+        request: ScheduleCreateRequest,
+    ) -> Result<ScheduleView> {
+        self.create_schedule_with_name_policy(request, false).await
+    }
+
+    pub(crate) async fn create_schedule_if_name_absent(
+        self: &Arc<Self>,
+        request: ScheduleCreateRequest,
+    ) -> Result<ScheduleView> {
+        self.create_schedule_with_name_policy(request, true).await
+    }
+
+    async fn create_schedule_with_name_policy(
+        self: &Arc<Self>,
         mut request: ScheduleCreateRequest,
+        reject_existing_name: bool,
     ) -> Result<ScheduleView> {
         validate_schedule_create_request(&request)?;
         let target_agent = self
@@ -82,7 +97,13 @@ where
         }
         let now = now_ms();
         let record = build_schedule_record(self.schedule_service.next_schedule_id(), now, request)?;
-        let view = self.schedule_service.create_schedule(record).await?;
+        let view = if reject_existing_name {
+            self.schedule_service
+                .create_schedule_if_name_absent(record)
+                .await?
+        } else {
+            self.schedule_service.create_schedule(record).await?
+        };
         info!(
             schedule_id = %view.schedule_id,
             target_session_id = %view.target_session_id,

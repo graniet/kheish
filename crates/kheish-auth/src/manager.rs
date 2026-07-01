@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
@@ -414,6 +414,27 @@ impl AuthManager {
             }
             return Err(error);
         }
+        *self
+            .records
+            .write()
+            .expect("auth manager records rwlock poisoned") = next;
+        self.refresh_debug_redaction_tokens();
+        self.broker.unrevoke_slot(&record.slot_id)?;
+        self.status(&record.slot_id)
+            .await?
+            .ok_or_else(|| anyhow!("failed to load auth slot status after save"))
+    }
+
+    pub async fn put_record_if_absent(&self, record: AuthSlotRecord) -> Result<AuthSlotStatus> {
+        let slot_lock = self.slot_lock(&record.slot_id);
+        let _slot_guard = slot_lock.lock().await;
+        let _mutation_guard = self.mutation_lock.lock().await;
+        let mut next = self.snapshot_records();
+        if next.contains_key(&record.slot_id.0) {
+            bail!("secret `{}` already exists", record.slot_id);
+        }
+        next.insert(record.slot_id.0.clone(), record.clone());
+        self.persist_records(next.clone()).await?;
         *self
             .records
             .write()

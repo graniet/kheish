@@ -80,6 +80,8 @@
         "group": "Operations",
         "pages": [
           "operators/runtime-configuration",
+          "operators/kheish-stack",
+          "operators/kheish-stack-api-spec",
           "operators/production-runbooks",
           "operators/mcp-catalog",
           "operators/oauth",

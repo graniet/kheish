@@ -60,6 +60,9 @@ pub(crate) async fn run() -> Result<()> {
         crate::Command::Playbooks { command } => {
             crate::cli::commands::playbooks::run_playbooks_command(&client, &printer, command).await
         }
+        crate::Command::Stack { command } => {
+            crate::cli::commands::stack::run_stack_command(&client, &printer, command).await
+        }
         crate::Command::Flows { command } => {
             crate::cli::commands::playbooks::run_flows_command(&client, &printer, command).await
         }
@@ -176,6 +179,8 @@ fn is_top_level_command(argument: &str) -> bool {
             | "project"
             | "playbooks"
             | "playbook"
+            | "stack"
+            | "kheishfile"
             | "flows"
             | "flow"
             | "derivations"
