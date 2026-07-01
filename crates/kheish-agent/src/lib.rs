@@ -10,6 +10,6 @@ pub use orchestrator::AgentOrchestrator;
 pub use supervisor::{AgentSupervisor, AgentSupervisorAuditSink};
 pub use types::{
     AgentId, AgentRecord, AgentStatus, AgentSupervisorAuditEntry, AgentSupervisorSnapshot,
-    AgentSupervisorStatusSnapshot, ChildRetentionPolicy, ForkContext, InterruptResult,
-    MailboxMessage, MailboxMessageState, ManagedAgentSnapshot, SubtaskSpec,
+    AgentSupervisorStatusSnapshot, ChildRetentionPolicy, DaemonOwnedWorktree, ForkContext,
+    InterruptResult, MailboxMessage, MailboxMessageState, ManagedAgentSnapshot, SubtaskSpec,
 };

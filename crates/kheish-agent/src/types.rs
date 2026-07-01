@@ -203,6 +203,17 @@ pub struct ForkContext {
     pub worktree_path: Option<String>,
 }
 
+/// Metadata for a worktree created and owned by the daemon.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonOwnedWorktree {
+    /// Absolute path to the managed worktree.
+    pub path: String,
+    /// Absolute source repository root used to create the worktree.
+    pub source_root: String,
+    /// Commit checked out when the worktree was created.
+    pub base_commit: String,
+}
+
 /// The persisted state of a single agent entry.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentRecord {
@@ -247,6 +258,9 @@ pub struct AgentRecord {
     pub sidechain_session_id: Option<String>,
     /// The optional fork context reused during resume.
     pub fork_context: Option<ForkContext>,
+    /// Worktree created by the daemon for this agent, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_owned_worktree: Option<DaemonOwnedWorktree>,
 }
 
 /// A serializable snapshot of supervisor state.

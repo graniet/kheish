@@ -329,6 +329,12 @@ where
         } else {
             Self::passive_snapshot_for_record(record.clone())
         };
+        let end_session_before_close =
+            reason == "close_on_settle" && record.daemon_owned_worktree.is_some();
+        if end_session_before_close {
+            self.end_session(&record.conversation.session_id, Some(reason.to_string()))
+                .await?;
+        }
         let closed_at_ms = now_ms();
         let updated = self.supervisor.update_record(agent_id, |agent| {
             agent.status = final_status.clone();
@@ -344,9 +350,11 @@ where
                 Some(reason),
             );
         }
-        let _ = self
-            .end_session(&updated.conversation.session_id, Some(reason.to_string()))
-            .await;
+        if !end_session_before_close {
+            let _ = self
+                .end_session(&updated.conversation.session_id, Some(reason.to_string()))
+                .await;
+        }
         let _ = self.orchestrator.close_runtime(agent_id);
         snapshot.agent = updated;
         snapshot.last_error = Some(reason.to_string());
@@ -477,6 +485,21 @@ where
 
     pub(crate) async fn restore_registered_agents(&self) -> Result<()> {
         debug!("restoring registered daemon agents");
+        for record in self.supervisor.list() {
+            if record.closed_at_ms.is_some() {
+                continue;
+            }
+            if let Some(ownership) = record.daemon_owned_worktree.as_ref() {
+                self.verify_daemon_owned_worktree(ownership)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to restore daemon-owned worktree for agent {}",
+                            record.id.0
+                        )
+                    })?;
+            }
+        }
         self.orchestrator.restore_registered_agents().await
     }
 }

@@ -2328,6 +2328,35 @@ fn observation_audit_path(state_root: &Path) -> PathBuf {
         .join(format!("{}.jsonl", safe_storage_name("events")))
 }
 
+fn run_test_git_command(cwd: &Path, args: &[&str]) -> Result<()> {
+    let output = std::process::Command::new("git")
+        .arg("-c")
+        .arg("commit.gpgsign=false")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    anyhow::bail!("git {} failed: {}", args.join(" "), stderr.trim())
+}
+
+fn init_test_git_repo(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)?;
+    run_test_git_command(path, &["init"])?;
+    run_test_git_command(
+        path,
+        &["config", "user.email", "kheish-test@example.invalid"],
+    )?;
+    run_test_git_command(path, &["config", "user.name", "Kheish Test"])?;
+    fs::write(path.join("README.md"), "kheish test repo\n")?;
+    run_test_git_command(path, &["add", "README.md"])?;
+    run_test_git_command(path, &["commit", "-m", "init"])?;
+    Ok(())
+}
+
 async fn start_test_daemon<M>(
     state_root: &Path,
     model: Arc<M>,
@@ -20647,6 +20676,7 @@ async fn daemon_agent_summaries_1000_agents_match_get_with_bounded_latency() -> 
                 subtasks: Vec::new(),
                 sidechain_session_id: None,
                 fork_context: None,
+                daemon_owned_worktree: None,
             };
             (agent_id, record)
         })
@@ -53015,6 +53045,279 @@ async fn daemon_session_end_and_worktree_hooks_execute() -> Result<()> {
     assert_eq!(
         std::fs::read_to_string(&worktree_remove_path)?,
         "worktree-remove"
+    );
+
+    let _ = shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_managed_sidechain_worktree_is_created_and_removed() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-state");
+    init_test_git_repo(&state_root)?;
+    let (address, shutdown) = echoing_delay_daemon(&state_root, Duration::from_millis(25)).await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+
+    let root = client
+        .post(format!("{base}/v1/sessions"))
+        .json(&CreateSessionRequest {
+            session_id: Some("managed-worktree-root".to_string()),
+            thread_id: None,
+            persona_id: None,
+            credential_scope: None,
+            capability_scope: None,
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionView>()
+        .await?;
+
+    let mut request =
+        bare_sidechain_request("managed-worktree-child", Some("thread-worktree"), None);
+    request.fork_context.team_name = Some("reviewer".to_string());
+    request.fork_context.isolation = Some("worktree".to_string());
+
+    let child = client
+        .post(format!("{base}/v1/agents/{}/sidechains", root.agent_id))
+        .json(&request)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionView>()
+        .await?;
+    assert_eq!(child.session_id, "managed-worktree-child");
+    let ownership = child
+        .snapshot
+        .agent
+        .daemon_owned_worktree
+        .as_ref()
+        .expect("daemon-owned worktree metadata");
+    let worktree_path = PathBuf::from(&ownership.path);
+    assert!(
+        worktree_path.starts_with(state_root.join(".kheish-agent-worktrees")),
+        "daemon-owned worktree should be under the reserved root: {}",
+        worktree_path.display()
+    );
+    assert_eq!(
+        child
+            .snapshot
+            .agent
+            .fork_context
+            .as_ref()
+            .and_then(|context| context.worktree_path.as_deref()),
+        Some(ownership.path.as_str())
+    );
+    assert!(worktree_path.join(".git").exists());
+    assert_eq!(
+        fs::read_to_string(worktree_path.join("README.md"))?,
+        "kheish test repo\n"
+    );
+
+    let ended = client
+        .post(format!("{base}/v1/sessions/managed-worktree-child/end"))
+        .json(&EndSessionRequest {
+            reason: Some("done".to_string()),
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionView>()
+        .await?;
+    assert!(ended.snapshot.agent.closed_at_ms.is_some());
+    assert!(
+        !worktree_path.exists(),
+        "daemon-managed sidechain worktree should be removed on session end"
+    );
+
+    let _ = shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_does_not_remove_explicit_reserved_worktree_without_ownership() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-state");
+    let worktree_path = state_root
+        .join(".kheish-agent-worktrees")
+        .join("user-owned")
+        .join("explicit");
+    fs::create_dir_all(&worktree_path)?;
+    fs::write(worktree_path.join("sentinel.txt"), "keep\n")?;
+    let (address, shutdown) = echoing_delay_daemon(&state_root, Duration::from_millis(25)).await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+
+    let root = client
+        .post(format!("{base}/v1/sessions"))
+        .json(&CreateSessionRequest {
+            session_id: Some("explicit-worktree-root".to_string()),
+            thread_id: None,
+            persona_id: None,
+            credential_scope: None,
+            capability_scope: None,
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionView>()
+        .await?;
+
+    let mut request =
+        bare_sidechain_request("explicit-worktree-child", Some("thread-worktree"), None);
+    request.fork_context.isolation = Some("worktree".to_string());
+    request.fork_context.worktree_path = Some(worktree_path.display().to_string());
+
+    let child = client
+        .post(format!("{base}/v1/agents/{}/sidechains", root.agent_id))
+        .json(&request)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionView>()
+        .await?;
+    assert_eq!(child.session_id, "explicit-worktree-child");
+    assert!(
+        child.snapshot.agent.daemon_owned_worktree.is_none(),
+        "explicit worktree paths must not be marked daemon-owned"
+    );
+
+    let ended = client
+        .post(format!("{base}/v1/sessions/explicit-worktree-child/end"))
+        .json(&EndSessionRequest {
+            reason: Some("done".to_string()),
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionView>()
+        .await?;
+    assert!(ended.snapshot.agent.closed_at_ms.is_none());
+    assert_eq!(
+        fs::read_to_string(worktree_path.join("sentinel.txt"))?,
+        "keep\n"
+    );
+
+    let _ = shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_managed_worktree_spawn_collision_preserves_existing_directory() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-state");
+    init_test_git_repo(&state_root)?;
+    let (address, shutdown) = echoing_delay_daemon(&state_root, Duration::from_millis(25)).await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+
+    let root = client
+        .post(format!("{base}/v1/sessions"))
+        .json(&CreateSessionRequest {
+            session_id: Some("collision-worktree-root".to_string()),
+            thread_id: None,
+            persona_id: None,
+            credential_scope: None,
+            capability_scope: None,
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionView>()
+        .await?;
+    let spawn_request_id = "collision";
+    let receipt_key = format!("{}:{spawn_request_id}", root.agent_id);
+    let collision_path = state_root
+        .join(".kheish-agent-worktrees")
+        .join(safe_storage_name(&root.agent_id))
+        .join(safe_storage_name(&receipt_key));
+    fs::create_dir_all(&collision_path)?;
+    fs::write(collision_path.join("sentinel.txt"), "do not delete\n")?;
+
+    let mut request =
+        bare_sidechain_request("collision-worktree-child", Some("thread-worktree"), None);
+    request.spawn_request_id = Some(spawn_request_id.to_string());
+    request.fork_context.isolation = Some("worktree".to_string());
+    let response = client
+        .post(format!("{base}/v1/agents/{}/sidechains", root.agent_id))
+        .json(&request)
+        .send()
+        .await?;
+    assert!(
+        !response.status().is_success(),
+        "spawn should fail rather than overwrite an existing non-worktree path"
+    );
+    assert_eq!(
+        fs::read_to_string(collision_path.join("sentinel.txt"))?,
+        "do not delete\n"
+    );
+
+    let _ = shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_managed_worktree_hook_block_prevents_creation() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-state");
+    init_test_git_repo(&state_root)?;
+    let (address, shutdown) = echoing_delay_daemon(&state_root, Duration::from_millis(25)).await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+
+    client
+        .post(format!("{base}/v1/runtime/hooks"))
+        .json(&HookSettings {
+            hooks: BTreeMap::from([(
+                HookEventName::WorktreeCreate,
+                vec![kheish_types::HookDefinition {
+                    name: "block-worktree".to_string(),
+                    matcher: None,
+                    failure_policy: Default::default(),
+                    executor: kheish_types::HookExecutorConfig::Command {
+                        command: "cat >/dev/null; printf '{\"decision\":\"block\",\"continue_execution\":false,\"stop_reason\":\"blocked\"}'".to_string(),
+                        shell: None,
+                        timeout_ms: Some(1_000),
+                    },
+                }],
+            )]),
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let root = client
+        .post(format!("{base}/v1/sessions"))
+        .json(&CreateSessionRequest {
+            session_id: Some("blocked-worktree-root".to_string()),
+            thread_id: None,
+            persona_id: None,
+            credential_scope: None,
+            capability_scope: None,
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionView>()
+        .await?;
+
+    let mut request =
+        bare_sidechain_request("blocked-worktree-child", Some("thread-worktree"), None);
+    request.fork_context.isolation = Some("worktree".to_string());
+    let response = client
+        .post(format!("{base}/v1/agents/{}/sidechains", root.agent_id))
+        .json(&request)
+        .send()
+        .await?;
+    assert!(
+        !response.status().is_success(),
+        "worktree create hook should block the sidechain spawn"
+    );
+    assert!(
+        !state_root.join(".kheish-agent-worktrees").exists(),
+        "blocked worktree hook should prevent daemon-owned worktree creation"
     );
 
     let _ = shutdown.send(());

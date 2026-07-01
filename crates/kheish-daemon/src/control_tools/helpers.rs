@@ -73,23 +73,8 @@ pub(super) async fn populate_spawn_request_from_context(
     ctx: &ToolContext,
     request: &mut SpawnAgentToolRequest,
 ) -> Result<()> {
-    if let Some(cwd) = request.cwd.clone() {
-        let Some(base) = ctx
-            .metadata
-            .get("workspace_root")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-        else {
-            anyhow::bail!("spawn_agent requires workspace_root metadata when cwd is set");
-        };
-        request.cwd = Some(
-            bounded_workspace_root(std::path::Path::new(base), std::path::Path::new(&cwd))?
-                .display()
-                .to_string(),
-        );
-    }
-
     let session_id = execution_session_id(ctx)?;
+    let _ = execution_agent_id(ctx)?;
     if let Some(assistant_message_id) = ctx
         .metadata
         .get("assistant_message_id")
@@ -126,6 +111,24 @@ pub(super) async fn populate_spawn_request_from_context(
                 .map(|run_id| format!("{run_id}:{tool_call_id}"))
                 .unwrap_or_else(|| tool_call_id.to_string())
         });
+    let workspace_root = ctx
+        .metadata
+        .get("workspace_root")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    match request.cwd.clone() {
+        Some(cwd) => {
+            let Some(base) = workspace_root else {
+                anyhow::bail!("spawn_agent requires workspace_root metadata when cwd is set");
+            };
+            request.cwd = Some(
+                bounded_workspace_root(Path::new(base), Path::new(&cwd))?
+                    .display()
+                    .to_string(),
+            );
+        }
+        None => {}
+    }
     Ok(())
 }
 

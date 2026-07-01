@@ -3385,6 +3385,7 @@ mod tests {
                 subtasks: Vec::new(),
                 sidechain_session_id: None,
                 fork_context: None,
+                daemon_owned_worktree: None,
             },
             pending_approvals: approvals,
             pending_questions: questions,

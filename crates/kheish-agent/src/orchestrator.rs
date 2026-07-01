@@ -21,8 +21,8 @@ use crate::snapshot::{
 };
 use crate::supervisor::AgentSupervisor;
 use crate::types::{
-    AgentId, AgentRecord, AgentStatus, ChildRetentionPolicy, ForkContext, InterruptResult,
-    ManagedAgentSnapshot, SubtaskSpec,
+    AgentId, AgentRecord, AgentStatus, ChildRetentionPolicy, DaemonOwnedWorktree, ForkContext,
+    InterruptResult, ManagedAgentSnapshot, SubtaskSpec,
 };
 
 fn filter_resolved_approvals_from_snapshot(
@@ -207,6 +207,7 @@ where
         retention: ChildRetentionPolicy,
         spawned_by_run_id: Option<String>,
         spawn_request_id: Option<String>,
+        daemon_owned_worktree: Option<DaemonOwnedWorktree>,
         subtask: Option<SubtaskSpec>,
     ) -> Result<ManagedAgentSnapshot> {
         let record = self.supervisor.fork(
@@ -218,6 +219,7 @@ where
             retention,
             spawned_by_run_id,
             spawn_request_id,
+            daemon_owned_worktree,
         )?;
         if let Some(subtask) = subtask {
             if let Err(error) = self.supervisor.assign_subtask(&record.id, subtask) {

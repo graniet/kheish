@@ -240,6 +240,7 @@ where
                 }),
             )
             .await;
+        let mut close_owned_worktree_agent = false;
         if let Some(worktree_path) = view
             .snapshot
             .agent
@@ -261,6 +262,35 @@ where
                     }),
                 )
                 .await;
+            if let Some(ownership) = view.snapshot.agent.daemon_owned_worktree.as_ref() {
+                self.remove_daemon_owned_git_worktree(ownership)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to remove daemon-owned worktree {} after session end",
+                            worktree_path
+                        )
+                    })?;
+                close_owned_worktree_agent = true;
+            }
+        }
+        if close_owned_worktree_agent {
+            let closed_at_ms = now_ms();
+            let updated = self.supervisor.update_record(&agent_id, |agent| {
+                if agent.settled_at_ms.is_none() {
+                    agent.settled_at_ms = Some(closed_at_ms);
+                }
+                if agent.closed_at_ms.is_none() {
+                    agent.closed_at_ms = Some(closed_at_ms);
+                }
+            })?;
+            self.supervisor.record_lifecycle_event(
+                "agent_closed",
+                &updated,
+                reason.as_deref().or(Some("end_session")),
+            );
+            let _ = self.orchestrator.close_runtime(&agent_id);
+            self.persist_topology().await?;
         }
         info!(
             session_id = %session_id,

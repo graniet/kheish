@@ -2,10 +2,13 @@
 
 use super::*;
 use crate::api::{validate_input_attachment_requests, validate_submit_input_items};
+use kheish_session::safe_storage_name;
 use kheish_types::{CapabilityScope, CredentialScope, allow_list_allows_entry};
 use sha2::{Digest, Sha256};
 
 const INTERNAL_SIDECHAIN_SPAWN_RECEIPT_KEY_PREFIX: &str = "__kheish_internal_sidechain_spawn__";
+const AGENT_WORKTREE_DIR: &str = ".kheish-agent-worktrees";
+const GIT_WORKTREE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SidechainSpawnReceiptKeyParts {
@@ -779,6 +782,261 @@ where
         anyhow!("sidechain spawn failed: {error}; rollback cleanup also failed: {cleanup_error}")
     }
 
+    fn canonical_workspace_root(&self) -> Result<PathBuf> {
+        std::fs::canonicalize(&self.workspace_root).with_context(|| {
+            format!(
+                "failed to resolve workspace root {}",
+                self.workspace_root.display()
+            )
+        })
+    }
+
+    fn daemon_worktree_root(&self) -> Result<PathBuf> {
+        Ok(self.canonical_workspace_root()?.join(AGENT_WORKTREE_DIR))
+    }
+
+    fn daemon_worktree_path(&self, parent: &AgentId, spawn_receipt_key: &str) -> Result<PathBuf> {
+        Ok(self
+            .daemon_worktree_root()?
+            .join(safe_storage_name(&parent.0))
+            .join(safe_storage_name(spawn_receipt_key)))
+    }
+
+    fn reserved_daemon_worktree_path(&self, path: &Path) -> Result<PathBuf> {
+        let workspace_root = self.canonical_workspace_root()?;
+        let resolved = bounded_workspace_root(&workspace_root, path)?;
+        let root = workspace_root.join(AGENT_WORKTREE_DIR);
+        anyhow::ensure!(
+            resolved.starts_with(&root),
+            "path {} is outside daemon-owned worktree root {}",
+            resolved.display(),
+            root.display()
+        );
+        Ok(resolved)
+    }
+
+    async fn run_git_command(&self, source_root: &Path, args: &[&str]) -> Result<Vec<u8>> {
+        let output = tokio::time::timeout(
+            GIT_WORKTREE_TIMEOUT,
+            Command::new("git")
+                .arg("-C")
+                .arg(source_root)
+                .args(args)
+                .stdin(Stdio::null())
+                .output(),
+        )
+        .await
+        .map_err(|_| anyhow!("git command timed out after 30s"))??;
+        if output.status.success() {
+            return Ok(output.stdout);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(
+            "git {} failed in {}: {}",
+            args.join(" "),
+            source_root.display(),
+            if stderr.is_empty() {
+                output.status.to_string()
+            } else {
+                stderr
+            }
+        )
+    }
+
+    async fn current_git_head(&self, source_root: &Path) -> Result<String> {
+        let output = self
+            .run_git_command(source_root, &["rev-parse", "HEAD"])
+            .await?;
+        let head = String::from_utf8(output)?.trim().to_string();
+        anyhow::ensure!(
+            !head.is_empty(),
+            "git rev-parse HEAD returned an empty commit"
+        );
+        Ok(head)
+    }
+
+    async fn prepare_daemon_owned_worktree(
+        &self,
+        parent: &AgentId,
+        spawn_receipt_key: &str,
+        request: &mut SpawnSidechainRequest,
+    ) -> Result<Option<DaemonOwnedWorktree>> {
+        if request.fork_context.isolation.as_deref() != Some("worktree")
+            || request.fork_context.worktree_path.is_some()
+        {
+            return Ok(None);
+        }
+        let source_root = self.canonical_workspace_root()?;
+        let path = self.daemon_worktree_path(parent, spawn_receipt_key)?;
+        let base_commit = self.current_git_head(&source_root).await?;
+        request.fork_context.worktree_path = Some(path.display().to_string());
+        Ok(Some(DaemonOwnedWorktree {
+            path: path.display().to_string(),
+            source_root: source_root.display().to_string(),
+            base_commit,
+        }))
+    }
+
+    async fn ensure_daemon_owned_git_worktree(
+        &self,
+        ownership: &DaemonOwnedWorktree,
+    ) -> Result<()> {
+        let path = self.reserved_daemon_worktree_path(Path::new(&ownership.path))?;
+        let source_root = Path::new(&ownership.source_root);
+        if path.join(".git").exists() {
+            self.verify_daemon_owned_worktree(ownership).await?;
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !path.exists(),
+            "refusing to create daemon-owned worktree over existing non-worktree path: {}",
+            path.display()
+        );
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::create_dir(&path).await.with_context(|| {
+            format!(
+                "failed to reserve daemon-owned worktree path {}",
+                path.display()
+            )
+        })?;
+        let output = tokio::time::timeout(
+            GIT_WORKTREE_TIMEOUT,
+            Command::new("git")
+                .arg("-C")
+                .arg(source_root)
+                .args(["worktree", "add", "--detach"])
+                .arg(&path)
+                .arg(&ownership.base_commit)
+                .stdin(Stdio::null())
+                .output(),
+        )
+        .await
+        .map_err(|_| anyhow!("git worktree add timed out after 30s"))??;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let error = anyhow!(
+                "git worktree add failed for {}: {}",
+                path.display(),
+                if stderr.is_empty() {
+                    output.status.to_string()
+                } else {
+                    stderr
+                }
+            );
+            if let Err(cleanup_error) = self
+                .remove_failed_daemon_worktree_creation(source_root, &path)
+                .await
+            {
+                return Err(anyhow!(
+                    "git worktree add failed: {error}; cleanup also failed: {cleanup_error}"
+                ));
+            }
+            return Err(error);
+        }
+        self.verify_daemon_owned_worktree(ownership).await
+    }
+
+    async fn remove_failed_daemon_worktree_creation(
+        &self,
+        source_root: &Path,
+        path: &Path,
+    ) -> Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        if path.join(".git").exists() {
+            let output = tokio::time::timeout(
+                GIT_WORKTREE_TIMEOUT,
+                Command::new("git")
+                    .arg("-C")
+                    .arg(source_root)
+                    .args(["worktree", "remove", "--force"])
+                    .arg(path)
+                    .stdin(Stdio::null())
+                    .output(),
+            )
+            .await
+            .map_err(|_| anyhow!("git worktree remove timed out after 30s"))??;
+            anyhow::ensure!(
+                output.status.success(),
+                "git worktree remove failed for {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            return Ok(());
+        }
+        tokio::fs::remove_dir_all(path).await.map_err(Into::into)
+    }
+
+    pub(super) async fn verify_daemon_owned_worktree(
+        &self,
+        ownership: &DaemonOwnedWorktree,
+    ) -> Result<()> {
+        let path = self.reserved_daemon_worktree_path(Path::new(&ownership.path))?;
+        let source_root = Path::new(&ownership.source_root);
+        let output = self
+            .run_git_command(source_root, &["worktree", "list", "--porcelain"])
+            .await?;
+        let list = String::from_utf8(output)?;
+        let registered = list
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .filter_map(|value| std::fs::canonicalize(value).ok())
+            .any(|candidate| candidate == path);
+        anyhow::ensure!(
+            registered,
+            "daemon-owned worktree {} is not registered in source repo {}",
+            ownership.path,
+            source_root.display()
+        );
+        Ok(())
+    }
+
+    pub(super) async fn remove_daemon_owned_git_worktree(
+        &self,
+        ownership: &DaemonOwnedWorktree,
+    ) -> Result<()> {
+        let requested_path = Path::new(&ownership.path);
+        if !requested_path.exists() {
+            return Ok(());
+        }
+        let path = self.reserved_daemon_worktree_path(requested_path)?;
+        anyhow::ensure!(
+            path.join(".git").exists(),
+            "refusing to remove daemon-owned worktree without .git marker: {}",
+            path.display()
+        );
+        self.verify_daemon_owned_worktree(ownership).await?;
+        let source_root = Path::new(&ownership.source_root);
+        let output = tokio::time::timeout(
+            GIT_WORKTREE_TIMEOUT,
+            Command::new("git")
+                .arg("-C")
+                .arg(source_root)
+                .args(["worktree", "remove", "--force"])
+                .arg(&path)
+                .stdin(Stdio::null())
+                .output(),
+        )
+        .await
+        .map_err(|_| anyhow!("git worktree remove timed out after 30s"))??;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(
+            "git worktree remove failed for {}: {}",
+            path.display(),
+            if stderr.is_empty() {
+                output.status.to_string()
+            } else {
+                stderr
+            }
+        )
+    }
+
     async fn rollback_pre_spawn_receipt(
         &self,
         spawn_receipt_key: Option<&str>,
@@ -940,6 +1198,10 @@ where
                 *slot = Some(error);
             }
         };
+        let daemon_owned_worktree = self
+            .supervisor
+            .get(agent_id)
+            .and_then(|record| record.daemon_owned_worktree);
 
         let _ = self.orchestrator.interrupt(agent_id).await;
         let _ = self.orchestrator.close_runtime(agent_id);
@@ -968,6 +1230,11 @@ where
             }
         }
         if let Err(error) = self.persist_topology().await {
+            remember_error(&mut cleanup_error, error);
+        }
+        if let Some(ownership) = daemon_owned_worktree
+            && let Err(error) = self.remove_daemon_owned_git_worktree(&ownership).await
+        {
             remember_error(&mut cleanup_error, error);
         }
         if let Some(cleanup_error) = cleanup_error {
@@ -1492,6 +1759,9 @@ where
             .clone()
             .unwrap_or_else(|| Self::internal_sidechain_spawn_receipt_key(&parent, &conversation));
         let spawn_receipt_is_internal = user_spawn_receipt_key.is_none();
+        let daemon_owned_worktree = self
+            .prepare_daemon_owned_worktree(&parent, &spawn_receipt_key, &mut request)
+            .await?;
         let request_fingerprint =
             Self::sidechain_spawn_request_fingerprint(&request, &conversation)?;
         let policy_scope = self
@@ -1778,6 +2048,17 @@ where
                 return Err(error);
             }
         }
+        if let Some(ownership) = daemon_owned_worktree.as_ref()
+            && let Err(error) = self.ensure_daemon_owned_git_worktree(ownership).await
+        {
+            if let Err(cleanup_error) = self
+                .rollback_pre_spawn_receipt(Some(&spawn_receipt_key), &error)
+                .await
+            {
+                return Err(Self::combined_spawn_failure(&error, cleanup_error));
+            }
+            return Err(error);
+        }
         let requested_name = prepared_subtask
             .as_ref()
             .map(|(subtask, _)| subtask.name.clone());
@@ -1803,6 +2084,7 @@ where
                 retention,
                 spawned_by_run_id.clone(),
                 spawn_request_id,
+                daemon_owned_worktree.clone(),
                 prepared_subtask
                     .as_ref()
                     .map(|(subtask, _)| subtask.clone()),
@@ -1811,9 +2093,21 @@ where
         {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                self.session_service
+                let receipt_cleanup = self
+                    .session_service
                     .forget_sidechain_spawn_receipt(&spawn_receipt_key)
-                    .await?;
+                    .await;
+                let worktree_cleanup = if let Some(ownership) = daemon_owned_worktree.as_ref() {
+                    self.remove_daemon_owned_git_worktree(ownership).await
+                } else {
+                    Ok(())
+                };
+                if let Err(cleanup_error) = receipt_cleanup {
+                    return Err(Self::combined_spawn_failure(&error, cleanup_error));
+                }
+                if let Err(cleanup_error) = worktree_cleanup {
+                    return Err(Self::combined_spawn_failure(&error, cleanup_error));
+                }
                 return Err(error);
             }
         };

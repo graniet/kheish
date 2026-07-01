@@ -11,8 +11,8 @@ use tracing::{debug, info, warn};
 
 use crate::types::{
     AgentId, AgentRecord, AgentStatus, AgentSupervisorAuditEntry, AgentSupervisorSnapshot,
-    AgentSupervisorStatusSnapshot, ChildRetentionPolicy, ForkContext, MailboxMessage,
-    ManagedAgentSnapshot, SubtaskSpec,
+    AgentSupervisorStatusSnapshot, ChildRetentionPolicy, DaemonOwnedWorktree, ForkContext,
+    MailboxMessage, ManagedAgentSnapshot, SubtaskSpec,
 };
 
 const AGENT_SUPERVISOR_AUDIT_LIMIT: usize = 2_048;
@@ -239,6 +239,7 @@ impl AgentSupervisor {
             subtasks: Vec::new(),
             sidechain_session_id: None,
             fork_context: None,
+            daemon_owned_worktree: None,
         };
         agents.insert(id.clone(), record.clone());
         drop(agents);
@@ -275,6 +276,7 @@ impl AgentSupervisor {
         retention: ChildRetentionPolicy,
         spawned_by_run_id: Option<String>,
         spawn_request_id: Option<String>,
+        daemon_owned_worktree: Option<DaemonOwnedWorktree>,
     ) -> Result<AgentRecord> {
         let mut record = self.spawn(
             Some(parent),
@@ -287,6 +289,7 @@ impl AgentSupervisor {
         )?;
         record.sidechain_session_id = Some(record.conversation.session_id.clone());
         record.fork_context = Some(fork_context);
+        record.daemon_owned_worktree = daemon_owned_worktree;
         self.agents
             .lock()
             .expect("agents mutex poisoned")

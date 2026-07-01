@@ -400,6 +400,7 @@ mod tests {
             ChildRetentionPolicy::Retain,
             None,
             None,
+            None,
         )?;
         supervisor.set_status(&child.id, AgentStatus::WaitingForApproval)?;
         let resumed = supervisor.resume(&child.id)?;
@@ -764,6 +765,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect_err("absolute workspace escape should fail");
@@ -813,6 +815,7 @@ mod tests {
             Some("child"),
             None,
             ChildRetentionPolicy::CloseOnSettle,
+            None,
             None,
             None,
         )?;

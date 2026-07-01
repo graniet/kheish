@@ -907,6 +907,7 @@ fn sample_snapshot(agent_id: &str, status: AgentStatus) -> ManagedAgentSnapshot 
             subtasks: Vec::new(),
             sidechain_session_id: None,
             fork_context: None,
+            daemon_owned_worktree: None,
         },
         pending_approvals: Vec::new(),
         pending_questions: Vec::new(),
@@ -2126,6 +2127,34 @@ async fn spawn_agent_tool_rebases_relative_cwd_within_workspace() -> Result<()> 
                 .to_string_lossy()
                 .as_ref()
         )
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn spawn_agent_tool_leaves_worktree_cwd_for_daemon_allocation() -> Result<()> {
+    let control = Arc::new(FakeControl::new());
+    let handle = bind_control(&control);
+    let context = FakeControl::context_with_run("session-a", "agent-parent", "run-1");
+
+    SpawnAgentTool::new(handle)
+        .execute(
+            context,
+            json!({
+                "name": "review:child",
+                "description": "Review in isolation.",
+                "prompt": "Review the diff.",
+                "isolation": "worktree",
+            }),
+        )
+        .await?;
+
+    let state = control.state.lock().expect("fake control mutex poisoned");
+    let request = &state.spawn_requests[0].1;
+    assert_eq!(request.isolation, Some(SpawnIsolation::Worktree));
+    assert!(
+        request.cwd.is_none(),
+        "daemon spawn should allocate the default worktree path"
     );
     Ok(())
 }

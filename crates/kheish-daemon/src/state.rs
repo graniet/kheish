@@ -50,8 +50,8 @@ use tracing::{debug, error, info, warn};
 
 use kheish_agent::{
     AgentId, AgentOrchestrator, AgentRecord, AgentStatus, AgentSupervisor,
-    AgentSupervisorAuditEntry, AgentSupervisorSnapshot, ChildRetentionPolicy, MailboxMessage,
-    ManagedAgentSnapshot, SubtaskSpec,
+    AgentSupervisorAuditEntry, AgentSupervisorSnapshot, ChildRetentionPolicy, DaemonOwnedWorktree,
+    MailboxMessage, ManagedAgentSnapshot, SubtaskSpec,
 };
 use kheish_auth::{
     AUTH_STORE_MASTER_KEY_ENV, AuthManager, AuthProvider, AuthSlotRecord, AuthSlotStatus,
