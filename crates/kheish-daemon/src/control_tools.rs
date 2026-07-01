@@ -31,7 +31,8 @@ use channels::{CreateChannelStimulusTool, ReadChannelThreadTool, SetChannelReact
 use goal::{CreateGoalTool, GetGoalTool, UpdateGoalTool};
 pub(crate) use helpers::parse_permission_mode;
 use helpers::{
-    USER_QUESTION_INPUT_EXAMPLE, build_array_field, build_boolean_field, build_number_field,
+    USER_QUESTION_INPUT_EXAMPLE, build_array_field, build_boolean_field,
+    build_capability_scope_field, build_credential_scope_field, build_number_field,
     build_object_field, build_string_field, build_user_question_expiration_fields,
     build_user_question_request, build_user_questions_field, execution_agent_id,
     execution_session_id, populate_spawn_request_from_context,
@@ -239,6 +240,8 @@ impl Tool for SpawnAgentTool {
                         false,
                         ToolInputKind::String,
                     ),
+                    build_capability_scope_field(),
+                    build_credential_scope_field(),
                     build_string_field("session_id", "Optional child session identifier.", false),
                     build_string_field("thread_id", "Optional child thread identifier.", false),
                     build_string_field(

@@ -403,6 +403,70 @@ pub(super) fn build_array_field(
     }
 }
 
+fn string_array_schema() -> StructuredFieldSchema {
+    let mut schema = StructuredFieldSchema::new(StructuredValueKind::Array);
+    schema.items = Some(Box::new(StructuredFieldSchema::new(
+        StructuredValueKind::String,
+    )));
+    schema
+}
+
+fn optional_string_array_object_schema(fields: &[&str]) -> StructuredFieldSchema {
+    StructuredFieldSchema {
+        kind: StructuredValueKind::Object,
+        fields: BTreeMap::new(),
+        optional_fields: fields
+            .iter()
+            .map(|field| ((*field).to_string(), string_array_schema()))
+            .collect(),
+        items: None,
+    }
+}
+
+pub(super) fn build_capability_scope_field() -> ToolSchemaField {
+    ToolSchemaField {
+        name: "capability_scope".to_string(),
+        kind: ToolInputKind::Object,
+        item_kind: None,
+        structured_schema: Some(optional_string_array_object_schema(&[
+            "skill_allow",
+            "skill_deny",
+            "mcp_server_allow",
+            "mcp_server_deny",
+            "mcp_tool_allow",
+            "mcp_tool_deny",
+        ])),
+        required: false,
+        description: Some(
+            "Optional child capability scope restriction applied on top of the parent session scope."
+                .to_string(),
+        ),
+    }
+}
+
+pub(super) fn build_credential_scope_field() -> ToolSchemaField {
+    ToolSchemaField {
+        name: "credential_scope".to_string(),
+        kind: ToolInputKind::Object,
+        item_kind: None,
+        structured_schema: Some(optional_string_array_object_schema(&[
+            "route_allow",
+            "route_deny",
+            "connector_allow",
+            "connector_deny",
+            "connector_credential_allow",
+            "connector_credential_deny",
+            "mcp_server_allow",
+            "mcp_server_deny",
+        ])),
+        required: false,
+        description: Some(
+            "Optional child credential scope restriction applied on top of the parent session scope."
+                .to_string(),
+        ),
+    }
+}
+
 pub(super) const USER_QUESTION_INPUT_EXAMPLE: &str = r#"{"questions":[{"id":"focus","header":"Focus","question":"Which focus should I use?","options":[{"id":"memory","label":"memory"},{"id":"kernel","label":"kernel"}],"multi_select":false}]}"#;
 
 const USER_QUESTION_FIELD_EXAMPLE: &str = r#"[{"id":"focus","header":"Focus","question":"Which focus should I use?","options":[{"id":"memory","label":"memory"},{"id":"kernel","label":"kernel"}],"multi_select":false}]"#;

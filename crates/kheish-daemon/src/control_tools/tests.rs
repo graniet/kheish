@@ -7,13 +7,14 @@ use async_trait::async_trait;
 use kheish_agent::{AgentId, AgentRecord, AgentStatus, ChildRetentionPolicy, ManagedAgentSnapshot};
 use kheish_runtime::{
     PermissionMode, PromptMergeMode, SandboxProfile, Tool, ToolContext, ToolExecutionOutput,
+    ToolInputKind,
 };
 use kheish_skills::{SkillDefinition, SkillRuntimeConfig, SkillScope, SkillSummary};
 use kheish_types::{
-    ActorRef, AttachmentRef, ConversationKey, DYNAMIC_MCP_TOOL_ALLOWLIST_SENTINEL,
-    ModelGenerationConfig, ReasoningConfig, ReasoningEffort, RichOutput, SessionControlState,
-    SessionGoal, SessionGoalStatus, SkillExecutionContext, TaskRecord, TaskStatus,
-    UserQuestionRequest,
+    ActorRef, AttachmentRef, CapabilityScope, ConversationKey, CredentialScope,
+    DYNAMIC_MCP_TOOL_ALLOWLIST_SENTINEL, ModelGenerationConfig, ReasoningConfig, ReasoningEffort,
+    RichOutput, SessionControlState, SessionGoal, SessionGoalStatus, SkillExecutionContext,
+    TaskRecord, TaskStatus, UserQuestionRequest,
 };
 use serde_json::json;
 
@@ -1049,6 +1050,13 @@ async fn agent_tools_delegate_to_daemon_control() -> Result<()> {
                 "description": "Investigate a subtask.",
                 "prompt": "Inspect the workspace.",
                 "session_id": "child-session",
+                "capability_scope": {
+                    "mcp_server_allow": ["github"],
+                    "mcp_tool_allow": ["mcp__github__pull_request_read"]
+                },
+                "credential_scope": {
+                    "mcp_server_allow": ["github"]
+                },
                 "wait": true,
                 "timeout_ms": 10,
             }),
@@ -1138,6 +1146,28 @@ async fn agent_tools_delegate_to_daemon_control() -> Result<()> {
 
     let state = control.state.lock().expect("fake control mutex poisoned");
     assert_eq!(state.spawn_requests.len(), 1);
+    let request = &state.spawn_requests[0].1;
+    assert_eq!(
+        request
+            .capability_scope
+            .as_ref()
+            .map(|scope| scope.mcp_server_allow.clone()),
+        Some(vec!["github".to_string()])
+    );
+    assert_eq!(
+        request
+            .capability_scope
+            .as_ref()
+            .map(|scope| scope.mcp_tool_allow.clone()),
+        Some(vec!["mcp__github__pull_request_read".to_string()])
+    );
+    assert_eq!(
+        request
+            .credential_scope
+            .as_ref()
+            .map(|scope| scope.mcp_server_allow.clone()),
+        Some(vec!["github".to_string()])
+    );
     assert_eq!(state.mailbox_requests.len(), 1);
     assert_eq!(state.parent_clarification_requests.len(), 1);
     assert_eq!(
@@ -1963,6 +1993,41 @@ fn spawn_agent_descriptor_describes_generic_provider_overrides_and_required_inpu
         description.contains("configured daemon provider"),
         "spawn_agent provider description should stay generic: {description}"
     );
+    for name in ["capability_scope", "credential_scope"] {
+        let field = descriptor
+            .schema
+            .fields
+            .iter()
+            .find(|field| field.name == name)
+            .unwrap_or_else(|| panic!("spawn_agent {name} field should exist"));
+        assert_eq!(field.kind, ToolInputKind::Object);
+        assert!(!field.required);
+        let description = field.description.as_deref().unwrap_or_default();
+        assert!(
+            description.contains("parent session scope"),
+            "spawn_agent {name} description should mention parent restriction: {description}"
+        );
+        let schema = field
+            .structured_schema
+            .as_ref()
+            .unwrap_or_else(|| panic!("spawn_agent {name} should use a closed structured schema"));
+        assert_eq!(schema.kind, kheish_types::StructuredValueKind::Object);
+        assert!(schema.fields.is_empty());
+        assert!(
+            schema.optional_fields.contains_key("mcp_server_allow"),
+            "spawn_agent {name} should expose mcp_server_allow"
+        );
+    }
+    let input_schema = descriptor.definition().input_schema;
+    for name in ["capability_scope", "credential_scope"] {
+        let nested = &input_schema["properties"][name];
+        assert_eq!(nested["additionalProperties"], json!(false));
+        assert_eq!(nested["properties"]["mcp_server_allow"]["type"], "array");
+        assert_eq!(
+            nested["properties"]["mcp_server_allow"]["items"]["type"],
+            "string"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2663,8 +2728,15 @@ fn sidechain_request_from_tool_applies_profiles_and_explicit_overrides() -> Resu
         nickname: None,
         allowed_tools: vec!["spawn_agent".to_string()],
         blocked_tools: vec!["bash".to_string()],
-        capability_scope: None,
-        credential_scope: None,
+        capability_scope: Some(CapabilityScope {
+            mcp_server_allow: vec!["github".to_string()],
+            mcp_tool_allow: vec!["mcp__github__pull_request_read".to_string()],
+            ..CapabilityScope::default()
+        }),
+        credential_scope: Some(CredentialScope {
+            mcp_server_allow: vec!["github".to_string()],
+            ..CredentialScope::default()
+        }),
         wait: false,
         run_in_background: true,
         timeout_ms: None,
@@ -2721,6 +2793,20 @@ fn sidechain_request_from_tool_applies_profiles_and_explicit_overrides() -> Resu
             .denylist
             .iter()
             .any(|tool| tool == "bash")
+    );
+    assert_eq!(
+        request
+            .capability_scope
+            .as_ref()
+            .map(|scope| scope.mcp_tool_allow.clone()),
+        Some(vec!["mcp__github__pull_request_read".to_string()])
+    );
+    assert_eq!(
+        request
+            .credential_scope
+            .as_ref()
+            .map(|scope| scope.mcp_server_allow.clone()),
+        Some(vec!["github".to_string()])
     );
     Ok(())
 }
