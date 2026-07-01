@@ -474,6 +474,7 @@ async fn build_schedule_request(
             reply_address: None,
         }),
         observation_materialization: None,
+        flow_start: None,
     };
     Ok(request)
 }

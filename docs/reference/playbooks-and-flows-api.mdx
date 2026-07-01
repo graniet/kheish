@@ -53,7 +53,7 @@ Flows:
 
 The daemon computes a digest over the immutable manifest body. Creating the same `playbook_id + version + digest` is idempotent. Creating the same `playbook_id + version` with a different digest is rejected.
 
-Manifest fields such as `tools`, `runtime_defaults`, `scopes`, and `required_evidence` are stored and digest-covered. Flow start still executes a normal `SubmitInputRequest`; enforcement is expressed through start-time scope checks and Flow contract projection rather than a separate workflow runtime.
+Manifest fields such as `tools`, `runtime_defaults`, `scopes`, and `required_evidence` are stored and digest-covered. Flow start still executes a normal `SubmitInputRequest`; enforcement is expressed through start-time scope checks and Flow contract projection rather than a separate workflow runtime. A durable schedule can also carry `flow_start`; in that case the root run is a scheduled input run with Flow correlation metadata.
 
 When `tools.enforce` is true, Flow views evaluate scoped session journals against the manifest `allow`/`deny` lists. A completed run that used a blocked or non-allowed tool is projected as fail-closed instead of `succeeded`.
 

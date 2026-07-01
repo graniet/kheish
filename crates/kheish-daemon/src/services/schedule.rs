@@ -562,6 +562,37 @@ impl ScheduleService {
         .await
     }
 
+    /// Replaces a scheduler-owned Flow claim marker with the root run created by Flow start.
+    pub(crate) async fn mark_scheduled_flow_run_persisted(
+        &self,
+        schedule_id: &str,
+        fire_at_ms: u64,
+        claim_id: &str,
+        run_id: &str,
+    ) -> Result<()> {
+        self.update_schedule_record(schedule_id, true, |record| {
+            if record.view.in_flight_run_id.as_deref() != Some(claim_id)
+                || record.view.in_flight_fire_at_ms != Some(fire_at_ms)
+            {
+                return Ok(((), false));
+            }
+            record.view.in_flight_run_id = Some(run_id.to_string());
+            record.view.last_dispatched_run_id = Some(run_id.to_string());
+            record_recent_execution(
+                record,
+                fire_at_ms,
+                Some(run_id.to_string()),
+                ScheduleExecutionStatus::Dispatched,
+                false,
+                now_ms(),
+                None,
+                None,
+            );
+            Ok(((), true))
+        })
+        .await
+    }
+
     /// Rolls back one claimed dispatch when run submission fails.
     pub(crate) async fn rollback_schedule_dispatch(
         &self,
@@ -1271,9 +1302,11 @@ mod tests {
                     approval_count: None,
                     question_count: None,
                 },
+                definition_digest: None,
             },
             request: Some(sample_submit_request()),
             observation_materialization: None,
+            flow_start: None,
         }
     }
 

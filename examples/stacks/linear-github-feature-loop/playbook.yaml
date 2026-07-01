@@ -1,0 +1,63 @@
+playbook_id: linear-github-feature-pr-loop
+version: "0.1.0"
+title: Linear to GitHub Feature PR Loop
+objective: Convert eligible Linear feature tickets into reviewed GitHub pull requests.
+description: Generic operator playbook for scheduled Linear intake and GitHub review follow-up.
+inputs:
+  - name: project
+    description: Linear project or team scope to inspect.
+    required: false
+  - name: repository
+    description: GitHub repository scope.
+    required: false
+roles:
+  - role_id: coordinator
+    purpose: Select safe work, coordinate subagents, and maintain Linear/GitHub state.
+  - role_id: implementer
+    purpose: Make code changes in an isolated worktree and run tests.
+  - role_id: reviewer
+    purpose: Review diff, tests, and acceptance criteria until the score is 10/10.
+phases:
+  - phase_id: discover
+    objective: Identify eligible Linear issues or GitHub review comments.
+    acceptance_criteria:
+      - Existing PRs are detected before new PR creation.
+      - Unsafe or ambiguous items are reported instead of auto-mutated.
+  - phase_id: plan
+    objective: Analyze ticket requirements and affected source code with a high-reasoning subagent.
+    acceptance_criteria:
+      - The plan names files, risks, and focused tests.
+  - phase_id: implement
+    objective: Implement the change in an isolated worktree.
+    acceptance_criteria:
+      - The implementation is limited to the ticket scope.
+      - Focused tests or a clear blocked reason are recorded.
+  - phase_id: review
+    objective: Obtain an internal xhigh review score of 10/10.
+    acceptance_criteria:
+      - Review evidence includes diff scope, tests, and remaining risk.
+      - Scores below 10/10 trigger another fix iteration or a blocked report.
+  - phase_id: publish
+    objective: Open or update the GitHub PR and update the Linear ticket.
+    acceptance_criteria:
+      - The PR references the Linear ticket.
+      - The Linear ticket records PR URL, tests, and blockers.
+acceptance_criteria:
+  - No duplicate PR is created for an issue with an active workflow PR.
+  - Every automatic code mutation has test evidence and xhigh review evidence.
+  - The workflow stops rather than guessing when human product judgment is required.
+required_evidence:
+  - kind: run
+    id: root
+    description: Root scheduled Flow run.
+  - kind: agent
+    id: reviewer
+    description: Internal reviewer subagent evidence.
+tools:
+  enforce: false
+runtime_defaults:
+  provider: openai
+  model: gpt-5.5
+metadata:
+  owner: examples
+  repository_scope: evapayrent

@@ -776,6 +776,7 @@ impl DaemonToolControl for FakeControl {
         let mut state = self.state.lock().expect("fake control mutex poisoned");
         let schedule_id = format!("schedule-{}", state.schedules.len() + 1);
         let request_summary = summarize_schedule_create_request(&request);
+        let definition_digest = crate::scheduler::schedule_definition_digest(&request).ok();
         let schedule = ScheduleView {
             schedule_id: schedule_id.clone(),
             name: request.name,
@@ -806,6 +807,7 @@ impl DaemonToolControl for FakeControl {
             consecutive_failures: 0,
             recent_executions: Vec::new(),
             request: request_summary,
+            definition_digest,
         };
         state.schedules.insert(schedule_id, schedule.clone());
         Ok(schedule)

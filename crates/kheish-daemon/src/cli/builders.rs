@@ -106,6 +106,7 @@ pub(crate) async fn build_schedule_create_request(
             reply_address: None,
         }),
         observation_materialization: None,
+        flow_start: None,
     })
 }
 
@@ -331,6 +332,7 @@ pub(crate) async fn build_observation_schedule_create_request(
             )?,
             fail_when_empty: !args.allow_empty,
         }),
+        flow_start: None,
     })
 }
 

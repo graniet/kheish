@@ -126,6 +126,7 @@ Required fields:
 - exactly one of:
   - `request`
   - `observation_materialization`
+  - `flow_start`
 
 Optional fields:
 
@@ -140,7 +141,10 @@ Optional fields:
 Important note:
 
 - `request` is a full `SubmitInputRequest`
+- `flow_start` is a `StartFlowRequest`; the daemon starts the referenced Playbook Flow at each fire and records the root run as scheduled work, including the owning `schedule_id` in Flow primitive refs
 - when the nested schedule request uses only `input_items`, `content` can be omitted
+- recurring `flow_start` schedules derive a unique `flow_id` and `idempotency_key` per fire; explicit `flow_id` or `idempotency_key` is only accepted on one-shot schedules
+- one-shot schedules with neither explicit identifier derive both values; when one identifier is supplied explicitly, the daemon preserves it without synthesizing the other one
 
 ### Cadence variants
 

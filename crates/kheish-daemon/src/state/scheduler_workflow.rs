@@ -77,6 +77,41 @@ where
             )
             .await?;
         }
+        if let Some(flow_start) = request.flow_start.as_mut() {
+            if contains_flow_metadata(&flow_start.request.metadata) {
+                anyhow::bail!("metadata key `{KHEISH_FLOW_METADATA_KEY}` is daemon-owned");
+            }
+            anyhow::ensure!(
+                flow_start.session_id == request.target_session_id,
+                "flow_start.session_id must match target_session_id"
+            );
+            self.ensure_submit_input_request_has_payload(&flow_start.request)?;
+            let mut validation_flow_start = flow_start.clone();
+            self.apply_flow_runtime_defaults(&mut validation_flow_start)
+                .await?;
+            self.resolve_generation_route_for_session(
+                &request.target_session_id,
+                validation_flow_start.request.provider.clone(),
+                validation_flow_start.request.generation.clone(),
+            )
+            .await?;
+            self.validate_submit_input_request(
+                &request.target_session_id,
+                &validation_flow_start.request,
+            )
+            .await?;
+            self.normalize_submit_input_request_for_schedule(
+                &request.target_session_id,
+                &mut flow_start.request,
+            )
+            .await?;
+            let manifest = self
+                .playbook_service
+                .manifest_for_ref(&flow_start.playbook_ref)
+                .await?;
+            self.validate_flow_start_contract(&flow_start.session_id, &manifest)
+                .await?;
+        }
         if let Some(target_agent_id) = request.target_agent_id.as_deref() {
             anyhow::ensure!(
                 target_agent_id == target_agent.0,
@@ -382,6 +417,17 @@ where
             );
             return Ok(false);
         }
+        if let Some(request) = record.flow_start.clone() {
+            return self
+                .dispatch_scheduled_flow_start(
+                    schedule_id,
+                    expected_updated_at_ms,
+                    fire_at_ms,
+                    from_queued_fire,
+                    request,
+                )
+                .await;
+        }
         let run_id = self.next_run_id();
         let now = now_ms();
         let target_agent = self
@@ -539,6 +585,109 @@ where
         );
         self.schedule_service
             .set_target_agent(schedule_id, target_agent.0.clone())
+            .await?;
+        Ok(true)
+    }
+
+    async fn dispatch_scheduled_flow_start(
+        self: &Arc<Self>,
+        schedule_id: &str,
+        expected_updated_at_ms: u64,
+        fire_at_ms: u64,
+        from_queued_fire: bool,
+        request: StartFlowRequest,
+    ) -> Result<bool> {
+        let request = resolved_flow_start_for_schedule(schedule_id, request, fire_at_ms);
+        let claim_run_id = self.next_run_id();
+        let claimed = self
+            .schedule_service
+            .mark_schedule_dispatched(
+                schedule_id,
+                fire_at_ms,
+                Some(claim_run_id.clone()),
+                from_queued_fire,
+                expected_updated_at_ms,
+            )
+            .await?;
+        if !claimed {
+            debug!(
+                schedule_id = %schedule_id,
+                fire_at_ms,
+                expected_updated_at_ms,
+                "skipping scheduled Flow start because the schedule changed before dispatch claim"
+            );
+            return Ok(false);
+        }
+
+        let flow = match self
+            .start_scheduled_flow(
+                request,
+                ScheduledRunOrigin {
+                    schedule_id: schedule_id.to_string(),
+                    fire_at_ms,
+                },
+                claim_run_id.clone(),
+            )
+            .await
+        {
+            Ok(flow) => flow,
+            Err(error) => {
+                if let Err(rollback_error) = self
+                    .schedule_service
+                    .rollback_schedule_dispatch(
+                        schedule_id,
+                        fire_at_ms,
+                        &claim_run_id,
+                        from_queued_fire,
+                        &error,
+                    )
+                    .await
+                {
+                    return Err(anyhow!(
+                        "failed to dispatch scheduled Flow start: {error}; rollback also failed: {rollback_error}"
+                    ));
+                }
+                return Err(error);
+            }
+        };
+        let run_id = match flow.run_id.clone() {
+            Some(run_id) => run_id,
+            None => {
+                let error = anyhow!(
+                    "scheduled Flow start {} did not create a root run",
+                    flow.flow_id
+                );
+                self.schedule_service
+                    .rollback_schedule_dispatch(
+                        schedule_id,
+                        fire_at_ms,
+                        &claim_run_id,
+                        from_queued_fire,
+                        &error,
+                    )
+                    .await?;
+                return Err(error);
+            }
+        };
+        self.schedule_service
+            .mark_scheduled_flow_run_persisted(schedule_id, fire_at_ms, &claim_run_id, &run_id)
+            .await?;
+        let run = match flow.run {
+            Some(run) if run.run_id == run_id => run,
+            _ => self.get_run(&run_id).await?,
+        };
+        info!(
+            schedule_id = %schedule_id,
+            flow_id = %flow.flow_id,
+            run_id = %run.run_id,
+            target_session_id = %run.session_id,
+            target_agent_id = %run.agent_id,
+            fire_at_ms,
+            from_queued_fire,
+            "dispatched scheduled Flow start"
+        );
+        self.schedule_service
+            .set_target_agent(schedule_id, run.agent_id)
             .await?;
         Ok(true)
     }

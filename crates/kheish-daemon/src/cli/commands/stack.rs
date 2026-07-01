@@ -215,20 +215,19 @@ fn resolve_manifest_file_refs(raw: &str, root: &Path) -> Result<String> {
                 let Some(schedule) = schedule.as_mapping_mut() else {
                     continue;
                 };
-                let Some(request) = schedule
+                if let Some(request) = schedule
                     .get_mut(key("request"))
                     .and_then(serde_yaml::Value::as_mapping_mut)
-                else {
-                    continue;
-                };
-                if let Some(path) = take_string(request, "content_file")? {
-                    if request.contains_key(key("content")) {
-                        bail!("schedule request must use either content or content_file");
-                    }
-                    request.insert(
-                        key("content"),
-                        serde_yaml::Value::String(read_stack_file(root, &path, &mut budget)?),
-                    );
+                {
+                    resolve_stack_request_file_ref(root, request, &mut budget)?;
+                }
+                if let Some(request) = schedule
+                    .get_mut(key("flow_start"))
+                    .and_then(serde_yaml::Value::as_mapping_mut)
+                    .and_then(|flow_start| flow_start.get_mut(key("request")))
+                    .and_then(serde_yaml::Value::as_mapping_mut)
+                {
+                    resolve_stack_request_file_ref(root, request, &mut budget)?;
                 }
             }
         }
@@ -253,6 +252,23 @@ fn resolve_manifest_file_refs(raw: &str, root: &Path) -> Result<String> {
         serde_yaml::to_string(&document).context("failed to render resolved KheishStack")?;
     kheish_daemon::validate_stack_manifest_source(&rendered)?;
     Ok(rendered)
+}
+
+fn resolve_stack_request_file_ref(
+    root: &Path,
+    request: &mut serde_yaml::Mapping,
+    budget: &mut FileRefExpansionBudget,
+) -> Result<()> {
+    if let Some(path) = take_string(request, "content_file")? {
+        if request.contains_key(key("content")) {
+            bail!("schedule request must use either content or content_file");
+        }
+        request.insert(
+            key("content"),
+            serde_yaml::Value::String(read_stack_file(root, &path, budget)?),
+        );
+    }
+    Ok(())
 }
 
 struct FileRefExpansionBudget {
@@ -397,6 +413,43 @@ spec:
         let message = format!("{error:#}");
 
         assert!(message.contains("KheishStack file limit"), "{message}");
+    }
+
+    #[test]
+    fn resolve_manifest_file_refs_embeds_flow_start_request_content_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("prompt.md"), "run scheduled flow").expect("write prompt");
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: scheduled-flow
+spec:
+  schedules:
+    - name: scheduled-flow
+      target_session_id: session-1
+      cadence:
+        type: once
+        fire_at_ms: 4102444800000
+      flow_start:
+        playbook_ref:
+          playbook_id: feature-flow
+          version: "1"
+        session_id: session-1
+        request:
+          content_file: prompt.md
+"#;
+
+        let rendered = resolve_manifest_file_refs(raw, temp.path()).expect("resolve refs");
+        let document = serde_yaml::from_str::<serde_yaml::Value>(&rendered).expect("rendered yaml");
+        let content = document["spec"]["schedules"][0]["flow_start"]["request"]["content"]
+            .as_str()
+            .expect("embedded content");
+
+        assert_eq!(content, "run scheduled flow");
+        assert!(
+            document["spec"]["schedules"][0]["flow_start"]["request"]["content_file"].is_null()
+        );
     }
 
     #[test]

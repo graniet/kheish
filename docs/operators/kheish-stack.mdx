@@ -41,4 +41,6 @@ Do not pass a separate `--state-root` to stack commands. Start the daemon with t
 - `down --yes` and prune execute supported teardown actions and skip blocked resources. Stack-managed secrets are daemon-global credentials, never deleted automatically, and remain ledger-owned until an operator explicitly handles them.
 - Connector `session_policy` scopes and declared persona/session scopes are always validated fail-closed in v1alpha1. A scope family needs an explicit allow-list or `*_deny: ["*"]`; partial deny-lists are rejected because they remain fail-open in the daemon. Legacy `strict_scopes: false` and `--no-strict-scopes` inputs are accepted only as compatibility no-ops.
 
-See `examples/stacks/linear-triage-daily` and `examples/stacks/playbook-review` for runnable stacks.
+Schedules can declare exactly one payload: `request`, `observation_materialization`, or `flow_start`. `flow_start` stores a normal Flow start request in the schedule. Recurring Flow schedules derive a per-fire Flow id and idempotency key. One-shot Flow schedules derive both only when neither identifier is supplied; an explicit `flow_id` or `idempotency_key` is preserved without synthesizing the missing counterpart. In Stack manifests, `flow_start.playbook_ref.digest` can be omitted when the referenced Playbook version is declared in the same Stack; the reconciler resolves the immutable digest from that manifest.
+
+See `examples/stacks/linear-triage-daily`, `examples/stacks/playbook-review`, and `examples/stacks/linear-github-feature-loop` for runnable stacks.

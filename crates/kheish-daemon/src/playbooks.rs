@@ -761,7 +761,10 @@ pub(crate) fn flow_id_from_run_metadata(run: &RunView) -> Option<&str> {
 
 /// Returns whether a run carries daemon-owned metadata for a specific Flow record.
 pub(crate) fn run_matches_flow_record(run: &RunView, record: &FlowRecord) -> bool {
-    if run.kind != DaemonRunKind::Input {
+    if !matches!(
+        run.kind,
+        DaemonRunKind::Input | DaemonRunKind::ScheduledInput
+    ) {
         return false;
     }
     if flow_id_from_run_metadata(run) != Some(record.flow_id.as_str()) {
@@ -1040,7 +1043,7 @@ mod tests {
     }
 
     #[test]
-    fn run_matching_requires_daemon_nonce_and_input_run_kind() {
+    fn run_matching_requires_daemon_nonce_and_flow_capable_run_kind() {
         let record = FlowRecord {
             flow_id: "flow-1".to_string(),
             idempotency_key: Some("flow-1".to_string()),
@@ -1064,6 +1067,9 @@ mod tests {
         assert!(run_matches_flow_record(&run, &record));
 
         run.kind = DaemonRunKind::ScheduledInput;
+        assert!(run_matches_flow_record(&run, &record));
+
+        run.kind = DaemonRunKind::MailboxDelivery;
         assert!(!run_matches_flow_record(&run, &record));
 
         let run = matching_run(&record, DaemonRunKind::Input, "forged");

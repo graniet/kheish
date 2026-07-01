@@ -540,6 +540,7 @@ where
             false,
             None,
             None,
+            None,
             DaemonRunKind::Input,
             false,
         )
@@ -569,6 +570,7 @@ where
                 request,
                 false,
                 Some(run_id.clone()),
+                None,
                 None,
                 DaemonRunKind::Input,
                 true,
@@ -602,6 +604,7 @@ where
             request,
             false,
             Some(run_id),
+            None,
             None,
             DaemonRunKind::Input,
             false,
@@ -700,6 +703,7 @@ where
                     false,
                     Some(run_id.clone()),
                     Some(idempotency),
+                    None,
                     DaemonRunKind::Input,
                     false,
                 )
@@ -752,7 +756,28 @@ where
             true,
             None,
             None,
+            None,
             DaemonRunKind::Input,
+            false,
+        )
+        .await
+    }
+
+    pub(crate) async fn submit_scheduled_input_run_with_daemon_metadata(
+        self: &Arc<Self>,
+        session_id: &str,
+        request: SubmitInputRequest,
+        scheduled_origin: ScheduledRunOrigin,
+        run_id: String,
+    ) -> Result<RunView> {
+        self.submit_input_run_inner(
+            session_id,
+            request,
+            true,
+            Some(run_id),
+            None,
+            Some(scheduled_origin),
+            DaemonRunKind::ScheduledInput,
             false,
         )
         .await
@@ -844,6 +869,7 @@ where
                 true,
                 Some(run_id.clone()),
                 None,
+                None,
                 DaemonRunKind::GoalContinuation,
                 false,
             )
@@ -862,6 +888,7 @@ where
         allow_daemon_metadata: bool,
         preallocated_run_id: Option<String>,
         idempotency: Option<RunInputIdempotency>,
+        scheduled_origin: Option<ScheduledRunOrigin>,
         kind: DaemonRunKind,
         require_idle: bool,
     ) -> Result<RunView> {
@@ -919,6 +946,19 @@ where
             reply_target_count = reply_targets.len(),
             "accepted input submission request"
         );
+        let request_summary = summarize_input_request(&request);
+        let payload = if let Some(origin) = scheduled_origin {
+            RunRequestPayload::ScheduledInput {
+                schedule_id: origin.schedule_id,
+                fire_at_ms: origin.fire_at_ms,
+                request,
+            }
+        } else {
+            RunRequestPayload::Input {
+                request,
+                idempotency,
+            }
+        };
         let record = RunRecord {
             view: RunView {
                 run_id: run_id.clone(),
@@ -931,7 +971,7 @@ where
                 started_at_ms: None,
                 finished_at_ms: None,
                 queued_position: None,
-                request: summarize_input_request(&request),
+                request: request_summary,
                 input_attachments,
                 input_metadata,
                 pending_approval_ids: Vec::new(),
@@ -943,10 +983,7 @@ where
                 error: None,
             },
             reply_targets,
-            payload: RunRequestPayload::Input {
-                request,
-                idempotency,
-            },
+            payload,
         };
         let view = self
             .schedule_run_with_idle_policy(record, require_idle)

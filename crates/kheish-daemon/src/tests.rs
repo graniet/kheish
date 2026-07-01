@@ -5839,10 +5839,71 @@ async fn daemon_playbook_flow_api_starts_idempotently_and_survives_restart() -> 
                 ..test_submit_input_request("should reject forged flow metadata")
             }),
             observation_materialization: None,
+            flow_start: None,
         })
         .send()
         .await?;
     assert_eq!(forged_schedule.status(), StatusCode::BAD_REQUEST);
+
+    let restricted_session = client
+        .post(format!("{base}/v1/sessions"))
+        .json(&CreateSessionRequest {
+            session_id: Some("flow-restricted-session".to_string()),
+            thread_id: None,
+            persona_id: None,
+            credential_scope: Some(kheish_types::CredentialScope {
+                route_deny: vec!["scripted".to_string()],
+                ..kheish_types::CredentialScope::default()
+            }),
+            capability_scope: None,
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionView>()
+        .await?;
+    let rejected_default_route_schedule = client
+        .post(format!("{base}/v1/schedules"))
+        .json(&CreateScheduleRequest {
+            name: "default-route-restricted-flow".to_string(),
+            target_session_id: "flow-restricted-session".to_string(),
+            target_agent_id: Some(restricted_session.agent_id.clone()),
+            owner_session_id: Some("flow-restricted-session".to_string()),
+            owner_agent_id: None,
+            created_by_run_id: None,
+            cadence: ScheduleCadence::Once {
+                fire_at_ms: crate::now_ms() + 60_000,
+            },
+            max_executions: None,
+            overlap_policy: ScheduleOverlapPolicy::Skip,
+            misfire_policy: ScheduleMisfirePolicy::CoalesceOnce,
+            request: None,
+            observation_materialization: None,
+            flow_start: Some(StartFlowRequest {
+                flow_id: Some("flow-default-route-restricted".to_string()),
+                idempotency_key: None,
+                playbook_ref: PlaybookVersionRef {
+                    playbook_id: "operator-flow".to_string(),
+                    version: "1.0.0".to_string(),
+                    digest: digest.clone(),
+                },
+                session_id: "flow-restricted-session".to_string(),
+                request: test_submit_input_request("should reject playbook default route"),
+                metadata: Value::Null,
+                evidence_refs: Vec::new(),
+            }),
+        })
+        .send()
+        .await?;
+    assert_eq!(
+        rejected_default_route_schedule.status(),
+        StatusCode::BAD_REQUEST
+    );
+    let body = rejected_default_route_schedule.text().await?;
+    assert!(
+        body.contains("credential_scope does not allow route `scripted`"),
+        "unexpected schedule rejection: {body}"
+    );
 
     let start_request = StartFlowRequest {
         flow_id: Some("flow-api-1".to_string()),
@@ -5968,6 +6029,195 @@ async fn daemon_playbook_flow_api_starts_idempotently_and_survives_restart() -> 
     assert_eq!(restored.primitive_refs.run_ids, vec![run_id.clone()]);
     let repaired_flows: Value = serde_json::from_str(&fs::read_to_string(&flows_path)?)?;
     assert_eq!(repaired_flows["flow-api-1"]["run_id"], run_id);
+
+    let _ = restart_shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_schedule_starts_flow_and_settles_with_scheduled_root_run() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-scheduled-flow");
+    let (address, shutdown) = scripted_daemon(
+        &state_root,
+        vec![Ok(scripted_events(
+            "assistant-scheduled-flow",
+            "SCHEDULED_FLOW_DONE",
+            kheish_types::ModelFinishReason::Completed,
+        ))],
+    )
+    .await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+
+    create_test_session(&client, &base, "scheduled-flow-session").await?;
+    let manifest = test_playbook_manifest("scheduled-flow-playbook", "1.0.0");
+    let validation = client
+        .post(format!("{base}/v1/playbooks/validate"))
+        .json(&ValidatePlaybookRequest {
+            manifest: manifest.clone(),
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<PlaybookValidationResult>()
+        .await?;
+    let digest = validation.digest.context("missing playbook digest")?;
+    client
+        .post(format!("{base}/v1/playbooks"))
+        .json(&CreatePlaybookRequest { manifest })
+        .send()
+        .await?
+        .error_for_status()?;
+    client
+        .post(format!(
+            "{base}/v1/playbooks/scheduled-flow-playbook/publish"
+        ))
+        .json(&PublishPlaybookRequest {
+            version: "1.0.0".to_string(),
+            digest: digest.clone(),
+            status: Some(PlaybookReleaseStatus::Active),
+            evidence_refs: test_release_evidence(),
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let fire_at_ms = now_ms().saturating_add(250);
+    let schedule = client
+        .post(format!("{base}/v1/schedules"))
+        .json(&CreateScheduleRequest {
+            name: "scheduled-flow-start".to_string(),
+            target_session_id: "scheduled-flow-session".to_string(),
+            target_agent_id: None,
+            owner_session_id: None,
+            owner_agent_id: None,
+            created_by_run_id: None,
+            cadence: ScheduleCadence::Once { fire_at_ms },
+            max_executions: Some(1),
+            overlap_policy: ScheduleOverlapPolicy::Skip,
+            misfire_policy: ScheduleMisfirePolicy::CoalesceOnce,
+            request: None,
+            observation_materialization: None,
+            flow_start: Some(StartFlowRequest {
+                flow_id: None,
+                idempotency_key: None,
+                playbook_ref: PlaybookVersionRef {
+                    playbook_id: "scheduled-flow-playbook".to_string(),
+                    version: "1.0.0".to_string(),
+                    digest: digest.clone(),
+                },
+                session_id: "scheduled-flow-session".to_string(),
+                request: test_submit_input_request("execute scheduled flow"),
+                metadata: json!({"operator": "scheduler"}),
+                evidence_refs: Vec::new(),
+            }),
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<ScheduleView>()
+        .await?;
+    let expected_flow_id = format!("scheduled-flow-{}-{fire_at_ms}", schedule.schedule_id);
+
+    let flow = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let response = client
+                .get(format!("{base}/v1/flows/{expected_flow_id}"))
+                .send()
+                .await?;
+            if response.status() == StatusCode::OK {
+                let flow = response.json::<FlowView>().await?;
+                if flow.run_id.is_some() {
+                    break Ok::<_, anyhow::Error>(flow);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await??;
+    assert_eq!(flow.metadata["operator"], "scheduler");
+    let run_id = flow
+        .run_id
+        .clone()
+        .context("scheduled Flow should have a run")?;
+    let run = wait_for_run_status(&client, &base, &run_id, &[DaemonRunStatus::Completed]).await?;
+    assert_eq!(run.kind, DaemonRunKind::ScheduledInput);
+    let metadata = run
+        .input_metadata
+        .as_ref()
+        .context("scheduled Flow run should preserve input metadata")?;
+    assert_eq!(metadata["schedule_id"], schedule.schedule_id);
+    assert_eq!(metadata["scheduled_for_ms"], fire_at_ms);
+    assert_eq!(
+        metadata[KHEISH_FLOW_METADATA_KEY]["flow_id"],
+        expected_flow_id
+    );
+    let completed_flow = client
+        .get(format!("{base}/v1/flows/{expected_flow_id}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<FlowView>()
+        .await?;
+    assert_eq!(
+        completed_flow.primitive_refs.schedule_ids,
+        vec![schedule.schedule_id.clone()]
+    );
+
+    let settled = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let schedule = client
+                .get(format!("{base}/v1/schedules/{}", schedule.schedule_id))
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<ScheduleView>()
+                .await?;
+            if schedule.execution_count == 1 && schedule.in_flight_run_id.is_none() {
+                break Ok::<_, anyhow::Error>(schedule);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await??;
+    assert_eq!(
+        settled.last_dispatched_run_id.as_deref(),
+        Some(run_id.as_str())
+    );
+
+    let flows_path = state_root.join("flows.json");
+    let mut persisted_flows: Value = serde_json::from_str(&fs::read_to_string(&flows_path)?)?;
+    persisted_flows
+        .as_object_mut()
+        .context("flows catalog should be an object")?
+        .get_mut(&expected_flow_id)
+        .context("scheduled Flow should be persisted")?
+        .as_object_mut()
+        .context("scheduled Flow record should be an object")?
+        .remove("run_id");
+    fs::write(&flows_path, serde_json::to_vec_pretty(&persisted_flows)?)?;
+
+    let _ = shutdown.send(());
+
+    let (restart_address, restart_shutdown) = scripted_daemon(&state_root, Vec::new()).await?;
+    let restart_base = format!("http://{restart_address}");
+    let restored = client
+        .get(format!("{restart_base}/v1/flows/{expected_flow_id}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<FlowView>()
+        .await?;
+    assert_eq!(restored.status, FlowStatus::Succeeded);
+    assert_eq!(restored.run_id.as_deref(), Some(run_id.as_str()));
+    assert_eq!(restored.primitive_refs.run_ids, vec![run_id.clone()]);
+    assert_eq!(
+        restored.primitive_refs.schedule_ids,
+        vec![schedule.schedule_id.clone()]
+    );
+    let repaired_flows: Value = serde_json::from_str(&fs::read_to_string(&flows_path)?)?;
+    assert_eq!(repaired_flows[&expected_flow_id]["run_id"], run_id);
 
     let _ = restart_shutdown.send(());
     Ok(())
@@ -14260,6 +14510,7 @@ async fn daemon_schedule_once_dispatches_one_later_run() -> Result<()> {
                 reply_address: None,
             }),
             observation_materialization: None,
+            flow_start: None,
         },
     )
     .await?;
@@ -14407,6 +14658,7 @@ async fn daemon_scheduled_run_reuses_resolved_external_reply_targets() -> Result
                 reply_address: None,
             }),
             observation_materialization: None,
+            flow_start: None,
         },
     )
     .await?;
@@ -14502,6 +14754,7 @@ async fn daemon_schedule_once_survives_restart_without_duplicate_dispatch() -> R
                 reply_address: None,
             }),
             observation_materialization: None,
+            flow_start: None,
         },
     )
     .await?;
@@ -14650,6 +14903,7 @@ async fn daemon_scheduled_run_reuses_external_reply_targets_after_restart() -> R
                 reply_address: None,
             }),
             observation_materialization: None,
+            flow_start: None,
         },
     )
     .await?;
@@ -14760,6 +15014,7 @@ async fn daemon_interval_schedule_skip_overlap_prevents_duplicate_active_runs() 
                 reply_address: None,
             }),
             observation_materialization: None,
+            flow_start: None,
         },
     )
     .await?;
@@ -14845,6 +15100,7 @@ async fn daemon_trigger_now_consumes_once_schedule_without_double_fire() -> Resu
                 reply_address: None,
             }),
             observation_materialization: None,
+            flow_start: None,
         },
     )
     .await?;
@@ -14934,6 +15190,7 @@ async fn daemon_trigger_now_skip_overlap_clears_queued_fire_without_duplicate_di
                 reply_address: None,
             }),
             observation_materialization: None,
+            flow_start: None,
         },
     )
     .await?;
@@ -15054,6 +15311,7 @@ async fn daemon_resume_schedule_preserves_remaining_delay() -> Result<()> {
                 reply_address: None,
             }),
             observation_materialization: None,
+            flow_start: None,
         },
     )
     .await?;
@@ -15163,6 +15421,7 @@ async fn daemon_running_scheduled_input_survives_restart_without_duplicate_dispa
                 reply_address: None,
             }),
             observation_materialization: None,
+            flow_start: None,
         },
     )
     .await?;
@@ -15281,6 +15540,7 @@ async fn daemon_scheduler_continues_when_one_due_schedule_is_broken() -> Result<
                 reply_address: None,
             }),
             observation_materialization: None,
+            flow_start: None,
         },
     )
     .await?;
@@ -15317,6 +15577,7 @@ async fn daemon_scheduler_continues_when_one_due_schedule_is_broken() -> Result<
                 reply_address: None,
             }),
             observation_materialization: None,
+            flow_start: None,
         },
     )
     .await?;
@@ -15434,6 +15695,7 @@ async fn daemon_broken_due_schedule_does_not_delay_the_next_valid_wakeup() -> Re
                 reply_address: None,
             }),
             observation_materialization: None,
+            flow_start: None,
         },
     )
     .await?;
@@ -15470,6 +15732,7 @@ async fn daemon_broken_due_schedule_does_not_delay_the_next_valid_wakeup() -> Re
                 reply_address: None,
             }),
             observation_materialization: None,
+            flow_start: None,
         },
     )
     .await?;
@@ -26827,6 +27090,7 @@ async fn daemon_boots_with_corrupted_index_run_and_schedule_files() -> Result<()
                 reply_address: None,
             }),
             observation_materialization: None,
+            flow_start: None,
         },
     )
     .await?;
@@ -26948,6 +27212,7 @@ async fn daemon_boots_with_corrupted_index_run_and_schedule_files() -> Result<()
                 reply_address: None,
             }),
             observation_materialization: None,
+            flow_start: None,
         },
     )
     .await?;
@@ -40241,6 +40506,7 @@ async fn daemon_scheduled_runs_use_session_route_policy_when_request_has_no_rout
                 reply_address: None,
             }),
             observation_materialization: None,
+            flow_start: None,
         },
     )
     .await?;
@@ -50223,6 +50489,7 @@ async fn daemon_scheduler_dispatches_observation_materialization_runs() -> Resul
                 raw_asset_policy: None,
                 fail_when_empty: true,
             }),
+            flow_start: None,
         })
         .send()
         .await?
@@ -50396,6 +50663,7 @@ async fn daemon_scheduler_dispatches_stream_scoped_observation_materializations(
                 raw_asset_policy: Some(ObservationRawAssetPolicy::Always),
                 fail_when_empty: true,
             }),
+            flow_start: None,
         })
         .send()
         .await?

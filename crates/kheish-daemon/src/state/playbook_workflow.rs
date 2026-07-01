@@ -68,7 +68,24 @@ where
 
     pub(crate) async fn start_flow(
         self: &Arc<Self>,
+        request: StartFlowRequest,
+    ) -> Result<FlowView> {
+        self.start_flow_inner(request, None).await
+    }
+
+    pub(super) async fn start_scheduled_flow(
+        self: &Arc<Self>,
+        request: StartFlowRequest,
+        origin: ScheduledRunOrigin,
+        run_id: String,
+    ) -> Result<FlowView> {
+        self.start_flow_inner(request, Some((origin, run_id))).await
+    }
+
+    async fn start_flow_inner(
+        self: &Arc<Self>,
         mut request: StartFlowRequest,
+        scheduled_origin: Option<(ScheduledRunOrigin, String)>,
     ) -> Result<FlowView> {
         if contains_flow_metadata(&request.request.metadata) {
             anyhow::bail!("metadata key `{KHEISH_FLOW_METADATA_KEY}` is daemon-owned");
@@ -112,10 +129,19 @@ where
                     .await?;
                 return Err(error);
             }
-            let run = match self
-                .submit_input_run_with_daemon_metadata(&record.session_id, run_request)
+            let run_result = if let Some((origin, run_id)) = scheduled_origin {
+                self.submit_scheduled_input_run_with_daemon_metadata(
+                    &record.session_id,
+                    run_request,
+                    origin,
+                    run_id,
+                )
                 .await
-            {
+            } else {
+                self.submit_input_run_with_daemon_metadata(&record.session_id, run_request)
+                    .await
+            };
+            let run = match run_result {
                 Ok(run) => run,
                 Err(error) => {
                     if let Err(rollback_error) = self
@@ -540,7 +566,7 @@ where
         ))
     }
 
-    async fn validate_flow_start_contract(
+    pub(super) async fn validate_flow_start_contract(
         &self,
         session_id: &str,
         manifest: &PlaybookManifest,
@@ -568,7 +594,10 @@ where
         Ok(())
     }
 
-    async fn apply_flow_runtime_defaults(&self, request: &mut StartFlowRequest) -> Result<()> {
+    pub(super) async fn apply_flow_runtime_defaults(
+        &self,
+        request: &mut StartFlowRequest,
+    ) -> Result<()> {
         let defaults = self
             .playbook_service
             .runtime_defaults(&request.playbook_ref)
@@ -886,6 +915,7 @@ where
         let mut descendant_agent_ids = BTreeSet::new();
         let mut approval_ids = BTreeSet::new();
         let mut question_ids = BTreeSet::new();
+        let mut schedule_ids = BTreeSet::new();
         let mut session_ids = BTreeSet::new();
         let mut child_session_ids = BTreeSet::new();
         let mut runs = BTreeMap::new();
@@ -900,6 +930,7 @@ where
                 &mut agent_ids,
                 &mut approval_ids,
                 &mut question_ids,
+                &mut schedule_ids,
                 &mut runs,
             );
             session_ids.insert(record.session_id.clone());
@@ -989,6 +1020,7 @@ where
                         &mut agent_ids,
                         &mut approval_ids,
                         &mut question_ids,
+                        &mut schedule_ids,
                         &mut runs,
                     );
                     if run_ids.len() != previous_run_count {
@@ -1057,7 +1089,7 @@ where
                 agent_ids: agent_ids.into_iter().collect(),
                 approval_ids: approval_ids.into_iter().collect(),
                 question_ids: question_ids.into_iter().collect(),
-                schedule_ids: Vec::new(),
+                schedule_ids: schedule_ids.into_iter().collect(),
                 output_ids: Vec::new(),
             },
             runs: runs.into_values().collect(),
@@ -1268,12 +1300,24 @@ fn insert_scoped_run(
     agent_ids: &mut BTreeSet<String>,
     approval_ids: &mut BTreeSet<String>,
     question_ids: &mut BTreeSet<String>,
+    schedule_ids: &mut BTreeSet<String>,
     runs: &mut BTreeMap<String, RunView>,
 ) {
     run_ids.insert(run.run_id.clone());
     agent_ids.insert(run.agent_id.clone());
     approval_ids.extend(run.pending_approval_ids.clone());
     question_ids.extend(run.pending_question_ids.clone());
+    if matches!(
+        run.kind,
+        DaemonRunKind::ScheduledInput | DaemonRunKind::ScheduledObservationMaterialization
+    ) && let Some(schedule_id) = run
+        .input_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("schedule_id"))
+        .and_then(serde_json::Value::as_str)
+    {
+        schedule_ids.insert(schedule_id.to_string());
+    }
     runs.insert(run.run_id.clone(), run);
 }
 

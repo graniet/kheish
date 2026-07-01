@@ -1,0 +1,131 @@
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: linear-github-feature-loop
+  labels:
+    example: linear-github-feature-loop
+spec:
+  apply:
+    strict_scopes: true
+    restart_policy: plan_only
+  requires:
+    secrets:
+      - ref: mcp.linear.LINEAR_API_KEY
+        provider: generic
+        value_env: LINEAR_API_KEY
+      - ref: mcp.github.GITHUB_TOKEN
+        provider: generic
+        value_env: GITHUB_TOKEN
+  personas:
+    - persona_id: feature-pr-operator
+      display_name: Feature PR Operator
+      soul_file: persona.md
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_allow: ["github", "linear"]
+        mcp_tool_allow:
+          - mcp__github__create_pull_request
+          - mcp__github__get_pull_request
+          - mcp__github__list_pull_request_comments
+          - mcp__github__reply_to_review_comment
+          - mcp__linear__create_comment
+          - mcp__linear__get_issue
+          - mcp__linear__list_issues
+          - mcp__linear__update_issue
+  sessions:
+    - session_id: feature-pr-loop
+      persona_id: feature-pr-operator
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_allow: ["github", "linear"]
+        mcp_tool_allow:
+          - mcp__github__create_pull_request
+          - mcp__github__get_pull_request
+          - mcp__github__list_pull_request_comments
+          - mcp__github__reply_to_review_comment
+          - mcp__linear__create_comment
+          - mcp__linear__get_issue
+          - mcp__linear__list_issues
+          - mcp__linear__update_issue
+      credential_scope:
+        route_allow: ["openai"]
+        connector_deny: ["*"]
+        connector_credential_deny: ["*"]
+        mcp_server_allow: ["github", "linear"]
+      route_policy:
+        provider: openai
+        generation:
+          model: gpt-5.5
+          reasoning:
+            effort: medium
+  playbooks:
+    - manifest_file: playbook.yaml
+      publish:
+        status: active
+        evidence_refs:
+          - kind: manual
+            id: stack-example-reviewed
+            description: Example reviewed before publication.
+  schedules:
+    - name: linear-intake-0800
+      target_session_id: feature-pr-loop
+      cadence:
+        type: cron
+        expression: "0 0 8 * * *"
+        timezone: Europe/Paris
+      overlap_policy: skip
+      misfire_policy:
+        type: coalesce_once
+      flow_start:
+        playbook_ref:
+          playbook_id: linear-github-feature-pr-loop
+          version: "0.1.0"
+        request:
+          provider: openai
+          content_file: intake.md
+          generation:
+            model: gpt-5.5
+            reasoning:
+              effort: medium
+        metadata:
+          workflow: linear-intake
+          max_tickets: 3
+    - name: github-review-followup-hourly
+      target_session_id: feature-pr-loop
+      cadence:
+        type: cron
+        expression: "0 0 * * * *"
+        timezone: Europe/Paris
+      overlap_policy: skip
+      misfire_policy:
+        type: coalesce_once
+      flow_start:
+        playbook_ref:
+          playbook_id: linear-github-feature-pr-loop
+          version: "0.1.0"
+        request:
+          provider: openai
+          content_file: review-followup.md
+          generation:
+            model: gpt-5.5
+            reasoning:
+              effort: medium
+        metadata:
+          workflow: github-review-followup
+  verification:
+    - name: persona
+      type: persona_exists
+      persona_id: feature-pr-operator
+    - name: session
+      type: session_exists
+      session_id: feature-pr-loop
+    - name: intake-schedule
+      type: schedule_exists
+      schedule_name: linear-intake-0800
+    - name: followup-schedule
+      type: schedule_exists
+      schedule_name: github-review-followup-hourly
+    - name: playbook
+      type: playbook_version_exists
+      playbook_id: linear-github-feature-pr-loop
+      version: "0.1.0"

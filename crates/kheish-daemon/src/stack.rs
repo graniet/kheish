@@ -662,11 +662,22 @@ pub(crate) struct StackDownOptions {
 
 pub(crate) async fn validate_stack_context(context: &StackContext) -> Result<StackValidation> {
     let mut validation = validate_stack(context)?;
-    if let Err(error) = ResolvedStack::from_context(context).await {
-        validation.errors.push(error.to_string());
-        validation.valid = false;
+    match ResolvedStack::from_context(context).await {
+        Ok(resolved) => validate_resolved_stack(context, &resolved, &mut validation),
+        Err(error) => validation.errors.push(error.to_string()),
     }
+    validation.valid = validation.errors.is_empty();
     Ok(validation)
+}
+
+async fn resolve_validated_stack(
+    context: &StackContext,
+) -> Result<(StackValidation, ResolvedStack)> {
+    let mut validation = validate_stack(context)?;
+    let resolved = ResolvedStack::from_context(context).await?;
+    validate_resolved_stack(context, &resolved, &mut validation);
+    validation.valid = validation.errors.is_empty();
+    Ok((validation, resolved))
 }
 
 pub(crate) async fn plan_stack<C>(
@@ -782,7 +793,7 @@ where
         &mut report,
     )
     .await?;
-    apply_schedules(
+    apply_playbooks(
         client,
         &context,
         &resolved,
@@ -791,7 +802,7 @@ where
         &mut report,
     )
     .await?;
-    apply_playbooks(
+    apply_schedules(
         client,
         &context,
         &resolved,
@@ -959,10 +970,9 @@ async fn build_plan<C>(
 where
     C: StackControlPlane + Sync,
 {
-    let mut validation = validate_stack(context)?;
     let ledger_path = resolve_ledger_path(client, context.state_root_override.as_deref()).await?;
     let ledger = ApplyLedger::load_or_new(&ledger_path).await?;
-    let resolved = ResolvedStack::from_context(context).await?;
+    let (mut validation, resolved) = resolve_validated_stack(context).await?;
     let mut plan = StackPlan {
         stack: context.document.metadata.name.clone(),
         ownership_id: context.ownership_id(),
@@ -989,8 +999,8 @@ where
     add_persona_actions(client, &resolved, &mut plan).await?;
     add_connector_actions(client, context, &resolved, &ledger, &mut plan).await?;
     add_session_actions(client, &resolved, &mut plan).await?;
-    add_schedule_actions(client, context, &resolved, &ledger, &mut plan).await?;
     add_playbook_actions(client, &resolved, &mut plan).await?;
+    add_schedule_actions(client, context, &resolved, &ledger, &mut plan).await?;
     add_verification_actions(&resolved, &mut plan);
     add_ownership_diagnostics(&ledger, &context.ownership_id(), &mut plan);
     plan.summary = StackPlanSummary::from_actions(&plan.actions);
@@ -1376,6 +1386,20 @@ fn validate_strict_scopes(context: &StackContext, validation: &mut StackValidati
         }
     }
     for schedule in &context.document.spec.schedules {
+        let payload_count = [
+            schedule.request.is_some(),
+            schedule.observation_materialization.is_some(),
+            schedule.flow_start.is_some(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+        if payload_count != 1 {
+            validation.errors.push(format!(
+                "spec.schedules[{}] must define exactly one of request, observation_materialization, or flow_start",
+                schedule.name
+            ));
+        }
         let Some(session) = context
             .document
             .spec
@@ -1396,6 +1420,51 @@ fn validate_strict_scopes(context: &StackContext, validation: &mut StackValidati
                 "spec.schedules[{}].observation_materialization.target_session_id must match target_session_id `{}`",
                 schedule.name, schedule.target_session_id
             ));
+        }
+        if let Some(flow_start) = schedule.flow_start.as_ref()
+            && let Some(session_id) = flow_start.session_id.as_ref()
+            && session_id != &schedule.target_session_id
+        {
+            validation.errors.push(format!(
+                "spec.schedules[{}].flow_start.session_id must match target_session_id `{}`",
+                schedule.name, schedule.target_session_id
+            ));
+        }
+        if let Some(flow_start) = schedule.flow_start.as_ref()
+            && flow_start
+                .request
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| !metadata.is_null() && !metadata.is_object())
+        {
+            validation.errors.push(format!(
+                "spec.schedules[{}].flow_start.request.metadata must be an object",
+                schedule.name
+            ));
+        }
+        if let Some(flow_start) = schedule.flow_start.as_ref()
+            && !matches!(schedule.cadence, crate::ScheduleCadence::Once { .. })
+        {
+            if flow_start
+                .flow_id
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+            {
+                validation.errors.push(format!(
+                    "spec.schedules[{}].flow_start.flow_id is only supported for one-shot schedules",
+                    schedule.name
+                ));
+            }
+            if flow_start
+                .idempotency_key
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+            {
+                validation.errors.push(format!(
+                    "spec.schedules[{}].flow_start.idempotency_key is only supported for one-shot schedules",
+                    schedule.name
+                ));
+            }
         }
         if let Some(request) = schedule.request.as_ref() {
             validate_scheduled_request_route(
@@ -1421,6 +1490,120 @@ fn validate_strict_scopes(context: &StackContext, validation: &mut StackValidati
     }
 }
 
+fn validate_resolved_stack(
+    context: &StackContext,
+    resolved: &ResolvedStack,
+    validation: &mut StackValidation,
+) {
+    validate_resolved_flow_start_playbooks(resolved, validation);
+    if context.strict_scopes() {
+        validate_resolved_flow_start_routes(resolved, validation);
+    }
+}
+
+fn validate_resolved_flow_start_playbooks(
+    resolved: &ResolvedStack,
+    validation: &mut StackValidation,
+) {
+    for schedule in &resolved.schedules {
+        let Some(flow_start) = schedule.request.flow_start.as_ref() else {
+            continue;
+        };
+        let Some(playbook) = resolved_playbook_for_ref(resolved, &flow_start.playbook_ref) else {
+            continue;
+        };
+        let status = playbook
+            .publish
+            .as_ref()
+            .map(|publish| publish.status.clone())
+            .unwrap_or_default();
+        if !status.is_startable() {
+            validation.warnings.push(format!(
+                "spec.schedules[{}].flow_start references same-stack playbook {}@{} with non-startable release status `{status:?}`; the schedule can be created but Flow starts will fail until the playbook is published as verified, canary, or active",
+                schedule.name,
+                flow_start.playbook_ref.playbook_id,
+                flow_start.playbook_ref.version
+            ));
+        }
+    }
+}
+
+fn validate_resolved_flow_start_routes(resolved: &ResolvedStack, validation: &mut StackValidation) {
+    for schedule in &resolved.schedules {
+        let Some(flow_start) = schedule.request.flow_start.as_ref() else {
+            continue;
+        };
+        let Some(session) = resolved
+            .sessions
+            .iter()
+            .find(|session| session.session_id == schedule.request.target_session_id)
+        else {
+            continue;
+        };
+        let playbook = resolved_playbook_for_ref(resolved, &flow_start.playbook_ref);
+        validate_scheduled_flow_start_route(
+            &format!("spec.schedules[{}].flow_start.request", schedule.name),
+            flow_start,
+            session,
+            playbook,
+            validation,
+        );
+    }
+}
+
+fn resolved_playbook_for_ref<'a>(
+    resolved: &'a ResolvedStack,
+    reference: &crate::PlaybookVersionRef,
+) -> Option<&'a ResolvedPlaybook> {
+    resolved.playbooks.iter().find(|playbook| {
+        playbook.manifest.playbook_id == reference.playbook_id
+            && playbook.manifest.version == reference.version
+            && playbook.digest == reference.digest
+    })
+}
+
+fn validate_scheduled_flow_start_route(
+    path: &str,
+    flow_start: &crate::StartFlowRequest,
+    session: &ResolvedSession,
+    playbook: Option<&ResolvedPlaybook>,
+    validation: &mut StackValidation,
+) {
+    let request_provider = flow_start.request.provider.as_deref();
+    let default_provider =
+        playbook.and_then(|playbook| playbook.manifest.runtime_defaults.provider.as_deref());
+    let default_model =
+        playbook.and_then(|playbook| playbook.manifest.runtime_defaults.model.as_deref());
+    let request_has_model = flow_start
+        .request
+        .generation
+        .as_ref()
+        .and_then(|generation| generation.model.as_ref())
+        .is_some();
+    let default_model_applies = !request_has_model
+        && default_model.is_some()
+        && request_provider.zip(default_provider).is_none_or(
+            |(request_provider, default_provider)| request_provider == default_provider,
+        );
+    let has_model = request_has_model || default_model_applies;
+    let provider = request_provider.or(default_provider).or_else(|| {
+        (!has_model)
+            .then(|| {
+                session
+                    .route_policy
+                    .as_ref()
+                    .and_then(|policy| policy.provider.as_deref())
+            })
+            .flatten()
+    });
+    validate_route_provider_scope(
+        path,
+        provider,
+        session.credential_scope.as_ref(),
+        validation,
+    );
+}
+
 fn validate_scheduled_request_route(
     path: &str,
     provider: Option<&str>,
@@ -1428,10 +1611,7 @@ fn validate_scheduled_request_route(
     session: &StackSessionSpec,
     validation: &mut StackValidation,
 ) {
-    let Some(scope) = session.credential_scope.as_ref() else {
-        return;
-    };
-    let Some(provider) = provider.or_else(|| {
+    let provider = provider.or_else(|| {
         generation
             .and_then(|generation| generation.model.as_deref())
             .is_none()
@@ -1442,7 +1622,25 @@ fn validate_scheduled_request_route(
                     .and_then(|policy| policy.provider.as_deref())
             })
             .flatten()
-    }) else {
+    });
+    validate_route_provider_scope(
+        path,
+        provider,
+        session.credential_scope.as_ref(),
+        validation,
+    );
+}
+
+fn validate_route_provider_scope(
+    path: &str,
+    provider: Option<&str>,
+    scope: Option<&kheish_types::CredentialScope>,
+    validation: &mut StackValidation,
+) {
+    let Some(scope) = scope else {
+        return;
+    };
+    let Some(provider) = provider else {
         return;
     };
     if !scope.normalized().allows_route(provider) {
@@ -2895,9 +3093,9 @@ where
                             .await
                             .map(|view| {
                                 view.is_some_and(|view| {
-                                    view.versions.iter().any(|version| {
-                                        version.version == playbook.manifest.version
-                                    })
+                                    view.versions
+                                        .iter()
+                                        .any(|version| version.version == playbook.manifest.version)
                                 })
                             });
                         return rollback_or_preserve_failed_create_claim(
@@ -2962,8 +3160,7 @@ pub(crate) async fn verify_stack<C>(
 where
     C: StackControlPlane + Sync,
 {
-    let validation = validate_stack(context)?;
-    let resolved = ResolvedStack::from_context(context).await?;
+    let (validation, resolved) = resolve_validated_stack(context).await?;
     let mut checks = Vec::new();
     checks.extend(
         validation
@@ -3256,7 +3453,7 @@ fn schedule_view_matches(
     live: &crate::ScheduleView,
     desired: &crate::ScheduleCreateRequest,
 ) -> bool {
-    live.name == desired.name
+    let base_matches = live.name == desired.name
         && live.target_session_id == desired.target_session_id
         && desired
             .target_agent_id
@@ -3267,7 +3464,14 @@ fn schedule_view_matches(
         && live.max_executions == desired.max_executions
         && live.overlap_policy == desired.overlap_policy
         && live.misfire_policy == desired.misfire_policy
-        && live.request == crate::summarize_schedule_create_request(desired)
+        && match live.definition_digest.as_deref() {
+            Some(live_digest) => crate::scheduler::schedule_definition_digest(desired)
+                .as_deref()
+                .is_ok_and(|desired_digest| desired_digest == live_digest),
+            None if desired.flow_start.is_some() => false,
+            None => live.request == crate::summarize_schedule_create_request(desired),
+        };
+    base_matches
 }
 
 async fn fetch_live_resource_value<C>(client: &C, key: &ResourceKey) -> Result<Value>
@@ -4006,6 +4210,8 @@ struct StackScheduleSpec {
     request: Option<StackRunRequestSpec>,
     #[serde(default)]
     observation_materialization: Option<crate::ObservationMaterializationRequest>,
+    #[serde(default)]
+    flow_start: Option<StackFlowStartSpec>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -4033,6 +4239,32 @@ struct StackRunRequestSpec {
     reply_plugin: Option<String>,
     #[serde(default)]
     reply_address: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StackFlowStartSpec {
+    #[serde(default)]
+    flow_id: Option<String>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+    playbook_ref: StackPlaybookVersionRef,
+    #[serde(default)]
+    session_id: Option<String>,
+    request: StackRunRequestSpec,
+    #[serde(default)]
+    metadata: Option<Value>,
+    #[serde(default)]
+    evidence_refs: Vec<crate::FlowEvidenceRef>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StackPlaybookVersionRef {
+    playbook_id: String,
+    version: String,
+    #[serde(default)]
+    digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -4253,48 +4485,6 @@ impl ResolvedStack {
                 Ok(ResolvedSession { digest, ..resolved })
             })
             .collect::<Result<Vec<_>>>()?;
-        let mut schedules = Vec::new();
-        for schedule in &context.document.spec.schedules {
-            match (
-                schedule.request.as_ref(),
-                schedule.observation_materialization.as_ref(),
-            ) {
-                (Some(_), None) | (None, Some(_)) => {}
-                (Some(_), Some(_)) => bail!(
-                    "schedule {} must define request or observation_materialization, not both",
-                    schedule.name
-                ),
-                (None, None) => bail!(
-                    "schedule {} must define request or observation_materialization",
-                    schedule.name
-                ),
-            }
-            let request = if let Some(request) = &schedule.request {
-                Some(resolve_run_request(context, request).await?)
-            } else {
-                None
-            };
-            let create = crate::ScheduleCreateRequest {
-                name: schedule.name.clone(),
-                target_session_id: schedule.target_session_id.clone(),
-                target_agent_id: schedule.target_agent_id.clone(),
-                owner_session_id: None,
-                owner_agent_id: None,
-                created_by_run_id: None,
-                cadence: schedule.cadence.clone(),
-                max_executions: schedule.max_executions,
-                overlap_policy: schedule.overlap_policy.clone(),
-                misfire_policy: schedule.misfire_policy.clone(),
-                request,
-                observation_materialization: schedule.observation_materialization.clone(),
-            };
-            let digest = digest_serializable(&create)?;
-            schedules.push(ResolvedSchedule {
-                name: schedule.name.clone(),
-                request: create,
-                digest,
-            });
-        }
         let mut playbooks = Vec::new();
         for playbook in &context.document.spec.playbooks {
             let manifest = match (&playbook.manifest, &playbook.manifest_file) {
@@ -4322,6 +4512,62 @@ impl ResolvedStack {
             playbooks.push(ResolvedPlaybook {
                 manifest,
                 publish: playbook.publish.clone(),
+                digest,
+            });
+        }
+        let mut schedules = Vec::new();
+        for schedule in &context.document.spec.schedules {
+            let payload_count = [
+                schedule.request.is_some(),
+                schedule.observation_materialization.is_some(),
+                schedule.flow_start.is_some(),
+            ]
+            .into_iter()
+            .filter(|present| *present)
+            .count();
+            if payload_count != 1 {
+                bail!("schedule {} must define exactly one payload", schedule.name);
+            }
+            let request = if let Some(request) = &schedule.request {
+                Some(resolve_run_request(context, request).await?)
+            } else {
+                None
+            };
+            let flow_start = if let Some(flow_start) = &schedule.flow_start {
+                Some(crate::StartFlowRequest {
+                    flow_id: flow_start.flow_id.clone(),
+                    idempotency_key: flow_start.idempotency_key.clone(),
+                    playbook_ref: resolve_stack_playbook_ref(&flow_start.playbook_ref, &playbooks)?,
+                    session_id: flow_start
+                        .session_id
+                        .clone()
+                        .unwrap_or_else(|| schedule.target_session_id.clone()),
+                    request: resolve_run_request(context, &flow_start.request).await?,
+                    metadata: flow_start.metadata.clone().unwrap_or(Value::Null),
+                    evidence_refs: flow_start.evidence_refs.clone(),
+                })
+            } else {
+                None
+            };
+            let create = crate::ScheduleCreateRequest {
+                name: schedule.name.clone(),
+                target_session_id: schedule.target_session_id.clone(),
+                target_agent_id: schedule.target_agent_id.clone(),
+                owner_session_id: None,
+                owner_agent_id: None,
+                created_by_run_id: None,
+                cadence: schedule.cadence.clone(),
+                max_executions: schedule.max_executions,
+                overlap_policy: schedule.overlap_policy.clone(),
+                misfire_policy: schedule.misfire_policy.clone(),
+                request,
+                observation_materialization: schedule.observation_materialization.clone(),
+                flow_start,
+            };
+            let digest = digest_serializable(&create)?;
+            schedules.push(ResolvedSchedule {
+                name: schedule.name.clone(),
+                request: create,
                 digest,
             });
         }
@@ -4393,6 +4639,34 @@ impl ResolvedStack {
         }));
         keys
     }
+}
+
+fn resolve_stack_playbook_ref(
+    reference: &StackPlaybookVersionRef,
+    playbooks: &[ResolvedPlaybook],
+) -> Result<crate::PlaybookVersionRef> {
+    if let Some(digest) = reference.digest.clone() {
+        return Ok(crate::PlaybookVersionRef {
+            playbook_id: reference.playbook_id.clone(),
+            version: reference.version.clone(),
+            digest,
+        });
+    }
+    let Some(playbook) = playbooks.iter().find(|candidate| {
+        candidate.manifest.playbook_id == reference.playbook_id
+            && candidate.manifest.version == reference.version
+    }) else {
+        bail!(
+            "flow_start.playbook_ref {}@{} omits digest but no matching spec.playbooks entry exists",
+            reference.playbook_id,
+            reference.version
+        );
+    };
+    Ok(crate::PlaybookVersionRef {
+        playbook_id: reference.playbook_id.clone(),
+        version: reference.version.clone(),
+        digest: playbook.digest.clone(),
+    })
 }
 
 async fn resolve_run_request(
@@ -5215,6 +5489,13 @@ mod tests {
 
     fn errors_contain(validation: &StackValidation, needle: &str) -> bool {
         validation.errors.iter().any(|error| error.contains(needle))
+    }
+
+    fn warnings_contain(validation: &StackValidation, needle: &str) -> bool {
+        validation
+            .warnings
+            .iter()
+            .any(|warning| warning.contains(needle))
     }
 
     struct EmptyControlPlane;
@@ -6148,6 +6429,331 @@ spec:
         assert!(errors_contain(
             &validation,
             "spec.schedules[observation-schedule].observation_materialization.request.provider `openai` is not allowed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolved_stack_accepts_scheduled_flow_start_with_default_session_and_content_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("prompt.md"), "Run the feature Flow.")
+            .expect("write prompt");
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: scheduled-flow-start
+spec:
+  sessions:
+    - session_id: declared-session
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_deny: ["*"]
+        mcp_tool_deny: ["*"]
+      credential_scope:
+        route_deny: ["*"]
+        connector_deny: ["*"]
+        connector_credential_deny: ["*"]
+        mcp_server_deny: ["*"]
+  playbooks:
+    - manifest:
+        playbook_id: feature-flow
+        version: "1"
+        title: Feature Flow
+        objective: Run a feature workflow.
+        phases:
+          - phase_id: run
+            objective: Run the scheduled feature workflow.
+        acceptance_criteria:
+          - The scheduled Flow creates a root run.
+  schedules:
+    - name: scheduled-flow
+      target_session_id: declared-session
+      cadence:
+        type: once
+        fire_at_ms: 4102444800000
+      flow_start:
+        playbook_ref:
+          playbook_id: feature-flow
+          version: "1"
+        request:
+          content_file: prompt.md
+"#;
+        let mut context =
+            StackContext::from_manifest(raw, temp.path().to_path_buf(), None, true).unwrap();
+        context.allow_file_refs = true;
+        let validation = validate_stack_context(&context).await.unwrap();
+        assert!(validation.valid, "{:?}", validation.errors);
+
+        let resolved = ResolvedStack::from_context(&context).await.unwrap();
+        let flow_start = resolved.schedules[0]
+            .request
+            .flow_start
+            .as_ref()
+            .expect("flow_start");
+        assert_eq!(flow_start.session_id, "declared-session");
+        assert_eq!(flow_start.request.content, "Run the feature Flow.");
+        assert!(!flow_start.playbook_ref.digest.is_empty());
+    }
+
+    #[tokio::test]
+    async fn schedule_view_matches_detects_flow_start_definition_drift() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: scheduled-flow-drift
+spec:
+  sessions:
+    - session_id: declared-session
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_deny: ["*"]
+        mcp_tool_deny: ["*"]
+      credential_scope:
+        route_deny: ["*"]
+        connector_deny: ["*"]
+        connector_credential_deny: ["*"]
+        mcp_server_deny: ["*"]
+  playbooks:
+    - manifest:
+        playbook_id: feature-flow
+        version: "1"
+        title: Feature Flow
+        objective: Run a generic feature workflow.
+        phases:
+          - phase_id: run
+            objective: Run the scheduled feature workflow.
+        acceptance_criteria:
+          - The scheduled Flow creates a root run.
+  schedules:
+    - name: scheduled-flow
+      target_session_id: declared-session
+      cadence:
+        type: once
+        fire_at_ms: 4102444800000
+      flow_start:
+        playbook_ref:
+          playbook_id: feature-flow
+          version: "1"
+        request:
+          content: run
+"#;
+        let resolved = ResolvedStack::from_context(&context(raw)).await.unwrap();
+        let desired = resolved.schedules[0].request.clone();
+        let record =
+            crate::scheduler::build_schedule_record("schedule-1".to_string(), 1, desired.clone())
+                .unwrap();
+        assert!(schedule_view_matches(&record.view, &desired));
+
+        let mut drifted = desired.clone();
+        drifted
+            .flow_start
+            .as_mut()
+            .expect("flow_start")
+            .playbook_ref
+            .digest = "different-digest".to_string();
+
+        assert!(!schedule_view_matches(&record.view, &drifted));
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_flow_start_provider_outside_session_scope() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: scheduled-flow-provider-scope
+spec:
+  sessions:
+    - session_id: declared-session
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_deny: ["*"]
+        mcp_tool_deny: ["*"]
+      credential_scope:
+        route_deny: ["*"]
+        connector_deny: ["*"]
+        connector_credential_deny: ["*"]
+        mcp_server_deny: ["*"]
+  schedules:
+    - name: scheduled-flow
+      target_session_id: declared-session
+      cadence:
+        type: once
+        fire_at_ms: 4102444800000
+      flow_start:
+        playbook_ref:
+          playbook_id: feature-flow
+          version: "1"
+          digest: digest-1
+        request:
+          provider: openai
+          content: run
+"#;
+
+        let validation = validate_stack_context(&context(raw)).await.unwrap();
+
+        assert!(!validation.valid);
+        assert!(errors_contain(
+            &validation,
+            "spec.schedules[scheduled-flow].flow_start.request.provider `openai` is not allowed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_flow_start_playbook_default_provider_outside_session_scope() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: scheduled-flow-runtime-default-scope
+spec:
+  sessions:
+    - session_id: declared-session
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_deny: ["*"]
+        mcp_tool_deny: ["*"]
+      credential_scope:
+        route_deny: ["openai"]
+        connector_deny: ["*"]
+        connector_credential_deny: ["*"]
+        mcp_server_deny: ["*"]
+  playbooks:
+    - manifest:
+        playbook_id: feature-flow
+        version: "1"
+        title: Feature Flow
+        objective: Run a generic feature workflow.
+        runtime_defaults:
+          provider: openai
+        phases:
+          - phase_id: run
+            objective: Run the scheduled feature workflow.
+        acceptance_criteria:
+          - The scheduled Flow creates a root run.
+      publish:
+        status: active
+        evidence_refs:
+          - kind: test
+            id: release
+  schedules:
+    - name: scheduled-flow
+      target_session_id: declared-session
+      cadence:
+        type: once
+        fire_at_ms: 4102444800000
+      flow_start:
+        playbook_ref:
+          playbook_id: feature-flow
+          version: "1"
+        request:
+          content: run
+"#;
+
+        let validation = validate_stack_context(&context(raw)).await.unwrap();
+
+        assert!(!validation.valid);
+        assert!(errors_contain(
+            &validation,
+            "spec.schedules[scheduled-flow].flow_start.request.provider `openai` is not allowed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn validate_warns_when_scheduled_flow_references_draft_same_stack_playbook() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: scheduled-flow-draft-warning
+spec:
+  sessions:
+    - session_id: declared-session
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_deny: ["*"]
+        mcp_tool_deny: ["*"]
+      credential_scope:
+        route_deny: ["*"]
+        connector_deny: ["*"]
+        connector_credential_deny: ["*"]
+        mcp_server_deny: ["*"]
+  playbooks:
+    - manifest:
+        playbook_id: feature-flow
+        version: "1"
+        title: Feature Flow
+        objective: Run a generic feature workflow.
+        phases:
+          - phase_id: run
+            objective: Run the scheduled feature workflow.
+        acceptance_criteria:
+          - The scheduled Flow creates a root run.
+  schedules:
+    - name: scheduled-flow
+      target_session_id: declared-session
+      cadence:
+        type: once
+        fire_at_ms: 4102444800000
+      flow_start:
+        playbook_ref:
+          playbook_id: feature-flow
+          version: "1"
+        request:
+          content: run
+"#;
+
+        let validation = validate_stack_context(&context(raw)).await.unwrap();
+
+        assert!(validation.valid, "{:?}", validation.errors);
+        assert!(warnings_contain(
+            &validation,
+            "flow_start references same-stack playbook feature-flow@1 with non-startable release status"
+        ));
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_flow_start_scalar_request_metadata() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: scheduled-flow-metadata
+spec:
+  sessions:
+    - session_id: declared-session
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_deny: ["*"]
+        mcp_tool_deny: ["*"]
+      credential_scope:
+        route_deny: ["*"]
+        connector_deny: ["*"]
+        connector_credential_deny: ["*"]
+        mcp_server_deny: ["*"]
+  schedules:
+    - name: scheduled-flow
+      target_session_id: declared-session
+      cadence:
+        type: once
+        fire_at_ms: 4102444800000
+      flow_start:
+        playbook_ref:
+          playbook_id: feature-flow
+          version: "1"
+          digest: digest-1
+        request:
+          content: run
+          metadata: scalar
+"#;
+
+        let validation = validate_stack_context(&context(raw)).await.unwrap();
+
+        assert!(!validation.valid);
+        assert!(errors_contain(
+            &validation,
+            "spec.schedules[scheduled-flow].flow_start.request.metadata must be an object"
         ));
     }
 

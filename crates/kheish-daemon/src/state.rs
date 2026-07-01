@@ -134,12 +134,13 @@ use crate::projects::{FileProjectStore, ProjectTaskView, ProjectView};
 use crate::runs::{
     DaemonRunKind, DaemonRunStatus, FileRunStore, ParentClarificationCompletionReason,
     ParentClarificationCompletionState, ParentClarificationRunRequest, RunEvent, RunEventEntry,
-    RunInputIdempotency, RunRecord, RunRequestPayload, RunView, SessionRunState, now_ms,
-    summarize_input_request, summarize_mailbox_request, summarize_parent_clarification_request,
+    RunInputIdempotency, RunRecord, RunRequestPayload, RunView, ScheduledRunOrigin,
+    SessionRunState, now_ms, summarize_input_request, summarize_mailbox_request,
+    summarize_parent_clarification_request,
 };
 use crate::scheduler::{
     DEFAULT_MAX_OWNER_SCHEDULES, FileScheduleStore, ScheduleCreateRequest, ScheduleRecord,
-    ScheduleStatus, ScheduleView, build_schedule_record,
+    ScheduleStatus, ScheduleView, build_schedule_record, resolved_flow_start_for_schedule,
     resolved_observation_materialization_request_for_schedule, resolved_request_for_schedule,
     validate_schedule_create_request,
 };
