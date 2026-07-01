@@ -2194,6 +2194,7 @@ async fn add_secret_actions<C>(
 where
     C: StackControlPlane + Sync,
 {
+    let ownership_id = context.ownership_id();
     for secret in &resolved.secrets {
         let encoded = url_encode_path_segment(&secret.slot);
         let live = client
@@ -2249,10 +2250,15 @@ where
                 ));
                 "blocked"
             }
+        } else if secret.value_env.is_none() {
+            "verify"
         } else if let Some(fingerprint) = desired_fingerprint.as_deref() {
             if ledger
-                .secret_fingerprint(&context.ownership_id(), &secret.slot)
+                .secret_fingerprint(&ownership_id, &secret.slot)
                 .is_some_and(|stored| stored == fingerprint)
+                && live.as_ref().is_some_and(|status| {
+                    !managed_secret_modified_after_apply(ledger, &ownership_id, &key, status)
+                })
             {
                 "noop"
             } else {
@@ -2266,7 +2272,11 @@ where
             key.kind,
             key.id,
             operation,
-            "secret values are not read back; drift is tracked by ledger fingerprints when value_env is provided",
+            if secret.value_env.is_some() {
+                "secret values are not read back; drift is tracked by ledger fingerprints when value_env is provided"
+            } else {
+                "required secret exists and provider matches; unmanaged prerequisite secrets are not owned by the stack ledger"
+            },
         ));
     }
     Ok(())
@@ -2565,7 +2575,7 @@ fn add_ownership_diagnostics(ledger: &ApplyLedger, ownership_id: &str, plan: &mu
             continue;
         };
         match ledger.owner_of_resource(&key) {
-            Some(owner) if owner != ownership_id => plan.errors.push(format!(
+            Some(owner) if owner != ownership_id && requires_stack_resource_ownership(action) => plan.errors.push(format!(
                 "resource {key} is already owned by stack `{owner}`; import or down that ownership before applying `{ownership_id}`"
             )),
             None if requires_existing_resource_ownership(action) => plan.errors.push(format!(
@@ -2588,6 +2598,24 @@ fn resource_key_for_action(action: &StackAction) -> Option<ResourceKey> {
 
 fn requires_existing_resource_ownership(action: &StackAction) -> bool {
     matches!(action.operation.as_str(), "noop" | "update" | "apply")
+}
+
+fn requires_stack_resource_ownership(action: &StackAction) -> bool {
+    matches!(
+        action.operation.as_str(),
+        "create" | "noop" | "update" | "apply"
+    )
+}
+
+fn managed_secret_modified_after_apply(
+    ledger: &ApplyLedger,
+    ownership_id: &str,
+    key: &ResourceKey,
+    live: &kheish_auth::AuthSlotStatus,
+) -> bool {
+    ledger
+        .resource_last_applied_at_ms(ownership_id, key)
+        .is_none_or(|last_applied_at_ms| live.updated_at_ms > last_applied_at_ms)
 }
 
 fn enforce_desired_resource_ownership(
@@ -2626,6 +2654,7 @@ async fn apply_secrets<C>(
 where
     C: StackControlPlane + Sync,
 {
+    let ownership_id = context.ownership_id();
     for secret in &resolved.secrets {
         let encoded = url_encode_path_segment(&secret.slot);
         let live = client
@@ -2643,7 +2672,7 @@ where
             }
             let key = ResourceKey::new("secret", &secret.slot);
             if live.is_some() {
-                ensure_existing_resource_owned(ledger, &context.ownership_id(), &key)?;
+                ensure_existing_resource_owned(ledger, &ownership_id, &key)?;
             }
             let fingerprint = secret_fingerprint(&ledger.ledger_salt, &secret.slot, env_name)?;
             if live.is_some()
@@ -2651,8 +2680,11 @@ where
                     .as_ref()
                     .is_some_and(|status| status.provider == secret.provider)
                 && ledger
-                    .secret_fingerprint(&context.ownership_id(), &secret.slot)
+                    .secret_fingerprint(&ownership_id, &secret.slot)
                     .is_some_and(|stored| stored == fingerprint)
+                && live.as_ref().is_some_and(|status| {
+                    !managed_secret_modified_after_apply(ledger, &ownership_id, &key, status)
+                })
             {
                 continue;
             }
@@ -2660,7 +2692,7 @@ where
                 claim_resource_for_create(
                     ledger_path,
                     ledger,
-                    &context.ownership_id(),
+                    &ownership_id,
                     &key,
                     fingerprint.clone(),
                 )
@@ -2685,7 +2717,7 @@ where
                     return rollback_or_preserve_failed_create_claim(
                         ledger_path,
                         ledger,
-                        &context.ownership_id(),
+                        &ownership_id,
                         &key,
                         error,
                         live_probe,
@@ -2695,8 +2727,8 @@ where
                 return Err(error);
             }
             let resource_digest = fingerprint.clone();
-            ledger.record_secret(&context.ownership_id(), &secret.slot, fingerprint);
-            ledger.record_resource(&context.ownership_id(), &key, resource_digest);
+            ledger.record_secret(&ownership_id, &secret.slot, fingerprint);
+            ledger.record_resource(&ownership_id, &key, resource_digest);
             ledger.save(ledger_path).await?;
             report.applied.push(StackAction::new(
                 "secrets",
@@ -2705,11 +2737,20 @@ where
                 if live.is_some() { "update" } else { "create" },
                 "secret was written through the daemon secret API; value is represented only by ledger fingerprint",
             ));
-        } else if live.is_none() {
-            bail!(
-                "required secret {} is missing and no value_env was provided",
-                secret.slot
-            );
+        } else {
+            match live.as_ref() {
+                None => bail!(
+                    "required secret {} is missing and no value_env was provided",
+                    secret.slot
+                ),
+                Some(status) if status.provider != secret.provider => bail!(
+                    "required secret {} exists with provider {} but manifest requires {} and has no value_env source",
+                    secret.slot,
+                    status.provider,
+                    secret.provider
+                ),
+                Some(_) => {}
+            }
         }
     }
     Ok(())
@@ -3430,6 +3471,8 @@ where
     C: StackControlPlane + Sync,
 {
     let (validation, resolved) = resolve_validated_stack(context).await?;
+    let ledger_path = resolve_ledger_path(client, context.state_root_override.as_deref()).await?;
+    let ledger = ApplyLedger::load_or_new(&ledger_path).await?;
     let mut checks = Vec::new();
     checks.extend(
         validation
@@ -3449,6 +3492,7 @@ where
             "runtime settings match desired fields",
         ));
     }
+    let ownership_id = context.ownership_id();
     for secret in &resolved.secrets {
         let encoded = url_encode_path_segment(&secret.slot);
         let live = client
@@ -3456,6 +3500,7 @@ where
                 "/v1/runtime/secrets/{encoded}"
             ))
             .await?;
+        let key = ResourceKey::new("secret", &secret.slot);
         let (ok, detail) = match live.as_ref() {
             None => (false, "required secret is missing".to_string()),
             Some(status) if status.provider != secret.provider => (
@@ -3465,6 +3510,29 @@ where
                     status.provider, secret.provider
                 ),
             ),
+            Some(_)
+                if secret.value_env.is_some()
+                    && ledger.owner_of_resource(&key) != Some(ownership_id.as_str()) =>
+            {
+                (
+                    false,
+                    "managed secret is not owned by this stack ledger".to_string(),
+                )
+            }
+            Some(status)
+                if secret.value_env.is_some()
+                    && managed_secret_modified_after_apply(
+                        &ledger,
+                        &ownership_id,
+                        &key,
+                        status,
+                    ) =>
+            {
+                (
+                    false,
+                    "managed secret may have drifted after the last stack apply".to_string(),
+                )
+            }
             Some(_) => (
                 true,
                 "required secret exists and provider matches".to_string(),
@@ -4999,6 +5067,7 @@ impl ResolvedStack {
         keys.extend(
             self.secrets
                 .iter()
+                .filter(|secret| secret.value_env.is_some())
                 .map(|secret| ResourceKey::new("secret", &secret.slot).to_string()),
         );
         keys.extend(self.connectors.iter().map(|connector| {
@@ -5561,6 +5630,14 @@ impl ApplyLedger {
             .map(|resource| resource.desired_digest.as_str())
     }
 
+    fn resource_last_applied_at_ms(&self, ownership_id: &str, key: &ResourceKey) -> Option<u64> {
+        self.stacks
+            .get(ownership_id)?
+            .resources
+            .get(&key.to_string())
+            .map(|resource| resource.last_applied_at_ms)
+    }
+
     fn record_secret(&mut self, ownership_id: &str, slot: &str, fingerprint: String) {
         self.stack_mut(ownership_id).append_operation(
             "record_secret",
@@ -6089,6 +6166,8 @@ impl StackControlPlane for RecordingControlPlane {
     struct LiveSecretControlPlane {
         posts: std::sync::Mutex<Vec<String>>,
         provider: kheish_auth::AuthProvider,
+        updated_at_ms: u64,
+        allow_secret_posts: bool,
     }
 
     impl Default for LiveSecretControlPlane {
@@ -6096,6 +6175,8 @@ impl StackControlPlane for RecordingControlPlane {
             Self {
                 posts: std::sync::Mutex::new(Vec::new()),
                 provider: kheish_auth::AuthProvider::Generic,
+                updated_at_ms: 1,
+                allow_secret_posts: false,
             }
         }
     }
@@ -6108,6 +6189,9 @@ impl StackControlPlane for LiveSecretControlPlane {
         {
             if path == "/v1/schedules" {
                 return encode_response(Vec::<crate::ScheduleView>::new());
+            }
+            if path == "/v1/runtime" {
+                return encode_response(crate::RuntimeSettingsView::default());
             }
             if path.starts_with("/v1/runtime/secrets/") {
                 return encode_response(self.secret_status());
@@ -6131,6 +6215,9 @@ impl StackControlPlane for LiveSecretControlPlane {
             T: DeserializeOwned + Send,
         {
             self.posts.lock().unwrap().push(path.to_string());
+            if self.allow_secret_posts && path == "/v1/runtime/secrets" {
+                return encode_response(self.secret_status());
+            }
             bail!("unexpected POST {path}")
         }
 
@@ -6157,7 +6244,7 @@ impl StackControlPlane for LiveSecretControlPlane {
                 provider: self.provider,
                 mode: kheish_auth::AuthMode::OpaqueSecret,
                 summary: "configured".to_string(),
-                updated_at_ms: 1,
+                updated_at_ms: self.updated_at_ms,
                 details: BTreeMap::new(),
             }
         }
@@ -8020,6 +8107,179 @@ spec:
     }
 
     #[tokio::test]
+    async fn plan_allows_existing_required_secret_without_value_env_unowned() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: required-live-secret-plan
+spec:
+  requires:
+    secrets:
+      - ref: stack.test.LIVE_SECRET
+        provider: generic
+"#;
+        let context = StackContext::from_manifest(
+            raw,
+            PathBuf::from("."),
+            Some(temp.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+
+        let plan = build_plan(&LiveSecretControlPlane::default(), &context, false, false)
+            .await
+            .unwrap();
+
+        assert!(plan.valid, "{:?}", plan.errors);
+        assert!(
+            plan.errors
+                .iter()
+                .all(|error| !error.contains("already exists but is not owned")),
+            "{:?}",
+            plan.errors
+        );
+        assert!(plan.actions.iter().any(|action| {
+            action.resource_type == "secret"
+                && action.resource_id == "stack.test.LIVE_SECRET"
+                && action.operation == "verify"
+        }));
+        assert!(!stack_ledger_path(temp.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn apply_treats_existing_required_secret_without_value_env_as_prerequisite() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: required-live-secret-apply
+spec:
+  requires:
+    secrets:
+      - ref: stack.test.LIVE_SECRET
+        provider: generic
+"#;
+        let context = StackContext::from_manifest(
+            raw,
+            PathBuf::from("."),
+            Some(temp.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+        let client = LiveSecretControlPlane::default();
+
+        let report = apply_stack(
+            &client,
+            context,
+            StackApplyOptions {
+                dry_run: false,
+                force_restart: false,
+                allow_secret_env: false,
+                prune: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            report
+                .verification
+                .as_ref()
+                .is_some_and(|verification| verification.valid),
+            "{:?}",
+            report.verification
+        );
+        assert!(
+            report
+                .applied
+                .iter()
+                .all(|action| action.resource_type != "secret")
+        );
+        assert!(client.posts.lock().unwrap().is_empty());
+        let ledger = ApplyLedger::load_or_new(&stack_ledger_path(temp.path()))
+            .await
+            .unwrap();
+        assert_eq!(
+            ledger.owner_of_resource(&ResourceKey::new("secret", "stack.test.LIVE_SECRET")),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_allows_required_secret_owned_by_another_stack_without_value_env() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let secret_key = ResourceKey::new("secret", "stack.test.LIVE_SECRET");
+        let ledger_path = stack_ledger_path(temp.path());
+        let mut ledger = ApplyLedger::new();
+        ledger.record_secret(
+            "credential-stack",
+            "stack.test.LIVE_SECRET",
+            "fingerprint".to_string(),
+        );
+        ledger.record_resource("credential-stack", &secret_key, "fingerprint".to_string());
+        ledger.save(&ledger_path).await.unwrap();
+
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: dependent-stack
+spec:
+  requires:
+    secrets:
+      - ref: stack.test.LIVE_SECRET
+        provider: generic
+"#;
+        let context = StackContext::from_manifest(
+            raw,
+            PathBuf::from("."),
+            Some(temp.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+        let client = LiveSecretControlPlane::default();
+
+        let plan = build_plan(&client, &context, false, false).await.unwrap();
+        assert!(plan.valid, "{:?}", plan.errors);
+        assert!(plan.actions.iter().any(|action| {
+            action.resource_type == "secret"
+                && action.resource_id == "stack.test.LIVE_SECRET"
+                && action.operation == "verify"
+        }));
+
+        let report = apply_stack(
+            &client,
+            context,
+            StackApplyOptions {
+                dry_run: false,
+                force_restart: false,
+                allow_secret_env: false,
+                prune: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            report
+                .verification
+                .as_ref()
+                .is_some_and(|verification| verification.valid),
+            "{:?}",
+            report.verification
+        );
+        assert!(client.posts.lock().unwrap().is_empty());
+        let ledger = ApplyLedger::load_or_new(&ledger_path).await.unwrap();
+        assert_eq!(
+            ledger.owner_of_resource(&secret_key),
+            Some("credential-stack")
+        );
+    }
+
+    #[tokio::test]
     async fn apply_rejects_value_env_secret_when_live_slot_is_not_imported_before_write() {
         let _guard = crate::debug::debug_capture_env_lock();
         let temp = tempfile::tempdir().expect("tempdir");
@@ -8132,6 +8392,233 @@ spec:
             action.resource_type == "secret"
                 && action.resource_id == "stack.test.LIVE_SECRET"
                 && action.operation == "blocked"
+        }));
+    }
+
+    #[tokio::test]
+    async fn plan_updates_managed_value_env_secret_when_live_slot_changed_after_apply() {
+        let _guard = crate::debug::debug_capture_env_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let env_name = "KHEISH_STACK_TEST_SECRET_TIMESTAMP_DRIFT_PLAN";
+        unsafe {
+            std::env::set_var(env_name, "managed-value");
+        }
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: timestamp-drift-secret-plan
+spec:
+  requires:
+    secrets:
+      - ref: stack.test.LIVE_SECRET
+        provider: generic
+        value_env: KHEISH_STACK_TEST_SECRET_TIMESTAMP_DRIFT_PLAN
+"#;
+        let context = StackContext::from_manifest(
+            raw,
+            PathBuf::from("."),
+            Some(temp.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+        let client = LiveSecretControlPlane::default();
+
+        import_stack(
+            &client,
+            context.clone(),
+            StackImportOptions {
+                resources: vec!["secret/stack.test.LIVE_SECRET".to_string()],
+                allow_secret_env: true,
+            },
+        )
+        .await
+        .unwrap();
+        let key = ResourceKey::new("secret", "stack.test.LIVE_SECRET");
+        let ledger_path = stack_ledger_path(temp.path());
+        let mut ledger = ApplyLedger::load_or_new(&ledger_path).await.unwrap();
+        ledger
+            .stack_mut("timestamp-drift-secret-plan")
+            .resources
+            .get_mut(&key.to_string())
+            .unwrap()
+            .last_applied_at_ms = 1;
+        ledger.save(&ledger_path).await.unwrap();
+
+        let drifted_client = LiveSecretControlPlane {
+            updated_at_ms: 2,
+            ..LiveSecretControlPlane::default()
+        };
+        let plan = build_plan(&drifted_client, &context, false, true)
+            .await
+            .unwrap();
+
+        unsafe {
+            std::env::remove_var(env_name);
+        }
+        assert!(plan.valid, "{:?}", plan.errors);
+        assert!(plan.actions.iter().any(|action| {
+            action.resource_type == "secret"
+                && action.resource_id == "stack.test.LIVE_SECRET"
+                && action.operation == "update"
+        }));
+    }
+
+    #[tokio::test]
+    async fn apply_rewrites_managed_value_env_secret_when_live_slot_changed_after_apply() {
+        let _guard = crate::debug::debug_capture_env_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let env_name = "KHEISH_STACK_TEST_SECRET_TIMESTAMP_DRIFT_APPLY";
+        unsafe {
+            std::env::set_var(env_name, "managed-value");
+        }
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: timestamp-drift-secret-apply
+spec:
+  requires:
+    secrets:
+      - ref: stack.test.LIVE_SECRET
+        provider: generic
+        value_env: KHEISH_STACK_TEST_SECRET_TIMESTAMP_DRIFT_APPLY
+"#;
+        let context = StackContext::from_manifest(
+            raw,
+            PathBuf::from("."),
+            Some(temp.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+        let client = LiveSecretControlPlane::default();
+
+        import_stack(
+            &client,
+            context.clone(),
+            StackImportOptions {
+                resources: vec!["secret/stack.test.LIVE_SECRET".to_string()],
+                allow_secret_env: true,
+            },
+        )
+        .await
+        .unwrap();
+        let key = ResourceKey::new("secret", "stack.test.LIVE_SECRET");
+        let ledger_path = stack_ledger_path(temp.path());
+        let mut ledger = ApplyLedger::load_or_new(&ledger_path).await.unwrap();
+        ledger
+            .stack_mut("timestamp-drift-secret-apply")
+            .resources
+            .get_mut(&key.to_string())
+            .unwrap()
+            .last_applied_at_ms = 1;
+        ledger.save(&ledger_path).await.unwrap();
+
+        let drifted_client = LiveSecretControlPlane {
+            updated_at_ms: 2,
+            allow_secret_posts: true,
+            ..LiveSecretControlPlane::default()
+        };
+        let report = apply_stack(
+            &drifted_client,
+            context,
+            StackApplyOptions {
+                dry_run: false,
+                force_restart: false,
+                allow_secret_env: true,
+                prune: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        unsafe {
+            std::env::remove_var(env_name);
+        }
+        assert!(report.applied.iter().any(|action| {
+            action.resource_type == "secret"
+                && action.resource_id == "stack.test.LIVE_SECRET"
+                && action.operation == "update"
+        }));
+        assert_eq!(
+            drifted_client.posts.lock().unwrap().as_slice(),
+            ["/v1/runtime/secrets"]
+        );
+        assert!(
+            report
+                .verification
+                .as_ref()
+                .is_some_and(|verification| verification.valid),
+            "{:?}",
+            report.verification
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_managed_value_env_secret_changed_after_apply() {
+        let _guard = crate::debug::debug_capture_env_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let env_name = "KHEISH_STACK_TEST_SECRET_TIMESTAMP_DRIFT_VERIFY";
+        unsafe {
+            std::env::set_var(env_name, "managed-value");
+        }
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: timestamp-drift-secret-verify
+spec:
+  requires:
+    secrets:
+      - ref: stack.test.LIVE_SECRET
+        provider: generic
+        value_env: KHEISH_STACK_TEST_SECRET_TIMESTAMP_DRIFT_VERIFY
+"#;
+        let context = StackContext::from_manifest(
+            raw,
+            PathBuf::from("."),
+            Some(temp.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+        let client = LiveSecretControlPlane::default();
+
+        import_stack(
+            &client,
+            context.clone(),
+            StackImportOptions {
+                resources: vec!["secret/stack.test.LIVE_SECRET".to_string()],
+                allow_secret_env: true,
+            },
+        )
+        .await
+        .unwrap();
+        let key = ResourceKey::new("secret", "stack.test.LIVE_SECRET");
+        let ledger_path = stack_ledger_path(temp.path());
+        let mut ledger = ApplyLedger::load_or_new(&ledger_path).await.unwrap();
+        ledger
+            .stack_mut("timestamp-drift-secret-verify")
+            .resources
+            .get_mut(&key.to_string())
+            .unwrap()
+            .last_applied_at_ms = 1;
+        ledger.save(&ledger_path).await.unwrap();
+
+        let drifted_client = LiveSecretControlPlane {
+            updated_at_ms: 2,
+            ..LiveSecretControlPlane::default()
+        };
+        let report = verify_stack(&drifted_client, &context).await.unwrap();
+
+        unsafe {
+            std::env::remove_var(env_name);
+        }
+        assert!(!report.valid);
+        assert!(report.checks.iter().any(|check| {
+            check.kind == "secret"
+                && check.target == "stack.test.LIVE_SECRET"
+                && !check.ok
+                && check.detail.contains("may have drifted")
         }));
     }
 
