@@ -23,19 +23,19 @@ spec:
           uses_credentials: true
           credential_secret_refs: ["mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN"]
         - name: linear
-          source: codex_config
+          source: built_in_catalog
+          catalog_entry_id: linear
           uses_credentials: true
           credential_secret_refs: ["mcp.linear.LINEAR_API_KEY"]
       tools:
         - mcp__github__create_pull_request
-        - mcp__github__get_pull_request
         - mcp__github__list_pull_requests
-        - mcp__github__list_pull_request_comments
-        - mcp__github__reply_to_review_comment
-        - mcp__linear__create_comment
+        - mcp__github__pull_request_read
+        - mcp__github__add_reply_to_pull_request_comment
         - mcp__linear__get_issue
         - mcp__linear__list_issues
-        - mcp__linear__update_issue
+        - mcp__linear__save_comment
+        - mcp__linear__save_issue
   personas:
     - persona_id: feature-pr-operator
       display_name: Feature PR Operator
@@ -45,14 +45,13 @@ spec:
         mcp_server_allow: ["github", "linear"]
         mcp_tool_allow:
           - mcp__github__create_pull_request
-          - mcp__github__get_pull_request
           - mcp__github__list_pull_requests
-          - mcp__github__list_pull_request_comments
-          - mcp__github__reply_to_review_comment
-          - mcp__linear__create_comment
+          - mcp__github__pull_request_read
+          - mcp__github__add_reply_to_pull_request_comment
           - mcp__linear__get_issue
           - mcp__linear__list_issues
-          - mcp__linear__update_issue
+          - mcp__linear__save_comment
+          - mcp__linear__save_issue
   sessions:
     - session_id: feature-pr-loop
       persona_id: feature-pr-operator
@@ -61,14 +60,13 @@ spec:
         mcp_server_allow: ["github", "linear"]
         mcp_tool_allow:
           - mcp__github__create_pull_request
-          - mcp__github__get_pull_request
           - mcp__github__list_pull_requests
-          - mcp__github__list_pull_request_comments
-          - mcp__github__reply_to_review_comment
-          - mcp__linear__create_comment
+          - mcp__github__pull_request_read
+          - mcp__github__add_reply_to_pull_request_comment
           - mcp__linear__get_issue
           - mcp__linear__list_issues
-          - mcp__linear__update_issue
+          - mcp__linear__save_comment
+          - mcp__linear__save_issue
       credential_scope:
         route_allow: ["openai"]
         connector_deny: ["*"]

@@ -46,13 +46,9 @@ acceptance_criteria:
   - No duplicate PR is created for an issue with an active workflow PR.
   - Every automatic code mutation has test evidence and xhigh review evidence.
   - The workflow stops rather than guessing when human product judgment is required.
-required_evidence:
-  - kind: run
-    id: root
-    description: Root scheduled Flow run.
-  - kind: agent
-    id: reviewer
-    description: Internal reviewer subagent evidence.
+evidence_expectations:
+  - The root scheduled run id is available from the Flow projection.
+  - Reviewer subagent evidence is recorded in the run output or linked PR/Linear comments.
 tools:
   enforce: false
 runtime_defaults:

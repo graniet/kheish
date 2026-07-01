@@ -6224,6 +6224,190 @@ async fn daemon_schedule_starts_flow_and_settles_with_scheduled_root_run() -> Re
 }
 
 #[tokio::test]
+async fn daemon_stack_schedule_flow_start_triggers_flow() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-stack-scheduled-flow");
+    let (address, shutdown) = scripted_daemon(
+        &state_root,
+        vec![Ok(scripted_events(
+            "assistant-stack-scheduled-flow",
+            "STACK_SCHEDULED_FLOW_DONE",
+            kheish_types::ModelFinishReason::Completed,
+        ))],
+    )
+    .await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+    let fire_at_ms = now_ms().saturating_add(60_000);
+    let manifest = format!(
+        r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: stack-scheduled-flow
+spec:
+  sessions:
+    - session_id: stack-flow-session
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_deny: ["*"]
+        mcp_tool_deny: ["*"]
+      credential_scope:
+        route_allow: ["scripted"]
+        connector_deny: ["*"]
+        connector_credential_deny: ["*"]
+        mcp_server_deny: ["*"]
+  playbooks:
+    - manifest:
+        playbook_id: stack-flow-playbook
+        version: "1.0.0"
+        title: Stack Flow Fixture
+        objective: Prove a Stack-created schedule can start a Flow.
+        phases:
+          - phase_id: execute
+            objective: Run the scheduled Flow.
+        acceptance_criteria:
+          - The Flow creates a scheduled root run.
+        runtime_defaults:
+          provider: scripted
+          model: scripted-model
+      publish:
+        status: active
+        evidence_refs:
+          - kind: test
+            id: stack-scheduled-flow
+  schedules:
+    - name: stack-scheduled-flow
+      target_session_id: stack-flow-session
+      cadence:
+        type: once
+        fire_at_ms: {fire_at_ms}
+      max_executions: 1
+      flow_start:
+        playbook_ref:
+          playbook_id: stack-flow-playbook
+          version: "1.0.0"
+        request:
+          content: execute stack scheduled flow
+          metadata:
+            caller: stack-test
+        metadata:
+          source: stack
+"#
+    );
+
+    let apply_response = client
+        .post(format!("{base}/v1/stacks/apply"))
+        .json(&StackApplyRequest {
+            stack: StackManifestRequest {
+                manifest,
+                file_root: None,
+                strict_scopes: None,
+            },
+            dry_run: false,
+            allow_secret_env: false,
+            force_restart: false,
+            prune: false,
+        })
+        .send()
+        .await?;
+    let apply_status = apply_response.status();
+    let apply_body = apply_response.text().await?;
+    anyhow::ensure!(
+        apply_status.is_success(),
+        "stack apply failed with {apply_status}: {apply_body}"
+    );
+    let apply = serde_json::from_str::<crate::StackApplyReport>(&apply_body)
+        .context("decode stack apply report")?;
+    assert!(
+        apply.applied.iter().any(|action| {
+            action.resource_type == "schedule" && action.resource_id == "stack-scheduled-flow"
+        }),
+        "stack apply should create the schedule: {apply:#?}"
+    );
+
+    let schedules = client
+        .get(format!("{base}/v1/schedules"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<ScheduleView>>()
+        .await?;
+    let schedule = schedules
+        .into_iter()
+        .find(|schedule| schedule.name == "stack-scheduled-flow")
+        .context("stack-created schedule missing")?;
+
+    let triggered = client
+        .post(format!(
+            "{base}/v1/schedules/{}/trigger",
+            schedule.schedule_id
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<crate::ScheduleMutationResponse>()
+        .await?;
+    let queued_fire_at_ms = triggered
+        .schedule
+        .queued_fire_at_ms
+        .context("trigger-now should queue an immediate fire")?;
+    let expected_flow_id = format!(
+        "scheduled-flow-{}-{queued_fire_at_ms}",
+        triggered.schedule.schedule_id
+    );
+
+    let flow = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let response = client
+                .get(format!("{base}/v1/flows/{expected_flow_id}"))
+                .send()
+                .await?;
+            if response.status() == StatusCode::OK {
+                let flow = response.json::<FlowView>().await?;
+                if flow.run_id.is_some() {
+                    break Ok::<_, anyhow::Error>(flow);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await??;
+    assert_eq!(flow.playbook_ref.playbook_id, "stack-flow-playbook");
+    assert_eq!(flow.metadata["source"], "stack");
+    assert_eq!(
+        flow.primitive_refs.schedule_ids,
+        vec![triggered.schedule.schedule_id.clone()]
+    );
+
+    let run_id = flow
+        .run_id
+        .clone()
+        .context("stack scheduled Flow should reference a run")?;
+    let run = wait_for_run_status(&client, &base, &run_id, &[DaemonRunStatus::Completed]).await?;
+    assert_eq!(run.kind, DaemonRunKind::ScheduledInput);
+    assert!(
+        run.outputs
+            .iter()
+            .any(|output| output.content.contains("STACK_SCHEDULED_FLOW_DONE"))
+    );
+    let metadata = run
+        .input_metadata
+        .as_ref()
+        .context("stack scheduled Flow run should preserve input metadata")?;
+    assert_eq!(metadata["caller"], "stack-test");
+    assert_eq!(metadata["schedule_id"], triggered.schedule.schedule_id);
+    assert_eq!(metadata["scheduled_for_ms"], queued_fire_at_ms);
+    assert_eq!(
+        metadata[KHEISH_FLOW_METADATA_KEY]["flow_id"],
+        expected_flow_id
+    );
+
+    let _ = shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
 async fn daemon_flow_required_evidence_fails_closed_and_append_recovers() -> Result<()> {
     let temp = tempdir()?;
     let state_root = temp.path().join("daemon-flow-evidence");
