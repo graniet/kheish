@@ -715,7 +715,7 @@ request = {
             "Call exactly one tool: mcp__github__get_me with empty input. Do not call bash or any other local tool.",
             "Do not create, update, close, comment on, branch, push, or delete anything in GitHub or Linear during this smoke run.",
             "Do not spawn subagents for this smoke because it is not an implementation task.",
-            "Finish with a concise report that includes these exact strings: linear-github-feature-pr-loop, 0.1.5, feature-pr-loop-v012, openai, gpt-5.5, mcp__github__get_me.",
+            "Finish with a concise report that includes these exact strings: linear-github-feature-pr-loop, 0.1.6, feature-pr-loop-v012, openai, gpt-5.5, mcp__github__get_me.",
         ]
     ),
     "generation": {
@@ -740,7 +740,7 @@ PY
     --flow-id "$STACK_FLOW_ID" \
     --idempotency-key "$STACK_FLOW_ID" \
     --playbook-id linear-github-feature-pr-loop \
-    --version "0.1.5" \
+    --version "0.1.6" \
     --digest "$PLAYBOOK_DIGEST" \
     --session-id feature-pr-loop-v012 \
     --request-file "$EVIDENCE/stack-flow-request.json" \
@@ -1034,8 +1034,8 @@ def has_all(text, snippets):
 
 linear_secret_block = list_item_block(original_text, "- ref: mcp.linear.LINEAR_API_KEY")
 github_secret_block = list_item_block(original_text, "- ref: mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN")
-intake_schedule_block = list_item_block(original_text, "- name: linear-intake-0800-v015")
-followup_schedule_block = list_item_block(original_text, "- name: github-review-followup-hourly-v015")
+intake_schedule_block = list_item_block(original_text, "- name: linear-intake-0800-v016")
+followup_schedule_block = list_item_block(original_text, "- name: github-review-followup-hourly-v016")
 original_manifest_expected = {
     "linear_secret_source": has_all(
         linear_secret_block,
@@ -1054,7 +1054,7 @@ original_manifest_expected = {
             "overlap_policy: skip",
             "type: coalesce_once",
             "playbook_id: linear-github-feature-pr-loop",
-            'version: "0.1.5"',
+            'version: "0.1.6"',
             "provider: openai",
             "content_file: intake.md",
             "model: gpt-5.5",
@@ -1075,7 +1075,7 @@ original_manifest_expected = {
             "overlap_policy: skip",
             "type: coalesce_once",
             "playbook_id: linear-github-feature-pr-loop",
-            'version: "0.1.5"',
+            'version: "0.1.6"',
             "provider: openai",
             "content_file: review-followup.md",
             "model: gpt-5.5",
@@ -1096,7 +1096,7 @@ original_manifest_expected = {
         playbook_text,
         [
             "playbook_id: linear-github-feature-pr-loop",
-            'version: "0.1.5"',
+            'version: "0.1.6"',
             "model: gpt-5.5",
             "workflow: linear-github-feature-loop",
         ],
@@ -1107,9 +1107,9 @@ original_manifest_expected = {
 expected_apply = {
     ("personas", "persona", "feature-pr-operator-v012", "create"),
     ("sessions", "session", "feature-pr-loop-v012", "create"),
-    ("playbooks", "playbook", "linear-github-feature-pr-loop/0.1.5", "apply"),
-    ("schedules", "schedule", "linear-intake-0800-v015", "create"),
-    ("schedules", "schedule", "github-review-followup-hourly-v015", "create"),
+    ("playbooks", "playbook", "linear-github-feature-pr-loop/0.1.6", "apply"),
+    ("schedules", "schedule", "linear-intake-0800-v016", "create"),
+    ("schedules", "schedule", "github-review-followup-hourly-v016", "create"),
 }
 expected_managed_imports = {
     ("import", "secret", "stack.e2e.MANAGED_SECRET", "adopt"),
@@ -1142,16 +1142,16 @@ expected_requirement_actions = {
     ("requirements", "mcp_tool", "mcp__linear__save_issue", "noop"),
 }
 expected_schedule_actions = {
-    ("schedules", "schedule", "linear-intake-0800-v015", "create"),
-    ("schedules", "schedule", "github-review-followup-hourly-v015", "create"),
+    ("schedules", "schedule", "linear-intake-0800-v016", "create"),
+    ("schedules", "schedule", "github-review-followup-hourly-v016", "create"),
 }
 expected_secret_actions = {
     ("secrets", "secret", "mcp.linear.LINEAR_API_KEY", "verify"),
     ("secrets", "secret", "mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN", "verify"),
 }
 expected_playbook_actions = {
-    ("playbooks", "playbook", "linear-github-feature-pr-loop/0.1.5", "create"),
-    ("playbooks", "playbook_release", "linear-github-feature-pr-loop/0.1.5", "update"),
+    ("playbooks", "playbook", "linear-github-feature-pr-loop/0.1.6", "create"),
+    ("playbooks", "playbook_release", "linear-github-feature-pr-loop/0.1.6", "update"),
 }
 expected_runtime_mcp_servers = {
     ("github", "codex_config", True, ("mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN",)),
@@ -1184,9 +1184,9 @@ expected_verify_checks = {
     ("secret", "mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN"),
     ("persona", "feature-pr-operator-v012"),
     ("session", "feature-pr-loop-v012"),
-    ("playbook", "linear-github-feature-pr-loop/0.1.5"),
-    ("schedule", "linear-intake-0800-v015"),
-    ("schedule", "github-review-followup-hourly-v015"),
+    ("playbook", "linear-github-feature-pr-loop/0.1.6"),
+    ("schedule", "linear-intake-0800-v016"),
+    ("schedule", "github-review-followup-hourly-v016"),
     ("probe", "persona"),
     ("probe", "session"),
     ("probe", "intake-schedule"),
@@ -1266,7 +1266,7 @@ managed_plan_secret_actions = [
     and action.get("resource_type") == "secret"
 ]
 schedules_by_name = {schedule.get("name"): schedule for schedule in schedules}
-expected_schedule_names = {"linear-intake-0800-v015", "github-review-followup-hourly-v015"}
+expected_schedule_names = {"linear-intake-0800-v016", "github-review-followup-hourly-v016"}
 required_schedule_quiescence_fields = {
     "status",
     "execution_count",
@@ -1446,7 +1446,7 @@ stack_flow_checks = {
     "run_id_recorded": bool(stack_flow_run_id),
     "flow_start_uses_stack_playbook": (
         stack_flow_start_ref.get("playbook_id") == "linear-github-feature-pr-loop"
-        and stack_flow_start_ref.get("version") == "0.1.5"
+        and stack_flow_start_ref.get("version") == "0.1.6"
     ),
     "flow_start_uses_stack_session": (
         isinstance(stack_flow_start, dict)
@@ -1481,7 +1481,7 @@ stack_flow_checks = {
         snippet in stack_flow_output_text
         for snippet in [
             "linear-github-feature-pr-loop",
-            "0.1.5",
+            "0.1.6",
             "feature-pr-loop-v012",
             "openai",
             "gpt-5.5",
@@ -1545,12 +1545,12 @@ check = {
     "plan_copy_has_no_value_env": "value_env:" not in plan_text,
     "plan_copy_keeps_schedule_drift": all(
         name in plan_text
-        for name in ["linear-intake-0800-v015", "github-review-followup-hourly-v015"]
+        for name in ["linear-intake-0800-v016", "github-review-followup-hourly-v016"]
     ),
     "live_copy_has_no_value_env": "value_env:" not in live_text,
     "live_copy_keeps_schedules": (
-        "linear-intake-0800-v015" in live_text
-        and "github-review-followup-hourly-v015" in live_text
+        "linear-intake-0800-v016" in live_text
+        and "github-review-followup-hourly-v016" in live_text
         and "intake-schedule" in live_text
         and "followup-schedule" in live_text
     ),

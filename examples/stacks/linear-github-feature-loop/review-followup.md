@@ -11,6 +11,16 @@ For Linear issues with `State: blocked-before-pr`, resume only when `BlockerCate
 
 When resuming a safe blocked issue, run the intake flow: inspect current source, create or update a coherent ticket-scoped patch, and open a durable draft PR before running additional review loops.
 
+For a selected draft PR with `State: blocked-with-pr`, inspect the machine-readable footer before deciding that no work is needed. If `Tests:` records blocked or unavailable test evidence, rerun the focused tests first even when there are no unresolved GitHub review comments. Do not carry forward stale test blockers without rechecking the current repository and local project-native test entrypoints.
+
+When retesting a blocked draft PR:
+- read the PR branch files needed to discover test commands and the smallest focused test path;
+- before declaring tests blocked because host runtimes or package managers are missing, inspect the repository for project-native dev/test entrypoints such as Docker Compose files, Makefile targets, justfile targets, package scripts, CI workflow commands, or devcontainer config;
+- local Docker and Docker Compose are allowed when the repository provides them. Prefer the smallest project-native command that installs dependencies or runs the focused tests, tear down long-running services after use, and record the exact command and result;
+- if focused tests pass, update the PR and Linear footer with passing evidence and keep the PR draft only for remaining blockers such as internal review below 10/10;
+- if focused tests fail and the failure is ticket-scoped and safe to fix, perform at most one implementation/test fix iteration in this run before review;
+- if tests remain blocked, replace the stale blocker with the current blocker and exact commands attempted.
+
 For the selected PR with unresolved review comments:
 - read only unresolved actionable comments and the current focused diff needed for those comments;
 - classify whether the request is safe to apply automatically;
