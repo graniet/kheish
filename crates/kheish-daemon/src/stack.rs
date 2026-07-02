@@ -893,12 +893,9 @@ where
             .into());
         }
         if key.kind == "secret" {
-            if let Some(fingerprint) = imported_secret_fingerprint(
-                &key,
-                &resolved,
-                &ledger,
-                options.allow_secret_env,
-            )? {
+            if let Some(fingerprint) =
+                imported_secret_fingerprint(&key, &resolved, &ledger, options.allow_secret_env)?
+            {
                 ledger.record_secret(&context.ownership_id(), &key.id, fingerprint.clone());
                 ledger.record_resource(&context.ownership_id(), &key, fingerprint);
             } else {
@@ -6033,6 +6030,17 @@ mod tests {
 
     struct RuntimeMcpControlPlane {
         runtime: crate::RuntimeSettingsView,
+        playbook_validate_posts: Arc<std::sync::atomic::AtomicUsize>,
+        state: Arc<RuntimeMcpControlPlaneState>,
+    }
+
+    #[derive(Default)]
+    struct RuntimeMcpControlPlaneState {
+        secrets: std::sync::Mutex<BTreeMap<String, kheish_auth::AuthSlotStatus>>,
+        personas: std::sync::Mutex<BTreeMap<String, crate::PersonaView>>,
+        sessions: std::sync::Mutex<BTreeMap<String, crate::SessionView>>,
+        playbooks: std::sync::Mutex<BTreeMap<String, crate::PlaybookView>>,
+        schedules: std::sync::Mutex<Vec<crate::ScheduleView>>,
     }
 
     impl RuntimeMcpControlPlane {
@@ -6053,6 +6061,8 @@ mod tests {
                     },
                     ..Default::default()
                 },
+                playbook_validate_posts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                state: Arc::default(),
             }
         }
 
@@ -6066,7 +6076,195 @@ mod tests {
                     },
                     ..Default::default()
                 },
+                playbook_validate_posts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                state: Arc::default(),
             }
+        }
+
+        fn playbook_validate_posts(&self) -> usize {
+            self.playbook_validate_posts
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn auth_status(record: kheish_auth::AuthSlotRecord) -> kheish_auth::AuthSlotStatus {
+            kheish_auth::AuthSlotStatus {
+                slot_id: record.slot_id,
+                provider: record.provider,
+                mode: record.mode,
+                summary: "configured".to_string(),
+                updated_at_ms: record.updated_at_ms,
+                details: BTreeMap::new(),
+            }
+        }
+
+        fn create_persona(request: crate::CreatePersonaRequest) -> Result<crate::PersonaView> {
+            let now_ms = crate::now_ms();
+            Ok(crate::PersonaView {
+                persona_id: request
+                    .persona_id
+                    .ok_or_else(|| anyhow!("persona create requires persona_id"))?,
+                display_name: request.display_name,
+                soul: request.soul,
+                version: 1,
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+                capability_scope: request.capability_scope.unwrap_or_default(),
+                default_skills: request.default_skills.unwrap_or_default(),
+                metadata: request.metadata.unwrap_or(Value::Null),
+            })
+        }
+
+        fn create_session(
+            &self,
+            request: crate::CreateSessionRequest,
+        ) -> Result<crate::SessionView> {
+            let session_id = request
+                .session_id
+                .ok_or_else(|| anyhow!("session create requires session_id"))?;
+            let agent_id = format!("agent-{session_id}");
+            let persona = request
+                .persona_id
+                .as_deref()
+                .map(|persona_id| self.session_persona_summary(persona_id))
+                .transpose()?;
+            Ok(crate::SessionView {
+                session_id: session_id.clone(),
+                agent_id: agent_id.clone(),
+                snapshot: Self::session_snapshot(&agent_id, &session_id),
+                route_policy: Default::default(),
+                goal: None,
+                capability_scope: request.capability_scope.clone().unwrap_or_default(),
+                effective_capability_scope: request.capability_scope.unwrap_or_default(),
+                credential_scope: request.credential_scope.clone().unwrap_or_default(),
+                effective_credential_scope: request.credential_scope.unwrap_or_default(),
+                persona,
+                reply_targets: Vec::new(),
+                outputs: Vec::new(),
+            })
+        }
+
+        fn session_snapshot(
+            agent_id: &str,
+            session_id: &str,
+        ) -> kheish_agent::ManagedAgentSnapshot {
+            kheish_agent::ManagedAgentSnapshot {
+                agent: kheish_agent::AgentRecord {
+                    id: kheish_agent::AgentId(agent_id.to_string()),
+                    parent: None,
+                    name: Some(agent_id.replace('-', "_")),
+                    path: Some(agent_id.replace('-', "_")),
+                    nickname: None,
+                    conversation: kheish_types::ConversationKey {
+                        session_id: session_id.to_string(),
+                        thread_id: None,
+                    },
+                    status: kheish_agent::AgentStatus::Idle,
+                    retention: kheish_agent::ChildRetentionPolicy::Retain,
+                    spawned_by_run_id: None,
+                    spawn_request_id: None,
+                    spawned_at_ms: crate::now_ms(),
+                    settled_at_ms: None,
+                    closed_at_ms: None,
+                    subtasks: Vec::new(),
+                    sidechain_session_id: None,
+                    fork_context: None,
+                    daemon_owned_worktree: None,
+                },
+                pending_approvals: Vec::new(),
+                pending_questions: Vec::new(),
+                last_assistant_message: None,
+                journal_len: 0,
+                checkpoint_len: 0,
+                last_error: None,
+            }
+        }
+
+        fn session_persona_summary(
+            &self,
+            persona_id: &str,
+        ) -> Result<crate::SessionPersonaSummaryView> {
+            let personas = self.state.personas.lock().expect("personas lock");
+            let persona = personas
+                .get(persona_id)
+                .ok_or_else(|| anyhow!("persona {persona_id} not found"))?;
+            Ok(crate::SessionPersonaSummaryView {
+                persona_id: persona.persona_id.clone(),
+                persona_version: persona.version,
+                display_name: persona.display_name.clone(),
+                bound_at_ms: crate::now_ms(),
+            })
+        }
+
+        fn store_playbook(
+            &self,
+            request: crate::CreatePlaybookRequest,
+        ) -> Result<crate::PlaybookView> {
+            let digest = crate::playbooks::playbook_manifest_digest(&request.manifest)?;
+            let now_ms = crate::now_ms();
+            let mut playbooks = self.state.playbooks.lock().expect("playbooks lock");
+            let entry = playbooks
+                .entry(request.manifest.playbook_id.clone())
+                .or_insert_with(|| crate::PlaybookView {
+                    playbook_id: request.manifest.playbook_id.clone(),
+                    latest_version: None,
+                    active_version: None,
+                    versions: Vec::new(),
+                    selected_version: None,
+                });
+            if !entry
+                .versions
+                .iter()
+                .any(|version| version.version == request.manifest.version)
+            {
+                entry.latest_version = Some(request.manifest.version.clone());
+                entry.selected_version = Some(crate::PlaybookVersionRecord {
+                    playbook_id: request.manifest.playbook_id.clone(),
+                    version: request.manifest.version.clone(),
+                    digest: digest.clone(),
+                    manifest: request.manifest.clone(),
+                    created_at_ms: now_ms,
+                });
+                entry.versions.push(crate::PlaybookVersionSummary {
+                    version: request.manifest.version,
+                    digest,
+                    status: crate::PlaybookReleaseStatus::Draft,
+                    created_at_ms: now_ms,
+                    updated_at_ms: now_ms,
+                    evidence_refs: Vec::new(),
+                    revoked_reason: None,
+                });
+            }
+            Ok(entry.clone())
+        }
+
+        fn publish_playbook(
+            &self,
+            playbook_id: &str,
+            request: crate::PublishPlaybookRequest,
+        ) -> Result<crate::PlaybookView> {
+            let now_ms = crate::now_ms();
+            let mut playbooks = self.state.playbooks.lock().expect("playbooks lock");
+            let view = playbooks
+                .get_mut(playbook_id)
+                .ok_or_else(|| anyhow!("playbook {playbook_id} not found"))?;
+            let version = view
+                .versions
+                .iter_mut()
+                .find(|version| version.version == request.version)
+                .ok_or_else(|| anyhow!("playbook version {} not found", request.version))?;
+            if version.digest != request.digest {
+                bail!("playbook digest mismatch");
+            }
+            version.status = request
+                .status
+                .unwrap_or(crate::PlaybookReleaseStatus::Active);
+            version.updated_at_ms = now_ms;
+            version.evidence_refs = request.evidence_refs;
+            version.revoked_reason = None;
+            if version.status == crate::PlaybookReleaseStatus::Active {
+                view.active_version = Some(version.version.clone());
+            }
+            Ok(view.clone())
         }
     }
 
@@ -6078,24 +6276,212 @@ mod tests {
         {
             match path {
                 "/v1/runtime" => encode_response(self.runtime.clone()),
-                "/v1/schedules" => encode_response(Vec::<crate::ScheduleView>::new()),
+                "/v1/schedules" => {
+                    encode_response(self.state.schedules.lock().expect("schedules lock").clone())
+                }
                 _ => bail!("unexpected GET {path}"),
             }
         }
 
-        async fn get_json_optional<T>(&self, _path: &str) -> Result<Option<T>>
+        async fn get_json_optional<T>(&self, path: &str) -> Result<Option<T>>
         where
             T: DeserializeOwned + Send,
         {
-            Ok(None)
+            let decoded_segments = decoded_path_segments(path)?;
+            let segments = decoded_segments
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            match segments.as_slice() {
+                ["v1", "runtime", "secrets", slot] => self
+                    .state
+                    .secrets
+                    .lock()
+                    .expect("secrets lock")
+                    .get(*slot)
+                    .cloned()
+                    .map(encode_response)
+                    .transpose(),
+                ["v1", "personas", persona_id] => self
+                    .state
+                    .personas
+                    .lock()
+                    .expect("personas lock")
+                    .get(*persona_id)
+                    .cloned()
+                    .map(encode_response)
+                    .transpose(),
+                ["v1", "sessions", session_id] => self
+                    .state
+                    .sessions
+                    .lock()
+                    .expect("sessions lock")
+                    .get(*session_id)
+                    .cloned()
+                    .map(encode_response)
+                    .transpose(),
+                ["v1", "playbooks", playbook_id] => self
+                    .state
+                    .playbooks
+                    .lock()
+                    .expect("playbooks lock")
+                    .get(*playbook_id)
+                    .cloned()
+                    .map(encode_response)
+                    .transpose(),
+                _ => self.get_json(path).await.map(Some),
+            }
         }
 
-        async fn post_json<B, T>(&self, path: &str, _body: &B) -> Result<T>
+        async fn post_json<B, T>(&self, path: &str, body: &B) -> Result<T>
         where
             B: Serialize + Sync + ?Sized,
             T: DeserializeOwned + Send,
         {
-            bail!("unexpected POST {path}")
+            if path == "/v1/playbooks/validate" {
+                self.playbook_validate_posts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let request = serde_json::from_value::<crate::ValidatePlaybookRequest>(
+                    serde_json::to_value(body)?,
+                )?;
+                return encode_response(crate::playbooks::validate_playbook_manifest(
+                    &request.manifest,
+                ));
+            }
+            if path == "/v1/runtime/secrets" {
+                let record = serde_json::from_value::<kheish_auth::AuthSlotRecord>(
+                    serde_json::to_value(body)?,
+                )?;
+                let status = Self::auth_status(record);
+                self.state
+                    .secrets
+                    .lock()
+                    .expect("secrets lock")
+                    .insert(status.slot_id.0.clone(), status.clone());
+                return encode_response(status);
+            }
+            if path == "/v1/personas" {
+                let request = serde_json::from_value::<crate::CreatePersonaRequest>(
+                    serde_json::to_value(body)?,
+                )?;
+                let persona = Self::create_persona(request)?;
+                self.state
+                    .personas
+                    .lock()
+                    .expect("personas lock")
+                    .insert(persona.persona_id.clone(), persona.clone());
+                return encode_response(persona);
+            }
+            if path == "/v1/sessions" {
+                let request = serde_json::from_value::<crate::CreateSessionRequest>(
+                    serde_json::to_value(body)?,
+                )?;
+                let session = self.create_session(request)?;
+                self.state
+                    .sessions
+                    .lock()
+                    .expect("sessions lock")
+                    .insert(session.session_id.clone(), session.clone());
+                return encode_response(session);
+            }
+            if path == "/v1/schedules" {
+                let request = serde_json::from_value::<crate::ScheduleCreateRequest>(
+                    serde_json::to_value(body)?,
+                )?;
+                let mut schedules = self.state.schedules.lock().expect("schedules lock");
+                let schedule = crate::scheduler::build_schedule_record(
+                    format!("schedule-{}", schedules.len() + 1),
+                    crate::now_ms(),
+                    request,
+                )?
+                .view;
+                schedules.push(schedule.clone());
+                return encode_response(schedule);
+            }
+            if path == "/v1/playbooks" {
+                let request = serde_json::from_value::<crate::CreatePlaybookRequest>(
+                    serde_json::to_value(body)?,
+                )?;
+                return encode_response(self.store_playbook(request)?);
+            }
+            let decoded_segments = decoded_path_segments(path)?;
+            let segments = decoded_segments
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            match segments.as_slice() {
+                ["v1", "sessions", session_id, "persona"] => {
+                    let request = serde_json::from_value::<crate::SetSessionPersonaRequest>(
+                        serde_json::to_value(body)?,
+                    )?;
+                    let persona = self.session_persona_summary(&request.persona_id)?;
+                    let mut sessions = self.state.sessions.lock().expect("sessions lock");
+                    let session = sessions
+                        .get_mut(*session_id)
+                        .ok_or_else(|| anyhow!("session {session_id} not found"))?;
+                    session.persona = Some(persona);
+                    encode_response(session.clone())
+                }
+                ["v1", "sessions", session_id, "capability-scope"] => {
+                    let request = serde_json::from_value::<crate::SetSessionCapabilityScopeRequest>(
+                        serde_json::to_value(body)?,
+                    )?;
+                    let mut sessions = self.state.sessions.lock().expect("sessions lock");
+                    let session = sessions
+                        .get_mut(*session_id)
+                        .ok_or_else(|| anyhow!("session {session_id} not found"))?;
+                    let scope = request.capability_scope.unwrap_or_default();
+                    session.capability_scope = scope.clone();
+                    session.effective_capability_scope = scope;
+                    encode_response(session.clone())
+                }
+                ["v1", "sessions", session_id, "credential-scope"] => {
+                    let request = serde_json::from_value::<crate::SetSessionCredentialScopeRequest>(
+                        serde_json::to_value(body)?,
+                    )?;
+                    let mut sessions = self.state.sessions.lock().expect("sessions lock");
+                    let session = sessions
+                        .get_mut(*session_id)
+                        .ok_or_else(|| anyhow!("session {session_id} not found"))?;
+                    let scope = request.credential_scope.unwrap_or_default();
+                    session.credential_scope = scope.clone();
+                    session.effective_credential_scope = scope;
+                    encode_response(session.clone())
+                }
+                ["v1", "sessions", session_id, "route-policy"] => {
+                    let request = serde_json::from_value::<crate::SetSessionRoutePolicyRequest>(
+                        serde_json::to_value(body)?,
+                    )?;
+                    let mut sessions = self.state.sessions.lock().expect("sessions lock");
+                    let session = sessions
+                        .get_mut(*session_id)
+                        .ok_or_else(|| anyhow!("session {session_id} not found"))?;
+                    session.route_policy = request.route_policy.unwrap_or_default();
+                    encode_response(session.clone())
+                }
+                ["v1", "sessions", session_id, "reply-targets"] => {
+                    let request = serde_json::from_value::<crate::SetSessionReplyTargetsRequest>(
+                        serde_json::to_value(body)?,
+                    )?;
+                    let mut sessions = self.state.sessions.lock().expect("sessions lock");
+                    let session = sessions
+                        .get_mut(*session_id)
+                        .ok_or_else(|| anyhow!("session {session_id} not found"))?;
+                    session.reply_targets = request
+                        .reply_targets
+                        .into_iter()
+                        .map(crate::SessionReplyTargetRequest::into_reply_handle)
+                        .collect();
+                    encode_response(session.clone())
+                }
+                ["v1", "playbooks", playbook_id, "publish"] => {
+                    let request = serde_json::from_value::<crate::PublishPlaybookRequest>(
+                        serde_json::to_value(body)?,
+                    )?;
+                    encode_response(self.publish_playbook(playbook_id, request)?)
+                }
+                _ => bail!("unexpected POST {path}"),
+            }
         }
 
         async fn put_json<B, T>(&self, path: &str, _body: &B) -> Result<T>
@@ -6120,7 +6506,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-impl StackControlPlane for RecordingControlPlane {
+    impl StackControlPlane for RecordingControlPlane {
         async fn get_json<T>(&self, path: &str) -> Result<T>
         where
             T: DeserializeOwned + Send,
@@ -6182,7 +6568,7 @@ impl StackControlPlane for RecordingControlPlane {
     }
 
     #[async_trait::async_trait]
-impl StackControlPlane for LiveSecretControlPlane {
+    impl StackControlPlane for LiveSecretControlPlane {
         async fn get_json<T>(&self, path: &str) -> Result<T>
         where
             T: DeserializeOwned + Send,
@@ -7807,19 +8193,14 @@ spec:
                     && action.operation == "blocked")
         );
 
-        let verification = verify_stack(
-            &RuntimeMcpControlPlane::with_mcp(&[], &[]),
-            &context,
-        )
-        .await
-        .unwrap();
+        let verification = verify_stack(&RuntimeMcpControlPlane::with_mcp(&[], &[]), &context)
+            .await
+            .unwrap();
         assert!(!verification.valid);
         assert!(verification.checks.iter().any(|check| {
             check.target == "mcp_tool/mcp__github__create_pull_request"
                 && !check.ok
-                && check
-                    .detail
-                    .contains("missing from the active MCP surface")
+                && check.detail.contains("missing from the active MCP surface")
         }));
     }
 
@@ -7946,6 +8327,1103 @@ spec:
                     && check.target == "mcp_tool/mcp__github__create_pull_request"
                     && check.ok)
         );
+    }
+
+    #[tokio::test]
+    async fn linear_github_feature_loop_example_plans_with_declared_mcp_surface() {
+        let _guard = crate::debug::debug_capture_env_lock();
+        let _env_guard = FeatureLoopEnvGuard::set();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let context = linear_github_feature_loop_context(temp.path());
+        let resolved = ResolvedStack::from_context(&context).await.unwrap();
+        let fixture = linear_github_feature_loop_mcp_fixture();
+        fixture.assert_valid();
+        assert_feature_loop_manifest_mcp_surface(&resolved, &fixture);
+        let control = linear_github_feature_loop_control(&fixture.runtime_tools);
+
+        let plan = build_plan(&control, &context, false, true).await.unwrap();
+
+        assert!(plan.valid, "{:?}", plan.errors);
+        assert_eq!(control.playbook_validate_posts(), 1);
+        assert_feature_loop_secret_contract(&resolved, &plan);
+        assert_feature_loop_mcp_contract(&resolved, &plan, &fixture.required_tools);
+        assert_feature_loop_persona_session_contract(&resolved, &fixture.required_tools);
+        assert_feature_loop_playbook_contract(&resolved, &plan);
+        assert_feature_loop_schedule_contract(&resolved, &plan);
+        assert_feature_loop_verification_contract(&resolved, &plan);
+        assert_feature_loop_plan_action_set(&plan, &fixture.required_tools);
+
+        let report = apply_stack(
+            &control,
+            linear_github_feature_loop_context(temp.path()),
+            StackApplyOptions {
+                dry_run: false,
+                force_restart: false,
+                allow_secret_env: true,
+                prune: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(control.playbook_validate_posts(), 2);
+        assert_feature_loop_apply_report(&report);
+
+        let verification = verify_stack(&control, &linear_github_feature_loop_context(temp.path()))
+            .await
+            .unwrap();
+        assert!(verification.valid, "{:#?}", verification.checks);
+    }
+
+    #[tokio::test]
+    async fn linear_github_feature_loop_example_fails_closed_on_missing_mcp_tool() {
+        let _guard = crate::debug::debug_capture_env_lock();
+        let _env_guard = FeatureLoopEnvGuard::set();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let context = linear_github_feature_loop_context(temp.path());
+        let resolved = ResolvedStack::from_context(&context).await.unwrap();
+        let fixture = linear_github_feature_loop_mcp_fixture();
+        fixture.assert_valid();
+        assert_feature_loop_manifest_mcp_surface(&resolved, &fixture);
+        for missing_tool in &fixture.required_tools {
+            let mut tools = fixture.runtime_tools.clone();
+            tools.retain(|tool| tool != missing_tool);
+            let control = linear_github_feature_loop_control(&tools);
+
+            let plan = build_plan(&control, &context, false, true).await.unwrap();
+
+            assert!(
+                !plan.valid,
+                "{missing_tool} unexpectedly produced a valid plan"
+            );
+            assert!(plan.errors.iter().any(|error| {
+                error.contains(&format!("required MCP tool `{missing_tool}` is not active"))
+            }));
+            assert_action(&plan, "requirements", "mcp_tool", missing_tool, "blocked");
+        }
+    }
+
+    #[tokio::test]
+    async fn linear_github_feature_loop_example_fails_on_stale_manifest_tool_name() {
+        let _guard = crate::debug::debug_capture_env_lock();
+        let _env_guard = FeatureLoopEnvGuard::set();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (root, raw) = linear_github_feature_loop_raw();
+        let stale_raw = raw.replace("mcp__linear__save_issue", "mcp__linear__update_issue");
+        let context = linear_github_feature_loop_context_from_raw(&stale_raw, root, temp.path());
+        let fixture = linear_github_feature_loop_mcp_fixture();
+        fixture.assert_valid();
+        let control = linear_github_feature_loop_control(&fixture.runtime_tools);
+
+        let plan = build_plan(&control, &context, false, true).await.unwrap();
+
+        assert!(!plan.valid);
+        assert!(plan.errors.iter().any(|error| {
+            error.contains("required MCP tool `mcp__linear__update_issue` is not active")
+        }));
+        assert_action(
+            &plan,
+            "requirements",
+            "mcp_tool",
+            "mcp__linear__update_issue",
+            "blocked",
+        );
+    }
+
+    struct FeatureLoopEnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl FeatureLoopEnvGuard {
+        fn set() -> Self {
+            let previous = FEATURE_LOOP_ENVS
+                .iter()
+                .map(|(name, _)| (*name, std::env::var_os(name)))
+                .collect();
+            for (name, value) in FEATURE_LOOP_ENVS {
+                unsafe {
+                    std::env::set_var(name, value);
+                }
+            }
+            Self(previous)
+        }
+    }
+
+    impl Drop for FeatureLoopEnvGuard {
+        fn drop(&mut self) {
+            for (name, previous) in self.0.drain(..) {
+                match previous {
+                    Some(value) => unsafe {
+                        std::env::set_var(name, value);
+                    },
+                    None => unsafe {
+                        std::env::remove_var(name);
+                    },
+                }
+            }
+        }
+    }
+
+    const FEATURE_LOOP_ENVS: &[(&str, &str)] = &[
+        ("LINEAR_API_KEY", "linear-test-token"),
+        ("GITHUB_PERSONAL_ACCESS_TOKEN", "github-test-token"),
+    ];
+
+    const EXPECTED_FEATURE_LOOP_INTAKE_PROMPT: &str = r#"Read eligible Linear issues for the Evapayrent project.
+
+For at most three feature tickets:
+- inspect the relevant source code before proposing work;
+- spawn one planning subagent with reasoning effort xhigh;
+- spawn implementation work in an isolated worktree;
+- run focused tests;
+- spawn one reviewer subagent with reasoning effort xhigh and require a 10/10 score with evidence;
+- if the score is below 10/10, fix and repeat up to three iterations;
+- open a draft GitHub PR against the Evapayrent repository only after tests and internal review pass;
+- comment on the Linear ticket with the PR URL, tests run, and any blocker.
+
+Do not process tickets that already have an active PR from this workflow.
+"#;
+
+    const EXPECTED_FEATURE_LOOP_REVIEW_PROMPT: &str = r#"Inspect open GitHub PRs created by the Linear feature loop.
+
+For each PR with unresolved review comments:
+- read the comments and the current diff;
+- classify whether the request is safe to apply automatically;
+- when safe, make the fix in an isolated worktree, run focused tests, and spawn an xhigh reviewer;
+- continue until reviewer score is 10/10 or three iterations have been attempted;
+- reply to the GitHub comments with the change made and test evidence;
+- update the linked Linear ticket.
+
+Stop and report instead of changing code when a comment requires product judgment, credentials, broad refactoring, or unclear ownership.
+"#;
+
+    const EXPECTED_FEATURE_LOOP_PERSONA: &str = r#"Operate the Linear to GitHub feature loop.
+
+Keep the daemon generic: treat Linear and GitHub as configured MCP surfaces, not special daemon behavior. Work only on the configured repository and the Linear project named in the run input. For every implementation, use subagents for analysis and review, require concrete test evidence, and stop for a human decision when the next action is ambiguous or unsafe.
+"#;
+
+    fn linear_github_feature_loop_context(state_root: &std::path::Path) -> StackContext {
+        let (root, raw) = linear_github_feature_loop_raw();
+        linear_github_feature_loop_context_from_raw(&raw, root, state_root)
+    }
+
+    fn linear_github_feature_loop_raw() -> (PathBuf, String) {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/stacks/linear-github-feature-loop")
+            .canonicalize()
+            .expect("example stack path");
+        let raw =
+            std::fs::read_to_string(root.join("Kheishfile.yaml")).expect("read example Kheishfile");
+        (root, raw)
+    }
+
+    fn linear_github_feature_loop_context_from_raw(
+        raw: &str,
+        root: PathBuf,
+        state_root: &std::path::Path,
+    ) -> StackContext {
+        let mut context =
+            StackContext::from_manifest(raw, root, Some(state_root.to_path_buf()), true).unwrap();
+        context.allow_file_refs = true;
+        context
+    }
+
+    fn linear_github_feature_loop_control(tools: &[String]) -> RuntimeMcpControlPlane {
+        let tool_refs = tools.iter().map(String::as_str).collect::<Vec<_>>();
+        RuntimeMcpControlPlane::with_mcp_snapshot(
+            vec![
+                kheish_mcp::McpServerSnapshot {
+                    server: "github".to_string(),
+                    source: Some("codex_config".to_string()),
+                    uses_credentials: true,
+                    credential_secret_refs: vec![
+                        "mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN".to_string(),
+                    ],
+                    connected: true,
+                    tools: tools
+                        .iter()
+                        .filter(|tool| tool.starts_with("mcp__github__"))
+                        .cloned()
+                        .collect(),
+                    ..Default::default()
+                },
+                kheish_mcp::McpServerSnapshot {
+                    server: "linear".to_string(),
+                    source: Some("built_in_catalog".to_string()),
+                    catalog_entry_id: Some("linear".to_string()),
+                    uses_credentials: true,
+                    credential_secret_refs: vec!["mcp.linear.LINEAR_API_KEY".to_string()],
+                    connected: true,
+                    tools: tools
+                        .iter()
+                        .filter(|tool| tool.starts_with("mcp__linear__"))
+                        .cloned()
+                        .collect(),
+                    ..Default::default()
+                },
+            ],
+            &tool_refs,
+        )
+    }
+
+    struct FeatureLoopMcpFixture {
+        runtime_tools: Vec<String>,
+        required_tools: Vec<String>,
+    }
+
+    impl FeatureLoopMcpFixture {
+        fn assert_valid(&self) {
+            let runtime = self.runtime_tools.iter().cloned().collect::<BTreeSet<_>>();
+            for tool in &self.required_tools {
+                assert!(
+                    runtime.contains(tool),
+                    "fixture is missing required tool {tool}"
+                );
+            }
+            assert!(
+                !runtime.contains("mcp__linear__update_issue"),
+                "fixture must catch stale Linear update_issue declarations"
+            );
+        }
+    }
+
+    fn linear_github_feature_loop_mcp_fixture() -> FeatureLoopMcpFixture {
+        let required_tools = vec![
+            "mcp__github__create_pull_request",
+            "mcp__github__list_pull_requests",
+            "mcp__github__pull_request_read",
+            "mcp__github__add_reply_to_pull_request_comment",
+            "mcp__linear__get_issue",
+            "mcp__linear__list_issues",
+            "mcp__linear__save_comment",
+            "mcp__linear__save_issue",
+        ]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+        let runtime_tools = vec![
+            "mcp__github__add_reply_to_pull_request_comment",
+            "mcp__github__create_pull_request",
+            "mcp__github__list_pull_requests",
+            "mcp__github__pull_request_read",
+            "mcp__linear__get_issue",
+            "mcp__linear__get_profile",
+            "mcp__linear__list_comments",
+            "mcp__linear__list_issues",
+            "mcp__linear__list_issue_statuses",
+            "mcp__linear__list_teams",
+            "mcp__linear__save_comment",
+            "mcp__linear__save_issue",
+        ]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+        FeatureLoopMcpFixture {
+            runtime_tools,
+            required_tools,
+        }
+    }
+
+    fn assert_feature_loop_secret_contract(resolved: &ResolvedStack, plan: &StackPlan) {
+        let secrets = resolved
+            .secrets
+            .iter()
+            .map(|secret| (secret.slot.as_str(), secret))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            secrets.keys().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN",
+                "mcp.linear.LINEAR_API_KEY",
+            ])
+        );
+        let linear = secrets
+            .get("mcp.linear.LINEAR_API_KEY")
+            .expect("linear secret requirement");
+        assert_eq!(linear.provider, kheish_auth::AuthProvider::Generic);
+        assert_eq!(linear.value_env.as_deref(), Some("LINEAR_API_KEY"));
+        let github = secrets
+            .get("mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN")
+            .expect("github secret requirement");
+        assert_eq!(github.provider, kheish_auth::AuthProvider::Generic);
+        assert_eq!(
+            github.value_env.as_deref(),
+            Some("GITHUB_PERSONAL_ACCESS_TOKEN")
+        );
+        assert_action(
+            plan,
+            "secrets",
+            "secret",
+            "mcp.linear.LINEAR_API_KEY",
+            "create",
+        );
+        assert_action(
+            plan,
+            "secrets",
+            "secret",
+            "mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN",
+            "create",
+        );
+    }
+
+    fn assert_feature_loop_manifest_mcp_surface(
+        resolved: &ResolvedStack,
+        fixture: &FeatureLoopMcpFixture,
+    ) {
+        let expected_tools = fixture
+            .required_tools
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            resolved
+                .mcp_requirements
+                .tools
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            expected_tools
+        );
+        assert_eq!(
+            resolved.personas[0]
+                .capability_scope
+                .as_ref()
+                .expect("persona capability scope")
+                .mcp_tool_allow
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            expected_tools
+        );
+        assert_eq!(
+            resolved.sessions[0]
+                .capability_scope
+                .as_ref()
+                .expect("session capability scope")
+                .mcp_tool_allow
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            expected_tools
+        );
+    }
+
+    fn assert_feature_loop_mcp_contract(
+        resolved: &ResolvedStack,
+        plan: &StackPlan,
+        tools: &[String],
+    ) {
+        let expected_tools = tools.iter().cloned().collect::<BTreeSet<_>>();
+        let actual_tools = resolved
+            .mcp_requirements
+            .tools
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual_tools, expected_tools);
+        let servers = resolved
+            .mcp_requirements
+            .servers
+            .iter()
+            .map(|server| (server.name.as_str(), server))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            servers.keys().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from(["github", "linear"])
+        );
+        let github = servers.get("github").expect("github MCP requirement");
+        assert_eq!(github.source.as_deref(), Some("codex_config"));
+        assert_eq!(github.catalog_entry_id.as_deref(), None);
+        assert_eq!(github.uses_credentials, Some(true));
+        assert_eq!(
+            github.credential_secret_refs,
+            vec!["mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN".to_string()]
+        );
+        let linear = servers.get("linear").expect("linear MCP requirement");
+        assert_eq!(linear.source.as_deref(), Some("built_in_catalog"));
+        assert_eq!(linear.catalog_entry_id.as_deref(), Some("linear"));
+        assert_eq!(linear.uses_credentials, Some(true));
+        assert_eq!(
+            linear.credential_secret_refs,
+            vec!["mcp.linear.LINEAR_API_KEY".to_string()]
+        );
+        assert_action(plan, "requirements", "mcp_server", "github", "noop");
+        assert_action(plan, "requirements", "mcp_server", "linear", "noop");
+        for tool in tools {
+            assert_action(plan, "requirements", "mcp_tool", tool, "noop");
+        }
+    }
+
+    fn assert_feature_loop_persona_session_contract(resolved: &ResolvedStack, tools: &[String]) {
+        assert_eq!(resolved.personas.len(), 1);
+        let persona = &resolved.personas[0];
+        assert_eq!(persona.persona_id, "feature-pr-operator");
+        assert_eq!(persona.display_name, "Feature PR Operator");
+        assert_eq!(
+            persona.soul.trim_end(),
+            EXPECTED_FEATURE_LOOP_PERSONA.trim_end()
+        );
+        assert_eq!(persona.metadata, Value::Null);
+        assert_scope_allows_exact_mcp(
+            persona
+                .capability_scope
+                .as_ref()
+                .expect("persona capability scope"),
+            tools,
+        );
+        assert!(persona.default_skills.is_empty());
+
+        assert_eq!(resolved.sessions.len(), 1);
+        let session = &resolved.sessions[0];
+        assert_eq!(session.session_id, "feature-pr-loop");
+        assert_eq!(session.thread_id, None);
+        assert_eq!(session.persona_id.as_deref(), Some("feature-pr-operator"));
+        assert_eq!(session.reply_targets, None);
+        assert_scope_allows_exact_mcp(
+            session
+                .capability_scope
+                .as_ref()
+                .expect("session capability scope"),
+            tools,
+        );
+        let credentials = session
+            .credential_scope
+            .as_ref()
+            .expect("session credential scope");
+        assert_eq!(credentials.route_allow, vec!["openai".to_string()]);
+        assert!(credentials.route_deny.is_empty());
+        assert!(credentials.connector_allow.is_empty());
+        assert_eq!(credentials.connector_deny, vec!["*".to_string()]);
+        assert!(credentials.connector_credential_allow.is_empty());
+        assert_eq!(credentials.connector_credential_deny, vec!["*".to_string()]);
+        assert_eq!(
+            credentials
+                .mcp_server_allow
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            feature_loop_server_set()
+        );
+        assert!(credentials.mcp_server_deny.is_empty());
+        let route_policy = session.route_policy.as_ref().expect("session route policy");
+        assert_eq!(route_policy.provider.as_deref(), Some("openai"));
+        assert_feature_loop_generation(
+            route_policy
+                .generation
+                .as_ref()
+                .expect("session route generation"),
+        );
+    }
+
+    fn assert_feature_loop_playbook_contract(resolved: &ResolvedStack, plan: &StackPlan) {
+        assert_eq!(resolved.playbooks.len(), 1);
+        let playbook = &resolved.playbooks[0];
+        assert_eq!(
+            playbook.manifest.playbook_id,
+            "linear-github-feature-pr-loop"
+        );
+        assert_eq!(playbook.manifest.version, "0.1.0");
+        assert_eq!(playbook.manifest.title, "Linear to GitHub Feature PR Loop");
+        assert_eq!(
+            playbook.manifest.objective,
+            "Convert eligible Linear feature tickets into reviewed GitHub pull requests."
+        );
+        assert_eq!(
+            playbook.manifest.description.as_deref(),
+            Some(
+                "Generic operator playbook for scheduled Linear intake and GitHub review follow-up."
+            )
+        );
+        assert!(playbook.manifest.preconditions.is_empty());
+        assert!(playbook.manifest.required_evidence.is_empty());
+        assert_eq!(
+            playbook.manifest.scopes,
+            crate::PlaybookScopePolicy::default()
+        );
+        assert_eq!(
+            playbook.manifest.runtime_defaults.provider.as_deref(),
+            Some("openai")
+        );
+        assert_eq!(
+            playbook.manifest.runtime_defaults.model.as_deref(),
+            Some("gpt-5.5")
+        );
+        assert_eq!(
+            playbook.manifest.metadata,
+            json!({
+                "owner": "examples",
+                "repository_scope": "evapayrent"
+            })
+        );
+        let inputs = playbook
+            .manifest
+            .inputs
+            .iter()
+            .map(|input| (input.name.as_str(), input))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            inputs.keys().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from(["project", "repository"])
+        );
+        assert_playbook_input(
+            inputs.get("project").copied(),
+            "Linear project or team scope to inspect.",
+            false,
+        );
+        assert_playbook_input(
+            inputs.get("repository").copied(),
+            "GitHub repository scope.",
+            false,
+        );
+        let roles = playbook
+            .manifest
+            .roles
+            .iter()
+            .map(|role| (role.role_id.as_str(), role.purpose.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            roles,
+            BTreeMap::from([
+                (
+                    "coordinator",
+                    "Select safe work, coordinate subagents, and maintain Linear/GitHub state.",
+                ),
+                (
+                    "implementer",
+                    "Make code changes in an isolated worktree and run tests.",
+                ),
+                (
+                    "reviewer",
+                    "Review diff, tests, and acceptance criteria until the score is 10/10.",
+                ),
+            ])
+        );
+        let phases = playbook
+            .manifest
+            .phases
+            .iter()
+            .map(|phase| (phase.phase_id.as_str(), phase))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            phases.keys().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from(["discover", "implement", "plan", "publish", "review"])
+        );
+        assert_playbook_phase(
+            phases.get("discover").copied(),
+            "Identify eligible Linear issues or GitHub review comments.",
+            &[
+                "Existing PRs are detected before new PR creation.",
+                "Unsafe or ambiguous items are reported instead of auto-mutated.",
+            ],
+        );
+        assert_playbook_phase(
+            phases.get("plan").copied(),
+            "Analyze ticket requirements and affected source code with a high-reasoning subagent.",
+            &["The plan names files, risks, and focused tests."],
+        );
+        assert_playbook_phase(
+            phases.get("implement").copied(),
+            "Implement the change in an isolated worktree.",
+            &[
+                "The implementation is limited to the ticket scope.",
+                "Focused tests or a clear blocked reason are recorded.",
+            ],
+        );
+        assert_playbook_phase(
+            phases.get("review").copied(),
+            "Obtain an internal xhigh review score of 10/10.",
+            &[
+                "Review evidence includes diff scope, tests, and remaining risk.",
+                "Scores below 10/10 trigger another fix iteration or a blocked report.",
+            ],
+        );
+        assert_playbook_phase(
+            phases.get("publish").copied(),
+            "Open or update the GitHub PR and update the Linear ticket.",
+            &[
+                "The PR references the Linear ticket.",
+                "The Linear ticket records PR URL, tests, and blockers.",
+            ],
+        );
+        assert_eq!(
+            playbook.manifest.acceptance_criteria,
+            vec![
+                "No duplicate PR is created for an issue with an active workflow PR.".to_string(),
+                "Every automatic code mutation has test evidence and xhigh review evidence."
+                    .to_string(),
+                "The workflow stops rather than guessing when human product judgment is required."
+                    .to_string(),
+            ]
+        );
+        assert_eq!(
+            playbook.manifest.evidence_expectations,
+            vec![
+                "The root scheduled run id is available from the Flow projection.".to_string(),
+                "Reviewer subagent evidence is recorded in the run output or linked PR/Linear comments.".to_string(),
+            ]
+        );
+        assert!(!playbook.manifest.tools.enforce);
+        assert!(playbook.manifest.tools.allow.is_empty());
+        assert!(playbook.manifest.tools.deny.is_empty());
+        let publish = playbook.publish.as_ref().expect("playbook publish spec");
+        assert_eq!(publish.status, crate::PlaybookReleaseStatus::Active);
+        assert_eq!(publish.evidence_refs.len(), 1);
+        assert_eq!(publish.evidence_refs[0].kind, "manual");
+        assert_eq!(publish.evidence_refs[0].id, "stack-example-reviewed");
+        assert_eq!(
+            publish.evidence_refs[0].description.as_deref(),
+            Some("Example reviewed before publication.")
+        );
+        assert_action(
+            plan,
+            "playbooks",
+            "playbook",
+            "linear-github-feature-pr-loop/0.1.0",
+            "create",
+        );
+        assert_action(
+            plan,
+            "playbooks",
+            "playbook_release",
+            "linear-github-feature-pr-loop/0.1.0",
+            "update",
+        );
+    }
+
+    fn assert_feature_loop_schedule_contract(resolved: &ResolvedStack, plan: &StackPlan) {
+        assert_eq!(
+            resolved
+                .schedules
+                .iter()
+                .map(|schedule| schedule.name.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["github-review-followup-hourly", "linear-intake-0800"])
+        );
+        let playbook = resolved.playbooks.first().expect("feature loop playbook");
+        assert_feature_loop_schedule(
+            schedule_by_name(resolved, "linear-intake-0800"),
+            playbook,
+            "0 0 8 * * *",
+            "linear-intake",
+            EXPECTED_FEATURE_LOOP_INTAKE_PROMPT,
+            Some(3),
+        );
+        assert_feature_loop_schedule(
+            schedule_by_name(resolved, "github-review-followup-hourly"),
+            playbook,
+            "0 0 * * * *",
+            "github-review-followup",
+            EXPECTED_FEATURE_LOOP_REVIEW_PROMPT,
+            None,
+        );
+        assert_action(
+            plan,
+            "schedules",
+            "schedule",
+            "linear-intake-0800",
+            "create",
+        );
+        assert_action(
+            plan,
+            "schedules",
+            "schedule",
+            "github-review-followup-hourly",
+            "create",
+        );
+    }
+
+    fn assert_feature_loop_verification_contract(resolved: &ResolvedStack, plan: &StackPlan) {
+        let expected = feature_loop_probe_set();
+        assert_eq!(
+            resolved
+                .verification
+                .iter()
+                .map(|probe| probe.name.as_str())
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
+        for probe in expected {
+            assert_action(plan, "verification", "probe", probe, "verify");
+        }
+        let probes = resolved
+            .verification
+            .iter()
+            .map(|probe| (probe.name.as_str(), &probe.kind))
+            .collect::<BTreeMap<_, _>>();
+        assert_probe_persona(probes.get("persona").copied(), "feature-pr-operator");
+        assert_probe_session(probes.get("session").copied(), "feature-pr-loop");
+        assert_probe_schedule(probes.get("intake-schedule").copied(), "linear-intake-0800");
+        assert_probe_schedule(
+            probes.get("followup-schedule").copied(),
+            "github-review-followup-hourly",
+        );
+        assert_probe_playbook(
+            probes.get("playbook").copied(),
+            "linear-github-feature-pr-loop",
+            "0.1.0",
+        );
+    }
+
+    fn assert_feature_loop_plan_action_set(plan: &StackPlan, tools: &[String]) {
+        let mut expected = Vec::new();
+        expected.push(action_key(
+            "secrets",
+            "secret",
+            "mcp.linear.LINEAR_API_KEY",
+            "create",
+        ));
+        expected.push(action_key(
+            "secrets",
+            "secret",
+            "mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN",
+            "create",
+        ));
+        expected.push(action_key("requirements", "mcp_server", "github", "noop"));
+        expected.push(action_key("requirements", "mcp_server", "linear", "noop"));
+        for tool in tools {
+            expected.push(action_key("requirements", "mcp_tool", tool, "noop"));
+        }
+        expected.push(action_key(
+            "personas",
+            "persona",
+            "feature-pr-operator",
+            "create",
+        ));
+        expected.push(action_key(
+            "sessions",
+            "session",
+            "feature-pr-loop",
+            "create",
+        ));
+        expected.push(action_key(
+            "playbooks",
+            "playbook",
+            "linear-github-feature-pr-loop/0.1.0",
+            "create",
+        ));
+        expected.push(action_key(
+            "playbooks",
+            "playbook_release",
+            "linear-github-feature-pr-loop/0.1.0",
+            "update",
+        ));
+        expected.push(action_key(
+            "schedules",
+            "schedule",
+            "linear-intake-0800",
+            "create",
+        ));
+        expected.push(action_key(
+            "schedules",
+            "schedule",
+            "github-review-followup-hourly",
+            "create",
+        ));
+        for probe in feature_loop_probe_set() {
+            expected.push(action_key("verification", "probe", probe, "verify"));
+        }
+        expected.sort();
+        assert_eq!(plan_action_keys(plan), expected);
+    }
+
+    fn assert_feature_loop_apply_report(report: &StackApplyReport) {
+        let verification = report.verification.as_ref().expect("apply verification");
+        assert!(verification.valid, "{:#?}", verification.checks);
+        assert!(
+            verification.checks.iter().all(|check| check.ok),
+            "{:#?}",
+            verification.checks
+        );
+        let mut expected = vec![
+            action_key("secrets", "secret", "mcp.linear.LINEAR_API_KEY", "create"),
+            action_key(
+                "secrets",
+                "secret",
+                "mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN",
+                "create",
+            ),
+            action_key("personas", "persona", "feature-pr-operator", "create"),
+            action_key("sessions", "session", "feature-pr-loop", "create"),
+            action_key(
+                "playbooks",
+                "playbook",
+                "linear-github-feature-pr-loop/0.1.0",
+                "apply",
+            ),
+            action_key("schedules", "schedule", "linear-intake-0800", "create"),
+            action_key(
+                "schedules",
+                "schedule",
+                "github-review-followup-hourly",
+                "create",
+            ),
+        ];
+        expected.sort();
+        assert_eq!(action_keys(&report.applied), expected);
+    }
+
+    fn assert_feature_loop_schedule(
+        schedule: &ResolvedSchedule,
+        playbook: &ResolvedPlaybook,
+        cron_expression: &str,
+        workflow: &str,
+        expected_content: &str,
+        max_tickets: Option<i64>,
+    ) {
+        assert_eq!(schedule.request.name, schedule.name);
+        assert_eq!(schedule.request.target_session_id, "feature-pr-loop");
+        assert_eq!(schedule.request.target_agent_id, None);
+        assert_eq!(schedule.request.max_executions, None);
+        assert_eq!(
+            schedule.request.overlap_policy,
+            crate::ScheduleOverlapPolicy::Skip
+        );
+        assert_eq!(
+            schedule.request.misfire_policy,
+            crate::ScheduleMisfirePolicy::CoalesceOnce
+        );
+        match &schedule.request.cadence {
+            crate::ScheduleCadence::Cron {
+                expression,
+                timezone,
+            } => {
+                assert_eq!(expression, cron_expression);
+                assert_eq!(timezone, "Europe/Paris");
+            }
+            other => panic!("expected cron schedule, got {other:?}"),
+        }
+        assert!(schedule.request.request.is_none());
+        assert!(schedule.request.observation_materialization.is_none());
+        let flow_start = schedule
+            .request
+            .flow_start
+            .as_ref()
+            .expect("feature loop schedules start flows");
+        assert_eq!(flow_start.flow_id, None);
+        assert_eq!(flow_start.idempotency_key, None);
+        assert!(flow_start.evidence_refs.is_empty());
+        assert_eq!(
+            flow_start.playbook_ref.playbook_id,
+            playbook.manifest.playbook_id
+        );
+        assert_eq!(flow_start.playbook_ref.version, playbook.manifest.version);
+        assert_eq!(flow_start.playbook_ref.digest, playbook.digest);
+        assert_eq!(flow_start.session_id, "feature-pr-loop");
+        assert_eq!(flow_start.request.provider.as_deref(), Some("openai"));
+        assert_eq!(flow_start.request.source_plugin, None);
+        assert_eq!(flow_start.request.source_kind, None);
+        assert_eq!(flow_start.request.actor_id, None);
+        assert!(flow_start.request.input_items.is_empty());
+        assert!(flow_start.request.attachments.is_empty());
+        assert_eq!(flow_start.request.completion_requirements, None);
+        assert_eq!(flow_start.request.metadata, Some(Value::Null));
+        assert!(flow_start.request.binding_keys.is_empty());
+        assert!(flow_start.request.reply_targets.is_empty());
+        assert_eq!(flow_start.request.reply_plugin, None);
+        assert_eq!(flow_start.request.reply_address, None);
+        assert_feature_loop_generation(
+            flow_start
+                .request
+                .generation
+                .as_ref()
+                .expect("flow start generation"),
+        );
+        assert_eq!(
+            flow_start.request.content.trim_end(),
+            expected_content.trim_end()
+        );
+        assert_eq!(
+            flow_start.metadata.get("workflow").and_then(Value::as_str),
+            Some(workflow)
+        );
+        assert_eq!(
+            flow_start
+                .metadata
+                .get("max_tickets")
+                .and_then(Value::as_i64),
+            max_tickets
+        );
+    }
+
+    fn assert_scope_allows_exact_mcp(scope: &kheish_types::CapabilityScope, tools: &[String]) {
+        assert_eq!(scope.skill_deny, vec!["*".to_string()]);
+        assert!(scope.skill_allow.is_empty());
+        assert!(scope.mcp_server_deny.is_empty());
+        assert!(scope.mcp_tool_deny.is_empty());
+        assert_eq!(
+            scope
+                .mcp_server_allow
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            feature_loop_server_set()
+        );
+        assert_eq!(
+            scope
+                .mcp_tool_allow
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            string_set(tools.iter().map(String::as_str))
+        );
+    }
+
+    fn assert_feature_loop_generation(generation: &kheish_runtime::ModelGenerationConfig) {
+        assert_eq!(generation.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(
+            generation
+                .reasoning
+                .as_ref()
+                .and_then(|reasoning| reasoning.effort),
+            Some(kheish_runtime::ReasoningEffort::Medium)
+        );
+    }
+
+    fn assert_playbook_input(
+        input: Option<&crate::PlaybookInputSpec>,
+        expected_description: &str,
+        expected_required: bool,
+    ) {
+        let input = input.expect("playbook input");
+        assert_eq!(input.description, expected_description);
+        assert_eq!(input.required, expected_required);
+    }
+
+    fn assert_playbook_phase(
+        phase: Option<&crate::PlaybookPhase>,
+        expected_objective: &str,
+        expected_acceptance_criteria: &[&str],
+    ) {
+        let phase = phase.expect("playbook phase");
+        assert_eq!(phase.objective, expected_objective);
+        assert!(phase.required_evidence.is_empty());
+        assert_eq!(
+            phase.acceptance_criteria,
+            expected_acceptance_criteria
+                .iter()
+                .map(|criterion| (*criterion).to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    fn schedule_by_name<'a>(resolved: &'a ResolvedStack, name: &str) -> &'a ResolvedSchedule {
+        resolved
+            .schedules
+            .iter()
+            .find(|schedule| schedule.name == name)
+            .unwrap_or_else(|| panic!("missing schedule {name}"))
+    }
+
+    fn assert_action(
+        plan: &StackPlan,
+        phase: &str,
+        resource_type: &str,
+        resource_id: &str,
+        operation: &str,
+    ) {
+        assert!(
+            plan.actions.iter().any(|action| {
+                action.phase == phase
+                    && action.resource_type == resource_type
+                    && action.resource_id == resource_id
+                    && action.operation == operation
+            }),
+            "missing action {phase}/{resource_type}/{resource_id}/{operation}: {:#?}",
+            plan.actions
+        );
+    }
+
+    fn plan_action_keys(plan: &StackPlan) -> Vec<(String, String, String, String)> {
+        action_keys(&plan.actions)
+    }
+
+    fn action_keys(actions: &[StackAction]) -> Vec<(String, String, String, String)> {
+        let mut keys = actions
+            .iter()
+            .map(|action| {
+                action_key(
+                    &action.phase,
+                    &action.resource_type,
+                    &action.resource_id,
+                    &action.operation,
+                )
+            })
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys
+    }
+
+    fn action_key(
+        phase: &str,
+        resource_type: &str,
+        resource_id: &str,
+        operation: &str,
+    ) -> (String, String, String, String) {
+        (
+            phase.to_string(),
+            resource_type.to_string(),
+            resource_id.to_string(),
+            operation.to_string(),
+        )
+    }
+
+    fn assert_probe_persona(probe: Option<&ProbeKind>, expected_persona_id: &str) {
+        match probe.expect("persona probe") {
+            ProbeKind::PersonaExists { persona_id } => {
+                assert_eq!(persona_id, expected_persona_id);
+            }
+            other => panic!("expected persona probe, got {other:?}"),
+        }
+    }
+
+    fn assert_probe_session(probe: Option<&ProbeKind>, expected_session_id: &str) {
+        match probe.expect("session probe") {
+            ProbeKind::SessionExists { session_id } => {
+                assert_eq!(session_id, expected_session_id);
+            }
+            other => panic!("expected session probe, got {other:?}"),
+        }
+    }
+
+    fn assert_probe_schedule(probe: Option<&ProbeKind>, expected_schedule_name: &str) {
+        match probe.expect("schedule probe") {
+            ProbeKind::ScheduleExists { name } => {
+                assert_eq!(name, expected_schedule_name);
+            }
+            other => panic!("expected schedule probe, got {other:?}"),
+        }
+    }
+
+    fn assert_probe_playbook(
+        probe: Option<&ProbeKind>,
+        expected_playbook_id: &str,
+        expected_version: &str,
+    ) {
+        match probe.expect("playbook probe") {
+            ProbeKind::PlaybookVersionExists {
+                playbook_id,
+                version,
+            } => {
+                assert_eq!(playbook_id, expected_playbook_id);
+                assert_eq!(version, expected_version);
+            }
+            other => panic!("expected playbook probe, got {other:?}"),
+        }
+    }
+
+    fn feature_loop_probe_set() -> BTreeSet<&'static str> {
+        BTreeSet::from([
+            "followup-schedule",
+            "intake-schedule",
+            "persona",
+            "playbook",
+            "session",
+        ])
+    }
+
+    fn feature_loop_server_set() -> BTreeSet<String> {
+        BTreeSet::from(["github".to_string(), "linear".to_string()])
+    }
+
+    fn string_set<'a>(values: impl IntoIterator<Item = &'a str>) -> BTreeSet<String> {
+        values.into_iter().map(ToOwned::to_owned).collect()
     }
 
     #[tokio::test]
