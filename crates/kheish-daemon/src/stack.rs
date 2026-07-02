@@ -8860,7 +8860,7 @@ spec:
             playbook.manifest.playbook_id,
             "linear-github-feature-pr-loop"
         );
-        assert_eq!(playbook.manifest.version, "0.1.4");
+        assert_eq!(playbook.manifest.version, "0.1.5");
         assert_eq!(playbook.manifest.title, "Linear to GitHub Feature PR Loop");
         assert_eq!(
             playbook.manifest.objective,
@@ -8969,6 +8969,7 @@ spec:
             "Implement the change in an isolated worktree.",
             &[
                 "The implementation is limited to the ticket scope.",
+                "Project-native dev/test entrypoints such as Docker Compose, Makefile, package scripts, CI workflow commands, or devcontainers are inspected before host missing tools are reported as a test blocker.",
                 "Focused tests or a clear blocked reason are recorded.",
             ],
         );
@@ -8998,6 +8999,7 @@ spec:
                 "Each root run processes at most one ticket or PR.".to_string(),
                 "No duplicate PR is created for an issue with an active workflow PR.".to_string(),
                 "Every automatic code mutation has test evidence or an explicit test blocker, plus xhigh review evidence when available.".to_string(),
+                "Missing host runtimes are not enough to mark tests blocked until repository-provided Docker Compose or other project-native test commands have been tried or ruled out.".to_string(),
                 "Draft PR creation is allowed before a 10/10 review score; leaving draft status is not.".to_string(),
                 "Subagents report blockers to the coordinator instead of asking user-facing clarification questions.".to_string(),
                 "The workflow stops rather than guessing when human product judgment is required."
@@ -9027,14 +9029,14 @@ spec:
             plan,
             "playbooks",
             "playbook",
-            "linear-github-feature-pr-loop/0.1.4",
+            "linear-github-feature-pr-loop/0.1.5",
             "create",
         );
         assert_action(
             plan,
             "playbooks",
             "playbook_release",
-            "linear-github-feature-pr-loop/0.1.4",
+            "linear-github-feature-pr-loop/0.1.5",
             "update",
         );
     }
@@ -9047,13 +9049,13 @@ spec:
                 .map(|schedule| schedule.name.as_str())
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from([
-                "github-review-followup-hourly-v014",
-                "linear-intake-0800-v014"
+                "github-review-followup-hourly-v015",
+                "linear-intake-0800-v015"
             ])
         );
         let playbook = resolved.playbooks.first().expect("feature loop playbook");
         assert_feature_loop_schedule(
-            schedule_by_name(resolved, "linear-intake-0800-v014"),
+            schedule_by_name(resolved, "linear-intake-0800-v015"),
             playbook,
             "0 0 8 * * *",
             "linear-intake",
@@ -9061,7 +9063,7 @@ spec:
             Some(1),
         );
         assert_feature_loop_schedule(
-            schedule_by_name(resolved, "github-review-followup-hourly-v014"),
+            schedule_by_name(resolved, "github-review-followup-hourly-v015"),
             playbook,
             "0 0 * * * *",
             "github-review-followup",
@@ -9072,20 +9074,20 @@ spec:
             plan,
             "schedules",
             "schedule",
-            "linear-intake-0800-v014",
+            "linear-intake-0800-v015",
             "create",
         );
         assert_action(
             plan,
             "schedules",
             "schedule",
-            "github-review-followup-hourly-v014",
+            "github-review-followup-hourly-v015",
             "create",
         );
     }
 
     fn assert_feature_loop_prompt_policy_contract(resolved: &ResolvedStack) {
-        let intake = schedule_by_name(resolved, "linear-intake-0800-v014")
+        let intake = schedule_by_name(resolved, "linear-intake-0800-v015")
             .request
             .flow_start
             .as_ref()
@@ -9102,8 +9104,14 @@ spec:
         assert!(intake.contains(
             "BlockerCategory: internal-review | tests | product-judgment | credentials | ownership | unsafe | no-coherent-patch | broad-refactor | unclear-scope"
         ));
+        assert!(intake.contains(
+            "local Docker and Docker Compose are allowed when the repository provides them"
+        ));
+        assert!(intake.contains(
+            "host missing tools such as `php`, `composer`, `node`, or language-specific package managers are not by themselves a test blocker"
+        ));
 
-        let followup = schedule_by_name(resolved, "github-review-followup-hourly-v014")
+        let followup = schedule_by_name(resolved, "github-review-followup-hourly-v015")
             .request
             .flow_start
             .as_ref()
@@ -9119,6 +9127,12 @@ spec:
         ));
         assert!(followup.contains(
             "BlockerCategory: internal-review | tests | product-judgment | credentials | ownership | unsafe | no-coherent-patch | broad-refactor | unclear-scope"
+        ));
+        assert!(followup.contains(
+            "local Docker and Docker Compose are allowed when the repository provides them"
+        ));
+        assert!(followup.contains(
+            "host missing tools such as `php`, `composer`, `node`, or language-specific package managers are not by themselves a test blocker"
         ));
     }
 
@@ -9144,16 +9158,16 @@ spec:
         assert_probe_session(probes.get("session").copied(), "feature-pr-loop-v012");
         assert_probe_schedule(
             probes.get("intake-schedule").copied(),
-            "linear-intake-0800-v014",
+            "linear-intake-0800-v015",
         );
         assert_probe_schedule(
             probes.get("followup-schedule").copied(),
-            "github-review-followup-hourly-v014",
+            "github-review-followup-hourly-v015",
         );
         assert_probe_playbook(
             probes.get("playbook").copied(),
             "linear-github-feature-pr-loop",
-            "0.1.4",
+            "0.1.5",
         );
     }
 
@@ -9191,25 +9205,25 @@ spec:
         expected.push(action_key(
             "playbooks",
             "playbook",
-            "linear-github-feature-pr-loop/0.1.4",
+            "linear-github-feature-pr-loop/0.1.5",
             "create",
         ));
         expected.push(action_key(
             "playbooks",
             "playbook_release",
-            "linear-github-feature-pr-loop/0.1.4",
+            "linear-github-feature-pr-loop/0.1.5",
             "update",
         ));
         expected.push(action_key(
             "schedules",
             "schedule",
-            "linear-intake-0800-v014",
+            "linear-intake-0800-v015",
             "create",
         ));
         expected.push(action_key(
             "schedules",
             "schedule",
-            "github-review-followup-hourly-v014",
+            "github-review-followup-hourly-v015",
             "create",
         ));
         for probe in feature_loop_probe_set() {
@@ -9240,14 +9254,14 @@ spec:
             action_key(
                 "playbooks",
                 "playbook",
-                "linear-github-feature-pr-loop/0.1.4",
+                "linear-github-feature-pr-loop/0.1.5",
                 "apply",
             ),
-            action_key("schedules", "schedule", "linear-intake-0800-v014", "create"),
+            action_key("schedules", "schedule", "linear-intake-0800-v015", "create"),
             action_key(
                 "schedules",
                 "schedule",
-                "github-review-followup-hourly-v014",
+                "github-review-followup-hourly-v015",
                 "create",
             ),
         ];

@@ -1,5 +1,5 @@
 playbook_id: linear-github-feature-pr-loop
-version: "0.1.4"
+version: "0.1.5"
 title: Linear to GitHub Feature PR Loop
 objective: Convert eligible Linear feature tickets into reviewed GitHub pull requests.
 description: Generic operator playbook for scheduled Linear intake and GitHub review follow-up.
@@ -34,6 +34,7 @@ phases:
     objective: Implement the change in an isolated worktree.
     acceptance_criteria:
       - The implementation is limited to the ticket scope.
+      - Project-native dev/test entrypoints such as Docker Compose, Makefile, package scripts, CI workflow commands, or devcontainers are inspected before host missing tools are reported as a test blocker.
       - Focused tests or a clear blocked reason are recorded.
   - phase_id: review
     objective: Obtain an internal xhigh review score after a durable draft PR exists.
@@ -53,6 +54,7 @@ acceptance_criteria:
   - Each root run processes at most one ticket or PR.
   - No duplicate PR is created for an issue with an active workflow PR.
   - Every automatic code mutation has test evidence or an explicit test blocker, plus xhigh review evidence when available.
+  - Missing host runtimes are not enough to mark tests blocked until repository-provided Docker Compose or other project-native test commands have been tried or ruled out.
   - Draft PR creation is allowed before a 10/10 review score; leaving draft status is not.
   - Subagents report blockers to the coordinator instead of asking user-facing clarification questions.
   - The workflow stops rather than guessing when human product judgment is required.

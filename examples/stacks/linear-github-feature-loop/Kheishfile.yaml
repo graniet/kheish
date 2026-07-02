@@ -124,7 +124,7 @@ spec:
             id: stack-example-reviewed
             description: Example reviewed before publication.
   schedules:
-    - name: linear-intake-0800-v014
+    - name: linear-intake-0800-v015
       target_session_id: feature-pr-loop-v012
       cadence:
         type: cron
@@ -136,7 +136,7 @@ spec:
       flow_start:
         playbook_ref:
           playbook_id: linear-github-feature-pr-loop
-          version: "0.1.4"
+          version: "0.1.5"
         request:
           provider: openai
           content_file: intake.md
@@ -150,7 +150,7 @@ spec:
           project: Evapayrent
           repository: graniet/evapayrent
           max_tickets: 1
-    - name: github-review-followup-hourly-v014
+    - name: github-review-followup-hourly-v015
       target_session_id: feature-pr-loop-v012
       cadence:
         type: cron
@@ -162,7 +162,7 @@ spec:
       flow_start:
         playbook_ref:
           playbook_id: linear-github-feature-pr-loop
-          version: "0.1.4"
+          version: "0.1.5"
         request:
           provider: openai
           content_file: review-followup.md
@@ -184,11 +184,11 @@ spec:
       session_id: feature-pr-loop-v012
     - name: intake-schedule
       type: schedule_exists
-      schedule_name: linear-intake-0800-v014
+      schedule_name: linear-intake-0800-v015
     - name: followup-schedule
       type: schedule_exists
-      schedule_name: github-review-followup-hourly-v014
+      schedule_name: github-review-followup-hourly-v015
     - name: playbook
       type: playbook_version_exists
       playbook_id: linear-github-feature-pr-loop
-      version: "0.1.4"
+      version: "0.1.5"

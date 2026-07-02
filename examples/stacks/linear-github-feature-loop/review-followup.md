@@ -14,7 +14,11 @@ When resuming a safe blocked issue, run the intake flow: inspect current source,
 For the selected PR with unresolved review comments:
 - read only unresolved actionable comments and the current focused diff needed for those comments;
 - classify whether the request is safe to apply automatically;
-- when safe, make the fix in an isolated worktree, run focused tests, and spawn an xhigh reviewer with a bounded review packet containing only the PR URL, branch, changed file list, diffstat, focused hunks or summary, test evidence or blocker, known risks, and exact review rubric;
+- when safe, make the fix in an isolated worktree;
+- before declaring tests blocked because host runtimes or package managers are missing, inspect the repository for project-native dev/test entrypoints such as Docker Compose files, Makefile targets, justfile targets, package scripts, CI workflow commands, or devcontainer config;
+- local Docker and Docker Compose are allowed when the repository provides them. Prefer the smallest project-native command that installs dependencies or runs the focused tests, tear down long-running services after use, and record the exact command and result;
+- host missing tools such as `php`, `composer`, `node`, or language-specific package managers are not by themselves a test blocker until project-native containerized or scripted test paths have been tried or shown unavailable or unsafe;
+- run focused tests through the project-native path when available, then spawn an xhigh reviewer with a bounded review packet containing only the PR URL, branch, changed file list, diffstat, focused hunks or summary, test evidence or blocker, known risks, and exact review rubric;
 - perform at most one implementation/review fix iteration in this run. If the reviewer score is below 10/10, keep the PR draft, record blockers, and let the next follow-up run resume. If a reviewer times out or fails due provider/context limits, keep the latest completed reviewer score, keep the PR draft, and record the failure as a blocker instead of spawning more review work;
 - before finishing the root run, verify that spawned subagents are terminal. If a subagent is still running and the tool surface supports cancellation or interruption, cancel it; otherwise record that cancellation is unavailable and leave the PR draft blocked;
 - keep the PR draft while tests are blocked, review score is below 10/10, or blockers remain;

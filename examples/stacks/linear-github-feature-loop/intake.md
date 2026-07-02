@@ -10,7 +10,10 @@ Process one feature ticket per run:
 - inspect the relevant source code before proposing work;
 - spawn one planning subagent with reasoning effort xhigh, using a compact prompt that names only the Linear issue, relevant source files, known constraints, and the concrete decision needed;
 - spawn implementation work in an isolated worktree;
-- run focused tests;
+- before declaring tests blocked because host runtimes or package managers are missing, inspect the repository for project-native dev/test entrypoints such as Docker Compose files, Makefile targets, justfile targets, package scripts, CI workflow commands, or devcontainer config;
+- local Docker and Docker Compose are allowed when the repository provides them. Prefer the smallest project-native command that installs dependencies or runs the focused tests, tear down long-running services after use, and record the exact command and result;
+- host missing tools such as `php`, `composer`, `node`, or language-specific package managers are not by themselves a test blocker until project-native containerized or scripted test paths have been tried or shown unavailable or unsafe;
+- run focused tests through the project-native path when available;
 - as soon as there is a coherent, ticket-scoped patch with passing focused tests, or a documented environment or pre-existing test blocker that does not invalidate the patch, push it to a workflow branch and open a GitHub draft PR against the configured repository, even when the internal reviewer score is below 10/10;
 - make the draft PR body explicit about status, Linear issue, files changed, tests run or blocked, review score, known blockers, and the actual PR URL once GitHub returns it;
 - spawn one reviewer subagent with reasoning effort xhigh and require a 10/10 score before treating the PR as ready for human review or merge. Give the reviewer a bounded review packet with the PR URL, branch, changed file list, diffstat, focused hunks or summary, test evidence or blocker, known risks, and exact review rubric. Do not pass the full session transcript, complete PR body, full logs, or large raw diffs;

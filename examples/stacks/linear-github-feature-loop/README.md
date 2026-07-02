@@ -16,7 +16,7 @@ Operational guardrails:
 - do not run this with broad GitHub or Linear credentials. Use tokens scoped to the intended repository/project/team and validate the first run on a non-production or read-only target before allowing PR/comment/status mutations.
 - the workflow creates a draft PR once it has a coherent ticket-scoped patch. The 10/10 internal review gate controls whether the PR can leave draft status; it does not block creation of the durable PR artifact used for recovery and follow-up.
 - the workflow intentionally processes one ticket or PR per root run. The follow-up schedule provides recovery and iteration instead of growing one long context.
-- missing local runtimes such as `php` or `composer` are recorded as a `tests` blocker. They do not prevent draft PR creation when the patch is coherent and the blocker does not invalidate it.
+- missing host runtimes such as `php` or `composer` are recorded as a `tests` blocker only after repository-provided Docker Compose, Makefile, package script, CI, or devcontainer test paths have been tried or shown unavailable or unsafe. They do not prevent draft PR creation when the patch is coherent and the blocker does not invalidate it.
 - schedule names include the playbook policy version because the current daemon API treats schedule definitions as create-only. Publish a new schedule name when changing scheduled prompt or playbook semantics.
 
 For credentialed MCP servers, import the preloaded secrets into the stack ledger before the first apply:
