@@ -96,7 +96,8 @@ where
                 }
             }
         };
-        let schedules = self.schedule_service.status_snapshot(now).await;
+        let mut schedules = self.schedule_service.status_snapshot(now).await;
+        schedules.dispatch_worker_enabled = self.schedule_dispatch_worker_enabled;
         let agents = self.agent_status_snapshot();
         let session_status = self.session_service.operator_status_snapshot().await;
         let mut tasks = self.task_service.status_snapshot().await;

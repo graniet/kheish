@@ -580,6 +580,10 @@ impl SubagentPolicySelector {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Runtime configuration for the Kheish daemon.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DaemonConfig {
@@ -625,6 +629,9 @@ pub struct DaemonConfig {
     /// Daemon scheduler retry/backoff behavior.
     #[serde(default)]
     pub scheduler_policy: SchedulerPolicyConfig,
+    /// Whether the background scheduler worker dispatches due schedules.
+    #[serde(default = "default_true")]
+    pub scheduler_enabled: bool,
     /// Number of daemon events retained for SSE replay and live backpressure buffering.
     #[serde(default = "default_event_history_capacity")]
     pub event_history_capacity: usize,
@@ -658,6 +665,7 @@ impl DaemonConfig {
             state_root_lock_held: false,
             subagent_policy: SubagentPolicyConfig::default(),
             scheduler_policy: SchedulerPolicyConfig::default(),
+            scheduler_enabled: true,
             event_history_capacity: default_event_history_capacity(),
             model_budget_max_total_output_tokens: default_model_budget_max_total_output_tokens(),
             model_budget_max_total_cost_usd: default_model_budget_max_total_cost_usd(),

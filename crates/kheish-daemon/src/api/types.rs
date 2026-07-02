@@ -2902,8 +2902,11 @@ pub struct DaemonRunStatusSummaryView {
 }
 
 /// Cheap schedule counters for operator status.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonScheduleStatusSummaryView {
+    /// Whether the background worker that dispatches due schedules is running.
+    #[serde(default = "default_true")]
+    pub dispatch_worker_enabled: bool,
     /// Number of persisted schedules.
     pub total: usize,
     /// Number of active schedules.
@@ -2931,6 +2934,26 @@ pub struct DaemonScheduleStatusSummaryView {
     /// Lag in milliseconds for `oldest_due_schedule_id`, when any schedule is overdue.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oldest_due_schedule_lag_ms: Option<u64>,
+}
+
+impl Default for DaemonScheduleStatusSummaryView {
+    fn default() -> Self {
+        Self {
+            dispatch_worker_enabled: true,
+            total: 0,
+            active: 0,
+            paused: 0,
+            completed: 0,
+            canceled: 0,
+            due_count: 0,
+            backoff_count: 0,
+            in_flight_count: 0,
+            queued_fire_count: 0,
+            next_due_at_ms: None,
+            oldest_due_schedule_id: None,
+            oldest_due_schedule_lag_ms: None,
+        }
+    }
 }
 
 /// Cheap agent counters for operator status.

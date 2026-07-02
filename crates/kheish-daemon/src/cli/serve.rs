@@ -134,6 +134,7 @@ pub(crate) async fn run_serve(args: crate::ServeArgs) -> Result<()> {
         retry_jitter_ms: args.scheduler_retry_jitter_ms,
         retry_max_attempts: args.scheduler_retry_max_attempts,
     };
+    config.scheduler_enabled = !args.disable_scheduler;
     config.event_history_capacity = args.event_history_capacity.max(1);
     config.model_budget_max_total_output_tokens = args.model_budget_max_total_output_tokens;
     config.model_budget_max_total_cost_usd = args.model_budget_max_total_cost_usd;

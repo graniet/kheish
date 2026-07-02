@@ -543,6 +543,8 @@ struct ServeArgs {
         default_value_t = 500
     )]
     scheduler_retry_base_delay_ms: u64,
+    #[arg(long, env = "KHEISH_DISABLE_SCHEDULER", default_value_t = false)]
+    disable_scheduler: bool,
     #[arg(
         long,
         env = "KHEISH_SCHEDULER_RETRY_MAX_DELAY_MS",
@@ -7311,6 +7313,7 @@ auth_ref = "openrouter.primary"
             estimated_spawn_cost_microusd: 1_000,
             estimated_spawn_cpu_ms: 1_000,
             scheduler_retry_base_delay_ms: 500,
+            disable_scheduler: false,
             scheduler_retry_max_delay_ms: 30_000,
             scheduler_retry_jitter_ms: 250,
             scheduler_retry_max_attempts: 0,
@@ -7321,6 +7324,38 @@ auth_ref = "openrouter.primary"
     fn cli_parses_global_daemon_token() {
         let cli = Cli::parse_from(["kheish-daemon", "--token", "secret-token", "status"]);
         assert_eq!(cli.token.as_deref(), Some("secret-token"));
+    }
+
+    #[test]
+    fn cli_parses_disable_scheduler_flag() {
+        let cli = Cli::parse_from(["kheish-daemon", "serve", "--disable-scheduler"]);
+        let Some(Command::Serve(args)) = cli.command else {
+            panic!("serve command expected");
+        };
+        assert!(args.disable_scheduler);
+    }
+
+    #[test]
+    fn cli_parses_disable_scheduler_env() {
+        let _guard = auth_store_env_lock()
+            .lock()
+            .expect("process env mutex poisoned");
+        let previous = std::env::var_os("KHEISH_DISABLE_SCHEDULER");
+        unsafe {
+            std::env::set_var("KHEISH_DISABLE_SCHEDULER", "true");
+        }
+        let cli = Cli::parse_from(["kheish-daemon", "serve"]);
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("KHEISH_DISABLE_SCHEDULER", previous);
+            } else {
+                std::env::remove_var("KHEISH_DISABLE_SCHEDULER");
+            }
+        }
+        let Some(Command::Serve(args)) = cli.command else {
+            panic!("serve command expected");
+        };
+        assert!(args.disable_scheduler);
     }
 
     #[test]

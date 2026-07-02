@@ -2444,6 +2444,44 @@ async fn start_test_daemon_with_policy<M>(
 where
     M: ModelDriver + Send + Sync + 'static,
 {
+    start_test_daemon_with_policy_and_scheduler(
+        state_root,
+        model,
+        permissions,
+        model_control,
+        events,
+        debug,
+        observer,
+        subagent_policy,
+        image_generation_factory,
+        transcription_factory,
+        enable_image_generation,
+        enable_image_edit,
+        true,
+        configure_tools,
+    )
+    .await
+}
+
+async fn start_test_daemon_with_policy_and_scheduler<M>(
+    state_root: &Path,
+    model: Arc<M>,
+    permissions: Arc<PermissionEngine>,
+    model_control: Option<Arc<dyn DaemonModelControl>>,
+    events: DaemonEventBus,
+    debug: DebugControl,
+    observer: Arc<dyn RuntimeObserver>,
+    subagent_policy: crate::SubagentPolicyConfig,
+    image_generation_factory: Option<TestImageGenerationFactory>,
+    transcription_factory: Option<TestTranscriptionFactory>,
+    enable_image_generation: bool,
+    enable_image_edit: bool,
+    scheduler_enabled: bool,
+    configure_tools: impl FnOnce(&mut ToolRuntime),
+) -> Result<(SocketAddr, oneshot::Sender<()>)>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
     let skills = Arc::new(SharedSkillRegistry::load_from_roots(vec![SkillRoot {
         path: state_root.join("skills"),
         scope: SkillScope::Repo,
@@ -2575,6 +2613,7 @@ where
         connector_service,
         subagent_policy,
         SchedulerPolicyConfig::default(),
+        scheduler_enabled,
         ControlPlaneAuthConfig::disabled(),
         crate::ControlPlaneAuthTokenFiles::default(),
         crate::ControlPlaneCorsConfig::loopback(),
@@ -2630,6 +2669,14 @@ async fn scripted_daemon(
     state_root: &Path,
     script: Vec<Result<Vec<ModelStreamEvent>, ProviderError>>,
 ) -> Result<(SocketAddr, oneshot::Sender<()>)> {
+    scripted_daemon_with_scheduler_enabled(state_root, script, true).await
+}
+
+async fn scripted_daemon_with_scheduler_enabled(
+    state_root: &Path,
+    script: Vec<Result<Vec<ModelStreamEvent>, ProviderError>>,
+    scheduler_enabled: bool,
+) -> Result<(SocketAddr, oneshot::Sender<()>)> {
     let events = DaemonEventBus::new(256);
     let debug = DebugControl::new(DebugCaptureLevel::Off);
     let observer: Arc<dyn RuntimeObserver> = DaemonObserver::shared(
@@ -2656,7 +2703,7 @@ async fn scripted_daemon(
     ));
     let model_control =
         Some(Arc::new(ScriptedModelControl::new("scripted-model")) as Arc<dyn DaemonModelControl>);
-    start_test_daemon(
+    start_test_daemon_with_policy_and_scheduler(
         state_root,
         model,
         permissions,
@@ -2664,6 +2711,12 @@ async fn scripted_daemon(
         events,
         debug,
         observer,
+        crate::SubagentPolicyConfig::default(),
+        None,
+        None,
+        false,
+        false,
+        scheduler_enabled,
         |tools| tools.register(EchoTool),
     )
     .await
@@ -14753,6 +14806,102 @@ async fn daemon_schedule_once_dispatches_one_later_run() -> Result<()> {
         .json::<crate::ScheduleView>()
         .await?;
     assert_eq!(schedule.status, crate::ScheduleStatus::Completed);
+    let _ = shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_scheduler_disabled_keeps_due_schedule_without_dispatching() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-state");
+    let (address, shutdown) = scripted_daemon_with_scheduler_enabled(
+        &state_root,
+        vec![Ok(scripted_events(
+            "scheduled-disabled-assistant-1",
+            "SHOULD_NOT_RUN",
+            kheish_types::ModelFinishReason::Completed,
+        ))],
+        false,
+    )
+    .await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+    create_test_session(&client, &base, "schedule-disabled-session").await?;
+
+    let schedule = create_test_schedule(
+        &client,
+        &base,
+        CreateScheduleRequest {
+            name: "disabled-dispatch-check".to_string(),
+            target_session_id: "schedule-disabled-session".to_string(),
+            target_agent_id: None,
+            owner_session_id: Some("schedule-disabled-session".to_string()),
+            owner_agent_id: Some("agent-1".to_string()),
+            created_by_run_id: None,
+            cadence: ScheduleCadence::Once {
+                fire_at_ms: crate::now_ms().saturating_sub(1_000),
+            },
+            max_executions: None,
+            overlap_policy: ScheduleOverlapPolicy::Skip,
+            misfire_policy: ScheduleMisfirePolicy::CoalesceOnce,
+            request: Some(SubmitInputRequest {
+                source_plugin: Some("scheduler".to_string()),
+                source_kind: Some("test".to_string()),
+                actor_id: Some("schedule-test".to_string()),
+                provider: None,
+                content: "scheduler disabled should not dispatch".to_string(),
+                input_items: Vec::new(),
+                attachments: Vec::new(),
+                generation: Some(ModelGenerationConfig::default()),
+                completion_requirements: None,
+                metadata: None,
+                binding_keys: Vec::new(),
+                reply_targets: Vec::new(),
+                reply_plugin: None,
+                reply_address: None,
+            }),
+            observation_materialization: None,
+            flow_start: None,
+        },
+    )
+    .await?;
+    assert_eq!(schedule.status, crate::ScheduleStatus::Active);
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let runs = client
+        .get(format!(
+            "{base}/v1/runs?session_id=schedule-disabled-session"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<RunView>>()
+        .await?;
+    assert!(
+        runs.is_empty(),
+        "disabled scheduler should not dispatch runs: {}",
+        serde_json::to_string_pretty(&runs)?
+    );
+    let schedule = client
+        .get(format!("{base}/v1/schedules/{}", schedule.schedule_id))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<crate::ScheduleView>()
+        .await?;
+    assert_eq!(schedule.status, crate::ScheduleStatus::Active);
+    assert_eq!(schedule.execution_count, 0);
+    assert!(schedule.in_flight_run_id.is_none());
+    assert!(schedule.last_dispatched_run_id.is_none());
+    let status = client
+        .get(format!("{base}/v1/status"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<crate::DaemonStatusView>()
+        .await?;
+    assert!(!status.schedules.dispatch_worker_enabled);
+
     let _ = shutdown.send(());
     Ok(())
 }

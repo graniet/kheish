@@ -380,6 +380,7 @@ impl OpenAiProvider {
             self.config.asset_root.as_deref(),
             &self.config.attachment_cache,
             self.flavor(),
+            codex_compat,
         )?;
         let default_max_output_tokens = model_max_output_tokens(&effective_model).default;
         let instructions = normalized.instructions.join("\n\n");
@@ -1264,10 +1265,12 @@ fn openai_conversation_delta(
     asset_root: Option<&std::path::Path>,
     cache: &AttachmentRenderCache,
     flavor: ResponsesProviderFlavor,
+    codex_compat: bool,
 ) -> Result<(Option<String>, Vec<Value>), ProviderError> {
     // Compaction requests are reconstructed from checkpoint/journal state and must stay
     // reproducible without provider-side continuation identifiers.
-    if matches!(flavor, ResponsesProviderFlavor::XAi)
+    if codex_compat
+        || matches!(flavor, ResponsesProviderFlavor::XAi)
         || matches!(request_kind, ModelRequestKind::Compaction)
     {
         let full_items = openai_input_items(
@@ -3978,6 +3981,7 @@ mod tests {
             None,
             &AttachmentRenderCache::default(),
             ResponsesProviderFlavor::OpenAi,
+            false,
         )?;
         assert!(previous_response_id.is_none());
         assert_eq!(items.len(), 3);
@@ -4063,6 +4067,7 @@ mod tests {
             None,
             &AttachmentRenderCache::default(),
             ResponsesProviderFlavor::OpenAi,
+            false,
         )?;
 
         assert!(previous_response_id.is_none());
@@ -4597,6 +4602,92 @@ mod tests {
         assert_eq!(
             body["instructions"],
             Value::String("You are a helpful assistant.".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_account_request_body_replays_tool_results_without_response_resume() {
+        let provider = OpenAiProvider::new(OpenAiProviderConfig::new("gpt-test", "test-key"))
+            .expect("provider should build");
+        let body = provider
+            .build_request_body(
+                &ModelRuntimeRequest {
+                    attempt: 1,
+                    kind: kheish_core::ModelRequestKind::MainLoop,
+                    session_id: "session-codex-tool-result".to_string(),
+                    thread_id: None,
+                    turn: 2,
+                    prompt: ProviderPrompt {
+                        instructions: Vec::new(),
+                        force_synthetic_user_prefix: false,
+                        items: vec![
+                            ProviderInputItem::Message {
+                                id: "user-1".to_string(),
+                                role: kheish_types::Role::User,
+                                content: "Call the tool.".to_string(),
+                                content_parts: Vec::new(),
+                                attachments: Vec::new(),
+                                provider_response_id: None,
+                                provider_context: None,
+                            },
+                            ProviderInputItem::ToolCall {
+                                assistant_message_id: Some("assistant-1".to_string()),
+                                call: ToolCallRecord {
+                                    id: "call-1".to_string(),
+                                    name: "echo".to_string(),
+                                    input: json!({"text": "ping"}),
+                                    assistant_message_id: Some("assistant-1".to_string()),
+                                    assistant_provider_response_id: Some("resp_123".to_string()),
+                                },
+                            },
+                            ProviderInputItem::ToolResult {
+                                result: ToolResultRecord {
+                                    call_id: "call-1".to_string(),
+                                    output: json!({"echo": "ping"}),
+                                    is_error: false,
+                                    tool_name: Some("echo".to_string()),
+                                    offset: None,
+                                    timestamp_ms: None,
+                                    context_updates: Vec::new(),
+                                    hook_contexts: Vec::new(),
+                                },
+                            },
+                            ProviderInputItem::Message {
+                                id: "user-2".to_string(),
+                                role: kheish_types::Role::User,
+                                content: "Finish.".to_string(),
+                                content_parts: Vec::new(),
+                                attachments: Vec::new(),
+                                provider_response_id: None,
+                                provider_context: None,
+                            },
+                        ],
+                    },
+                    available_tools: vec![ToolDefinition {
+                        name: "echo".to_string(),
+                        description: "Echoes input".to_string(),
+                        input_schema: json!({
+                            "type": "object",
+                            "properties": {"text": {"type": "string"}},
+                            "required": ["text"],
+                            "additionalProperties": false
+                        }),
+                        allows_parallel: true,
+                    }],
+                    generation: ModelGenerationConfig::default(),
+                },
+                true,
+            )
+            .expect("request body should build");
+
+        assert_eq!(body["store"], Value::Bool(false));
+        assert!(body.get("previous_response_id").is_none());
+        let input = body["input"].as_array().expect("input should be an array");
+        assert!(input.iter().any(|item| item["type"] == "function_call"));
+        assert!(
+            input
+                .iter()
+                .any(|item| item["type"] == "function_call_output")
         );
     }
 
@@ -5863,6 +5954,7 @@ mod tests {
             None,
             &AttachmentRenderCache::default(),
             ResponsesProviderFlavor::XAi,
+            false,
         )?;
         assert!(previous_response_id.is_none());
         assert_eq!(items.len(), 3);
@@ -5906,6 +5998,7 @@ mod tests {
             None,
             &AttachmentRenderCache::default(),
             ResponsesProviderFlavor::XAi,
+            false,
         )?;
         assert!(previous_response_id.is_none());
         assert_eq!(items.len(), 3);

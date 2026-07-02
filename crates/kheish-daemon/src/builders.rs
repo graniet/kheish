@@ -804,6 +804,7 @@ where
         connector_service,
         config.subagent_policy.clone(),
         config.scheduler_policy.clone(),
+        config.scheduler_enabled,
         config.control_plane_auth.clone(),
         config.control_plane_auth_token_files.clone(),
         config.control_plane_cors.clone(),

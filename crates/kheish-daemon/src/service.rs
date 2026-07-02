@@ -514,6 +514,7 @@ impl DaemonService {
         connector_service: Arc<ConnectorService>,
         subagent_policy: SubagentPolicyConfig,
         scheduler_policy: SchedulerPolicyConfig,
+        scheduler_enabled: bool,
         control_plane_auth: ControlPlaneAuthConfig,
         control_plane_auth_token_files: ControlPlaneAuthTokenFiles,
         control_plane_cors: ControlPlaneCorsConfig,
@@ -899,6 +900,7 @@ impl DaemonService {
             connector_service,
             connector_ingress_service,
             subagent_policy,
+            scheduler_enabled,
             scheduler_policy,
             next_session_id,
             next_run_id,
@@ -995,7 +997,12 @@ impl DaemonService {
         }
         let delivery_task = Some(delivery_queue.spawn_worker());
         let learning_publication_task = Some(state.spawn_learning_publication_worker());
-        let scheduler_task = Some(state.spawn_schedule_worker());
+        let scheduler_task = if scheduler_enabled {
+            Some(state.spawn_schedule_worker())
+        } else {
+            warn!("background schedule dispatch worker disabled by configuration");
+            None
+        };
         let observation_transcript_task = Some(state.spawn_observation_transcript_worker());
         let user_question_expiration_task = Some(state.spawn_user_question_expiration_worker());
         let debug_retention_task = Some(state.spawn_debug_retention_worker());

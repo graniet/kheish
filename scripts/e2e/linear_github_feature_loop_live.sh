@@ -12,7 +12,7 @@ STATE_ROOT="$EVIDENCE/state"
 WORKSPACE_ROOT="$EVIDENCE/workspace"
 STACK_EVIDENCE_DIR="$EVIDENCE/stack"
 STACK_PLAN_FILE="$STACK_EVIDENCE_DIR/Kheishfile.no-secret-env.yaml"
-LIVE_STACK_FILE="$STACK_EVIDENCE_DIR/Kheishfile.no-secret-env.no-schedules.yaml"
+LIVE_STACK_FILE="$STACK_PLAN_FILE"
 PROVENANCE_FILE="$EVIDENCE/provenance.json"
 MCP_CONFIG="$EVIDENCE/codex-mcp.toml"
 ADMIN_TOKEN_FILE="$EVIDENCE/admin.token"
@@ -27,8 +27,22 @@ PID=""
 GITHUB_MCP_IMAGE_REF="${GITHUB_MCP_IMAGE:-}"
 GITHUB_MCP_RUN_IMAGE=""
 GITHUB_MCP_CONTAINER_NAME="kheish-github-mcp-$RUN_ID"
+RUN_STACK_FLOW="${KHEISH_E2E_RUN_STACK_FLOW:-0}"
+OPENAI_FLOW_AUTH_SOURCE="${KHEISH_E2E_OPENAI_AUTH_SOURCE:-codex}"
+STACK_FLOW_ID="stack-direct-flow-smoke-$RUN_ID"
+
+if [[ "$RUN_STACK_FLOW" != "0" && "$RUN_STACK_FLOW" != "1" ]]; then
+  echo "KHEISH_E2E_RUN_STACK_FLOW must be 0 or 1" >&2
+  exit 2
+fi
+export KHEISH_E2E_RUN_STACK_FLOW="$RUN_STACK_FLOW"
 
 mkdir -p "$STATE_ROOT" "$WORKSPACE_ROOT" "$STACK_EVIDENCE_DIR" "$MANAGED_SECRET_STACK_DIR"
+if git -C "$ROOT" check-ignore -q "$EVIDENCE"; then
+  printf 'true\n' >"$EVIDENCE/evidence-gitignored.txt"
+else
+  printf 'false\n' >"$EVIDENCE/evidence-gitignored.txt"
+fi
 cp -R "$STACK_DIR"/. "$STACK_EVIDENCE_DIR"/
 cd "$ROOT"
 
@@ -118,6 +132,7 @@ payload = {
     },
     "stack_file": str(stack_file),
     "github_mcp_image": image_ref,
+    "run_stack_flow": os.environ.get("KHEISH_E2E_RUN_STACK_FLOW") == "1",
 }
 output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
@@ -335,13 +350,12 @@ GITHUB_MCP_RUN_IMAGE="$(docker image inspect \
   "$GITHUB_MCP_IMAGE_REF")"
 printf '%s\n' "$GITHUB_MCP_RUN_IMAGE" >"$EVIDENCE/github-mcp-image-id.txt"
 
-python3 - "$STACK_FILE" "$STACK_PLAN_FILE" "$LIVE_STACK_FILE" <<'PY'
+python3 - "$STACK_FILE" "$STACK_PLAN_FILE" <<'PY'
 import pathlib
 import sys
 
 source = pathlib.Path(sys.argv[1])
 plan_target = pathlib.Path(sys.argv[2])
-live_target = pathlib.Path(sys.argv[3])
 lines = source.read_text(encoding="utf-8").splitlines()
 
 
@@ -357,40 +371,7 @@ def without_secret_env(source_lines):
 
 
 plan_lines = without_secret_env(lines)
-live_lines = []
-i = 0
-while i < len(plan_lines):
-    line = plan_lines[i]
-    stripped = line.strip()
-    indent = len(line) - len(line.lstrip(" "))
-    if indent == 2 and stripped == "schedules:":
-        live_lines.append("  schedules: []")
-        i += 1
-        while i < len(plan_lines):
-            next_line = plan_lines[i]
-            next_stripped = next_line.strip()
-            next_indent = len(next_line) - len(next_line.lstrip(" "))
-            if next_stripped and next_indent <= 2:
-                break
-            i += 1
-        continue
-    if indent == 4 and stripped.startswith("- name: ") and stripped.split(":", 1)[1].strip() in {
-        "intake-schedule",
-        "followup-schedule",
-    }:
-        i += 1
-        while i < len(plan_lines):
-            next_line = plan_lines[i]
-            next_stripped = next_line.strip()
-            next_indent = len(next_line) - len(next_line.lstrip(" "))
-            if next_stripped and next_indent <= 4:
-                break
-            i += 1
-        continue
-    live_lines.append(line)
-    i += 1
 plan_target.write_text("\n".join(plan_lines) + "\n", encoding="utf-8")
-live_target.write_text("\n".join(live_lines) + "\n", encoding="utf-8")
 PY
 
 pick_port() {
@@ -439,6 +420,7 @@ python3 - "$MCP_CONFIG" "$GITHUB_MCP_RUN_IMAGE" "$GITHUB_MCP_CONTAINER_NAME" <<'
 import json
 import os
 import pathlib
+import re
 import sys
 
 path = pathlib.Path(sys.argv[1])
@@ -521,6 +503,21 @@ for name in \
 done
 DAEMON_ENV+=("$MANAGED_SECRET_ENV_NAME=$MANAGED_SECRET_VALUE")
 
+OPENAI_SERVE_ARGS=(
+  --provider openai
+  --model gpt-5.5
+)
+if [[ "$RUN_STACK_FLOW" == "1" ]]; then
+  OPENAI_SERVE_ARGS+=(--openai-auth-source "$OPENAI_FLOW_AUTH_SOURCE")
+  if [[ -n "${KHEISH_E2E_OPENAI_AUTH_FILE:-}" ]]; then
+    OPENAI_SERVE_ARGS+=(--openai-auth-file "$KHEISH_E2E_OPENAI_AUTH_FILE")
+  elif [[ "$OPENAI_FLOW_AUTH_SOURCE" == "codex" && -f "${HOME:-$ROOT}/.codex/auth.json" ]]; then
+    OPENAI_SERVE_ARGS+=(--openai-auth-file "${HOME:-$ROOT}/.codex/auth.json")
+  fi
+else
+  OPENAI_SERVE_ARGS+=(--api-key "sk-e2e-no-network")
+fi
+
 env -i "${DAEMON_ENV[@]}" "$BIN" serve \
   --bind "127.0.0.1:$PORT" \
   --state-root "$STATE_ROOT" \
@@ -528,11 +525,10 @@ env -i "${DAEMON_ENV[@]}" "$BIN" serve \
   --mcp-config "$MCP_CONFIG" \
   --mcp-discovery disabled \
   --mcp-profile planning \
-  --provider openai \
-  --model gpt-5.5 \
-  --api-key "sk-e2e-no-network" \
+  "${OPENAI_SERVE_ARGS[@]}" \
   --http-auth-mode bearer \
   --http-admin-token-file "$ADMIN_TOKEN_FILE" \
+  --disable-scheduler \
   >"$LOG" 2>&1 &
 PID="$!"
 
@@ -673,6 +669,217 @@ cli stack diff \
 cli schedules list \
   >"$EVIDENCE/schedules-after-apply.json"
 
+cli runs list --session-id feature-pr-loop \
+  >"$EVIDENCE/runs-after-apply.json"
+
+cli tasks list feature-pr-loop \
+  >"$EVIDENCE/tasks-after-apply.json"
+
+if [[ "$RUN_STACK_FLOW" == "1" ]]; then
+  if [[ "${KHEISH_E2E_FLOW_DEBUG_FULL:-0}" == "1" ]]; then
+    cli runtime set-debug-level full \
+      >"$EVIDENCE/stack-flow-debug-level.json"
+  fi
+
+  cli playbooks get linear-github-feature-pr-loop \
+    >"$EVIDENCE/playbook-after-apply.json"
+
+  python3 - \
+    "$EVIDENCE/playbook-after-apply.json" \
+    "$EVIDENCE/playbook-digest.txt" \
+    "$EVIDENCE/stack-flow-request.json" \
+    "$GITHUB_REPOSITORY_FULL_NAME" <<'PY'
+import json
+import pathlib
+import sys
+
+playbook = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+digest_file = pathlib.Path(sys.argv[2])
+request_file = pathlib.Path(sys.argv[3])
+repo = sys.argv[4]
+
+selected = playbook.get("selected_version") or {}
+digest = selected.get("digest")
+if not digest:
+    raise SystemExit("playbook detail has no selected_version.digest")
+digest_file.write_text(digest + "\n", encoding="utf-8")
+
+request = {
+    "provider": "openai",
+    "content": "\n".join(
+        [
+            "E2E smoke for the Kheishfile-installed Linear/GitHub feature loop.",
+            "Use the persona, session capability scope, declared MCP surface, and playbook installed by the Kheishfile.",
+            f"Repository scope: {repo}. Linear scope: Evapayrent.",
+            "This smoke validates that the Kheishfile-installed playbook and session can call one read-only MCP tool through the Flow API.",
+            "Call exactly one tool: mcp__github__get_me with empty input. Do not call bash or any other local tool.",
+            "Do not create, update, close, comment on, branch, push, or delete anything in GitHub or Linear during this smoke run.",
+            "Do not spawn subagents for this smoke because it is not an implementation task.",
+            "Finish with a concise report that includes these exact strings: linear-github-feature-pr-loop, 0.1.0, feature-pr-loop, openai, gpt-5.5, mcp__github__get_me.",
+        ]
+    ),
+    "generation": {
+        "model": "gpt-5.5",
+        "allow_parallel_tool_calls": False,
+        "reasoning": {"effort": "medium"},
+    },
+    "metadata": {
+        "workflow": "stack-direct-flow-smoke",
+        "source": "kheishfile-e2e",
+        "repository": repo,
+    },
+}
+request_file.write_text(
+    json.dumps(request, indent=2, separators=(",", ": ")) + "\n",
+    encoding="utf-8",
+)
+PY
+
+  PLAYBOOK_DIGEST="$(cat "$EVIDENCE/playbook-digest.txt")"
+  cli flows start \
+    --flow-id "$STACK_FLOW_ID" \
+    --idempotency-key "$STACK_FLOW_ID" \
+    --playbook-id linear-github-feature-pr-loop \
+    --version "0.1.0" \
+    --digest "$PLAYBOOK_DIGEST" \
+    --session-id feature-pr-loop \
+    --request-file "$EVIDENCE/stack-flow-request.json" \
+    --metadata-json '{"workflow":"stack-direct-flow-smoke","source":"kheishfile-e2e"}' \
+    >"$EVIDENCE/stack-flow-start.json"
+
+  python3 - "$EVIDENCE/stack-flow-start.json" "$EVIDENCE/stack-flow-run-id.txt" <<'PY'
+import json
+import pathlib
+import sys
+
+flow = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+run_id = flow.get("run_id")
+if not run_id:
+    raise SystemExit("flow start returned no run_id")
+pathlib.Path(sys.argv[2]).write_text(run_id + "\n", encoding="utf-8")
+PY
+
+  STACK_FLOW_RUN_ID="$(cat "$EVIDENCE/stack-flow-run-id.txt")"
+  approve_stack_flow_smoke() {
+    local decisions_file="$EVIDENCE/stack-flow-approval-decisions.jsonl"
+    local poll_file="$EVIDENCE/stack-flow-approvals-poll.json"
+    local run_file="$EVIDENCE/stack-flow-run-poll.json"
+    local max_polls="${KHEISH_E2E_APPROVAL_POLLS:-450}"
+    local poll_index
+    : >"$decisions_file"
+    for ((poll_index = 1; poll_index <= max_polls; poll_index++)); do
+      "$BIN" --base-url "$BASE_URL" --token-file "$ADMIN_TOKEN_FILE" --output json \
+        approvals list --session-id feature-pr-loop \
+        >"$poll_file" 2>/dev/null || true
+
+      python3 - "$poll_file" "$decisions_file" <<'PY' |
+import json
+import pathlib
+import sys
+
+poll_file = pathlib.Path(sys.argv[1])
+decisions_file = pathlib.Path(sys.argv[2])
+allowed = {
+    "mcp__github__get_me",
+    "mcp__github__list_pull_requests",
+    "mcp__github__pull_request_read",
+    "mcp__linear__list_issues",
+    "mcp__linear__get_issue",
+    "mcp__linear__list_comments",
+    "mcp__linear__list_issue_statuses",
+    "mcp__linear__list_projects",
+}
+try:
+    approvals = json.loads(poll_file.read_text(encoding="utf-8"))
+except Exception:
+    approvals = []
+if not isinstance(approvals, list):
+    approvals = []
+seen = set()
+if decisions_file.exists():
+    for line in decisions_file.read_text(encoding="utf-8").splitlines():
+        try:
+            seen.add(json.loads(line).get("request_id"))
+        except Exception:
+            pass
+for approval in approvals:
+    request = approval.get("request", {})
+    request_id = request.get("id")
+    tool = request.get("tool_name")
+    if not request_id or request_id in seen:
+        continue
+    action = "allow" if tool in allowed else "deny"
+    print(json.dumps({"action": action, "request_id": request_id, "tool": tool}))
+PY
+      while IFS= read -r decision; do
+        [[ -n "$decision" ]] || continue
+        action="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["action"])' "$decision")"
+        request_id="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["request_id"])' "$decision")"
+        tool_name="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("tool") or "")' "$decision")"
+        output_file="$EVIDENCE/stack-flow-approval-$request_id.json"
+        error_file="$EVIDENCE/stack-flow-approval-$request_id.err"
+        if [[ "$action" == "allow" ]]; then
+          if "$BIN" --base-url "$BASE_URL" --token-file "$ADMIN_TOKEN_FILE" --output json \
+            approvals allow feature-pr-loop "$request_id" \
+            --justification "approved read-only Kheishfile E2E smoke tool: $tool_name" \
+            >"$output_file" 2>"$error_file"; then
+            printf '%s\n' "$decision" >>"$decisions_file"
+          fi
+        else
+          if "$BIN" --base-url "$BASE_URL" --token-file "$ADMIN_TOKEN_FILE" --output json \
+            approvals deny feature-pr-loop "$request_id" \
+            --reason "not part of read-only Kheishfile E2E smoke: $tool_name" \
+            --justification "Kheishfile E2E smoke only permits read-only GitHub/Linear MCP probes" \
+            >"$output_file" 2>"$error_file"; then
+            printf '%s\n' "$decision" >>"$decisions_file"
+          fi
+        fi
+      done
+
+      "$BIN" --base-url "$BASE_URL" --token-file "$ADMIN_TOKEN_FILE" --output json \
+        runs get "$STACK_FLOW_RUN_ID" >"$run_file" 2>/dev/null || true
+      if python3 - "$run_file" <<'PY'
+import json
+import pathlib
+import sys
+
+try:
+    status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")).get("status")
+except Exception:
+    status = None
+raise SystemExit(0 if status in {"completed", "failed", "cancelled", "interrupted"} else 1)
+PY
+      then
+        return 0
+      fi
+      sleep 2
+    done
+  }
+  approve_stack_flow_smoke &
+  STACK_FLOW_APPROVAL_PID="$!"
+  set +e
+  timeout "${KHEISH_E2E_FLOW_TIMEOUT_SEC:-900}" \
+    "$BIN" --base-url "$BASE_URL" --token-file "$ADMIN_TOKEN_FILE" --output json \
+      runs wait "$STACK_FLOW_RUN_ID" \
+      >"$EVIDENCE/stack-flow-run-wait.json" \
+      2>"$EVIDENCE/stack-flow-run-wait.err"
+  STACK_FLOW_WAIT_EXIT="$?"
+  set -e
+  wait "$STACK_FLOW_APPROVAL_PID" >/dev/null 2>&1 || true
+  printf '%s\n' "$STACK_FLOW_WAIT_EXIT" >"$EVIDENCE/stack-flow-run-wait.exit"
+
+  cli flows get "$STACK_FLOW_ID" \
+    >"$EVIDENCE/stack-flow-final.json" || true
+  cli runs get "$STACK_FLOW_RUN_ID" \
+    >"$EVIDENCE/stack-flow-run.json" || true
+  cli runs events "$STACK_FLOW_RUN_ID" \
+    >"$EVIDENCE/stack-flow-run-events.json" || true
+  cli runs external-actions "$STACK_FLOW_RUN_ID" \
+    >"$EVIDENCE/stack-flow-external-actions.json" || true
+  cli approvals list --session-id feature-pr-loop \
+    >"$EVIDENCE/stack-flow-approvals.json" || true
+fi
+
 cli stack validate \
   --file "$MANAGED_SECRET_STACK_FILE" \
   >"$EVIDENCE/managed-secret-validate.json"
@@ -707,6 +914,7 @@ import json
 import os
 import pathlib
 import re
+import stat
 import sys
 
 evidence = pathlib.Path(sys.argv[1])
@@ -714,9 +922,15 @@ stack_dir = evidence / "stack"
 original_text = (stack_dir / "Kheishfile.yaml").read_text(encoding="utf-8")
 playbook_text = (stack_dir / "playbook.yaml").read_text(encoding="utf-8")
 plan_text = (stack_dir / "Kheishfile.no-secret-env.yaml").read_text(encoding="utf-8")
-live_text = (stack_dir / "Kheishfile.no-secret-env.no-schedules.yaml").read_text(encoding="utf-8")
+live_text = plan_text
 mcp_config_text = (evidence / "codex-mcp.toml").read_text(encoding="utf-8")
+daemon_log_text = (evidence / "daemon.log").read_text(encoding="utf-8", errors="replace")
+evidence_gitignored = (
+    (evidence / "evidence-gitignored.txt").read_text(encoding="utf-8").strip()
+    == "true"
+)
 provenance = json.loads((evidence / "provenance.json").read_text(encoding="utf-8"))
+status = json.loads((evidence / "status.json").read_text(encoding="utf-8"))
 runtime = json.loads((evidence / "runtime.json").read_text(encoding="utf-8"))
 daemon_env_keys = set(
     (evidence / "daemon-env-keys.txt").read_text(encoding="utf-8").splitlines()
@@ -734,6 +948,8 @@ verify = json.loads((evidence / "verify.json").read_text(encoding="utf-8"))
 apply_second = json.loads((evidence / "apply-second.json").read_text(encoding="utf-8"))
 diff = json.loads((evidence / "diff.json").read_text(encoding="utf-8"))
 schedules = json.loads((evidence / "schedules-after-apply.json").read_text(encoding="utf-8"))
+runs_after_apply = json.loads((evidence / "runs-after-apply.json").read_text(encoding="utf-8"))
+tasks_after_apply = json.loads((evidence / "tasks-after-apply.json").read_text(encoding="utf-8"))
 managed_validate = json.loads((evidence / "managed-secret-validate.json").read_text(encoding="utf-8"))
 managed_import = json.loads((evidence / "managed-secret-import.json").read_text(encoding="utf-8"))
 managed_plan = json.loads((evidence / "managed-secret-plan.json").read_text(encoding="utf-8"))
@@ -741,6 +957,48 @@ managed_apply = json.loads((evidence / "managed-secret-apply.json").read_text(en
 managed_verify = json.loads((evidence / "managed-secret-verify.json").read_text(encoding="utf-8"))
 managed_diff = json.loads((evidence / "managed-secret-diff.json").read_text(encoding="utf-8"))
 ledger = json.loads((evidence / "state/kheish-apply/ledger.json").read_text(encoding="utf-8"))
+
+
+def mode_is_private(path):
+    return stat.S_IMODE(path.stat().st_mode) & 0o077 == 0
+
+
+def load_json_optional(name):
+    path = evidence / name
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as error:
+        return {"__json_error": str(error)}
+
+
+def read_text_optional(name):
+    path = evidence / name
+    if not path.exists():
+        return None
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+run_stack_flow = os.environ.get("KHEISH_E2E_RUN_STACK_FLOW") == "1"
+playbook_after_apply = load_json_optional("playbook-after-apply.json")
+stack_flow_request = load_json_optional("stack-flow-request.json")
+stack_flow_start = load_json_optional("stack-flow-start.json")
+stack_flow_final = load_json_optional("stack-flow-final.json")
+stack_flow_run_wait = load_json_optional("stack-flow-run-wait.json")
+stack_flow_run = load_json_optional("stack-flow-run.json")
+stack_flow_events = load_json_optional("stack-flow-run-events.json")
+stack_flow_external_actions = load_json_optional("stack-flow-external-actions.json")
+stack_flow_approvals = load_json_optional("stack-flow-approvals.json")
+stack_flow_approval_decisions_text = read_text_optional("stack-flow-approval-decisions.jsonl")
+stack_flow_wait_exit_text = read_text_optional("stack-flow-run-wait.exit")
+stack_flow_wait_exit = (
+    int(stack_flow_wait_exit_text.strip())
+    if stack_flow_wait_exit_text and stack_flow_wait_exit_text.strip().isdigit()
+    else None
+)
+
+
 
 
 def action_key(action):
@@ -844,6 +1102,8 @@ expected_apply = {
     ("personas", "persona", "feature-pr-operator", "create"),
     ("sessions", "session", "feature-pr-loop", "create"),
     ("playbooks", "playbook", "linear-github-feature-pr-loop/0.1.0", "apply"),
+    ("schedules", "schedule", "linear-intake-0800", "create"),
+    ("schedules", "schedule", "github-review-followup-hourly", "create"),
 }
 expected_managed_imports = {
     ("import", "secret", "stack.e2e.MANAGED_SECRET", "adopt"),
@@ -854,12 +1114,23 @@ expected_managed_plan_actions = {
 expected_requirement_actions = {
     ("requirements", "mcp_server", "github", "noop"),
     ("requirements", "mcp_server", "linear", "noop"),
+    ("requirements", "mcp_tool", "mcp__github__get_me", "noop"),
+    ("requirements", "mcp_tool", "mcp__github__search_code", "noop"),
+    ("requirements", "mcp_tool", "mcp__github__search_pull_requests", "noop"),
+    ("requirements", "mcp_tool", "mcp__github__get_file_contents", "noop"),
+    ("requirements", "mcp_tool", "mcp__github__list_branches", "noop"),
+    ("requirements", "mcp_tool", "mcp__github__create_branch", "noop"),
+    ("requirements", "mcp_tool", "mcp__github__create_or_update_file", "noop"),
+    ("requirements", "mcp_tool", "mcp__github__push_files", "noop"),
     ("requirements", "mcp_tool", "mcp__github__create_pull_request", "noop"),
     ("requirements", "mcp_tool", "mcp__github__list_pull_requests", "noop"),
     ("requirements", "mcp_tool", "mcp__github__pull_request_read", "noop"),
     ("requirements", "mcp_tool", "mcp__github__add_reply_to_pull_request_comment", "noop"),
     ("requirements", "mcp_tool", "mcp__linear__get_issue", "noop"),
+    ("requirements", "mcp_tool", "mcp__linear__list_comments", "noop"),
     ("requirements", "mcp_tool", "mcp__linear__list_issues", "noop"),
+    ("requirements", "mcp_tool", "mcp__linear__list_issue_statuses", "noop"),
+    ("requirements", "mcp_tool", "mcp__linear__list_projects", "noop"),
     ("requirements", "mcp_tool", "mcp__linear__save_comment", "noop"),
     ("requirements", "mcp_tool", "mcp__linear__save_issue", "noop"),
 }
@@ -882,12 +1153,23 @@ expected_runtime_mcp_servers = {
 expected_verify_checks = {
     ("requirement", "mcp_server/github"),
     ("requirement", "mcp_server/linear"),
+    ("requirement", "mcp_tool/mcp__github__get_me"),
+    ("requirement", "mcp_tool/mcp__github__search_code"),
+    ("requirement", "mcp_tool/mcp__github__search_pull_requests"),
+    ("requirement", "mcp_tool/mcp__github__get_file_contents"),
+    ("requirement", "mcp_tool/mcp__github__list_branches"),
+    ("requirement", "mcp_tool/mcp__github__create_branch"),
+    ("requirement", "mcp_tool/mcp__github__create_or_update_file"),
+    ("requirement", "mcp_tool/mcp__github__push_files"),
     ("requirement", "mcp_tool/mcp__github__create_pull_request"),
     ("requirement", "mcp_tool/mcp__github__list_pull_requests"),
     ("requirement", "mcp_tool/mcp__github__pull_request_read"),
     ("requirement", "mcp_tool/mcp__github__add_reply_to_pull_request_comment"),
     ("requirement", "mcp_tool/mcp__linear__get_issue"),
+    ("requirement", "mcp_tool/mcp__linear__list_comments"),
     ("requirement", "mcp_tool/mcp__linear__list_issues"),
+    ("requirement", "mcp_tool/mcp__linear__list_issue_statuses"),
+    ("requirement", "mcp_tool/mcp__linear__list_projects"),
     ("requirement", "mcp_tool/mcp__linear__save_comment"),
     ("requirement", "mcp_tool/mcp__linear__save_issue"),
     ("secret", "mcp.linear.LINEAR_API_KEY"),
@@ -895,8 +1177,12 @@ expected_verify_checks = {
     ("persona", "feature-pr-operator"),
     ("session", "feature-pr-loop"),
     ("playbook", "linear-github-feature-pr-loop/0.1.0"),
+    ("schedule", "linear-intake-0800"),
+    ("schedule", "github-review-followup-hourly"),
     ("probe", "persona"),
     ("probe", "session"),
+    ("probe", "intake-schedule"),
+    ("probe", "followup-schedule"),
     ("probe", "playbook"),
 }
 plan_actions = plan_original.get("actions", [])
@@ -971,6 +1257,275 @@ managed_plan_secret_actions = [
     if action.get("phase") == "secrets"
     and action.get("resource_type") == "secret"
 ]
+schedules_by_name = {schedule.get("name"): schedule for schedule in schedules}
+expected_schedule_names = {"linear-intake-0800", "github-review-followup-hourly"}
+required_schedule_quiescence_fields = {
+    "status",
+    "execution_count",
+    "next_fire_at_ms",
+    "scheduler_retry_attempt",
+    "consecutive_failures",
+}
+schedule_quiescence_fields_present = all(
+    name in schedules_by_name
+    and required_schedule_quiescence_fields.issubset(schedules_by_name[name])
+    for name in expected_schedule_names
+)
+schedule_dispatch_quiescent = (
+    schedule_quiescence_fields_present
+    and all(
+        schedules_by_name[name]["status"] == "active"
+        and schedules_by_name[name]["execution_count"] == 0
+        and schedules_by_name[name]["next_fire_at_ms"] is not None
+        and schedules_by_name[name]["scheduler_retry_attempt"] == 0
+        and schedules_by_name[name]["consecutive_failures"] == 0
+        for name in expected_schedule_names
+    )
+)
+sensitive_evidence_guarded_locally = (
+    evidence_gitignored
+    and mode_is_private(evidence / "admin.token")
+    and mode_is_private(evidence / "auth-store-master.key")
+    and mode_is_private(evidence / "state/auth/global-slots.json")
+)
+stack_flow_selected_playbook = (
+    (playbook_after_apply or {}).get("selected_version")
+    if isinstance(playbook_after_apply, dict)
+    else None
+) or {}
+stack_flow_start_ref = (
+    (stack_flow_start or {}).get("playbook_ref")
+    if isinstance(stack_flow_start, dict)
+    else None
+) or {}
+stack_flow_final_ref = (
+    (stack_flow_final or {}).get("playbook_ref")
+    if isinstance(stack_flow_final, dict)
+    else None
+) or {}
+stack_flow_run_id = (
+    (stack_flow_start or {}).get("run_id")
+    if isinstance(stack_flow_start, dict)
+    else None
+)
+stack_flow_run_wait_status = (
+    (stack_flow_run_wait or {}).get("status")
+    if isinstance(stack_flow_run_wait, dict)
+    else None
+)
+stack_flow_run_status = (
+    (stack_flow_run or {}).get("status")
+    if isinstance(stack_flow_run, dict)
+    else None
+)
+stack_flow_final_status = (
+    (stack_flow_final or {}).get("status")
+    if isinstance(stack_flow_final, dict)
+    else None
+)
+stack_flow_request_content = (
+    (stack_flow_request or {}).get("content", "")
+    if isinstance(stack_flow_request, dict)
+    else ""
+)
+stack_flow_request_generation = (
+    (stack_flow_request or {}).get("generation")
+    if isinstance(stack_flow_request, dict)
+    else None
+) or {}
+stack_flow_request_reasoning = stack_flow_request_generation.get("reasoning") or {}
+stack_flow_approval_count = (
+    len(stack_flow_approvals)
+    if isinstance(stack_flow_approvals, list)
+    else None
+)
+stack_flow_event_tools = []
+if isinstance(stack_flow_events, list):
+    for entry in stack_flow_events:
+        event = entry.get("event", {}) if isinstance(entry, dict) else {}
+        if event.get("type") != "waiting_for_approval":
+            continue
+        for request in event.get("requests", []):
+            if isinstance(request, dict) and request.get("tool_name"):
+                stack_flow_event_tools.append(request["tool_name"])
+stack_flow_approval_decisions = []
+if stack_flow_approval_decisions_text:
+    for line in stack_flow_approval_decisions_text.splitlines():
+        try:
+            decision = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(decision, dict):
+            stack_flow_approval_decisions.append(decision)
+stack_flow_decision_tools = [
+    decision.get("tool")
+    for decision in stack_flow_approval_decisions
+    if decision.get("tool")
+]
+stack_flow_denied_tools = [
+    decision.get("tool")
+    for decision in stack_flow_approval_decisions
+    if decision.get("action") == "deny"
+]
+stack_flow_output_text = "\n".join(
+    output.get("content", "")
+    for output in (stack_flow_run or {}).get("outputs", [])
+    if isinstance(output, dict)
+)
+stack_flow_external_action_records = (
+    stack_flow_external_actions
+    if isinstance(stack_flow_external_actions, list)
+    else []
+)
+stack_flow_external_action_has_tool_request = any(
+    record.get("run_id") == stack_flow_run_id
+    and record.get("phase") == "request"
+    and record.get("kind") == "tool"
+    and record.get("target") == "mcp_tool:mcp__github__get_me"
+    for record in stack_flow_external_action_records
+    if isinstance(record, dict)
+)
+stack_flow_external_action_has_tool_ok = any(
+    record.get("run_id") == stack_flow_run_id
+    and record.get("phase") == "response"
+    and record.get("kind") == "tool"
+    and record.get("target") == "mcp_tool:mcp__github__get_me"
+    and record.get("outcome") == "ok"
+    for record in stack_flow_external_action_records
+    if isinstance(record, dict)
+)
+stack_flow_external_action_has_mcp_request = any(
+    record.get("run_id") == stack_flow_run_id
+    and record.get("phase") == "request"
+    and record.get("kind") == "mcp"
+    and record.get("target") == "mcp:github/get_me"
+    for record in stack_flow_external_action_records
+    if isinstance(record, dict)
+)
+stack_flow_external_action_has_mcp_ok = any(
+    record.get("run_id") == stack_flow_run_id
+    and record.get("phase") == "response"
+    and record.get("kind") == "mcp"
+    and record.get("target") == "mcp:github/get_me"
+    and record.get("outcome") == "ok"
+    for record in stack_flow_external_action_records
+    if isinstance(record, dict)
+)
+stack_flow_exercised_tools = sorted(
+    set(stack_flow_event_tools).union(stack_flow_decision_tools)
+)
+mcp_tool_call_exercised = all(
+    [
+        github_get_me.get("tool_name") == "mcp__github__get_me",
+        github_list_pull_requests.get("tool_name") == "mcp__github__list_pull_requests",
+        github_pull_request_read.get("tool_name") == "mcp__github__pull_request_read",
+        linear_list_issues.get("tool_name") == "mcp__linear__list_issues",
+        linear_get_issue.get("tool_name") == "mcp__linear__get_issue",
+    ]
+)
+stack_flow_checks = {
+    "enabled": run_stack_flow,
+    "playbook_detail_loaded": isinstance(playbook_after_apply, dict)
+    and "__json_error" not in playbook_after_apply,
+    "flow_start_loaded": isinstance(stack_flow_start, dict)
+    and "__json_error" not in stack_flow_start,
+    "flow_final_loaded": isinstance(stack_flow_final, dict)
+    and "__json_error" not in stack_flow_final,
+    "run_wait_loaded": isinstance(stack_flow_run_wait, dict)
+    and "__json_error" not in stack_flow_run_wait,
+    "run_loaded": isinstance(stack_flow_run, dict)
+    and "__json_error" not in stack_flow_run,
+    "run_id_recorded": bool(stack_flow_run_id),
+    "flow_start_uses_stack_playbook": (
+        stack_flow_start_ref.get("playbook_id") == "linear-github-feature-pr-loop"
+        and stack_flow_start_ref.get("version") == "0.1.0"
+    ),
+    "flow_start_uses_stack_session": (
+        isinstance(stack_flow_start, dict)
+        and stack_flow_start.get("session_id") == "feature-pr-loop"
+    ),
+    "flow_digest_matches_published_playbook": (
+        bool(stack_flow_selected_playbook.get("digest"))
+        and stack_flow_start_ref.get("digest") == stack_flow_selected_playbook.get("digest")
+        and stack_flow_final_ref.get("digest") == stack_flow_selected_playbook.get("digest")
+    ),
+    "request_is_bounded_smoke": all(
+        snippet in stack_flow_request_content
+        for snippet in [
+            "Kheishfile-installed",
+            "Call exactly one tool: mcp__github__get_me",
+            "Do not create, update, close, comment on, branch, push, or delete anything",
+        ]
+    ),
+    "request_uses_openai_gpt55_medium_single_tool": (
+        (stack_flow_request or {}).get("provider") == "openai"
+        and stack_flow_request_generation.get("model") == "gpt-5.5"
+        and stack_flow_request_generation.get("allow_parallel_tool_calls") is False
+        and stack_flow_request_reasoning.get("effort") == "medium"
+    ),
+    "flow_requested_github_get_me": "mcp__github__get_me" in stack_flow_exercised_tools,
+    "flow_requested_no_denied_tools": not stack_flow_denied_tools,
+    "flow_approval_decisions_recorded": (
+        not run_stack_flow
+        or bool(stack_flow_approval_decisions)
+    ),
+    "flow_output_mentions_expected_contract": all(
+        snippet in stack_flow_output_text
+        for snippet in [
+            "linear-github-feature-pr-loop",
+            "0.1.0",
+            "feature-pr-loop",
+            "openai",
+            "gpt-5.5",
+            "mcp__github__get_me",
+        ]
+    ),
+    "flow_external_actions_loaded": (
+        not run_stack_flow
+        or isinstance(stack_flow_external_actions, list)
+    ),
+    "flow_external_tool_request_recorded": stack_flow_external_action_has_tool_request,
+    "flow_external_tool_response_ok": stack_flow_external_action_has_tool_ok,
+    "flow_external_mcp_request_recorded": stack_flow_external_action_has_mcp_request,
+    "flow_external_mcp_response_ok": stack_flow_external_action_has_mcp_ok,
+    "flow_exercised_tools": stack_flow_exercised_tools,
+    "flow_denied_tools": stack_flow_denied_tools,
+    "wait_exit_zero": stack_flow_wait_exit == 0,
+    "run_completed": stack_flow_run_wait_status == "completed"
+    and stack_flow_run_status == "completed",
+    "flow_succeeded": stack_flow_final_status == "succeeded",
+    "no_pending_approvals": stack_flow_approval_count == 0,
+}
+stack_flow_required = [
+    "playbook_detail_loaded",
+    "flow_start_loaded",
+    "flow_final_loaded",
+    "run_wait_loaded",
+    "run_loaded",
+    "run_id_recorded",
+    "flow_start_uses_stack_playbook",
+    "flow_start_uses_stack_session",
+    "flow_digest_matches_published_playbook",
+    "request_is_bounded_smoke",
+    "request_uses_openai_gpt55_medium_single_tool",
+    "flow_requested_github_get_me",
+    "flow_requested_no_denied_tools",
+    "flow_approval_decisions_recorded",
+    "flow_output_mentions_expected_contract",
+    "flow_external_actions_loaded",
+    "flow_external_tool_request_recorded",
+    "flow_external_tool_response_ok",
+    "flow_external_mcp_request_recorded",
+    "flow_external_mcp_response_ok",
+    "wait_exit_zero",
+    "run_completed",
+    "flow_succeeded",
+    "no_pending_approvals",
+]
+stack_flow_checks["passed"] = (
+    not run_stack_flow
+    or all(stack_flow_checks.get(name) is True for name in stack_flow_required)
+)
 
 check = {
     "provenance_recorded": bool(
@@ -985,13 +1540,20 @@ check = {
         for name in ["linear-intake-0800", "github-review-followup-hourly"]
     ),
     "live_copy_has_no_value_env": "value_env:" not in live_text,
-    "live_copy_removes_schedules": (
-        "  schedules: []" in live_text
-        and "linear-intake-0800" not in live_text
-        and "github-review-followup-hourly" not in live_text
-        and "intake-schedule" not in live_text
-        and "followup-schedule" not in live_text
+    "live_copy_keeps_schedules": (
+        "linear-intake-0800" in live_text
+        and "github-review-followup-hourly" in live_text
+        and "intake-schedule" in live_text
+        and "followup-schedule" in live_text
     ),
+    "scheduler_disabled_warning_logged": (
+        "background schedule dispatch worker disabled by configuration" in daemon_log_text
+    ),
+    "status_reports_scheduler_dispatch_worker_disabled": (
+        status.get("schedules", {}).get("dispatch_worker_enabled") is False
+    ),
+    "sensitive_evidence_guarded_locally": sensitive_evidence_guarded_locally,
+    "evidence_gitignored": evidence_gitignored,
     "mcp_config_raw_secret_leaks": mcp_config_raw_secret_leaks,
     "runtime_mcp_servers_expected": runtime_mcp_server_keys == expected_runtime_mcp_servers,
     "daemon_env_checked": "__unavailable__" not in daemon_env_keys,
@@ -1046,7 +1608,13 @@ check = {
     "second_apply_actions": len(apply_second.get("applied", [])),
     "diff_actions": len(diff.get("actions", [])),
     "schedules_after_apply": len(schedules),
-    "mcp_tool_call_exercised": True,
+    "schedule_names_after_apply": sorted(schedules_by_name),
+    "schedule_quiescence_fields_present": schedule_quiescence_fields_present,
+    "schedule_dispatch_quiescent": schedule_dispatch_quiescent,
+    "runs_after_apply": len(runs_after_apply),
+    "tasks_after_apply": len(tasks_after_apply),
+    "stack_direct_flow": stack_flow_checks,
+    "mcp_tool_call_exercised": mcp_tool_call_exercised,
     "managed_secret_validated": bool(managed_validate.get("valid")),
     "managed_secret_import_actions": sorted(action_key(action) for action in managed_import.get("adopted", [])),
     "managed_secret_plan_valid": bool(managed_plan.get("valid")),
@@ -1068,7 +1636,10 @@ failed = (
     or not check["plan_copy_has_no_value_env"]
     or not check["plan_copy_keeps_schedule_drift"]
     or not check["live_copy_has_no_value_env"]
-    or not check["live_copy_removes_schedules"]
+    or not check["live_copy_keeps_schedules"]
+    or not check["scheduler_disabled_warning_logged"]
+    or not check["status_reports_scheduler_dispatch_worker_disabled"]
+    or not check["sensitive_evidence_guarded_locally"]
     or bool(check["mcp_config_raw_secret_leaks"])
     or not check["runtime_mcp_servers_expected"]
     or not check["daemon_env_checked"]
@@ -1109,7 +1680,14 @@ failed = (
     or bool(check["diff_errors"])
     or check["second_apply_actions"] != 0
     or check["diff_actions"] != 0
-    or check["schedules_after_apply"] != 0
+    or check["schedules_after_apply"] != 2
+    or set(check["schedule_names_after_apply"]) != expected_schedule_names
+    or not check["schedule_quiescence_fields_present"]
+    or not check["schedule_dispatch_quiescent"]
+    or check["runs_after_apply"] != 0
+    or check["tasks_after_apply"] != 0
+    or not check["stack_direct_flow"]["passed"]
+    or not check["mcp_tool_call_exercised"]
     or not check["managed_secret_validated"]
     or set(check["managed_secret_import_actions"]) != expected_managed_imports
     or not check["managed_secret_plan_valid"]
@@ -1128,12 +1706,18 @@ failed = (
 verdict = {
     "scenario": "linear_github_feature_loop_live",
     "status": "failed" if failed else "passed",
-    "mode": "non_destructive_no_schedules_apply",
+    "mode": (
+        "stack_direct_flow_live"
+        if run_stack_flow
+        else "non_destructive_scheduler_disabled_full_apply"
+    ),
     "limits": [
         "The original Kheishfile is validated. Planning uses an evidence copy with value_env sources removed after offline secret pre-seeding, including schedule drift.",
-        "The live apply uses an evidence copy with value_env sources and schedules removed; secrets are pre-seeded as daemon auth-store prerequisites, not managed ledger resources.",
+        "The live apply uses an evidence copy with value_env sources removed and schedules retained; the daemon scheduler worker is disabled so schedules are reconciled but not dispatched.",
+        "When KHEISH_E2E_RUN_STACK_FLOW=1, the harness starts the playbook/session installed by the Kheishfile through the Flow API with a bounded read-only MCP smoke request.",
         "The live provider probe calls non-destructive GitHub and Linear MCP read tools before stack reconciliation.",
         "Managed value_env secret import/apply/diff is covered by a synthetic canary stack, not by the provider tokens.",
+        "The evidence directory contains encrypted auth-store state and local admin credentials; keep it local and do not publish it as a CI artifact.",
     ],
     "check": check,
     "evidence_root": str(evidence),
