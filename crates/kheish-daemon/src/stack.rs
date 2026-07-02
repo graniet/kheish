@@ -4029,6 +4029,7 @@ where
             continue;
         }
         let key = ResourceKey::new(&action.resource_type, &action.resource_id);
+        let mut remove_claim = true;
         match action.resource_type.as_str() {
             "connector" => {
                 let (kind, name) = action
@@ -4051,19 +4052,21 @@ where
                     .iter()
                     .find(|schedule| schedule.name == action.resource_id)
                 {
-                    client
-                        .post_json::<_, crate::ScheduleMutationResponse>(
-                            &format!(
-                                "/v1/schedules/{}/cancel",
-                                url_encode_path_segment(&schedule.schedule_id)
-                            ),
-                            &json!({}),
-                        )
-                        .await?;
+                    if !schedule.status.is_terminal() {
+                        client
+                            .post_json::<_, crate::ScheduleMutationResponse>(
+                                &format!(
+                                    "/v1/schedules/{}/cancel",
+                                    url_encode_path_segment(&schedule.schedule_id)
+                                ),
+                                &json!({}),
+                            )
+                            .await?;
+                    }
                 }
             }
             "session" => {
-                client
+                let result = client
                     .post_json::<_, crate::SessionView>(
                         &format!(
                             "/v1/sessions/{}/end",
@@ -4073,7 +4076,17 @@ where
                             reason: Some("stack down".to_string()),
                         },
                     )
-                    .await?;
+                    .await;
+                if let Err(error) = result {
+                    let message = error.to_string();
+                    if message.contains("session_not_idle")
+                        || message.contains("non-terminal work or live descendants")
+                    {
+                        remove_claim = false;
+                    } else {
+                        return Err(error);
+                    }
+                }
             }
             "secret" => {
                 bail!(
@@ -4083,8 +4096,10 @@ where
             }
             _ => continue,
         }
-        ledger.remove_resource(&context.ownership_id(), &key);
-        ledger.save(ledger_path).await?;
+        if remove_claim {
+            ledger.remove_resource(&context.ownership_id(), &key);
+            ledger.save(ledger_path).await?;
+        }
     }
     Ok(())
 }
@@ -6503,6 +6518,8 @@ mod tests {
     #[derive(Default)]
     struct RecordingControlPlane {
         deletes: std::sync::Mutex<Vec<String>>,
+        posts: std::sync::Mutex<Vec<String>>,
+        schedules: std::sync::Mutex<Vec<crate::ScheduleView>>,
     }
 
     #[async_trait::async_trait]
@@ -6512,7 +6529,7 @@ mod tests {
             T: DeserializeOwned + Send,
         {
             if path == "/v1/schedules" {
-                return encode_response(Vec::<crate::ScheduleView>::new());
+                return encode_response(self.schedules.lock().unwrap().clone());
             }
             bail!("unexpected GET {path}")
         }
@@ -6529,6 +6546,22 @@ mod tests {
             B: Serialize + Sync + ?Sized,
             T: DeserializeOwned + Send,
         {
+            self.posts.lock().unwrap().push(path.to_string());
+            if path.starts_with("/v1/schedules/") && path.ends_with("/cancel") {
+                let schedule = self
+                    .schedules
+                    .lock()
+                    .unwrap()
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| anyhow!("missing test schedule"))?;
+                return encode_response(crate::ScheduleMutationResponse { schedule });
+            }
+            if path.starts_with("/v1/sessions/") && path.ends_with("/end") {
+                bail!(
+                    "409 Conflict (session_not_idle): session has non-terminal work or live descendants"
+                );
+            }
             bail!("unexpected POST {path}")
         }
 
@@ -8350,6 +8383,7 @@ spec:
         assert_feature_loop_persona_session_contract(&resolved, &fixture.required_tools);
         assert_feature_loop_playbook_contract(&resolved, &plan);
         assert_feature_loop_schedule_contract(&resolved, &plan);
+        assert_feature_loop_prompt_policy_contract(&resolved);
         assert_feature_loop_verification_contract(&resolved, &plan);
         assert_feature_loop_plan_action_set(&plan, &fixture.required_tools);
 
@@ -8466,38 +8500,20 @@ spec:
         ("GITHUB_PERSONAL_ACCESS_TOKEN", "github-test-token"),
     ];
 
-    const EXPECTED_FEATURE_LOOP_INTAKE_PROMPT: &str = r#"Read eligible Linear issues for the Evapayrent project.
+    const EXPECTED_FEATURE_LOOP_INTAKE_PROMPT: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/stacks/linear-github-feature-loop/intake.md"
+    ));
 
-For at most three feature tickets:
-- inspect the relevant source code before proposing work;
-- spawn one planning subagent with reasoning effort xhigh;
-- spawn implementation work in an isolated worktree;
-- run focused tests;
-- spawn one reviewer subagent with reasoning effort xhigh and require a 10/10 score with evidence;
-- if the score is below 10/10, fix and repeat up to three iterations;
-- open a draft GitHub PR against the Evapayrent repository only after tests and internal review pass;
-- comment on the Linear ticket with the PR URL, tests run, and any blocker.
+    const EXPECTED_FEATURE_LOOP_REVIEW_PROMPT: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/stacks/linear-github-feature-loop/review-followup.md"
+    ));
 
-Do not process tickets that already have an active PR from this workflow.
-"#;
-
-    const EXPECTED_FEATURE_LOOP_REVIEW_PROMPT: &str = r#"Inspect open GitHub PRs created by the Linear feature loop.
-
-For each PR with unresolved review comments:
-- read the comments and the current diff;
-- classify whether the request is safe to apply automatically;
-- when safe, make the fix in an isolated worktree, run focused tests, and spawn an xhigh reviewer;
-- continue until reviewer score is 10/10 or three iterations have been attempted;
-- reply to the GitHub comments with the change made and test evidence;
-- update the linked Linear ticket.
-
-Stop and report instead of changing code when a comment requires product judgment, credentials, broad refactoring, or unclear ownership.
-"#;
-
-    const EXPECTED_FEATURE_LOOP_PERSONA: &str = r#"Operate the Linear to GitHub feature loop.
-
-Keep the daemon generic: treat Linear and GitHub as configured MCP surfaces, not special daemon behavior. Work only on the configured repository and the Linear project named in the run input. For every implementation, use subagents for analysis and review, require concrete test evidence, and stop for a human decision when the next action is ambiguous or unsafe.
-"#;
+    const EXPECTED_FEATURE_LOOP_PERSONA: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/stacks/linear-github-feature-loop/persona.md"
+    ));
 
     fn linear_github_feature_loop_context(state_root: &std::path::Path) -> StackContext {
         let (root, raw) = linear_github_feature_loop_raw();
@@ -8595,6 +8611,7 @@ Keep the daemon generic: treat Linear and GitHub as configured MCP surfaces, not
             "mcp__github__create_or_update_file",
             "mcp__github__push_files",
             "mcp__github__create_pull_request",
+            "mcp__github__update_pull_request",
             "mcp__github__list_pull_requests",
             "mcp__github__pull_request_read",
             "mcp__github__add_reply_to_pull_request_comment",
@@ -8622,6 +8639,7 @@ Keep the daemon generic: treat Linear and GitHub as configured MCP surfaces, not
             "mcp__github__pull_request_read",
             "mcp__github__search_code",
             "mcp__github__search_pull_requests",
+            "mcp__github__update_pull_request",
             "mcp__linear__get_issue",
             "mcp__linear__get_profile",
             "mcp__linear__list_comments",
@@ -8774,7 +8792,7 @@ Keep the daemon generic: treat Linear and GitHub as configured MCP surfaces, not
     fn assert_feature_loop_persona_session_contract(resolved: &ResolvedStack, tools: &[String]) {
         assert_eq!(resolved.personas.len(), 1);
         let persona = &resolved.personas[0];
-        assert_eq!(persona.persona_id, "feature-pr-operator");
+        assert_eq!(persona.persona_id, "feature-pr-operator-v012");
         assert_eq!(persona.display_name, "Feature PR Operator");
         assert_eq!(
             persona.soul.trim_end(),
@@ -8792,9 +8810,12 @@ Keep the daemon generic: treat Linear and GitHub as configured MCP surfaces, not
 
         assert_eq!(resolved.sessions.len(), 1);
         let session = &resolved.sessions[0];
-        assert_eq!(session.session_id, "feature-pr-loop");
+        assert_eq!(session.session_id, "feature-pr-loop-v012");
         assert_eq!(session.thread_id, None);
-        assert_eq!(session.persona_id.as_deref(), Some("feature-pr-operator"));
+        assert_eq!(
+            session.persona_id.as_deref(),
+            Some("feature-pr-operator-v012")
+        );
         assert_eq!(session.reply_targets, None);
         assert_scope_allows_exact_mcp(
             session
@@ -8839,7 +8860,7 @@ Keep the daemon generic: treat Linear and GitHub as configured MCP surfaces, not
             playbook.manifest.playbook_id,
             "linear-github-feature-pr-loop"
         );
-        assert_eq!(playbook.manifest.version, "0.1.0");
+        assert_eq!(playbook.manifest.version, "0.1.4");
         assert_eq!(playbook.manifest.title, "Linear to GitHub Feature PR Loop");
         assert_eq!(
             playbook.manifest.objective,
@@ -8869,7 +8890,7 @@ Keep the daemon generic: treat Linear and GitHub as configured MCP surfaces, not
             playbook.manifest.metadata,
             json!({
                 "owner": "examples",
-                "repository_scope": "evapayrent"
+                "workflow": "linear-github-feature-loop"
             })
         );
         let inputs = playbook
@@ -8911,7 +8932,7 @@ Keep the daemon generic: treat Linear and GitHub as configured MCP surfaces, not
                 ),
                 (
                     "reviewer",
-                    "Review diff, tests, and acceptance criteria until the score is 10/10.",
+                    "Review diff, tests, and acceptance criteria until the PR can leave draft status.",
                 ),
             ])
         );
@@ -8929,14 +8950,19 @@ Keep the daemon generic: treat Linear and GitHub as configured MCP surfaces, not
             phases.get("discover").copied(),
             "Identify eligible Linear issues or GitHub review comments.",
             &[
+                "Exactly one ticket or PR is selected for the run.",
                 "Existing PRs are detected before new PR creation.",
+                "Previously blocked Linear issues without PRs can be recovered by a later run.",
                 "Unsafe or ambiguous items are reported instead of auto-mutated.",
             ],
         );
         assert_playbook_phase(
             phases.get("plan").copied(),
             "Analyze ticket requirements and affected source code with a high-reasoning subagent.",
-            &["The plan names files, risks, and focused tests."],
+            &[
+                "The plan names files, risks, and focused tests.",
+                "Subagent prompts are compact and do not include the full coordinator transcript.",
+            ],
         );
         assert_playbook_phase(
             phases.get("implement").copied(),
@@ -8948,26 +8974,32 @@ Keep the daemon generic: treat Linear and GitHub as configured MCP surfaces, not
         );
         assert_playbook_phase(
             phases.get("review").copied(),
-            "Obtain an internal xhigh review score of 10/10.",
+            "Obtain an internal xhigh review score after a durable draft PR exists.",
             &[
                 "Review evidence includes diff scope, tests, and remaining risk.",
-                "Scores below 10/10 trigger another fix iteration or a blocked report.",
+                "Scores below 10/10 keep the PR draft and trigger another fix iteration or a blocked report.",
+                "Reviewer timeout or context-limit failure preserves the latest completed score and does not spawn unbounded review work.",
+                "The root run does not intentionally finish while spawned subagents remain running.",
             ],
         );
         assert_playbook_phase(
             phases.get("publish").copied(),
             "Open or update the GitHub PR and update the Linear ticket.",
             &[
+                "A coherent ticket-scoped patch is published as a draft PR before the final 10/10 gate.",
                 "The PR references the Linear ticket.",
-                "The Linear ticket records PR URL, tests, and blockers.",
+                "The PR and Linear ticket record PR URL, tests, review score, and blockers.",
+                "Machine-readable footers never contain placeholder PR URLs after a PR exists.",
             ],
         );
         assert_eq!(
             playbook.manifest.acceptance_criteria,
             vec![
+                "Each root run processes at most one ticket or PR.".to_string(),
                 "No duplicate PR is created for an issue with an active workflow PR.".to_string(),
-                "Every automatic code mutation has test evidence and xhigh review evidence."
-                    .to_string(),
+                "Every automatic code mutation has test evidence or an explicit test blocker, plus xhigh review evidence when available.".to_string(),
+                "Draft PR creation is allowed before a 10/10 review score; leaving draft status is not.".to_string(),
+                "Subagents report blockers to the coordinator instead of asking user-facing clarification questions.".to_string(),
                 "The workflow stops rather than guessing when human product judgment is required."
                     .to_string(),
             ]
@@ -8995,14 +9027,14 @@ Keep the daemon generic: treat Linear and GitHub as configured MCP surfaces, not
             plan,
             "playbooks",
             "playbook",
-            "linear-github-feature-pr-loop/0.1.0",
+            "linear-github-feature-pr-loop/0.1.4",
             "create",
         );
         assert_action(
             plan,
             "playbooks",
             "playbook_release",
-            "linear-github-feature-pr-loop/0.1.0",
+            "linear-github-feature-pr-loop/0.1.4",
             "update",
         );
     }
@@ -9014,19 +9046,22 @@ Keep the daemon generic: treat Linear and GitHub as configured MCP surfaces, not
                 .iter()
                 .map(|schedule| schedule.name.as_str())
                 .collect::<BTreeSet<_>>(),
-            BTreeSet::from(["github-review-followup-hourly", "linear-intake-0800"])
+            BTreeSet::from([
+                "github-review-followup-hourly-v014",
+                "linear-intake-0800-v014"
+            ])
         );
         let playbook = resolved.playbooks.first().expect("feature loop playbook");
         assert_feature_loop_schedule(
-            schedule_by_name(resolved, "linear-intake-0800"),
+            schedule_by_name(resolved, "linear-intake-0800-v014"),
             playbook,
             "0 0 8 * * *",
             "linear-intake",
             EXPECTED_FEATURE_LOOP_INTAKE_PROMPT,
-            Some(3),
+            Some(1),
         );
         assert_feature_loop_schedule(
-            schedule_by_name(resolved, "github-review-followup-hourly"),
+            schedule_by_name(resolved, "github-review-followup-hourly-v014"),
             playbook,
             "0 0 * * * *",
             "github-review-followup",
@@ -9037,16 +9072,54 @@ Keep the daemon generic: treat Linear and GitHub as configured MCP surfaces, not
             plan,
             "schedules",
             "schedule",
-            "linear-intake-0800",
+            "linear-intake-0800-v014",
             "create",
         );
         assert_action(
             plan,
             "schedules",
             "schedule",
-            "github-review-followup-hourly",
+            "github-review-followup-hourly-v014",
             "create",
         );
+    }
+
+    fn assert_feature_loop_prompt_policy_contract(resolved: &ResolvedStack) {
+        let intake = schedule_by_name(resolved, "linear-intake-0800-v014")
+            .request
+            .flow_start
+            .as_ref()
+            .expect("intake schedule starts a flow")
+            .request
+            .content
+            .as_str();
+        assert!(intake.contains(
+            "Recover previously blocked Kheish workflow issues that have no GitHub PR yet only when `BlockerCategory` is `internal-review`, `tests`, or `no-coherent-patch`"
+        ));
+        assert!(intake.contains(
+            "Keep `product-judgment`, `credentials`, `ownership`, `unsafe`, `broad-refactor`, and `unclear-scope` blockers blocked."
+        ));
+        assert!(intake.contains(
+            "BlockerCategory: internal-review | tests | product-judgment | credentials | ownership | unsafe | no-coherent-patch | broad-refactor | unclear-scope"
+        ));
+
+        let followup = schedule_by_name(resolved, "github-review-followup-hourly-v014")
+            .request
+            .flow_start
+            .as_ref()
+            .expect("follow-up schedule starts a flow")
+            .request
+            .content
+            .as_str();
+        assert!(followup.contains(
+            "resume only when `BlockerCategory` is `internal-review`, `tests`, or `no-coherent-patch`"
+        ));
+        assert!(followup.contains(
+            "Keep `product-judgment`, `credentials`, `ownership`, `unsafe`, `broad-refactor`, and `unclear-scope` blockers blocked."
+        ));
+        assert!(followup.contains(
+            "BlockerCategory: internal-review | tests | product-judgment | credentials | ownership | unsafe | no-coherent-patch | broad-refactor | unclear-scope"
+        ));
     }
 
     fn assert_feature_loop_verification_contract(resolved: &ResolvedStack, plan: &StackPlan) {
@@ -9067,17 +9140,20 @@ Keep the daemon generic: treat Linear and GitHub as configured MCP surfaces, not
             .iter()
             .map(|probe| (probe.name.as_str(), &probe.kind))
             .collect::<BTreeMap<_, _>>();
-        assert_probe_persona(probes.get("persona").copied(), "feature-pr-operator");
-        assert_probe_session(probes.get("session").copied(), "feature-pr-loop");
-        assert_probe_schedule(probes.get("intake-schedule").copied(), "linear-intake-0800");
+        assert_probe_persona(probes.get("persona").copied(), "feature-pr-operator-v012");
+        assert_probe_session(probes.get("session").copied(), "feature-pr-loop-v012");
+        assert_probe_schedule(
+            probes.get("intake-schedule").copied(),
+            "linear-intake-0800-v014",
+        );
         assert_probe_schedule(
             probes.get("followup-schedule").copied(),
-            "github-review-followup-hourly",
+            "github-review-followup-hourly-v014",
         );
         assert_probe_playbook(
             probes.get("playbook").copied(),
             "linear-github-feature-pr-loop",
-            "0.1.0",
+            "0.1.4",
         );
     }
 
@@ -9103,37 +9179,37 @@ Keep the daemon generic: treat Linear and GitHub as configured MCP surfaces, not
         expected.push(action_key(
             "personas",
             "persona",
-            "feature-pr-operator",
+            "feature-pr-operator-v012",
             "create",
         ));
         expected.push(action_key(
             "sessions",
             "session",
-            "feature-pr-loop",
+            "feature-pr-loop-v012",
             "create",
         ));
         expected.push(action_key(
             "playbooks",
             "playbook",
-            "linear-github-feature-pr-loop/0.1.0",
+            "linear-github-feature-pr-loop/0.1.4",
             "create",
         ));
         expected.push(action_key(
             "playbooks",
             "playbook_release",
-            "linear-github-feature-pr-loop/0.1.0",
+            "linear-github-feature-pr-loop/0.1.4",
             "update",
         ));
         expected.push(action_key(
             "schedules",
             "schedule",
-            "linear-intake-0800",
+            "linear-intake-0800-v014",
             "create",
         ));
         expected.push(action_key(
             "schedules",
             "schedule",
-            "github-review-followup-hourly",
+            "github-review-followup-hourly-v014",
             "create",
         ));
         for probe in feature_loop_probe_set() {
@@ -9159,19 +9235,19 @@ Keep the daemon generic: treat Linear and GitHub as configured MCP surfaces, not
                 "mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN",
                 "create",
             ),
-            action_key("personas", "persona", "feature-pr-operator", "create"),
-            action_key("sessions", "session", "feature-pr-loop", "create"),
+            action_key("personas", "persona", "feature-pr-operator-v012", "create"),
+            action_key("sessions", "session", "feature-pr-loop-v012", "create"),
             action_key(
                 "playbooks",
                 "playbook",
-                "linear-github-feature-pr-loop/0.1.0",
+                "linear-github-feature-pr-loop/0.1.4",
                 "apply",
             ),
-            action_key("schedules", "schedule", "linear-intake-0800", "create"),
+            action_key("schedules", "schedule", "linear-intake-0800-v014", "create"),
             action_key(
                 "schedules",
                 "schedule",
-                "github-review-followup-hourly",
+                "github-review-followup-hourly-v014",
                 "create",
             ),
         ];
@@ -9188,7 +9264,7 @@ Keep the daemon generic: treat Linear and GitHub as configured MCP surfaces, not
         max_tickets: Option<i64>,
     ) {
         assert_eq!(schedule.request.name, schedule.name);
-        assert_eq!(schedule.request.target_session_id, "feature-pr-loop");
+        assert_eq!(schedule.request.target_session_id, "feature-pr-loop-v012");
         assert_eq!(schedule.request.target_agent_id, None);
         assert_eq!(schedule.request.max_executions, None);
         assert_eq!(
@@ -9225,7 +9301,7 @@ Keep the daemon generic: treat Linear and GitHub as configured MCP surfaces, not
         );
         assert_eq!(flow_start.playbook_ref.version, playbook.manifest.version);
         assert_eq!(flow_start.playbook_ref.digest, playbook.digest);
-        assert_eq!(flow_start.session_id, "feature-pr-loop");
+        assert_eq!(flow_start.session_id, "feature-pr-loop-v012");
         assert_eq!(flow_start.request.provider.as_deref(), Some("openai"));
         assert_eq!(flow_start.request.source_plugin, None);
         assert_eq!(flow_start.request.source_kind, None);
@@ -9260,6 +9336,17 @@ Keep the daemon generic: treat Linear and GitHub as configured MCP surfaces, not
                 .and_then(Value::as_i64),
             max_tickets
         );
+        assert_eq!(
+            flow_start.metadata.get("project").and_then(Value::as_str),
+            Some("Evapayrent")
+        );
+        assert_eq!(
+            flow_start
+                .metadata
+                .get("repository")
+                .and_then(Value::as_str),
+            Some("graniet/evapayrent")
+        );
     }
 
     fn assert_scope_allows_exact_mcp(scope: &kheish_types::CapabilityScope, tools: &[String]) {
@@ -9287,6 +9374,7 @@ Keep the daemon generic: treat Linear and GitHub as configured MCP surfaces, not
 
     fn assert_feature_loop_generation(generation: &kheish_runtime::ModelGenerationConfig) {
         assert_eq!(generation.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(generation.max_output_tokens, Some(6000));
         assert_eq!(
             generation
                 .reasoning
@@ -10648,6 +10736,214 @@ spec: {}
         assert_eq!(
             ledger.owner_of_resource(&ResourceKey::new("secret", "stack.e2e.PRUNE_SECRET")),
             Some("partial-prune")
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_treats_terminal_schedules_as_already_removed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: terminal-schedule-prune
+spec: {}
+"#;
+        let context = StackContext::from_manifest(
+            raw,
+            PathBuf::from("."),
+            Some(temp.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+        let ledger_path = stack_ledger_path(temp.path());
+        let mut ledger = ApplyLedger::new();
+        ledger.record_resource(
+            "terminal-schedule-prune",
+            &ResourceKey::new("schedule", "old-schedule"),
+            "schedule-digest".to_string(),
+        );
+        ledger.save(&ledger_path).await.unwrap();
+
+        let request = crate::ScheduleCreateRequest {
+            name: "old-schedule".to_string(),
+            target_session_id: "session-1".to_string(),
+            target_agent_id: None,
+            owner_session_id: None,
+            owner_agent_id: None,
+            created_by_run_id: None,
+            cadence: crate::ScheduleCadence::Once {
+                fire_at_ms: crate::now_ms() + 60_000,
+            },
+            max_executions: None,
+            overlap_policy: crate::ScheduleOverlapPolicy::Skip,
+            misfire_policy: crate::ScheduleMisfirePolicy::CoalesceOnce,
+            request: Some(crate::SubmitInputRequest {
+                provider: None,
+                source_plugin: None,
+                source_kind: None,
+                actor_id: None,
+                content: "noop".to_string(),
+                input_items: Vec::new(),
+                attachments: Vec::new(),
+                generation: None,
+                completion_requirements: None,
+                metadata: None,
+                binding_keys: Vec::new(),
+                reply_targets: Vec::new(),
+                reply_plugin: None,
+                reply_address: None,
+            }),
+            observation_materialization: None,
+            flow_start: None,
+        };
+        let mut schedule = crate::scheduler::build_schedule_record(
+            "schedule-terminal".to_string(),
+            crate::now_ms(),
+            request,
+        )
+        .unwrap()
+        .view;
+        schedule.status = crate::ScheduleStatus::Canceled;
+        schedule.next_fire_at_ms = None;
+        schedule.queued_fire_at_ms = None;
+
+        let client = RecordingControlPlane::default();
+        client.schedules.lock().unwrap().push(schedule);
+
+        let report = apply_stack(
+            &client,
+            context,
+            StackApplyOptions {
+                dry_run: false,
+                force_restart: false,
+                allow_secret_env: false,
+                prune: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            report.applied.iter().any(|action| {
+                action.resource_type == "schedule" && action.operation == "cancel"
+            })
+        );
+        assert!(client.posts.lock().unwrap().is_empty());
+        let ledger = ApplyLedger::load_or_new(&ledger_path).await.unwrap();
+        assert!(
+            ledger
+                .owner_of_resource(&ResourceKey::new("schedule", "old-schedule"))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_retains_non_idle_session_and_continues_other_resources() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: non-idle-session-prune
+spec: {}
+"#;
+        let context = StackContext::from_manifest(
+            raw,
+            PathBuf::from("."),
+            Some(temp.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+        let ledger_path = stack_ledger_path(temp.path());
+        let mut ledger = ApplyLedger::new();
+        ledger.record_resource(
+            "non-idle-session-prune",
+            &ResourceKey::new("session", "old-session"),
+            "session-digest".to_string(),
+        );
+        ledger.record_resource(
+            "non-idle-session-prune",
+            &ResourceKey::new("schedule", "old-schedule"),
+            "schedule-digest".to_string(),
+        );
+        ledger.save(&ledger_path).await.unwrap();
+
+        let request = crate::ScheduleCreateRequest {
+            name: "old-schedule".to_string(),
+            target_session_id: "old-session".to_string(),
+            target_agent_id: None,
+            owner_session_id: None,
+            owner_agent_id: None,
+            created_by_run_id: None,
+            cadence: crate::ScheduleCadence::Once {
+                fire_at_ms: crate::now_ms() + 60_000,
+            },
+            max_executions: None,
+            overlap_policy: crate::ScheduleOverlapPolicy::Skip,
+            misfire_policy: crate::ScheduleMisfirePolicy::CoalesceOnce,
+            request: Some(crate::SubmitInputRequest {
+                provider: None,
+                source_plugin: None,
+                source_kind: None,
+                actor_id: None,
+                content: "noop".to_string(),
+                input_items: Vec::new(),
+                attachments: Vec::new(),
+                generation: None,
+                completion_requirements: None,
+                metadata: None,
+                binding_keys: Vec::new(),
+                reply_targets: Vec::new(),
+                reply_plugin: None,
+                reply_address: None,
+            }),
+            observation_materialization: None,
+            flow_start: None,
+        };
+        let schedule = crate::scheduler::build_schedule_record(
+            "schedule-active".to_string(),
+            crate::now_ms(),
+            request,
+        )
+        .unwrap()
+        .view;
+        let client = RecordingControlPlane::default();
+        client.schedules.lock().unwrap().push(schedule);
+
+        apply_stack(
+            &client,
+            context,
+            StackApplyOptions {
+                dry_run: false,
+                force_restart: false,
+                allow_secret_env: false,
+                prune: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        let posts = client.posts.lock().unwrap().clone();
+        assert!(
+            posts
+                .iter()
+                .any(|path| path == "/v1/sessions/old-session/end")
+        );
+        assert!(
+            posts
+                .iter()
+                .any(|path| path == "/v1/schedules/schedule-active/cancel")
+        );
+        let ledger = ApplyLedger::load_or_new(&ledger_path).await.unwrap();
+        assert_eq!(
+            ledger.owner_of_resource(&ResourceKey::new("session", "old-session")),
+            Some("non-idle-session-prune")
+        );
+        assert!(
+            ledger
+                .owner_of_resource(&ResourceKey::new("schedule", "old-schedule"))
+                .is_none()
         );
     }
 

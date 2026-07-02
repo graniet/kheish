@@ -37,6 +37,7 @@ spec:
         - mcp__github__create_or_update_file
         - mcp__github__push_files
         - mcp__github__create_pull_request
+        - mcp__github__update_pull_request
         - mcp__github__list_pull_requests
         - mcp__github__pull_request_read
         - mcp__github__add_reply_to_pull_request_comment
@@ -48,7 +49,7 @@ spec:
         - mcp__linear__save_comment
         - mcp__linear__save_issue
   personas:
-    - persona_id: feature-pr-operator
+    - persona_id: feature-pr-operator-v012
       display_name: Feature PR Operator
       soul_file: persona.md
       capability_scope:
@@ -64,6 +65,7 @@ spec:
           - mcp__github__create_or_update_file
           - mcp__github__push_files
           - mcp__github__create_pull_request
+          - mcp__github__update_pull_request
           - mcp__github__list_pull_requests
           - mcp__github__pull_request_read
           - mcp__github__add_reply_to_pull_request_comment
@@ -75,8 +77,8 @@ spec:
           - mcp__linear__save_comment
           - mcp__linear__save_issue
   sessions:
-    - session_id: feature-pr-loop
-      persona_id: feature-pr-operator
+    - session_id: feature-pr-loop-v012
+      persona_id: feature-pr-operator-v012
       capability_scope:
         skill_deny: ["*"]
         mcp_server_allow: ["github", "linear"]
@@ -90,6 +92,7 @@ spec:
           - mcp__github__create_or_update_file
           - mcp__github__push_files
           - mcp__github__create_pull_request
+          - mcp__github__update_pull_request
           - mcp__github__list_pull_requests
           - mcp__github__pull_request_read
           - mcp__github__add_reply_to_pull_request_comment
@@ -109,6 +112,7 @@ spec:
         provider: openai
         generation:
           model: gpt-5.5
+          max_output_tokens: 6000
           reasoning:
             effort: medium
   playbooks:
@@ -120,8 +124,8 @@ spec:
             id: stack-example-reviewed
             description: Example reviewed before publication.
   schedules:
-    - name: linear-intake-0800
-      target_session_id: feature-pr-loop
+    - name: linear-intake-0800-v014
+      target_session_id: feature-pr-loop-v012
       cadence:
         type: cron
         expression: "0 0 8 * * *"
@@ -132,19 +136,22 @@ spec:
       flow_start:
         playbook_ref:
           playbook_id: linear-github-feature-pr-loop
-          version: "0.1.0"
+          version: "0.1.4"
         request:
           provider: openai
           content_file: intake.md
           generation:
             model: gpt-5.5
+            max_output_tokens: 6000
             reasoning:
               effort: medium
         metadata:
           workflow: linear-intake
-          max_tickets: 3
-    - name: github-review-followup-hourly
-      target_session_id: feature-pr-loop
+          project: Evapayrent
+          repository: graniet/evapayrent
+          max_tickets: 1
+    - name: github-review-followup-hourly-v014
+      target_session_id: feature-pr-loop-v012
       cadence:
         type: cron
         expression: "0 0 * * * *"
@@ -155,30 +162,33 @@ spec:
       flow_start:
         playbook_ref:
           playbook_id: linear-github-feature-pr-loop
-          version: "0.1.0"
+          version: "0.1.4"
         request:
           provider: openai
           content_file: review-followup.md
           generation:
             model: gpt-5.5
+            max_output_tokens: 6000
             reasoning:
               effort: medium
         metadata:
           workflow: github-review-followup
+          project: Evapayrent
+          repository: graniet/evapayrent
   verification:
     - name: persona
       type: persona_exists
-      persona_id: feature-pr-operator
+      persona_id: feature-pr-operator-v012
     - name: session
       type: session_exists
-      session_id: feature-pr-loop
+      session_id: feature-pr-loop-v012
     - name: intake-schedule
       type: schedule_exists
-      schedule_name: linear-intake-0800
+      schedule_name: linear-intake-0800-v014
     - name: followup-schedule
       type: schedule_exists
-      schedule_name: github-review-followup-hourly
+      schedule_name: github-review-followup-hourly-v014
     - name: playbook
       type: playbook_version_exists
       playbook_id: linear-github-feature-pr-loop
-      version: "0.1.0"
+      version: "0.1.4"

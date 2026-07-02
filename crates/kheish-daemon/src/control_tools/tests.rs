@@ -1479,6 +1479,79 @@ async fn edit_image_tool_preserves_null_asset_ids_without_inference() -> Result<
 }
 
 #[tokio::test]
+async fn spawn_agent_rejects_oversized_inline_wait_before_spawning() -> Result<()> {
+    let control = Arc::new(FakeControl::new());
+    let handle = bind_control(&control);
+
+    let wait_error = SpawnAgentTool::new(handle.clone())
+        .execute(
+            FakeControl::context("session-a", "agent-parent"),
+            json!({
+                "name": "child",
+                "description": "Investigate a subtask.",
+                "prompt": "Inspect the workspace.",
+                "wait": true,
+                "timeout_ms": WAIT_AGENT_MAX_TIMEOUT_MS + 1,
+            }),
+        )
+        .await
+        .expect_err("oversized explicit wait should fail before spawning");
+    assert!(
+        wait_error
+            .to_string()
+            .contains("spawn_agent inline wait maximum")
+    );
+
+    let foreground_error = SpawnAgentTool::new(handle.clone())
+        .execute(
+            FakeControl::context("session-a", "agent-parent"),
+            json!({
+                "name": "child",
+                "description": "Investigate a subtask.",
+                "prompt": "Inspect the workspace.",
+                "run_in_background": false,
+                "timeout_ms": WAIT_AGENT_MAX_TIMEOUT_MS + 1,
+            }),
+        )
+        .await
+        .expect_err("oversized foreground wait should fail before spawning");
+    assert!(
+        foreground_error
+            .to_string()
+            .contains("spawn_agent inline wait maximum")
+    );
+
+    let state = control.state.lock().expect("fake control mutex poisoned");
+    assert!(state.spawn_requests.is_empty());
+    assert!(state.waited_agents.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn spawn_agent_allows_background_timeout_without_inline_wait() -> Result<()> {
+    let control = Arc::new(FakeControl::new());
+    let handle = bind_control(&control);
+
+    SpawnAgentTool::new(handle)
+        .execute(
+            FakeControl::context("session-a", "agent-parent"),
+            json!({
+                "name": "child",
+                "description": "Investigate a subtask.",
+                "prompt": "Inspect the workspace.",
+                "run_in_background": true,
+                "timeout_ms": WAIT_AGENT_MAX_TIMEOUT_MS + 1,
+            }),
+        )
+        .await?;
+
+    let state = control.state.lock().expect("fake control mutex poisoned");
+    assert_eq!(state.spawn_requests.len(), 1);
+    assert!(state.waited_agents.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn emit_output_tool_normalizes_visible_parts_and_artifacts() -> Result<()> {
     let control = Arc::new(FakeControl::new());
     let handle = bind_control(&control);

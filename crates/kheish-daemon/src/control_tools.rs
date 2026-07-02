@@ -16,7 +16,7 @@ mod tests;
 
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use kheish_agent::AgentStatus;
 use kheish_coding_tools::CodingToolConfig;
@@ -271,7 +271,9 @@ impl Tool for SpawnAgentTool {
                     ),
                     build_number_field(
                         "timeout_ms",
-                        "Optional wait timeout in milliseconds.",
+                        &format!(
+                            "Optional inline wait timeout in milliseconds, capped at {WAIT_AGENT_MAX_TIMEOUT_MS} when wait is true or run_in_background is false."
+                        ),
                         false,
                     ),
                 ],
@@ -289,6 +291,11 @@ impl Tool for SpawnAgentTool {
         populate_spawn_request_from_context(control.as_ref(), &ctx, &mut request).await?;
         let wait = request.wait || !request.run_in_background;
         let timeout_ms = request.timeout_ms.unwrap_or(60_000);
+        if wait && timeout_ms > WAIT_AGENT_MAX_TIMEOUT_MS {
+            bail!(
+                "timeout_ms exceeds spawn_agent inline wait maximum of {WAIT_AGENT_MAX_TIMEOUT_MS}; run in background and use repeated shorter wait_agent calls"
+            );
+        }
         let mut response = control.spawn_agent(parent_agent_id, request).await?;
         if wait {
             let snapshot = control
@@ -444,6 +451,8 @@ struct WaitAgentTool {
     control: DaemonToolControlHandle,
 }
 
+const WAIT_AGENT_MAX_TIMEOUT_MS: u64 = 90_000;
+
 impl WaitAgentTool {
     fn new(control: DaemonToolControlHandle) -> Self {
         Self { control }
@@ -465,7 +474,9 @@ impl Tool for WaitAgentTool {
                         item_kind: None,
                         structured_schema: None,
                         required: false,
-                        description: Some("Maximum wait time in milliseconds.".to_string()),
+                        description: Some(format!(
+                            "Maximum wait time in milliseconds, capped at {WAIT_AGENT_MAX_TIMEOUT_MS}. Use repeated waits for longer-running agents."
+                        )),
                     },
                 ],
             },
@@ -485,6 +496,11 @@ impl Tool for WaitAgentTool {
             .get("timeout_ms")
             .and_then(Value::as_u64)
             .unwrap_or(30_000);
+        if timeout_ms > WAIT_AGENT_MAX_TIMEOUT_MS {
+            bail!(
+                "timeout_ms exceeds wait_agent maximum of {WAIT_AGENT_MAX_TIMEOUT_MS}; use repeated shorter waits"
+            );
+        }
         let snapshot = self
             .control
             .resolve()?

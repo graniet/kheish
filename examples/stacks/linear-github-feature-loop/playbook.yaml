@@ -1,5 +1,5 @@
 playbook_id: linear-github-feature-pr-loop
-version: "0.1.0"
+version: "0.1.4"
 title: Linear to GitHub Feature PR Loop
 objective: Convert eligible Linear feature tickets into reviewed GitHub pull requests.
 description: Generic operator playbook for scheduled Linear intake and GitHub review follow-up.
@@ -16,35 +16,45 @@ roles:
   - role_id: implementer
     purpose: Make code changes in an isolated worktree and run tests.
   - role_id: reviewer
-    purpose: Review diff, tests, and acceptance criteria until the score is 10/10.
+    purpose: Review diff, tests, and acceptance criteria until the PR can leave draft status.
 phases:
   - phase_id: discover
     objective: Identify eligible Linear issues or GitHub review comments.
     acceptance_criteria:
+      - Exactly one ticket or PR is selected for the run.
       - Existing PRs are detected before new PR creation.
+      - Previously blocked Linear issues without PRs can be recovered by a later run.
       - Unsafe or ambiguous items are reported instead of auto-mutated.
   - phase_id: plan
     objective: Analyze ticket requirements and affected source code with a high-reasoning subagent.
     acceptance_criteria:
       - The plan names files, risks, and focused tests.
+      - Subagent prompts are compact and do not include the full coordinator transcript.
   - phase_id: implement
     objective: Implement the change in an isolated worktree.
     acceptance_criteria:
       - The implementation is limited to the ticket scope.
       - Focused tests or a clear blocked reason are recorded.
   - phase_id: review
-    objective: Obtain an internal xhigh review score of 10/10.
+    objective: Obtain an internal xhigh review score after a durable draft PR exists.
     acceptance_criteria:
       - Review evidence includes diff scope, tests, and remaining risk.
-      - Scores below 10/10 trigger another fix iteration or a blocked report.
+      - Scores below 10/10 keep the PR draft and trigger another fix iteration or a blocked report.
+      - Reviewer timeout or context-limit failure preserves the latest completed score and does not spawn unbounded review work.
+      - The root run does not intentionally finish while spawned subagents remain running.
   - phase_id: publish
     objective: Open or update the GitHub PR and update the Linear ticket.
     acceptance_criteria:
+      - A coherent ticket-scoped patch is published as a draft PR before the final 10/10 gate.
       - The PR references the Linear ticket.
-      - The Linear ticket records PR URL, tests, and blockers.
+      - The PR and Linear ticket record PR URL, tests, review score, and blockers.
+      - Machine-readable footers never contain placeholder PR URLs after a PR exists.
 acceptance_criteria:
+  - Each root run processes at most one ticket or PR.
   - No duplicate PR is created for an issue with an active workflow PR.
-  - Every automatic code mutation has test evidence and xhigh review evidence.
+  - Every automatic code mutation has test evidence or an explicit test blocker, plus xhigh review evidence when available.
+  - Draft PR creation is allowed before a 10/10 review score; leaving draft status is not.
+  - Subagents report blockers to the coordinator instead of asking user-facing clarification questions.
   - The workflow stops rather than guessing when human product judgment is required.
 evidence_expectations:
   - The root scheduled run id is available from the Flow projection.
@@ -56,4 +66,4 @@ runtime_defaults:
   model: gpt-5.5
 metadata:
   owner: examples
-  repository_scope: evapayrent
+  workflow: linear-github-feature-loop
