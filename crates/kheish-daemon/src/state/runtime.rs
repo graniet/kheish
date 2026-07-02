@@ -123,6 +123,66 @@ where
             .expect("mcp runtime surface rwlock poisoned") = surface;
     }
 
+    pub(crate) async fn call_mcp_tool(
+        &self,
+        tool_name: &str,
+        input: serde_json::Value,
+    ) -> Result<crate::McpToolCallResponse> {
+        let tool_name = tool_name.trim();
+        if tool_name.is_empty() {
+            return Err(DaemonProblem::bad_request(
+                "mcp",
+                "mcp_tool_name_empty",
+                "MCP tool name cannot be empty",
+            )
+            .into());
+        }
+        if !input.is_object() {
+            return Err(DaemonProblem::bad_request(
+                "mcp",
+                "mcp_tool_input_not_object",
+                "MCP tool input must be a JSON object",
+            )
+            .into());
+        }
+        let Some(manager) = self.mcp_manager.as_ref() else {
+            return Err(DaemonProblem::conflict(
+                "mcp",
+                "mcp_not_configured",
+                "MCP is not configured for this daemon",
+            )
+            .into());
+        };
+        let known_discovered_tool = self
+            .mcp
+            .lock()
+            .expect("mcp runtime snapshot mutex poisoned")
+            .servers
+            .iter()
+            .any(|server| server.tools.iter().any(|candidate| candidate == tool_name));
+        if !known_discovered_tool {
+            return Err(DaemonProblem::not_found(
+                "mcp",
+                "mcp_tool_not_found",
+                format!("unknown MCP tool `{tool_name}`"),
+            )
+            .into());
+        }
+        let output = manager.call_tool(tool_name, input).await;
+        self.refresh_mcp_runtime_snapshot().await;
+        let output = output.map_err(|_error| {
+            DaemonProblem::bad_gateway(
+                "mcp",
+                "mcp_tool_call_failed",
+                format!("MCP tool `{tool_name}` call failed"),
+            )
+        })?;
+        Ok(crate::McpToolCallResponse {
+            tool_name: tool_name.to_string(),
+            output,
+        })
+    }
+
     pub(crate) async fn runtime_config_revisions(
         &self,
     ) -> crate::RuntimeConfigRevisionListResponse {

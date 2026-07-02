@@ -248,6 +248,17 @@ fi
 cli runtime get \
   >"$EVIDENCE/runtime.json"
 
+if ! cli mcp tools call mcp__github__get_me \
+  >"$EVIDENCE/mcp-github-get-me.json" \
+  2>"$EVIDENCE/mcp-github-get-me-empty.err"; then
+  cli mcp tools call mcp__github__get_me \
+    --input-json '{"dummy":true}' \
+    >"$EVIDENCE/mcp-github-get-me.json"
+fi
+
+cli mcp tools call mcp__linear__get_profile \
+  >"$EVIDENCE/mcp-linear-get-profile.json"
+
 cli stack validate \
   --file "$STACK_FILE" \
   >"$EVIDENCE/validate.json"
@@ -299,6 +310,8 @@ evidence = pathlib.Path(sys.argv[1])
 runtime = json.loads((evidence / "runtime.json").read_text(encoding="utf-8"))
 validate = json.loads((evidence / "validate.json").read_text(encoding="utf-8"))
 validate_live = json.loads((evidence / "validate-live.json").read_text(encoding="utf-8"))
+github_get_me = json.loads((evidence / "mcp-github-get-me.json").read_text(encoding="utf-8"))
+linear_get_profile = json.loads((evidence / "mcp-linear-get-profile.json").read_text(encoding="utf-8"))
 plan_original = json.loads((evidence / "plan-original.json").read_text(encoding="utf-8"))
 import_secrets = json.loads((evidence / "import-secrets.json").read_text(encoding="utf-8"))
 apply = json.loads((evidence / "apply.json").read_text(encoding="utf-8"))
@@ -407,6 +420,10 @@ check = {
         for server in runtime.get("mcp", {}).get("servers", [])
     ],
     "runtime_has_planning_profile": "planning" in runtime.get("mcp", {}).get("selected_profiles", []),
+    "github_get_me_called": github_get_me.get("tool_name") == "mcp__github__get_me",
+    "github_get_me_is_error": github_get_me.get("output", {}).get("output", {}).get("is_error"),
+    "linear_get_profile_called": linear_get_profile.get("tool_name") == "mcp__linear__get_profile",
+    "linear_get_profile_is_error": linear_get_profile.get("output", {}).get("output", {}).get("is_error"),
     "original_validated": bool(validate.get("valid")),
     "live_validated": bool(validate_live.get("valid")),
     "original_plan_valid": bool(plan_original.get("valid")),
@@ -429,10 +446,14 @@ check = {
     "second_apply_actions": len(apply_second.get("applied", [])),
     "diff_actions": len(diff.get("actions", [])),
     "schedules_after_apply": len(schedules),
-    "mcp_tool_call_exercised": False,
+    "mcp_tool_call_exercised": True,
 }
 failed = (
     not check["runtime_has_planning_profile"]
+    or not check["github_get_me_called"]
+    or check["github_get_me_is_error"] is not False
+    or not check["linear_get_profile_called"]
+    or check["linear_get_profile_is_error"] is not False
     or not check["original_validated"]
     or not check["live_validated"]
     or not check["original_plan_valid"]
@@ -463,7 +484,7 @@ verdict = {
     "limits": [
         "The original Kheishfile is validated and planned, including schedule drift.",
         "The live apply uses an evidence copy with schedules removed to avoid accidental provider mutations.",
-        "This CLI path proves MCP startup/list_tools and stack reconciliation, not an authenticated tools/call.",
+        "The live provider probe calls only non-destructive MCP profile/account tools before stack reconciliation.",
     ],
     "check": check,
     "evidence_root": str(evidence),

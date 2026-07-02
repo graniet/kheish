@@ -108,7 +108,36 @@ fn default_learning_confidence() -> u8 {
 fn is_false(value: &bool) -> bool {
     !*value
 }
+
+fn default_json_object() -> Value {
+    Value::Object(Default::default())
+}
 use crate::{ScheduleCreateRequest, ScheduleView};
+
+/// Request body for invoking one daemon-loaded MCP tool through the operator API.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct McpToolCallRequest {
+    /// JSON object passed to the MCP tool as `arguments`.
+    #[serde(default = "default_json_object")]
+    pub input: Value,
+}
+
+impl Default for McpToolCallRequest {
+    fn default() -> Self {
+        Self {
+            input: default_json_object(),
+        }
+    }
+}
+
+/// Response body for one daemon-loaded MCP tool invocation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct McpToolCallResponse {
+    /// Qualified MCP tool name, for example `mcp__github__get_me`.
+    pub tool_name: String,
+    /// Sanitized MCP tool output in the same shape returned to model tools.
+    pub output: kheish_runtime::ToolExecutionOutput,
+}
 
 /// RFC 7807-style API error response used by the daemon control plane.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -4504,12 +4533,21 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        DaemonStatusView, InlineAssetUpload, InputAttachmentRequest, ListPageQuery, ProblemDetails,
-        ResolveApprovalsRequest, ResolveUserQuestionRequest, RuntimeSettingsView, SetHooksRequest,
-        SetLearningPolicyRequest, SetRunMemoryPolicyRequest, SubmitInputItemRequest,
-        SubmitInputRequest, SubmitRunRequest, validate_input_attachment_requests,
-        validate_submit_input_items,
+        DaemonStatusView, InlineAssetUpload, InputAttachmentRequest, ListPageQuery,
+        McpToolCallRequest, ProblemDetails, ResolveApprovalsRequest, ResolveUserQuestionRequest,
+        RuntimeSettingsView, SetHooksRequest, SetLearningPolicyRequest, SetRunMemoryPolicyRequest,
+        SubmitInputItemRequest, SubmitInputRequest, SubmitRunRequest,
+        validate_input_attachment_requests, validate_submit_input_items,
     };
+
+    #[test]
+    fn mcp_tool_call_request_defaults_missing_input_to_empty_object() {
+        let request = serde_json::from_value::<McpToolCallRequest>(json!({}))
+            .expect("request should deserialize");
+
+        assert_eq!(request.input, json!({}));
+        assert_eq!(McpToolCallRequest::default().input, json!({}));
+    }
 
     #[test]
     fn submit_input_request_defaults_missing_content_for_ordered_items() {

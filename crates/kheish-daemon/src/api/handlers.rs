@@ -46,27 +46,27 @@ use super::types::{
     DerivationCreateQuery, DerivationListQuery, EndSessionRequest, EventStreamQuery,
     HookDeadLetterView, InterruptSessionResponse, LearningCandidateListQuery, LearningListQuery,
     LearningSkillRolloutResultRequest, LearningSkillsListQuery, ListPage, ListPageMeta,
-    ListPageQuery, ObservationAuditListQuery, ObservationListQuery, ObservationSourceListQuery,
-    ObservationTranscriptListQuery, ObservationTranscriptSegmentListQuery, PatchSessionGoalRequest,
-    PendingQuestionListQuery, PersonaListQuery, PersonaSummaryView, PersonaView,
-    PostChannelMessageRequest, PostMailboxRequest, PostMailboxResponse, ProblemDetails,
-    ProjectChannelLinkRequest, ProjectListQuery, ProjectMemberRequest, ProjectTaskListQuery,
-    PublishLearningCandidateRequest, PutExternalConnectorRequest, PutHttpConnectorRequest,
-    PutSlackConnectorRequest, PutTelegramConnectorRequest, ResolveApprovalsRequest,
-    ResolveHookDeadLetterRequest, ResolveUserQuestionRequest, RevokeLearningRequest,
-    RevokeLearningSkillRequest, RevokeMatchingLearningsRequest, RollbackLearningSkillRequest,
-    RunListQuery, RunRetentionPruneRequest, RunRetentionPruneResponse,
-    RuntimeConfigRevisionListResponse, RuntimeRollbackRequest, RuntimeSettingsView,
-    ScheduleListQuery, ScheduleMutationResponse, SessionEventLogView, SessionGoalResponse,
-    SessionListQuery, SessionMemoryContextQuery, SessionMemoryContextView,
-    SessionMemorySearchQuery, SessionMemorySearchView, SessionReplyTargetRequest,
-    SessionReplyTargetsView, SessionView, SetAgentNicknameRequest, SetChannelReactionRequest,
-    SetDebugLevelRequest, SetHooksRequest, SetLearningPolicyRequest, SetModelRequest,
-    SetPermissionModeRequest, SetRunMemoryPolicyRequest, SetSessionCapabilityScopeRequest,
-    SetSessionCredentialScopeRequest, SetSessionGoalRequest, SetSessionPersonaRequest,
-    SetSessionReplyTargetsRequest, SetSessionRoutePolicyRequest, SetSystemPromptRequest,
-    SetToolRuntimeLimitsRequest, SkillListQuery, SkillSummaryView, SkillView,
-    SpawnSidechainRequest, StackApplyRequest, StackDownRequest, StackImportRequest,
+    ListPageQuery, McpToolCallRequest, McpToolCallResponse, ObservationAuditListQuery,
+    ObservationListQuery, ObservationSourceListQuery, ObservationTranscriptListQuery,
+    ObservationTranscriptSegmentListQuery, PatchSessionGoalRequest, PendingQuestionListQuery,
+    PersonaListQuery, PersonaSummaryView, PersonaView, PostChannelMessageRequest,
+    PostMailboxRequest, PostMailboxResponse, ProblemDetails, ProjectChannelLinkRequest,
+    ProjectListQuery, ProjectMemberRequest, ProjectTaskListQuery, PublishLearningCandidateRequest,
+    PutExternalConnectorRequest, PutHttpConnectorRequest, PutSlackConnectorRequest,
+    PutTelegramConnectorRequest, ResolveApprovalsRequest, ResolveHookDeadLetterRequest,
+    ResolveUserQuestionRequest, RevokeLearningRequest, RevokeLearningSkillRequest,
+    RevokeMatchingLearningsRequest, RollbackLearningSkillRequest, RunListQuery,
+    RunRetentionPruneRequest, RunRetentionPruneResponse, RuntimeConfigRevisionListResponse,
+    RuntimeRollbackRequest, RuntimeSettingsView, ScheduleListQuery, ScheduleMutationResponse,
+    SessionEventLogView, SessionGoalResponse, SessionListQuery, SessionMemoryContextQuery,
+    SessionMemoryContextView, SessionMemorySearchQuery, SessionMemorySearchView,
+    SessionReplyTargetRequest, SessionReplyTargetsView, SessionView, SetAgentNicknameRequest,
+    SetChannelReactionRequest, SetDebugLevelRequest, SetHooksRequest, SetLearningPolicyRequest,
+    SetModelRequest, SetPermissionModeRequest, SetRunMemoryPolicyRequest,
+    SetSessionCapabilityScopeRequest, SetSessionCredentialScopeRequest, SetSessionGoalRequest,
+    SetSessionPersonaRequest, SetSessionReplyTargetsRequest, SetSessionRoutePolicyRequest,
+    SetSystemPromptRequest, SetToolRuntimeLimitsRequest, SkillListQuery, SkillSummaryView,
+    SkillView, SpawnSidechainRequest, StackApplyRequest, StackDownRequest, StackImportRequest,
     StackManifestRequest, StackPlanRequest, StartProjectTaskRequest, StopTaskRequest,
     SubmitInputRequest, SubmitRunRequest, SupersedeLearningRequest, TaskListQuery, TaskOutputQuery,
     UpdateBoardRequest, UpdateChannelRequest, UpdatePersonaRequest, UpdateProjectRequest,
@@ -361,6 +361,10 @@ where
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/openapi.json", get(openapi))
         .route("/v1/runtime", get(get_runtime::<M>))
+        .route(
+            "/v1/runtime/mcp/tools/{tool_name}/call",
+            post(call_runtime_mcp_tool::<M>),
+        )
         .route(
             "/v1/runtime/subagent-policy/quotas",
             get(get_subagent_policy_quotas::<M>),
@@ -1270,6 +1274,7 @@ fn openapi_base_responses() -> Value {
         "413": { "$ref": "#/components/responses/Problem" },
         "422": { "$ref": "#/components/responses/Problem" },
         "429": { "$ref": "#/components/responses/Problem" },
+        "502": { "$ref": "#/components/responses/Problem" },
         "503": { "$ref": "#/components/responses/Problem" },
         "500": { "$ref": "#/components/responses/Problem" }
     })
@@ -1707,6 +1712,10 @@ const CONTROL_PLANE_OPENAPI_ROUTES: &[OpenApiRouteSpec] = &[
     OpenApiRouteSpec {
         path: "/v1/runtime",
         methods: &["GET"],
+    },
+    OpenApiRouteSpec {
+        path: "/v1/runtime/mcp/tools/{tool_name}/call",
+        methods: &["POST"],
     },
     OpenApiRouteSpec {
         path: "/v1/runtime/subagent-policy/quotas",
@@ -2470,6 +2479,21 @@ where
     M: ModelDriver + Send + Sync + 'static,
 {
     Json(state.runtime_settings().await)
+}
+
+async fn call_runtime_mcp_tool<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    AxumPath(tool_name): AxumPath<String>,
+    Json(request): Json<McpToolCallRequest>,
+) -> Result<Json<McpToolCallResponse>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    state
+        .call_mcp_tool(&tool_name, request.input)
+        .await
+        .map(Json)
+        .map_err(internal_error)
 }
 
 async fn list_runtime_config_revisions<M>(
@@ -8205,12 +8229,20 @@ mod tests {
     use anyhow::anyhow;
     use axum::body::Body;
     use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
+    use kheish_runtime::OpenAiProviderConfig;
+    use reqwest::Client;
+    use serde_json::json;
+    use std::fs;
+    use std::net::SocketAddr;
+    use tempfile::tempdir;
+    use tokio::sync::oneshot;
 
     use crate::problems::DaemonProblem;
+    use crate::{DaemonConfig, build_openai_daemon};
 
     use super::{
-        STACK_CONTROL_PLANE_JSON_BODY_LIMIT_BYTES, direct_run_idempotency_key, internal_error,
-        parse_stack_json_request,
+        ProblemDetails, STACK_CONTROL_PLANE_JSON_BODY_LIMIT_BYTES, direct_run_idempotency_key,
+        internal_error, parse_stack_json_request,
     };
 
     #[test]
@@ -8249,6 +8281,142 @@ mod tests {
         assert_eq!(busy.status, StatusCode::CONFLICT);
         assert_eq!(busy.domain, Some("sessions"));
         assert_eq!(busy.code, "session_busy");
+    }
+
+    #[test]
+    fn internal_error_classifies_mcp_tool_call_failures() {
+        let error = internal_error(
+            DaemonProblem::bad_gateway("mcp", "mcp_tool_call_failed", "MCP tool call failed")
+                .into(),
+        );
+
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error.domain, Some("mcp"));
+        assert_eq!(error.code, "mcp_tool_call_failed");
+    }
+
+    #[tokio::test]
+    async fn runtime_mcp_tool_call_api_rejects_invalid_requests_fail_closed() {
+        let temp = tempdir().expect("tempdir");
+        let state_root = temp.path().join("daemon-mcp-tool-call-api");
+        let config = DaemonConfig::new(
+            "127.0.0.1:0".parse::<SocketAddr>().expect("bind addr"),
+            &state_root,
+            temp.path(),
+        );
+        let (service, listener) = build_openai_daemon(
+            config,
+            OpenAiProviderConfig::new("gpt-test", "test-openai-key"),
+        )
+        .await
+        .expect("daemon should build");
+        let address = listener.local_addr().expect("listener addr");
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let _ = service
+                .serve_with_shutdown(listener, async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        let client = Client::new();
+        let base = format!("http://{address}");
+        let problem = client
+            .post(format!("{base}/v1/runtime/mcp/tools/%20/call"))
+            .json(&json!({}))
+            .send()
+            .await
+            .expect("request should complete")
+            .json::<ProblemDetails>()
+            .await
+            .expect("problem details");
+        assert_eq!(problem.status, 400);
+        assert_eq!(problem.domain.as_deref(), Some("mcp"));
+        assert_eq!(problem.code, "mcp_tool_name_empty");
+
+        let problem = client
+            .post(format!("{base}/v1/runtime/mcp/tools/mcp__demo__tool/call"))
+            .json(&json!({ "input": [] }))
+            .send()
+            .await
+            .expect("request should complete")
+            .json::<ProblemDetails>()
+            .await
+            .expect("problem details");
+        assert_eq!(problem.status, 400);
+        assert_eq!(problem.domain.as_deref(), Some("mcp"));
+        assert_eq!(problem.code, "mcp_tool_input_not_object");
+
+        let problem = client
+            .post(format!("{base}/v1/runtime/mcp/tools/mcp__demo__tool/call"))
+            .json(&json!({}))
+            .send()
+            .await
+            .expect("request should complete")
+            .json::<ProblemDetails>()
+            .await
+            .expect("problem details");
+        assert_eq!(problem.status, 409);
+        assert_eq!(problem.domain.as_deref(), Some("mcp"));
+        assert_eq!(problem.code, "mcp_not_configured");
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn runtime_mcp_tool_call_api_returns_not_found_for_unknown_tool() {
+        let temp = tempdir().expect("tempdir");
+        let state_root = temp.path().join("daemon-mcp-unknown-tool-api");
+        let mcp_config = temp.path().join("mcp-config.toml");
+        fs::write(
+            &mcp_config,
+            r#"
+[mcp_servers.empty]
+command = "true"
+required = false
+startup_timeout_sec = 1
+"#,
+        )
+        .expect("mcp config should be written");
+        let mut config = DaemonConfig::new(
+            "127.0.0.1:0".parse::<SocketAddr>().expect("bind addr"),
+            &state_root,
+            temp.path(),
+        );
+        config.mcp_config_path = Some(mcp_config);
+        let (service, listener) = build_openai_daemon(
+            config,
+            OpenAiProviderConfig::new("gpt-test", "test-openai-key"),
+        )
+        .await
+        .expect("daemon should build");
+        let address = listener.local_addr().expect("listener addr");
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let _ = service
+                .serve_with_shutdown(listener, async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        let problem = Client::new()
+            .post(format!(
+                "http://{address}/v1/runtime/mcp/tools/mcp__empty__missing/call"
+            ))
+            .json(&json!({}))
+            .send()
+            .await
+            .expect("request should complete")
+            .json::<ProblemDetails>()
+            .await
+            .expect("problem details");
+        assert_eq!(problem.status, 404);
+        assert_eq!(problem.domain.as_deref(), Some("mcp"));
+        assert_eq!(problem.code, "mcp_tool_not_found");
+
+        let _ = shutdown.send(());
     }
 
     #[test]
@@ -8844,6 +9012,15 @@ mod tests {
         assert!(
             spec["paths"]["/v1/runtime/auth/accounts"]["get"].is_object(),
             "runtime auth accounts path should be documented"
+        );
+        assert!(
+            spec["paths"]["/v1/runtime/mcp/tools/{tool_name}/call"]["post"].is_object(),
+            "runtime MCP tool call path should be documented"
+        );
+        assert!(
+            spec["paths"]["/v1/runtime/mcp/tools/{tool_name}/call"]["post"]["responses"]["502"]
+                .is_object(),
+            "runtime MCP tool call path should document upstream failure responses"
         );
         assert!(
             spec["paths"]["/v1/runtime/connectors/external/metrics"]["get"].is_object(),

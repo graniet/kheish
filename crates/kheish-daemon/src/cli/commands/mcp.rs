@@ -105,6 +105,39 @@ pub(crate) async fn run_mcp_command(
                 .await
             }
         },
+        crate::McpCommand::Tools { command } => match command {
+            crate::McpToolsCommand::Call(args) => {
+                let has_inline = args.input_json.is_some();
+                let input: serde_json::Value = if args.input_file.is_none() && !args.stdin {
+                    let inline = args.input_json.unwrap_or_else(|| "{}".to_string());
+                    serde_json::from_str(&inline)
+                        .map_err(|error| anyhow!("invalid --input-json: {error}"))?
+                } else {
+                    if has_inline {
+                        return Err(anyhow!(
+                            "provide only one of --input-json, --input-file, or --stdin"
+                        ));
+                    }
+                    crate::cli::read_json_input::<serde_json::Value>(
+                        None,
+                        args.input_file.as_deref(),
+                        args.stdin,
+                    )
+                    .await?
+                };
+                if !input.is_object() {
+                    return Err(anyhow!("MCP tool input must be a JSON object"));
+                }
+                let encoded = crate::cli::url_encode_path_segment(&args.tool_name);
+                let response = client
+                    .post_json::<_, kheish_daemon::McpToolCallResponse>(
+                        &format!("/v1/runtime/mcp/tools/{encoded}/call"),
+                        &kheish_daemon::McpToolCallRequest { input },
+                    )
+                    .await?;
+                printer.print(&response)
+            }
+        },
         crate::McpCommand::Oauth { command } => match command {
             crate::McpOAuthCommand::Status(args) => {
                 let slot_id = resolve_oauth_slot_id(&args.id, args.slot.as_deref());

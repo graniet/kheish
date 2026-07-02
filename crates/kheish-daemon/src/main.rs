@@ -714,6 +714,11 @@ enum McpCommand {
         #[command(subcommand)]
         command: McpAuthCommand,
     },
+    /// Invoke daemon-loaded MCP tools explicitly through the operator API.
+    Tools {
+        #[command(subcommand)]
+        command: McpToolsCommand,
+    },
     /// Run MCP OAuth login, status, refresh, and logout flows.
     Oauth {
         #[command(subcommand)]
@@ -767,6 +772,27 @@ struct McpAuthSetArgs {
     stdin: bool,
     #[command(flatten)]
     store: SecretStoreArgs,
+}
+
+#[derive(Subcommand, Debug)]
+enum McpToolsCommand {
+    /// Call one qualified MCP tool with JSON arguments.
+    Call(McpToolCallArgs),
+}
+
+#[derive(Args, Debug)]
+struct McpToolCallArgs {
+    /// Qualified MCP tool name, for example `mcp__github__get_me`.
+    tool_name: String,
+    /// JSON object passed to the MCP tool as arguments.
+    #[arg(long)]
+    input_json: Option<String>,
+    /// Read MCP tool arguments from a JSON file instead of --input-json.
+    #[arg(long)]
+    input_file: Option<PathBuf>,
+    /// Read MCP tool arguments JSON from stdin instead of --input-json.
+    #[arg(long)]
+    stdin: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -4738,6 +4764,33 @@ mod tests {
             } => {
                 assert_eq!(args.id, "linear");
                 assert_eq!(args.from_env.as_deref(), Some("LINEAR_API_KEY"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_mcp_tool_call_command() {
+        let cli = Cli::parse_from([
+            "kheish-daemon",
+            "mcp",
+            "tools",
+            "call",
+            "mcp__github__get_me",
+            "--input-json",
+            r#"{"dummy":true}"#,
+        ]);
+        match cli.command.expect("command") {
+            Command::Mcp {
+                command:
+                    McpCommand::Tools {
+                        command: McpToolsCommand::Call(args),
+                    },
+            } => {
+                assert_eq!(args.tool_name, "mcp__github__get_me");
+                assert_eq!(args.input_json.as_deref(), Some(r#"{"dummy":true}"#));
+                assert_eq!(args.input_file, None);
+                assert!(!args.stdin);
             }
             other => panic!("unexpected command: {other:?}"),
         }
