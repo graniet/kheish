@@ -9,7 +9,8 @@ RUN_ID="linear-github-feature-loop-$(date +%Y%m%d-%H%M%S)-$$"
 EVIDENCE="$ROOT/tmp/e2e/$RUN_ID"
 STATE_ROOT="$EVIDENCE/state"
 WORKSPACE_ROOT="$EVIDENCE/workspace"
-LIVE_STACK_FILE="$EVIDENCE/Kheishfile.no-schedules.yaml"
+STACK_PLAN_FILE="$EVIDENCE/Kheishfile.no-secret-env.yaml"
+LIVE_STACK_FILE="$EVIDENCE/Kheishfile.no-secret-env.no-schedules.yaml"
 MCP_CONFIG="$EVIDENCE/codex-mcp.toml"
 ADMIN_TOKEN_FILE="$EVIDENCE/admin.token"
 LOG="$EVIDENCE/daemon.log"
@@ -90,6 +91,157 @@ if [[ "$GITHUB_MCP_IMAGE_REF" != *@sha256:* ]]; then
   exit 2
 fi
 
+python3 - "$STACK_FILE" "$EVIDENCE/github-repository-full-name.txt" <<'PY'
+import json
+import os
+import pathlib
+import re
+import sys
+import urllib.error
+import urllib.request
+
+stack_file = pathlib.Path(sys.argv[1])
+output_file = pathlib.Path(sys.argv[2])
+
+
+def metadata_value(text, key):
+    match = re.search(
+        rf"(?m)^\s*{re.escape(key)}:\s*[\"']?([^\"'\n#]+)",
+        text,
+    )
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
+def first_manifest_file(text):
+    match = re.search(
+        r"(?m)^\s*(?:-\s*)?manifest_file:\s*[\"']?([^\"'\n#]+)",
+        text,
+    )
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
+explicit = (
+    os.environ.get("GITHUB_REPOSITORY_FULL_NAME")
+    or os.environ.get("GITHUB_REPOSITORY")
+    or ""
+).strip()
+if explicit:
+    if "/" not in explicit:
+        print(
+            "GITHUB_REPOSITORY_FULL_NAME/GITHUB_REPOSITORY must be owner/repo",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    output_file.write_text(explicit + "\n", encoding="utf-8")
+    sys.exit(0)
+
+scope = os.environ.get("GITHUB_REPOSITORY_SCOPE", "").strip()
+stack_text = stack_file.read_text(encoding="utf-8")
+if not scope:
+    scope = metadata_value(stack_text, "repository_scope")
+if not scope:
+    manifest = first_manifest_file(stack_text)
+    if manifest:
+        playbook_file = (stack_file.parent / manifest).resolve()
+        if playbook_file.is_file():
+            scope = metadata_value(
+                playbook_file.read_text(encoding="utf-8"),
+                "repository_scope",
+            )
+if not scope:
+    print(
+        "could not resolve repository scope; set GITHUB_REPOSITORY_FULL_NAME=owner/repo",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+if "/" in scope:
+    output_file.write_text(scope + "\n", encoding="utf-8")
+    sys.exit(0)
+
+token = os.environ["GITHUB_PERSONAL_ACCESS_TOKEN"]
+matches = []
+url = (
+    "https://api.github.com/user/repos"
+    "?per_page=100&affiliation=owner,collaborator,organization_member"
+)
+for _ in range(10):
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "kheish-live-e2e",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            repos = json.loads(response.read().decode("utf-8"))
+            link = response.headers.get("Link", "")
+    except urllib.error.HTTPError as error:
+        print(
+            f"failed to list GitHub repositories for scope {scope!r}: HTTP {error.code}; "
+            "set GITHUB_REPOSITORY_FULL_NAME=owner/repo",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    matches.extend(
+        repo["full_name"]
+        for repo in repos
+        if repo.get("name", "").lower() == scope.lower()
+    )
+    next_url = None
+    for part in link.split(","):
+        if 'rel="next"' in part:
+            next_url = part.split(";", 1)[0].strip()[1:-1]
+            break
+    if not next_url:
+        break
+    url = next_url
+
+if len(matches) == 1:
+    output_file.write_text(matches[0] + "\n", encoding="utf-8")
+    sys.exit(0)
+if len(matches) > 1:
+    print(
+        f"repository scope {scope!r} matched multiple repositories; "
+        "set GITHUB_REPOSITORY_FULL_NAME=owner/repo",
+        file=sys.stderr,
+    )
+else:
+    print(
+        f"repository scope {scope!r} was not visible to the GitHub token; "
+        "set GITHUB_REPOSITORY_FULL_NAME=owner/repo",
+        file=sys.stderr,
+    )
+sys.exit(2)
+PY
+GITHUB_REPOSITORY_FULL_NAME="$(cat "$EVIDENCE/github-repository-full-name.txt")"
+python3 - "$GITHUB_REPOSITORY_FULL_NAME" "$EVIDENCE/mcp-github-list-pull-requests-input.json" <<'PY'
+import json
+import pathlib
+import sys
+
+owner, repo = sys.argv[1].split("/", 1)
+pathlib.Path(sys.argv[2]).write_text(
+    json.dumps(
+        {
+            "owner": owner,
+            "repo": repo,
+            "state": "open",
+            "perPage": 1,
+        },
+        separators=(",", ":"),
+    )
+    + "\n",
+    encoding="utf-8",
+)
+PY
+
 if [[ -z "${KHEISH_AUTH_STORE_MASTER_KEY:-}" && -z "${KHEISH_AUTH_STORE_MASTER_KEY_FILE:-}" ]]; then
   export KHEISH_AUTH_STORE_MASTER_KEY="$("$BIN" secrets generate)"
 fi
@@ -103,24 +255,39 @@ GITHUB_MCP_RUN_IMAGE="$(docker image inspect \
   "$GITHUB_MCP_IMAGE_REF")"
 printf '%s\n' "$GITHUB_MCP_RUN_IMAGE" >"$EVIDENCE/github-mcp-image-id.txt"
 
-python3 - "$STACK_FILE" "$LIVE_STACK_FILE" <<'PY'
+python3 - "$STACK_FILE" "$STACK_PLAN_FILE" "$LIVE_STACK_FILE" <<'PY'
 import pathlib
 import sys
 
 source = pathlib.Path(sys.argv[1])
-target = pathlib.Path(sys.argv[2])
+plan_target = pathlib.Path(sys.argv[2])
+live_target = pathlib.Path(sys.argv[3])
 lines = source.read_text(encoding="utf-8").splitlines()
-output = []
+
+
+def without_secret_env(source_lines):
+    return [
+        line
+        for line in source_lines
+        if not (
+            line.strip().startswith("value_env:")
+            and len(line) - len(line.lstrip(" ")) >= 8
+        )
+    ]
+
+
+plan_lines = without_secret_env(lines)
+live_lines = []
 i = 0
-while i < len(lines):
-    line = lines[i]
+while i < len(plan_lines):
+    line = plan_lines[i]
     stripped = line.strip()
     indent = len(line) - len(line.lstrip(" "))
     if indent == 2 and stripped == "schedules:":
-        output.append("  schedules: []")
+        live_lines.append("  schedules: []")
         i += 1
-        while i < len(lines):
-            next_line = lines[i]
+        while i < len(plan_lines):
+            next_line = plan_lines[i]
             next_stripped = next_line.strip()
             next_indent = len(next_line) - len(next_line.lstrip(" "))
             if next_stripped and next_indent <= 2:
@@ -132,17 +299,18 @@ while i < len(lines):
         "followup-schedule",
     }:
         i += 1
-        while i < len(lines):
-            next_line = lines[i]
+        while i < len(plan_lines):
+            next_line = plan_lines[i]
             next_stripped = next_line.strip()
             next_indent = len(next_line) - len(next_line.lstrip(" "))
             if next_stripped and next_indent <= 4:
                 break
             i += 1
         continue
-    output.append(line)
+    live_lines.append(line)
     i += 1
-target.write_text("\n".join(output) + "\n", encoding="utf-8")
+plan_target.write_text("\n".join(plan_lines) + "\n", encoding="utf-8")
+live_target.write_text("\n".join(live_lines) + "\n", encoding="utf-8")
 PY
 
 pick_port() {
@@ -179,40 +347,93 @@ cli() {
   --state-root "$STATE_ROOT" \
   >"$EVIDENCE/github-secret.json"
 
-cat >"$MCP_CONFIG" <<'TOML'
-[mcp_servers.github]
-command = "docker"
-args = [
-  "run",
-  "-i",
-  "--rm",
-  "--name",
-  "__KHEISH_GITHUB_MCP_CONTAINER_NAME__",
-  "-e",
-  "GITHUB_PERSONAL_ACCESS_TOKEN",
-  "-e",
-  "GITHUB_TOOLSETS",
-  "__KHEISH_GITHUB_MCP_RUN_IMAGE__",
-]
-env = { GITHUB_TOOLSETS = "context,repos,issues,pull_requests,users" }
-env_secret_refs = { GITHUB_PERSONAL_ACCESS_TOKEN = "mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN" }
-inherit_env = false
-required = true
-startup_timeout_sec = 90
-tool_timeout_sec = 120
-TOML
 python3 - "$MCP_CONFIG" "$GITHUB_MCP_RUN_IMAGE" "$GITHUB_MCP_CONTAINER_NAME" <<'PY'
+import json
+import os
 import pathlib
 import sys
 
 path = pathlib.Path(sys.argv[1])
-content = path.read_text(encoding="utf-8")
-content = content.replace("__KHEISH_GITHUB_MCP_RUN_IMAGE__", sys.argv[2])
-content = content.replace("__KHEISH_GITHUB_MCP_CONTAINER_NAME__", sys.argv[3])
+image = sys.argv[2]
+container = sys.argv[3]
+env = {"GITHUB_TOOLSETS": "context,repos,issues,pull_requests,users"}
+for key in [
+    "DOCKER_HOST",
+    "DOCKER_CONTEXT",
+    "DOCKER_CONFIG",
+    "DOCKER_TLS_VERIFY",
+    "DOCKER_CERT_PATH",
+    "XDG_RUNTIME_DIR",
+    "HOME",
+]:
+    value = os.environ.get(key)
+    if value:
+        env[key] = value
+env_inline = ", ".join(
+    f"{key} = {json.dumps(value)}" for key, value in sorted(env.items())
+)
+args = [
+    "run",
+    "-i",
+    "--rm",
+    "--name",
+    container,
+    "-e",
+    "GITHUB_PERSONAL_ACCESS_TOKEN",
+    "-e",
+    "GITHUB_TOOLSETS",
+    image,
+]
+args_block = "\n".join(f"  {json.dumps(arg)}," for arg in args)
+content = f"""[mcp_servers.github]
+command = "docker"
+args = [
+{args_block}
+]
+env = {{ {env_inline} }}
+env_secret_refs = {{ GITHUB_PERSONAL_ACCESS_TOKEN = "mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN" }}
+inherit_env = false
+required = true
+startup_timeout_sec = 90
+tool_timeout_sec = 120
+"""
 path.write_text(content, encoding="utf-8")
 PY
+python3 - "$MCP_CONFIG" <<'PY'
+import os
+import pathlib
+import sys
 
-"$BIN" serve \
+content = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+for name in ["LINEAR_API_KEY", "GITHUB_PERSONAL_ACCESS_TOKEN"]:
+    value = os.environ.get(name, "")
+    if value and value in content:
+        print(f"{name} value leaked into generated MCP config", file=sys.stderr)
+        sys.exit(1)
+PY
+
+DAEMON_ENV=(
+  "PATH=${PATH:-/usr/bin:/bin}"
+  "HOME=${HOME:-$ROOT}"
+  "USER=${USER:-kheish}"
+  "LOGNAME=${LOGNAME:-${USER:-kheish}}"
+  "SHELL=${SHELL:-/bin/sh}"
+)
+for name in \
+  KHEISH_AUTH_STORE_MASTER_KEY \
+  KHEISH_AUTH_STORE_MASTER_KEY_FILE \
+  DOCKER_HOST \
+  DOCKER_CONTEXT \
+  DOCKER_CONFIG \
+  DOCKER_TLS_VERIFY \
+  DOCKER_CERT_PATH \
+  XDG_RUNTIME_DIR; do
+  if [[ -n "${!name:-}" ]]; then
+    DAEMON_ENV+=("$name=${!name}")
+  fi
+done
+
+env -i "${DAEMON_ENV[@]}" "$BIN" serve \
   --bind "127.0.0.1:$PORT" \
   --state-root "$STATE_ROOT" \
   --workspace-root "$WORKSPACE_ROOT" \
@@ -245,6 +466,15 @@ if [[ "$ready" != "1" ]]; then
   exit 1
 fi
 
+if [[ -r "/proc/$PID/environ" ]]; then
+  tr '\0' '\n' <"/proc/$PID/environ" \
+    | sed 's/=.*//' \
+    | sort \
+    >"$EVIDENCE/daemon-env-keys.txt"
+else
+  printf '__unavailable__\n' >"$EVIDENCE/daemon-env-keys.txt"
+fi
+
 cli runtime get \
   >"$EVIDENCE/runtime.json"
 
@@ -256,23 +486,26 @@ if ! cli mcp tools call mcp__github__get_me \
     >"$EVIDENCE/mcp-github-get-me.json"
 fi
 
-cli mcp tools call mcp__linear__get_profile \
-  >"$EVIDENCE/mcp-linear-get-profile.json"
+cli mcp tools call mcp__github__list_pull_requests \
+  --input-file "$EVIDENCE/mcp-github-list-pull-requests-input.json" \
+  >"$EVIDENCE/mcp-github-list-pull-requests.json"
+
+cli mcp tools call mcp__linear__list_issues \
+  --input-json '{"limit":1}' \
+  >"$EVIDENCE/mcp-linear-list-issues.json"
 
 cli stack validate \
   --file "$STACK_FILE" \
   >"$EVIDENCE/validate.json"
 
 cli stack import \
-  --file "$STACK_FILE" \
+  --file "$STACK_PLAN_FILE" \
   --resource secret/mcp.linear.LINEAR_API_KEY \
   --resource secret/mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN \
-  --allow-secret-env \
   >"$EVIDENCE/import-secrets.json"
 
 cli stack plan \
-  --file "$STACK_FILE" \
-  --allow-secret-env \
+  --file "$STACK_PLAN_FILE" \
   >"$EVIDENCE/plan-original.json"
 
 cli stack validate \
@@ -281,7 +514,6 @@ cli stack validate \
 
 cli stack apply \
   --file "$LIVE_STACK_FILE" \
-  --allow-secret-env \
   >"$EVIDENCE/apply.json"
 
 cli stack verify \
@@ -290,12 +522,10 @@ cli stack verify \
 
 cli stack apply \
   --file "$LIVE_STACK_FILE" \
-  --allow-secret-env \
   >"$EVIDENCE/apply-second.json"
 
 cli stack diff \
   --file "$LIVE_STACK_FILE" \
-  --allow-secret-env \
   >"$EVIDENCE/diff.json"
 
 cli schedules list \
@@ -308,10 +538,14 @@ import sys
 
 evidence = pathlib.Path(sys.argv[1])
 runtime = json.loads((evidence / "runtime.json").read_text(encoding="utf-8"))
+daemon_env_keys = set(
+    (evidence / "daemon-env-keys.txt").read_text(encoding="utf-8").splitlines()
+)
 validate = json.loads((evidence / "validate.json").read_text(encoding="utf-8"))
 validate_live = json.loads((evidence / "validate-live.json").read_text(encoding="utf-8"))
 github_get_me = json.loads((evidence / "mcp-github-get-me.json").read_text(encoding="utf-8"))
-linear_get_profile = json.loads((evidence / "mcp-linear-get-profile.json").read_text(encoding="utf-8"))
+github_list_pull_requests = json.loads((evidence / "mcp-github-list-pull-requests.json").read_text(encoding="utf-8"))
+linear_list_issues = json.loads((evidence / "mcp-linear-list-issues.json").read_text(encoding="utf-8"))
 plan_original = json.loads((evidence / "plan-original.json").read_text(encoding="utf-8"))
 import_secrets = json.loads((evidence / "import-secrets.json").read_text(encoding="utf-8"))
 apply = json.loads((evidence / "apply.json").read_text(encoding="utf-8"))
@@ -409,6 +643,11 @@ failed_second_apply_verify_checks = [
 ]
 
 check = {
+    "daemon_env_checked": "__unavailable__" not in daemon_env_keys,
+    "daemon_secret_env_scrubbed": not {
+        "LINEAR_API_KEY",
+        "GITHUB_PERSONAL_ACCESS_TOKEN",
+    }.intersection(daemon_env_keys),
     "runtime_mcp_servers": [
         {
             "server": server.get("server"),
@@ -422,8 +661,10 @@ check = {
     "runtime_has_planning_profile": "planning" in runtime.get("mcp", {}).get("selected_profiles", []),
     "github_get_me_called": github_get_me.get("tool_name") == "mcp__github__get_me",
     "github_get_me_is_error": github_get_me.get("output", {}).get("output", {}).get("is_error"),
-    "linear_get_profile_called": linear_get_profile.get("tool_name") == "mcp__linear__get_profile",
-    "linear_get_profile_is_error": linear_get_profile.get("output", {}).get("output", {}).get("is_error"),
+    "github_list_pull_requests_called": github_list_pull_requests.get("tool_name") == "mcp__github__list_pull_requests",
+    "github_list_pull_requests_is_error": github_list_pull_requests.get("output", {}).get("output", {}).get("is_error"),
+    "linear_list_issues_called": linear_list_issues.get("tool_name") == "mcp__linear__list_issues",
+    "linear_list_issues_is_error": linear_list_issues.get("output", {}).get("output", {}).get("is_error"),
     "original_validated": bool(validate.get("valid")),
     "live_validated": bool(validate_live.get("valid")),
     "original_plan_valid": bool(plan_original.get("valid")),
@@ -449,11 +690,15 @@ check = {
     "mcp_tool_call_exercised": True,
 }
 failed = (
-    not check["runtime_has_planning_profile"]
+    not check["daemon_env_checked"]
+    or not check["daemon_secret_env_scrubbed"]
+    or not check["runtime_has_planning_profile"]
     or not check["github_get_me_called"]
     or check["github_get_me_is_error"] is not False
-    or not check["linear_get_profile_called"]
-    or check["linear_get_profile_is_error"] is not False
+    or not check["github_list_pull_requests_called"]
+    or check["github_list_pull_requests_is_error"] is not False
+    or not check["linear_list_issues_called"]
+    or check["linear_list_issues_is_error"] is not False
     or not check["original_validated"]
     or not check["live_validated"]
     or not check["original_plan_valid"]
@@ -482,9 +727,9 @@ verdict = {
     "status": "failed" if failed else "passed",
     "mode": "non_destructive_no_schedules_apply",
     "limits": [
-        "The original Kheishfile is validated and planned, including schedule drift.",
-        "The live apply uses an evidence copy with schedules removed to avoid accidental provider mutations.",
-        "The live provider probe calls only non-destructive MCP profile/account tools before stack reconciliation.",
+        "The original Kheishfile is validated. Planning uses an evidence copy with value_env sources removed after offline secret import, including schedule drift.",
+        "The live apply uses an evidence copy with value_env sources and schedules removed to avoid daemon env secret exposure and accidental provider mutations.",
+        "The live provider probe calls non-destructive GitHub and Linear MCP read tools before stack reconciliation.",
     ],
     "check": check,
     "evidence_root": str(evidence),
