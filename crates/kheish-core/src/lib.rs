@@ -5,6 +5,7 @@ mod compaction;
 mod engine;
 mod hooks;
 mod microcompact;
+mod restoration;
 mod snip;
 mod tokens;
 mod user_questions;
@@ -25,6 +26,7 @@ pub use hooks::{HookDispatcher, NoopHookDispatcher};
 pub use microcompact::{
     CLEARED_TOOL_RESULT_MESSAGE, COMPACTABLE_TOOLS, MicrocompactResult, microcompact_tool_results,
 };
+pub use restoration::render_post_compact_restoration;
 pub use snip::{SnipResult, snip_if_needed};
 pub use tokens::{
     calibrated_prompt_token_count, calibrated_token_count, latest_api_usage, rough_token_estimate,

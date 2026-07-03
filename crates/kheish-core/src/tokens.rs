@@ -59,6 +59,14 @@ pub fn calibrated_token_count(
 }
 
 /// Estimates prompt tokens from visible prompt components sent to the provider.
+///
+/// When the window carries a measured provider usage, that measurement already
+/// covers the system sections, summary block, restoration payload, and every
+/// message present in that request — adding component estimates on top would
+/// double-count them, and an inflated estimate can wedge autocompact
+/// permanently above its threshold (compaction cannot shrink components that
+/// are re-attached after every compaction). Only messages appended since the
+/// measured call still need estimating.
 pub fn calibrated_prompt_token_count(
     summary: Option<&SummaryBlock>,
     system_sections: &[SystemPromptSection],
@@ -66,7 +74,11 @@ pub fn calibrated_prompt_token_count(
     open_tool_calls: &[ToolCallRecord],
     restoration: Option<&PostCompactRestoration>,
 ) -> usize {
-    let message_tokens = calibrated_token_count(messages, latest_api_usage(messages));
+    let last_api_usage = latest_api_usage(messages);
+    let message_tokens = calibrated_token_count(messages, last_api_usage);
+    if last_api_usage.is_some() {
+        return message_tokens;
+    }
     let summary_tokens = summary
         .map(|summary| rough_token_estimate(&summary.content))
         .unwrap_or_default();
@@ -87,9 +99,14 @@ pub fn calibrated_prompt_token_count(
             rough_token_estimate(&call.name).saturating_add(rough_token_estimate_value(&call.input))
         })
         .sum::<usize>();
+    // The restoration payload reaches the provider as rendered text, not as
+    // its raw serialized form; estimate what is actually sent.
     let restoration_tokens = restoration
-        .and_then(|restoration| serde_json::to_string(restoration).ok())
-        .map(|restoration| rough_token_estimate(&restoration))
+        .map(|restoration| {
+            rough_token_estimate(&crate::restoration::render_post_compact_restoration(
+                restoration,
+            ))
+        })
         .unwrap_or_default();
     message_tokens
         .saturating_add(summary_tokens)
@@ -190,5 +207,86 @@ mod tests {
         );
         assert!(count > rough_token_estimate("hello"));
         assert!(count > rough_token_estimate("Recovered run memory"));
+    }
+
+    fn fat_restoration() -> PostCompactRestoration {
+        // A task archive worth of metadata: the rendered prompt line only
+        // carries id, status, owner, and title, so descriptions, outputs, and
+        // metadata must not weigh on the estimate.
+        let tasks = (0..100)
+            .map(|index| kheish_types::TaskRecord {
+                id: format!("task-{index}"),
+                title: format!("Task {index}"),
+                description: "d".repeat(2_000),
+                status: kheish_types::TaskStatus::Completed,
+                owner_agent_id: None,
+                blocked_by: Vec::new(),
+                blocks: Vec::new(),
+                output: Some("o".repeat(2_000)),
+                metadata: json!({ "padding": "m".repeat(1_000) }),
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            })
+            .collect();
+        PostCompactRestoration {
+            modified_files: Vec::new(),
+            active_tools: Vec::new(),
+            active_skills: Vec::new(),
+            active_plugins: Vec::new(),
+            active_mcp_tools: Vec::new(),
+            mcp_server_instructions: Vec::new(),
+            workspace_state: WorkspaceSnapshot::default(),
+            retained_user_inputs: Vec::new(),
+            session_control: SessionControlState {
+                tasks,
+                ..SessionControlState::default()
+            },
+        }
+    }
+
+    #[test]
+    fn measured_usage_anchors_the_estimate_without_double_counting() {
+        // The provider already measured a prompt that contained the summary,
+        // system sections, and restoration payload; re-adding component
+        // estimates would keep the count above the autocompact threshold
+        // forever (compaction re-attaches those components), wedging the
+        // engine in a compaction loop.
+        let messages = vec![
+            MessageRecord::new("u1", Role::User, "hello"),
+            MessageRecord::new("a1", Role::Assistant, "done").with_api_usage(ModelUsage {
+                input_tokens: 150_000,
+                output_tokens: 200,
+                cost_usd: 0.0,
+            }),
+            MessageRecord::new("u2", Role::User, "tail"),
+        ];
+        let summary = SummaryBlock {
+            title: "summary".to_string(),
+            content: "s".repeat(10_000),
+        };
+        let count = calibrated_prompt_token_count(
+            Some(&summary),
+            &[],
+            &messages,
+            &[],
+            Some(&fat_restoration()),
+        );
+        assert_eq!(count, 150_200 + rough_token_estimate("tail"));
+    }
+
+    #[test]
+    fn restoration_is_estimated_as_rendered_text_not_raw_json() {
+        let restoration = fat_restoration();
+        let messages = vec![MessageRecord::new("u1", Role::User, "hello")];
+        let count = calibrated_prompt_token_count(None, &[], &messages, &[], Some(&restoration));
+        let raw_json_tokens = rough_token_estimate(&serde_json::to_string(&restoration).unwrap());
+        // 100 tasks × ~5 KB of non-rendered fields: the raw payload estimate
+        // is hundreds of thousands of tokens, the rendered form a few
+        // thousand.
+        assert!(raw_json_tokens > 100_000);
+        assert!(
+            count < raw_json_tokens / 10,
+            "estimate {count} should reflect the rendered text, not the {raw_json_tokens}-token raw payload"
+        );
     }
 }
