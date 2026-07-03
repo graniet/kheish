@@ -13,9 +13,10 @@ Session state is persisted as append-only JSONL records. The journal stores:
 
 - conversation events
 - checkpoints
-- metadata records
 - permission audit records
 - output records
+
+Session metadata is last-wins per key, so it lives outside the journal in per-key sidecar files (`sessions/__safe/<name>.meta/<key>.json`), each replaced atomically on write. Journals written by older builds carried metadata inline; those records are still read, and a sidecar value for the same key takes precedence.
 
 Session metadata also carries:
 

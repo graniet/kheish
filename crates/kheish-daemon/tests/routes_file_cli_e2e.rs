@@ -47,7 +47,9 @@ use kheish_daemon::{
 };
 use kheish_runtime::{DebugCaptureLevel, PermissionMode};
 use kheish_session::{
-    FileSessionStore, PermissionAuditRecord, PersistedSessionRecord, resolve_storage_path_for_read,
+    CURRENT_SESSION_ENVELOPE_VERSION, FileSessionStore, PermissionAuditRecord,
+    PersistedSessionRecord, SessionRecordEnvelope, append_json_line_sync,
+    resolve_storage_path_for_read, safe_storage_path,
 };
 use kheish_skills::SkillScope;
 use kheish_types::{
@@ -33674,10 +33676,22 @@ async fn sessions_vacuum_cli_compacts_journal_and_respects_daemon_lock() -> Resu
     stop_daemon(&mut daemon)?;
     drop(daemon);
 
-    // Bloat the journal exactly the way production does: superseded
-    // control-state snapshots appended through the real store code.
+    // Bloat the journal the way pre-sidecar builds did: superseded
+    // control-state snapshots appended inline. Current builds route metadata
+    // to per-key sidecars, so the legacy shape is written directly — and any
+    // control-state sidecar the live daemon just created is removed, because
+    // a genuine legacy journal has none and it would shadow the inline
+    // snapshots.
     let sessions_root = state_root.join("sessions");
     let store = FileSessionStore::new(&sessions_root);
+    let control_state_sidecar =
+        safe_storage_path(&sessions_root, session_id, "meta").join(format!(
+            "{}.json",
+            kheish_session::safe_storage_name(SESSION_CONTROL_STATE_METADATA_KEY)
+        ));
+    if control_state_sidecar.exists() {
+        fs::remove_file(&control_state_sidecar)?;
+    }
     let snapshot_count = 60usize;
     for revision in 0..snapshot_count {
         let state = SessionControlState {
@@ -33702,15 +33716,17 @@ async fn sessions_vacuum_cli_compacts_journal_and_respects_daemon_lock() -> Resu
                 .collect(),
             ..SessionControlState::default()
         };
-        store
-            .append(
-                session_id,
-                PersistedSessionRecord::Metadata {
+        append_json_line_sync(
+            &resolve_storage_path_for_read(&sessions_root, session_id, "jsonl"),
+            &SessionRecordEnvelope {
+                version: CURRENT_SESSION_ENVELOPE_VERSION,
+                session_id: session_id.to_string(),
+                record: PersistedSessionRecord::Metadata {
                     key: SESSION_CONTROL_STATE_METADATA_KEY.to_string(),
                     value: serde_json::to_value(&state)?,
                 },
-            )
-            .await?;
+            },
+        )?;
     }
     let journal_path = resolve_storage_path_for_read(&sessions_root, session_id, "jsonl");
     let bytes_before = fs::metadata(&journal_path)?.len();

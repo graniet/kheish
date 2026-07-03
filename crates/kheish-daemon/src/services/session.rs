@@ -1756,14 +1756,12 @@ mod tests {
             service.load_session_reply_targets("session-1").await?,
             Some(Vec::new())
         );
-        let transcript = fs::read_to_string(sessions.session_path("session-1"))?;
-        assert!(
-            transcript.contains(SESSION_REPLY_TARGETS_METADATA_KEY),
-            "explicit clear should be recorded in session metadata"
-        );
-        assert!(
-            transcript.contains("\"value\":null"),
-            "explicit clear should persist a null tombstone"
+        assert_eq!(
+            sessions
+                .load_metadata_value("session-1", SESSION_REPLY_TARGETS_METADATA_KEY)
+                .await?,
+            Some(serde_json::Value::Null),
+            "explicit clear should persist a null tombstone, not an absent key"
         );
         Ok(())
     }
@@ -2217,8 +2215,21 @@ mod tests {
         let transcript = std::fs::read_to_string(sessions.session_path("session-idempotent"))?;
         assert_eq!(
             transcript.lines().count(),
-            2,
-            "idempotent metadata writes should not append duplicate session records"
+            0,
+            "metadata writes must not grow the journal"
+        );
+        let sidecar_dir = kheish_session::safe_storage_path(
+            &temp.path().join("sessions"),
+            "session-idempotent",
+            "meta",
+        );
+        let sidecar_files = std::fs::read_dir(&sidecar_dir)?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .count();
+        assert_eq!(
+            sidecar_files, 2,
+            "idempotent metadata writes should keep exactly one sidecar per key"
         );
         Ok(())
     }

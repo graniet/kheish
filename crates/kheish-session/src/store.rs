@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -11,8 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    append_json_line_sync, append_json_lines_sync, decode_safe_storage_name, legacy_storage_path,
-    prepare_storage_path_for_write, resolve_storage_path_for_read, safe_storage_path,
+    append_json_line_sync, append_json_lines_sync, atomic_write, decode_safe_storage_name,
+    legacy_storage_path, prepare_storage_path_for_write, resolve_storage_path_for_read,
+    safe_storage_name, safe_storage_path,
 };
 
 /// The current JSONL envelope version stored on disk.
@@ -255,8 +257,104 @@ impl FileSessionStore {
         safe_storage_path(&self.root, session_id, "jsonl")
     }
 
-    /// Appends a single record to the session JSONL file.
+    /// Returns the directory holding the per-key metadata sidecars.
+    fn metadata_sidecar_dir(&self, session_id: &str) -> PathBuf {
+        safe_storage_path(&self.root, session_id, "meta")
+    }
+
+    /// Writes the latest value of one metadata key to its sidecar file.
+    ///
+    /// Metadata is last-wins per key; storing each key in its own
+    /// atomically-replaced file makes writes O(value) instead of growing the
+    /// journal, and reads O(1). The journal is created first when missing so
+    /// a metadata-first session stays visible to `list_session_ids`. Returns
+    /// whether the stored value changed.
+    fn write_metadata_sidecar(&self, session_id: &str, key: &str, value: &Value) -> Result<bool> {
+        let journal = prepare_storage_path_for_write(&self.root, session_id, "jsonl")?;
+        self.ensure_parent_dir(&journal)?;
+        if !journal.exists() {
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&journal)
+                .with_context(|| format!("failed to create {}", journal.display()))?;
+            crate::fs::sync_parent_dir(&journal)?;
+        }
+        let dir = self.metadata_sidecar_dir(session_id);
+        let path = dir.join(format!("{}.json", safe_storage_name(key)));
+        let bytes = serde_json::to_vec(value)?;
+        if let Ok(existing) = fs::read(&path)
+            && existing == bytes
+        {
+            return Ok(false);
+        }
+        atomic_write(&path, &bytes)
+            .with_context(|| format!("failed to write metadata sidecar {}", path.display()))?;
+        Ok(true)
+    }
+
+    /// Reads the sidecar value of one metadata key, when present.
+    fn read_metadata_sidecar(&self, session_id: &str, key: &str) -> Result<Option<Value>> {
+        let path = self
+            .metadata_sidecar_dir(session_id)
+            .join(format!("{}.json", safe_storage_name(key)));
+        match fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .with_context(|| format!("corrupt metadata sidecar {}", path.display()))
+                .map(Some),
+            Err(error)
+                if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error)
+                .with_context(|| format!("failed to read metadata sidecar {}", path.display())),
+        }
+    }
+
+    /// Reads every metadata sidecar of one session.
+    fn read_metadata_sidecars(&self, session_id: &str) -> Result<BTreeMap<String, Value>> {
+        let dir = self.metadata_sidecar_dir(session_id);
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error)
+                if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) =>
+            {
+                return Ok(BTreeMap::new());
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read sidecar dir {}", dir.display()));
+            }
+        };
+        let mut metadata = BTreeMap::new();
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(key) = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .and_then(decode_safe_storage_name)
+            else {
+                continue;
+            };
+            let bytes = fs::read(&path)
+                .with_context(|| format!("failed to read metadata sidecar {}", path.display()))?;
+            let value = serde_json::from_slice(&bytes)
+                .with_context(|| format!("corrupt metadata sidecar {}", path.display()))?;
+            metadata.insert(key, value);
+        }
+        Ok(metadata)
+    }
+
+    /// Appends a single record; metadata records go to their key sidecar.
     pub async fn append(&self, session_id: &str, record: PersistedSessionRecord) -> Result<()> {
+        if let PersistedSessionRecord::Metadata { key, value } = &record {
+            self.write_metadata_sidecar(session_id, key, value)?;
+            return Ok(());
+        }
         let path = prepare_storage_path_for_write(&self.root, session_id, "jsonl")?;
         self.ensure_parent_dir(&path)?;
         let envelope = SessionRecordEnvelope {
@@ -268,9 +366,9 @@ impl FileSessionStore {
             .with_context(|| format!("failed to append to {}", path.display()))
     }
 
-    /// Appends a batch of records as-is with a single fsync. Callers own
-    /// dedup; the incremental journal path uses this so each turn boundary
-    /// costs one durable write.
+    /// Appends a batch of records with a single journal fsync; metadata
+    /// records go to their key sidecars. Callers own dedup; the incremental
+    /// journal path uses this so each turn boundary costs one durable write.
     pub async fn append_records(
         &self,
         session_id: &str,
@@ -279,21 +377,28 @@ impl FileSessionStore {
         if records.is_empty() {
             return Ok(());
         }
-        let path = prepare_storage_path_for_write(&self.root, session_id, "jsonl")?;
-        let envelopes = records
-            .iter()
-            .cloned()
-            .map(|record| SessionRecordEnvelope {
+        let mut envelopes = Vec::new();
+        for record in records {
+            if let PersistedSessionRecord::Metadata { key, value } = record {
+                self.write_metadata_sidecar(session_id, key, value)?;
+                continue;
+            }
+            envelopes.push(SessionRecordEnvelope {
                 version: CURRENT_SESSION_ENVELOPE_VERSION,
                 session_id: session_id.to_string(),
-                record,
-            })
-            .collect::<Vec<_>>();
+                record: record.clone(),
+            });
+        }
+        if envelopes.is_empty() {
+            return Ok(());
+        }
+        let path = prepare_storage_path_for_write(&self.root, session_id, "jsonl")?;
         append_json_lines_sync(&path, &envelopes)
             .with_context(|| format!("failed to append to {}", path.display()))
     }
 
-    /// Appends only the non-duplicate suffix of a record batch.
+    /// Appends only the non-duplicate suffix of a record batch; metadata
+    /// records go to their key sidecars (unchanged values are skipped).
     pub async fn append_batch_dedup(
         &self,
         session_id: &str,
@@ -303,15 +408,39 @@ impl FileSessionStore {
             return Ok(Vec::new());
         }
 
+        let mut written = Vec::new();
+        let mut journal_records = Vec::new();
+        for record in records {
+            if let PersistedSessionRecord::Metadata { key, value } = record {
+                if self.write_metadata_sidecar(session_id, key, value)? {
+                    written.push(record.clone());
+                }
+                continue;
+            }
+            journal_records.push(record.clone());
+        }
+        if journal_records.is_empty() {
+            return Ok(written);
+        }
+
         // Dedup only ever matches a suffix of the existing records against a
         // prefix of the incoming batch, so the last `records.len()` persisted
         // records are enough — reading just the file tail keeps each persist
-        // O(batch) instead of re-parsing the whole transcript.
-        let existing_records = self.load_record_tail(session_id, records.len()).await?;
-        let overlap = max_suffix_prefix_overlap(&existing_records, records);
-        let appended = records[overlap..].to_vec();
+        // O(batch) instead of re-parsing the whole transcript. Legacy inline
+        // metadata records in the tail are filtered out so they cannot break
+        // the contiguous suffix match and duplicate events or checkpoints;
+        // the window is sized to the unfiltered batch so that filtering never
+        // leaves it shorter than the incoming records.
+        let existing_records = self
+            .load_record_tail(session_id, records.len())
+            .await?
+            .into_iter()
+            .filter(|record| !matches!(record, PersistedSessionRecord::Metadata { .. }))
+            .collect::<Vec<_>>();
+        let overlap = max_suffix_prefix_overlap(&existing_records, &journal_records);
+        let appended = journal_records[overlap..].to_vec();
         if appended.is_empty() {
-            return Ok(appended);
+            return Ok(written);
         }
         let path = prepare_storage_path_for_write(&self.root, session_id, "jsonl")?;
         let envelopes = appended
@@ -325,7 +454,8 @@ impl FileSessionStore {
             .collect::<Vec<_>>();
         append_json_lines_sync(&path, &envelopes)
             .with_context(|| format!("failed to append to {}", path.display()))?;
-        Ok(appended)
+        written.extend(appended);
+        Ok(written)
     }
 
     /// Loads the full persisted session state.
@@ -353,6 +483,17 @@ impl FileSessionStore {
                 }
             }
         }
+        let sidecar_dir = self.metadata_sidecar_dir(session_id);
+        match fs::remove_dir_all(&sidecar_dir) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to delete sidecar dir {}", sidecar_dir.display())
+                });
+            }
+        }
         Ok(())
     }
 
@@ -370,12 +511,20 @@ impl FileSessionStore {
     pub fn list_session_ids_modified_since(&self, since: SystemTime) -> Result<Vec<String>> {
         let mut session_ids = Vec::new();
         for (session_id, path) in self.session_file_entries()? {
-            let modified_at = fs::metadata(&path)
+            let mut modified_at = fs::metadata(&path)
                 .with_context(|| format!("failed to stat session file {}", path.display()))?
                 .modified()
                 .with_context(|| {
                     format!("failed to read mtime for session file {}", path.display())
                 })?;
+            // Metadata-only changes land in the sidecar dir, whose mtime is
+            // bumped by each atomic-write rename; without it the boot-time
+            // index repair would miss sessions whose only change was state.
+            if let Ok(sidecar) = fs::metadata(self.metadata_sidecar_dir(&session_id))
+                && let Ok(sidecar_modified_at) = sidecar.modified()
+            {
+                modified_at = modified_at.max(sidecar_modified_at);
+            }
             if modified_at >= since {
                 session_ids.push(session_id);
             }
@@ -391,9 +540,12 @@ impl FileSessionStore {
     ) -> Result<(StoredSession, SessionRestoreCursor)> {
         let path = resolve_storage_path_for_read(&self.root, session_id, "jsonl");
         if !path.exists() {
+            // Sidecar metadata can exist without journal records (a session
+            // configured before its first run); it must still be visible.
             return Ok((
                 StoredSession {
                     session_id: session_id.to_string(),
+                    metadata: self.read_metadata_sidecars(session_id)?,
                     ..StoredSession::default()
                 },
                 cursor,
@@ -442,14 +594,25 @@ impl FileSessionStore {
             }
         }
 
+        // Sidecars hold the latest value per key and win over any inline
+        // journal record they superseded.
+        for (key, value) in self.read_metadata_sidecars(session_id)? {
+            session.metadata.insert(key, value);
+        }
+
         Ok((session, next_cursor))
     }
 
     /// Loads the latest persisted value for one metadata key without materializing the full session.
     pub async fn load_metadata_value(&self, session_id: &str, key: &str) -> Result<Option<Value>> {
-        // Metadata is last-wins per key: scanning backwards, the first match
-        // is the latest value, so a multi-gigabyte journal costs only a tail
-        // read instead of a full parse.
+        // The sidecar, when present, is the latest value: every metadata write
+        // goes there and wins over older inline journal records.
+        if let Some(value) = self.read_metadata_sidecar(session_id, key)? {
+            return Ok(Some(value));
+        }
+        // Legacy fallback: metadata is last-wins per key, so scanning
+        // backwards the first match is the latest value and a multi-gigabyte
+        // journal costs only a tail read instead of a full parse.
         self.scan_tail_windows(session_id, 32, |records, reached_start| {
             for envelope in records.into_iter().rev() {
                 if let PersistedSessionRecord::Metadata {
@@ -646,6 +809,26 @@ impl FileSessionStore {
             })
             .await?
             .unwrap_or_default())
+    }
+
+    /// Appends a record inline to the journal, bypassing the metadata sidecar
+    /// split, to simulate journals written before sidecars existed.
+    #[cfg(test)]
+    pub(crate) fn append_inline_for_tests(
+        &self,
+        session_id: &str,
+        record: PersistedSessionRecord,
+    ) -> Result<()> {
+        let path = prepare_storage_path_for_write(&self.root, session_id, "jsonl")?;
+        self.ensure_parent_dir(&path)?;
+        append_json_line_sync(
+            &path,
+            &SessionRecordEnvelope {
+                version: CURRENT_SESSION_ENVELOPE_VERSION,
+                session_id: session_id.to_string(),
+                record,
+            },
+        )
     }
 
     #[cfg(test)]
@@ -985,15 +1168,13 @@ mod tests {
         let store = FileSessionStore::new(root.path());
         let session_id = "session-torn-middle";
 
-        store
-            .append(
-                session_id,
-                PersistedSessionRecord::Metadata {
-                    key: "summary".to_string(),
-                    value: json!("first"),
-                },
-            )
-            .await?;
+        store.append_inline_for_tests(
+            session_id,
+            PersistedSessionRecord::Metadata {
+                key: "summary".to_string(),
+                value: json!("first"),
+            },
+        )?;
         let path = store.session_path(session_id);
         let intact = std::fs::read_to_string(&path)?;
         let torn_then_valid = format!("{}{}\n{}", intact, r#"{"version":2,"ses"#, intact.trim());
@@ -1013,15 +1194,13 @@ mod tests {
         let store = FileSessionStore::new(root.path());
         let session_id = "session-heal";
 
-        store
-            .append(
-                session_id,
-                PersistedSessionRecord::Metadata {
-                    key: "summary".to_string(),
-                    value: json!("first"),
-                },
-            )
-            .await?;
+        store.append_inline_for_tests(
+            session_id,
+            PersistedSessionRecord::Metadata {
+                key: "summary".to_string(),
+                value: json!("first"),
+            },
+        )?;
         let path = store.session_path(session_id);
         let mut raw = std::fs::read(&path)?;
         raw.extend_from_slice(br#"{"version":2,"torn"#);
@@ -1030,9 +1209,20 @@ mod tests {
         store
             .append(
                 session_id,
-                PersistedSessionRecord::Metadata {
-                    key: "status".to_string(),
-                    value: json!("appended-after-tear"),
+                PersistedSessionRecord::Event {
+                    entry: LogEntry {
+                        offset: 0,
+                        timestamp_ms: 0,
+                        event: SessionEvent::InputReceived {
+                            input: InputEnvelope::text(
+                                "memory",
+                                "test",
+                                session_id,
+                                "user-1",
+                                "appended-after-tear",
+                            ),
+                        },
+                    },
                 },
             )
             .await?;
@@ -1041,10 +1231,7 @@ mod tests {
         // was glued onto the partial line.
         let loaded = store.load(session_id).await?;
         assert_eq!(loaded.metadata.get("summary"), Some(&json!("first")));
-        assert_eq!(
-            loaded.metadata.get("status"),
-            Some(&json!("appended-after-tear"))
-        );
+        assert_eq!(loaded.journal.len(), 1);
         let raw = std::fs::read_to_string(&path)?;
         assert!(raw.ends_with('\n'));
         assert_eq!(raw.lines().count(), 2);
@@ -1122,18 +1309,24 @@ mod tests {
             std::env::temp_dir().join(format!("kheish-session-dedup-{}", std::process::id()));
         let store = FileSessionStore::new(&root);
         let session_id = "session-d";
-        let first = PersistedSessionRecord::Metadata {
-            key: "summary".to_string(),
-            value: json!("first"),
+        let event = |offset: u64| PersistedSessionRecord::Event {
+            entry: LogEntry {
+                offset,
+                timestamp_ms: 0,
+                event: SessionEvent::InputReceived {
+                    input: InputEnvelope::text(
+                        "memory",
+                        "test",
+                        session_id,
+                        "user-1",
+                        format!("payload-{offset}"),
+                    ),
+                },
+            },
         };
-        let second = PersistedSessionRecord::Metadata {
-            key: "status".to_string(),
-            value: json!("second"),
-        };
-        let third = PersistedSessionRecord::Metadata {
-            key: "tail".to_string(),
-            value: json!("third"),
-        };
+        let first = event(0);
+        let second = event(1);
+        let third = event(2);
 
         store
             .append_batch_dedup(session_id, &[first.clone(), second.clone()])
@@ -1156,37 +1349,32 @@ mod tests {
         let store = FileSessionStore::new(root.path());
         let session_id = "session-metadata-backward";
 
-        // The early-only key forces the backward scan to grow its window past
-        // the padding until it reaches the file start.
-        store
-            .append(
-                session_id,
-                PersistedSessionRecord::Metadata {
-                    key: "early_only".to_string(),
-                    value: json!("first-and-only"),
-                },
-            )
-            .await?;
+        // Inline journal metadata simulates a pre-sidecar session; the
+        // early-only key forces the backward scan to grow its window past the
+        // padding until it reaches the file start.
+        store.append_inline_for_tests(
+            session_id,
+            PersistedSessionRecord::Metadata {
+                key: "early_only".to_string(),
+                value: json!("first-and-only"),
+            },
+        )?;
         for revision in 0..200 {
-            store
-                .append(
-                    session_id,
-                    PersistedSessionRecord::Metadata {
-                        key: "hot_key".to_string(),
-                        value: json!({ "revision": revision, "padding": "x".repeat(512) }),
-                    },
-                )
-                .await?;
-        }
-        store
-            .append(
+            store.append_inline_for_tests(
                 session_id,
                 PersistedSessionRecord::Metadata {
-                    key: "tombstoned".to_string(),
-                    value: json!(null),
+                    key: "hot_key".to_string(),
+                    value: json!({ "revision": revision, "padding": "x".repeat(512) }),
                 },
-            )
-            .await?;
+            )?;
+        }
+        store.append_inline_for_tests(
+            session_id,
+            PersistedSessionRecord::Metadata {
+                key: "tombstoned".to_string(),
+                value: json!(null),
+            },
+        )?;
 
         let hot = store
             .load_metadata_value(session_id, "hot_key")
@@ -1211,6 +1399,26 @@ mod tests {
                 .load_metadata_value("no-such-session", "hot_key")
                 .await?,
             None
+        );
+
+        // A sidecar write supersedes every inline value for that key, on both
+        // the mono-key path and the full-load overlay.
+        store
+            .append(
+                session_id,
+                PersistedSessionRecord::Metadata {
+                    key: "hot_key".to_string(),
+                    value: json!({ "revision": 200 }),
+                },
+            )
+            .await?;
+        assert_eq!(
+            store.load_metadata_value(session_id, "hot_key").await?,
+            Some(json!({ "revision": 200 }))
+        );
+        assert_eq!(
+            store.load(session_id).await?.metadata.get("hot_key"),
+            Some(&json!({ "revision": 200 }))
         );
         Ok(())
     }
@@ -1397,6 +1605,202 @@ mod tests {
             session_ids,
             vec!["legacy-session".to_string(), "safe/session".to_string()]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metadata_appends_write_sidecars_instead_of_growing_the_journal() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = FileSessionStore::new(root.path());
+        let session_id = "session-sidecar";
+
+        for revision in 0..3 {
+            store
+                .append(
+                    session_id,
+                    PersistedSessionRecord::Metadata {
+                        key: "hot_key".to_string(),
+                        value: json!({ "revision": revision }),
+                    },
+                )
+                .await?;
+        }
+
+        // The journal exists (the session is listable) but holds no metadata
+        // lines; rewriting one key does not grow it.
+        assert!(store.load_record_sequence(session_id).await?.is_empty());
+        assert_eq!(std::fs::metadata(store.session_path(session_id))?.len(), 0);
+        assert_eq!(store.list_session_ids()?, vec![session_id.to_string()]);
+        assert_eq!(
+            store.load_metadata_value(session_id, "hot_key").await?,
+            Some(json!({ "revision": 2 }))
+        );
+        assert_eq!(
+            store.load(session_id).await?.metadata.get("hot_key"),
+            Some(&json!({ "revision": 2 }))
+        );
+
+        // Sidecar metadata stays visible even without a journal file: a
+        // metadata-first session must never become invisible.
+        std::fs::remove_file(store.session_path(session_id))?;
+        assert_eq!(
+            store.load(session_id).await?.metadata.get("hot_key"),
+            Some(&json!({ "revision": 2 }))
+        );
+        assert_eq!(
+            store.load_metadata_value(session_id, "hot_key").await?,
+            Some(json!({ "revision": 2 }))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn modified_since_sees_sidecar_only_changes() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = FileSessionStore::new(root.path());
+        let session_id = "session-mtime";
+
+        store
+            .append(
+                session_id,
+                PersistedSessionRecord::Metadata {
+                    key: "summary".to_string(),
+                    value: json!("initial"),
+                },
+            )
+            .await?;
+
+        // Age both the journal and the sidecar dir, then cut after them: the
+        // session must drop out of the modified-since view.
+        let now = std::time::SystemTime::now();
+        let past = now - std::time::Duration::from_secs(600);
+        let since = now - std::time::Duration::from_secs(300);
+        for path in [
+            store.session_path(session_id),
+            store.metadata_sidecar_dir(session_id),
+        ] {
+            std::fs::File::open(&path)?.set_modified(past)?;
+        }
+        assert!(store.list_session_ids_modified_since(since)?.is_empty());
+
+        // A metadata-only write touches just the sidecar dir; the index
+        // repair must still pick the session up.
+        store
+            .append(
+                session_id,
+                PersistedSessionRecord::Metadata {
+                    key: "summary".to_string(),
+                    value: json!("updated"),
+                },
+            )
+            .await?;
+        assert_eq!(
+            store.list_session_ids_modified_since(since)?,
+            vec![session_id.to_string()]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_dedup_splits_metadata_without_duplicating_journal_records() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = FileSessionStore::new(root.path());
+        let session_id = "session-mixed";
+        let event = |offset: u64| PersistedSessionRecord::Event {
+            entry: LogEntry {
+                offset,
+                timestamp_ms: 0,
+                event: SessionEvent::InputReceived {
+                    input: InputEnvelope::text(
+                        "memory",
+                        "test",
+                        session_id,
+                        "user-1",
+                        format!("payload-{offset}"),
+                    ),
+                },
+            },
+        };
+        let audit = PersistedSessionRecord::PermissionAudit {
+            audit: PermissionAuditRecord {
+                scope: "session".to_string(),
+                tool_name: "bash".to_string(),
+                tool_call_id: None,
+                decision: "allow".to_string(),
+                base_decision: None,
+                effective_mode: None,
+                mode_effect: None,
+                matched_rule_pattern: None,
+                matched_rule_origin: None,
+                justification: None,
+                reason: None,
+                approval_request_id: None,
+            },
+        };
+        let metadata = PersistedSessionRecord::Metadata {
+            key: "hook_state".to_string(),
+            value: json!("v1"),
+        };
+
+        let first = store
+            .append_batch_dedup(
+                session_id,
+                &[event(0), metadata.clone(), audit.clone(), event(1)],
+            )
+            .await?;
+        assert_eq!(first.len(), 4);
+
+        // The end-of-run batch re-sends the same records plus a new suffix.
+        // Interleaved metadata must not defeat the suffix match: audits (like
+        // checkpoints) are not deduplicated at read time, so a miss here would
+        // persist them twice.
+        let second = store
+            .append_batch_dedup(
+                session_id,
+                &[
+                    event(0),
+                    metadata.clone(),
+                    audit.clone(),
+                    event(1),
+                    event(2),
+                ],
+            )
+            .await?;
+        assert_eq!(second, vec![event(2)]);
+
+        let sequence = store.load_record_sequence(session_id).await?;
+        assert_eq!(sequence, vec![event(0), audit, event(1), event(2)]);
+        assert_eq!(
+            store.load_metadata_value(session_id, "hook_state").await?,
+            Some(json!("v1"))
+        );
+
+        // An identical metadata value is reported as written only once.
+        let third = store.append_batch_dedup(session_id, &[metadata]).await?;
+        assert!(third.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_purges_metadata_sidecars() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = FileSessionStore::new(root.path());
+        let session_id = "session-delete";
+
+        store
+            .append(
+                session_id,
+                PersistedSessionRecord::Metadata {
+                    key: "summary".to_string(),
+                    value: json!("kept"),
+                },
+            )
+            .await?;
+        assert!(store.metadata_sidecar_dir(session_id).exists());
+
+        store.delete(session_id)?;
+        assert!(!store.metadata_sidecar_dir(session_id).exists());
+        assert!(store.load(session_id).await?.metadata.is_empty());
         Ok(())
     }
 }

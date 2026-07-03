@@ -16,8 +16,9 @@ pub use path::{
     resolve_storage_path_for_read, safe_storage_dir, safe_storage_name, safe_storage_path,
 };
 pub use store::{
-    FileSessionStore, PermissionAuditRecord, PersistedSessionRecord, SessionMigration,
-    SessionRecordEnvelope, SessionRestoreCursor, StoredOutputRecord, StoredSession,
+    CURRENT_SESSION_ENVELOPE_VERSION, FileSessionStore, PermissionAuditRecord,
+    PersistedSessionRecord, SessionMigration, SessionRecordEnvelope, SessionRestoreCursor,
+    StoredOutputRecord, StoredSession,
 };
 pub use transcript::{
     NormalizedTranscriptMessage, ParsedToolCall, ParsedToolResult, TranscriptGraph, TranscriptNode,

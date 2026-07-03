@@ -69,7 +69,7 @@ When a public thread behaves unexpectedly after restart, inspect the restored ch
 
 ## Oversized session journals
 
-A session whose runs mutate tasks constantly appends a full control-state snapshot per mutation; only the last snapshot per metadata key matters, so a long-running autonomous session can accumulate gigabytes of superseded snapshots and slow every run start. Compact it offline:
+Current builds store session metadata (control state, persona binding, operator config, and the rest of the last-wins keys) in per-key sidecar files under `sessions/__safe/<name>.meta/`, so metadata rewrites replace one small file instead of growing the journal. Journals written by older builds appended a full control-state snapshot per task mutation; only the last snapshot per metadata key matters, so a long-running autonomous session could accumulate gigabytes of superseded snapshots and slow every run start. Compact such a journal offline:
 
 ```bash
 # Requires the daemon to be stopped: the command takes the state-root lock
@@ -78,6 +78,8 @@ A session whose runs mutate tasks constantly appends a full control-state snapsh
 ```
 
 The rewrite is verified against the original before an atomic swap, and the pre-vacuum journal is preserved next to it as `<name>.jsonl.vacuum-bak` (remove that backup before vacuuming the same session again). Events, checkpoints, audits, and outputs are all kept in order; only superseded metadata snapshots are dropped, so the loaded session state is byte-for-byte equivalent. The lock-based exclusivity is enforced on unix (same mechanism as `serve`).
+
+One deliberate non-guarantee: running an older daemon build against a state root that already has metadata sidecars is not supported. The old build appends metadata inline, the newer build's sidecars keep precedence on read, and those inline writes are shadowed. Stay on one build per state root, or accept that a downgrade's metadata writes are lost on upgrade.
 
 ## Debug capture
 

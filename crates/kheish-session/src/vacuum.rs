@@ -298,22 +298,18 @@ mod tests {
         let store = FileSessionStore::new(root.path());
         let session_id = "session-vacuum";
 
+        // Inline metadata simulates the pre-sidecar journals vacuum exists to
+        // compact; current writes never add inline metadata.
         store.append(session_id, event(session_id, 0)).await?;
         for revision in 0..5 {
-            store
-                .append(
-                    session_id,
-                    metadata("session_control_state", json!({ "revision": revision })),
-                )
-                .await?;
+            store.append_inline_for_tests(
+                session_id,
+                metadata("session_control_state", json!({ "revision": revision })),
+            )?;
         }
         store.append(session_id, event(session_id, 1)).await?;
-        store
-            .append(session_id, metadata("summary", json!("latest")))
-            .await?;
-        store
-            .append(session_id, metadata("tombstone", json!(null)))
-            .await?;
+        store.append_inline_for_tests(session_id, metadata("summary", json!("latest")))?;
+        store.append_inline_for_tests(session_id, metadata("tombstone", json!(null)))?;
 
         let before = store.load(session_id).await?;
         let report = vacuum_session(root.path(), session_id)?;
