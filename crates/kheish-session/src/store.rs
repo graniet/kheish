@@ -1,6 +1,5 @@
 use std::fs;
 use std::io::ErrorKind;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -269,6 +268,31 @@ impl FileSessionStore {
             .with_context(|| format!("failed to append to {}", path.display()))
     }
 
+    /// Appends a batch of records as-is with a single fsync. Callers own
+    /// dedup; the incremental journal path uses this so each turn boundary
+    /// costs one durable write.
+    pub async fn append_records(
+        &self,
+        session_id: &str,
+        records: &[PersistedSessionRecord],
+    ) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let path = prepare_storage_path_for_write(&self.root, session_id, "jsonl")?;
+        let envelopes = records
+            .iter()
+            .cloned()
+            .map(|record| SessionRecordEnvelope {
+                version: CURRENT_SESSION_ENVELOPE_VERSION,
+                session_id: session_id.to_string(),
+                record,
+            })
+            .collect::<Vec<_>>();
+        append_json_lines_sync(&path, &envelopes)
+            .with_context(|| format!("failed to append to {}", path.display()))
+    }
+
     /// Appends only the non-duplicate suffix of a record batch.
     pub async fn append_batch_dedup(
         &self,
@@ -279,7 +303,11 @@ impl FileSessionStore {
             return Ok(Vec::new());
         }
 
-        let existing_records = self.load_record_sequence(session_id).await?;
+        // Dedup only ever matches a suffix of the existing records against a
+        // prefix of the incoming batch, so the last `records.len()` persisted
+        // records are enough — reading just the file tail keeps each persist
+        // O(batch) instead of re-parsing the whole transcript.
+        let existing_records = self.load_record_tail(session_id, records.len()).await?;
         let overlap = max_suffix_prefix_overlap(&existing_records, records);
         let appended = records[overlap..].to_vec();
         if appended.is_empty() {
@@ -380,26 +408,23 @@ impl FileSessionStore {
         };
         let mut next_cursor = SessionRestoreCursor::default();
 
-        for (line_index, line) in raw.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if line_index < cursor.line_count {
-                continue;
-            }
-
-            let envelope = self.parse_envelope(line).await?;
+        let mut last_seen_offset = cursor.last_offset;
+        for (line_index, envelope) in self.parse_session_lines(&path, &raw, cursor.line_count)? {
             next_cursor.line_count = line_index + 1;
             match envelope.record {
                 PersistedSessionRecord::Event { entry } => {
-                    next_cursor.last_offset = Some(entry.offset);
-                    if cursor
-                        .last_offset
+                    // Offsets are unique and monotonic per session; an entry at
+                    // or below the last accepted offset is a duplicate write
+                    // (incremental flush later re-covered by a batched persist)
+                    // and must not be replayed twice.
+                    if last_seen_offset
                         .map(|last_offset| entry.offset <= last_offset)
                         .unwrap_or(false)
                     {
                         continue;
                     }
+                    last_seen_offset = Some(entry.offset);
+                    next_cursor.last_offset = Some(entry.offset);
                     session.journal.push(entry);
                 }
                 PersistedSessionRecord::Checkpoint { checkpoint } => {
@@ -427,20 +452,10 @@ impl FileSessionStore {
             return Ok(None);
         }
 
-        let mut latest = None;
-        let file = fs::File::open(&path)
+        let raw = fs::read_to_string(&path)
             .with_context(|| format!("failed to read session file {}", path.display()))?;
-        for line in BufReader::new(file).lines() {
-            let line = line.with_context(|| {
-                format!(
-                    "failed to read one line from session file {}",
-                    path.display()
-                )
-            })?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let envelope = self.parse_envelope(&line).await?;
+        let mut latest = None;
+        for (_, envelope) in self.parse_session_lines(&path, &raw, 0)? {
             if let PersistedSessionRecord::Metadata {
                 key: record_key,
                 value,
@@ -453,8 +468,59 @@ impl FileSessionStore {
         Ok(latest)
     }
 
-    async fn parse_envelope(&self, line: &str) -> Result<SessionRecordEnvelope> {
-        let mut raw = serde_json::from_str::<Value>(line)?;
+    /// Parses every session line, tolerating exactly one torn line at the tail.
+    ///
+    /// A crash during an append can leave a partial final line; that is the
+    /// only corruption shape the appender can produce, so a JSON syntax error
+    /// on the last non-empty line is skipped with a warning while the same
+    /// error on any earlier line still fails the load. Envelope and migration
+    /// errors stay fatal everywhere: a torn line is never valid JSON, so a
+    /// well-formed line that fails those checks is real corruption.
+    /// Lines before `skip_lines` are counted but not parsed or returned.
+    fn parse_session_lines(
+        &self,
+        path: &Path,
+        raw: &str,
+        skip_lines: usize,
+    ) -> Result<Vec<(usize, SessionRecordEnvelope)>> {
+        let mut last_data_line = None;
+        for (index, line) in raw.lines().enumerate() {
+            if !line.trim().is_empty() {
+                last_data_line = Some(index);
+            }
+        }
+        let mut parsed = Vec::new();
+        for (line_index, line) in raw.lines().enumerate() {
+            if line.trim().is_empty() || line_index < skip_lines {
+                continue;
+            }
+            let value = match serde_json::from_str::<Value>(line) {
+                Ok(value) => value,
+                Err(error) if Some(line_index) == last_data_line => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        line = line_index + 1,
+                        %error,
+                        "ignoring torn trailing session record (likely an interrupted append)"
+                    );
+                    break;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "corrupt session record at {}:{}",
+                            path.display(),
+                            line_index + 1
+                        )
+                    });
+                }
+            };
+            parsed.push((line_index, self.upgrade_envelope(value)?));
+        }
+        Ok(parsed)
+    }
+
+    fn upgrade_envelope(&self, mut raw: Value) -> Result<SessionRecordEnvelope> {
         let mut version =
             raw.get("version")
                 .and_then(Value::as_u64)
@@ -473,6 +539,85 @@ impl FileSessionStore {
         serde_json::from_value(raw).map_err(Into::into)
     }
 
+    /// Loads at least the last `count` persisted records by reading backwards
+    /// from the end of the file, without parsing the whole transcript.
+    async fn load_record_tail(
+        &self,
+        session_id: &str,
+        count: usize,
+    ) -> Result<Vec<PersistedSessionRecord>> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let path = resolve_storage_path_for_read(&self.root, session_id, "jsonl");
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let file = fs::File::open(&path)
+            .with_context(|| format!("failed to read session file {}", path.display()))?;
+        let len = file
+            .metadata()
+            .with_context(|| format!("failed to stat session file {}", path.display()))?
+            .len();
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+
+        const CHUNK: u64 = 64 * 1024;
+        // One newline per record line, plus one for the boundary line we drop
+        // and one spare for a torn tail.
+        let mut demanded = count.saturating_add(2);
+        loop {
+            let mut window: Vec<u8> = Vec::new();
+            let mut newlines = 0usize;
+            let mut cursor = len;
+            while cursor > 0 && newlines < demanded {
+                let start = cursor.saturating_sub(CHUNK);
+                let span = (cursor - start) as usize;
+                let mut chunk = vec![0u8; span];
+                (&file)
+                    .seek(SeekFrom::Start(start))
+                    .and_then(|_| (&file).read_exact(&mut chunk))
+                    .with_context(|| {
+                        format!("failed to read tail of session file {}", path.display())
+                    })?;
+                newlines += chunk.iter().filter(|byte| **byte == b'\n').count();
+                chunk.extend_from_slice(&window);
+                window = chunk;
+                cursor = start;
+            }
+            let reached_start = cursor == 0;
+            let text_start = if reached_start {
+                0
+            } else {
+                // Drop the leading partial line so parsing starts on a record
+                // boundary.
+                window
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .map(|index| index + 1)
+                    .unwrap_or(0)
+            };
+            // Lossy is safe here: a torn tail can split a multi-byte character,
+            // and the replacement bytes just make that line unparseable JSON,
+            // which the torn-tail tolerance already handles.
+            let raw = String::from_utf8_lossy(&window[text_start..]).into_owned();
+            let parsed = self.parse_session_lines(&path, &raw, 0).with_context(|| {
+                format!(
+                    "in the trailing window of session file {} (line numbers are window-relative)",
+                    path.display()
+                )
+            })?;
+            if parsed.len() >= count || reached_start {
+                return Ok(parsed
+                    .into_iter()
+                    .map(|(_, envelope)| envelope.record)
+                    .collect());
+            }
+            demanded = demanded.saturating_mul(2);
+        }
+    }
+
+    #[cfg(test)]
     async fn load_record_sequence(&self, session_id: &str) -> Result<Vec<PersistedSessionRecord>> {
         let path = resolve_storage_path_for_read(&self.root, session_id, "jsonl");
         if !path.exists() {
@@ -481,11 +626,11 @@ impl FileSessionStore {
 
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("failed to read session file {}", path.display()))?;
-        let mut records = Vec::new();
-        for line in raw.lines().filter(|line| !line.trim().is_empty()) {
-            records.push(self.parse_envelope(line).await?.record);
-        }
-        Ok(records)
+        Ok(self
+            .parse_session_lines(&path, &raw, 0)?
+            .into_iter()
+            .map(|(_, envelope)| envelope.record)
+            .collect())
     }
 
     fn ensure_parent_dir(&self, path: &Path) -> Result<()> {
@@ -495,6 +640,26 @@ impl FileSessionStore {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
         Ok(())
+    }
+}
+
+/// In-flight journal entries stream straight into the session file at engine
+/// turn boundaries; the end-of-run batched persist then dedups against what
+/// is already on disk.
+#[async_trait::async_trait]
+impl kheish_core::JournalSink for FileSessionStore {
+    async fn persist_entries(
+        &self,
+        conversation: &ConversationKey,
+        entries: &[LogEntry],
+    ) -> Result<()> {
+        let records = entries
+            .iter()
+            .cloned()
+            .map(|entry| PersistedSessionRecord::Event { entry })
+            .collect::<Vec<_>>();
+        self.append_records(&conversation.session_id, &records)
+            .await
     }
 }
 
@@ -752,6 +917,175 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_store_tolerates_a_torn_trailing_line() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = FileSessionStore::new(root.path());
+        let session_id = "session-torn-tail";
+
+        store
+            .append(
+                session_id,
+                PersistedSessionRecord::Metadata {
+                    key: "summary".to_string(),
+                    value: json!("intact"),
+                },
+            )
+            .await?;
+        let path = store.session_path(session_id);
+        let mut raw = std::fs::read(&path)?;
+        raw.extend_from_slice(br#"{"version":2,"session_id":"session-torn-ta"#);
+        std::fs::write(&path, &raw)?;
+
+        let loaded = store.load(session_id).await?;
+        assert_eq!(loaded.metadata.get("summary"), Some(&json!("intact")));
+        assert_eq!(
+            store
+                .load_metadata_value(session_id, "summary")
+                .await?
+                .as_ref(),
+            Some(&json!("intact"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_store_still_fails_on_a_torn_middle_line() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = FileSessionStore::new(root.path());
+        let session_id = "session-torn-middle";
+
+        store
+            .append(
+                session_id,
+                PersistedSessionRecord::Metadata {
+                    key: "summary".to_string(),
+                    value: json!("first"),
+                },
+            )
+            .await?;
+        let path = store.session_path(session_id);
+        let intact = std::fs::read_to_string(&path)?;
+        let torn_then_valid = format!("{}{}\n{}", intact, r#"{"version":2,"ses"#, intact.trim());
+        std::fs::write(&path, torn_then_valid)?;
+
+        let error = store
+            .load(session_id)
+            .await
+            .expect_err("a torn line before valid records is real corruption");
+        assert!(error.to_string().contains("corrupt session record"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_store_append_heals_a_torn_trailing_line() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = FileSessionStore::new(root.path());
+        let session_id = "session-heal";
+
+        store
+            .append(
+                session_id,
+                PersistedSessionRecord::Metadata {
+                    key: "summary".to_string(),
+                    value: json!("first"),
+                },
+            )
+            .await?;
+        let path = store.session_path(session_id);
+        let mut raw = std::fs::read(&path)?;
+        raw.extend_from_slice(br#"{"version":2,"torn"#);
+        std::fs::write(&path, &raw)?;
+
+        store
+            .append(
+                session_id,
+                PersistedSessionRecord::Metadata {
+                    key: "status".to_string(),
+                    value: json!("appended-after-tear"),
+                },
+            )
+            .await?;
+
+        // The torn fragment is gone and every remaining line parses; nothing
+        // was glued onto the partial line.
+        let loaded = store.load(session_id).await?;
+        assert_eq!(loaded.metadata.get("summary"), Some(&json!("first")));
+        assert_eq!(
+            loaded.metadata.get("status"),
+            Some(&json!("appended-after-tear"))
+        );
+        let raw = std::fs::read_to_string(&path)?;
+        assert!(raw.ends_with('\n'));
+        assert_eq!(raw.lines().count(), 2);
+        for line in raw.lines() {
+            serde_json::from_str::<serde_json::Value>(line)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_store_torn_tail_keeps_restore_cursor_stable() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = FileSessionStore::new(root.path());
+        let session_id = "session-torn-cursor";
+
+        for offset in 0..2 {
+            store
+                .append(
+                    session_id,
+                    PersistedSessionRecord::Event {
+                        entry: LogEntry {
+                            offset,
+                            timestamp_ms: 0,
+                            event: SessionEvent::InputReceived {
+                                input: InputEnvelope::text(
+                                    "memory",
+                                    "test",
+                                    session_id,
+                                    "user-1",
+                                    format!("hello-{offset}"),
+                                ),
+                            },
+                        },
+                    },
+                )
+                .await?;
+        }
+        let path = store.session_path(session_id);
+        let mut raw = std::fs::read(&path)?;
+        raw.extend_from_slice(br#"{"version":2,"torn"#);
+        std::fs::write(&path, &raw)?;
+
+        let (first, cursor) = store
+            .load_after(session_id, SessionRestoreCursor::default())
+            .await?;
+        assert_eq!(first.journal.len(), 2);
+        // The cursor stops at the last intact line, so once the tear is
+        // healed by a later append the new record is picked up incrementally.
+        assert_eq!(cursor.line_count, 2);
+
+        store
+            .append(
+                session_id,
+                PersistedSessionRecord::Event {
+                    entry: LogEntry {
+                        offset: 2,
+                        timestamp_ms: 0,
+                        event: SessionEvent::InputReceived {
+                            input: InputEnvelope::text(
+                                "memory", "test", session_id, "user-1", "hello-2",
+                            ),
+                        },
+                    },
+                },
+            )
+            .await?;
+        let (second, _) = store.load_after(session_id, cursor).await?;
+        assert_eq!(second.journal.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn session_store_dedups_only_the_overlapping_prefix_of_a_batch() -> Result<()> {
         let root =
             std::env::temp_dir().join(format!("kheish-session-dedup-{}", std::process::id()));
@@ -781,6 +1115,151 @@ mod tests {
         assert_eq!(
             store.load_record_sequence(session_id).await?,
             vec![first, second, third]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_store_dedups_against_a_large_transcript_via_the_tail_window() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = FileSessionStore::new(root.path());
+        let session_id = "session-large-tail";
+
+        // Enough records to exceed one 64 KiB backward-read chunk, so the
+        // dedup path exercises the windowed tail read instead of seeing the
+        // whole file in a single chunk.
+        let record = |offset: u64| PersistedSessionRecord::Event {
+            entry: LogEntry {
+                offset,
+                timestamp_ms: 0,
+                event: SessionEvent::InputReceived {
+                    input: InputEnvelope::text(
+                        "memory",
+                        "test",
+                        session_id,
+                        "user-1",
+                        format!("payload-{offset}-{}", "x".repeat(120)),
+                    ),
+                },
+            },
+        };
+        let all = (0..500).map(record).collect::<Vec<_>>();
+        store.append_batch_dedup(session_id, &all).await?;
+        assert!(std::fs::metadata(store.session_path(session_id))?.len() > 64 * 1024);
+
+        // Re-persisting a batch that overlaps the tail appends only the new
+        // suffix.
+        let batch = vec![record(498), record(499), record(500)];
+        let appended = store.append_batch_dedup(session_id, &batch).await?;
+        assert_eq!(appended, vec![record(500)]);
+
+        let loaded = store.load(session_id).await?;
+        assert_eq!(loaded.journal.len(), 501);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn journal_sink_appends_are_deduped_by_the_batched_persist() -> Result<()> {
+        use kheish_core::JournalSink as _;
+
+        let root = tempfile::tempdir()?;
+        let store = FileSessionStore::new(root.path());
+        let session_id = "session-sink";
+        let conversation = kheish_types::ConversationKey {
+            session_id: session_id.to_string(),
+            thread_id: None,
+        };
+        let entry = |offset: u64| LogEntry {
+            offset,
+            timestamp_ms: 0,
+            event: SessionEvent::InputReceived {
+                input: InputEnvelope::text(
+                    "memory",
+                    "test",
+                    session_id,
+                    "user-1",
+                    format!("payload-{offset}"),
+                ),
+            },
+        };
+
+        // Incremental flushes during the run…
+        store
+            .persist_entries(&conversation, &[entry(0), entry(1)])
+            .await?;
+        store.persist_entries(&conversation, &[entry(2)]).await?;
+        // …then the end-of-run batch re-sends the same entries.
+        let records = (0..3)
+            .map(|offset| PersistedSessionRecord::Event {
+                entry: entry(offset),
+            })
+            .collect::<Vec<_>>();
+        let appended = store.append_batch_dedup(session_id, &records).await?;
+        assert!(
+            appended.is_empty(),
+            "the batched persist must recognize incrementally flushed entries"
+        );
+
+        let loaded = store.load(session_id).await?;
+        assert_eq!(loaded.journal.len(), 3);
+        assert_eq!(
+            loaded
+                .journal
+                .iter()
+                .map(|entry| entry.offset)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_after_skips_duplicate_event_offsets() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = FileSessionStore::new(root.path());
+        let session_id = "session-duplicate-offsets";
+        let entry = |offset: u64| PersistedSessionRecord::Event {
+            entry: LogEntry {
+                offset,
+                timestamp_ms: 0,
+                event: SessionEvent::InputReceived {
+                    input: InputEnvelope::text(
+                        "memory",
+                        "test",
+                        session_id,
+                        "user-1",
+                        format!("payload-{offset}"),
+                    ),
+                },
+            },
+        };
+
+        // A duplicated write (e.g. an interleaved metadata record defeated the
+        // suffix dedup) must not replay the same offset twice.
+        store
+            .append_records(session_id, &[entry(0), entry(1)])
+            .await?;
+        store
+            .append(
+                session_id,
+                PersistedSessionRecord::Metadata {
+                    key: "summary".to_string(),
+                    value: json!("interleaved"),
+                },
+            )
+            .await?;
+        store
+            .append_records(session_id, &[entry(1), entry(2)])
+            .await?;
+
+        let loaded = store.load(session_id).await?;
+        assert_eq!(
+            loaded
+                .journal
+                .iter()
+                .map(|entry| entry.offset)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
         );
         Ok(())
     }

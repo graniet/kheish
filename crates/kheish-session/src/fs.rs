@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -111,6 +111,62 @@ fn append_all_once(file: &mut File, payload: &[u8], path: &Path) -> Result<()> {
         .with_context(|| format!("failed to append {}", path.display()))
 }
 
+/// Truncates the bytes after the final newline — the torn trailing line an
+/// interrupted append leaves behind. Without this, the next append would glue
+/// its first record onto the partial line, corrupting that record too and
+/// turning a recoverable trailing tear into a mid-file parse error.
+fn heal_torn_trailing_line(file: &File, path: &Path) -> Result<()> {
+    let len = file
+        .metadata()
+        .with_context(|| format!("failed to stat {}", path.display()))?
+        .len();
+    if len == 0 {
+        return Ok(());
+    }
+
+    let mut last = [0u8; 1];
+    (&*file)
+        .seek(SeekFrom::End(-1))
+        .and_then(|_| (&*file).read_exact(&mut last))
+        .with_context(|| format!("failed to read tail of {}", path.display()))?;
+    if last[0] == b'\n' {
+        return Ok(());
+    }
+
+    // Scan backwards in chunks for the last newline; everything after it is
+    // the torn line.
+    const CHUNK: u64 = 4096;
+    let mut keep = 0u64;
+    let mut cursor = len;
+    let mut buffer = [0u8; CHUNK as usize];
+    'scan: while cursor > 0 {
+        let start = cursor.saturating_sub(CHUNK);
+        let span = (cursor - start) as usize;
+        (&*file)
+            .seek(SeekFrom::Start(start))
+            .and_then(|_| (&*file).read_exact(&mut buffer[..span]))
+            .with_context(|| format!("failed to scan tail of {}", path.display()))?;
+        for index in (0..span).rev() {
+            if buffer[index] == b'\n' {
+                keep = start + index as u64 + 1;
+                break 'scan;
+            }
+        }
+        cursor = start;
+    }
+
+    tracing::warn!(
+        path = %path.display(),
+        torn_bytes = len - keep,
+        "dropping torn trailing line before append (likely an interrupted write)"
+    );
+    file.set_len(keep)
+        .with_context(|| format!("failed to truncate torn line in {}", path.display()))?;
+    file.sync_data()
+        .with_context(|| format!("failed to sync {}", path.display()))?;
+    Ok(())
+}
+
 /// Appends one or more JSON values as newline-delimited records and syncs the file contents.
 pub fn append_json_lines_sync<T>(path: &Path, values: &[T]) -> Result<()>
 where
@@ -122,11 +178,25 @@ where
 
     ensure_parent_dir(path)?;
     let existed = path.exists();
-    let file = OpenOptions::new()
+    #[cfg(not(unix))]
+    let mut file = OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .open(path)
         .with_context(|| format!("failed to open {}", path.display()))?;
+    #[cfg(unix)]
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    heal_torn_trailing_line(&file, path)?;
+    let len_before_append = file
+        .metadata()
+        .with_context(|| format!("failed to stat {}", path.display()))?
+        .len();
     let mut payload = Vec::new();
     for value in values {
         serde_json::to_writer(&mut payload, value)
@@ -134,9 +204,16 @@ where
         payload.push(b'\n');
     }
     #[cfg(unix)]
-    append_all_once(&file, &payload, path)?;
+    let appended = append_all_once(&file, &payload, path);
     #[cfg(not(unix))]
-    append_all_once(&mut file, &payload, path)?;
+    let appended = append_all_once(&mut file, &payload, path);
+    if appended.is_err() {
+        // Roll a short write back to the pre-append length so the file keeps
+        // ending on a complete line; a crash between write and truncate still
+        // leaves only a trailing tear, which the next append heals.
+        let _ = file.set_len(len_before_append);
+    }
+    appended?;
     file.sync_data()
         .with_context(|| format!("failed to sync {}", path.display()))?;
     if !existed {

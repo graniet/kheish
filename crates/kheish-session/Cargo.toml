@@ -13,6 +13,7 @@ serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 [dependencies.kheish-codec]
 path = "../kheish-codec"

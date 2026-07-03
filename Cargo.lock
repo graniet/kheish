@@ -1431,6 +1431,7 @@ dependencies = [
  "async-trait",
  "kheish-codec",
  "kheish-types",
+ "parking_lot",
  "serde",
  "serde_json",
  "tokio",
@@ -1577,6 +1578,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

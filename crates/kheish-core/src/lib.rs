@@ -17,9 +17,9 @@ pub use compaction::{
     format_compaction_summary,
 };
 pub use engine::{
-    AgentEngine, AllowAllPermissions, LoopPolicy, ModelDriver, ModelRequest, ModelRequestKind,
-    ModelTurn, PermissionGate, PostCompactRestorationProvider, RunOutcome, ToolCatalog,
-    ToolExecutor,
+    AgentEngine, AllowAllPermissions, JournalSink, LoopPolicy, ModelDriver, ModelRequest,
+    ModelRequestKind, ModelTurn, PermissionGate, PostCompactRestorationProvider, RunOutcome,
+    ToolCatalog, ToolExecutor,
 };
 pub use hooks::{HookDispatcher, NoopHookDispatcher};
 pub use microcompact::{
