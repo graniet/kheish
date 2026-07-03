@@ -12,9 +12,7 @@ use kheish_core::{
     pending_approval_requests, rough_token_estimate, rough_token_estimate_value,
 };
 use kheish_output::{OutputHost, ResponseEnvelope};
-use kheish_session::{
-    FileSessionStore, PersistedSessionRecord, SessionRestoreCursor, StoredOutputRecord,
-};
+use kheish_session::{FileSessionStore, PersistedSessionRecord, StoredOutputRecord};
 use kheish_skills::{SharedSkillRegistry, SkillSummary, render_skill_catalog};
 use kheish_types::{
     ActiveSkillSnapshot, ActorRef, ApprovalResolution, CapabilityScope, CompletionRequirement,
@@ -234,7 +232,6 @@ pub struct AgentRuntime<M> {
     session_skills: SessionSkillsState,
     session_visible_skills: Option<BTreeSet<String>>,
     hook_runtime: HookRuntimeState,
-    cursor: SessionRestoreCursor,
     pending_batch: Option<PendingToolBatch>,
     pending_question: Option<PendingUserQuestion>,
     pending_generation: Option<ModelGenerationConfig>,
@@ -1140,7 +1137,6 @@ where
             session_skills: SessionSkillsState::default(),
             session_visible_skills: None,
             hook_runtime: HookRuntimeState::default(),
-            cursor: SessionRestoreCursor::default(),
             pending_batch: None,
             pending_question: None,
             pending_generation: None,
@@ -1154,13 +1150,7 @@ where
         restore: AgentRuntimeRestore,
         deps: AgentRuntimeDependencies<M>,
     ) -> Result<Self> {
-        let (stored, cursor) = deps
-            .sessions
-            .load_after(
-                &restore.conversation.session_id,
-                SessionRestoreCursor::default(),
-            )
-            .await?;
+        let stored = deps.sessions.load(&restore.conversation.session_id).await?;
         let mut engine = stored.restore_engine(
             restore.policy.clone(),
             restore.conversation.thread_id.clone(),
@@ -1266,7 +1256,6 @@ where
             session_skills,
             session_visible_skills,
             hook_runtime: hook_runtime_state_from_metadata(&stored_metadata)?,
-            cursor,
             pending_batch: stored
                 .metadata
                 .get(PENDING_BATCH_METADATA_KEY)
@@ -1361,15 +1350,7 @@ where
             self.pending_batch.is_none() && self.pending_question.is_none(),
             "session is waiting for user interaction before accepting new input"
         );
-        self.session_persona = self.load_session_persona_binding().await?;
-        self.session_control = self.load_session_control_state().await?;
-        self.session_goal = self.load_session_goal().await?;
-        self.session_operator = self.load_session_operator_config().await?;
-        self.session_reply_targets = self.load_session_reply_targets().await?;
-        self.session_capability_scope = self.load_session_capability_scope().await?;
-        self.session_credential_scope = self.load_session_credential_scope().await?;
-        self.session_execution_identity = self.load_session_execution_identity().await?;
-        self.hook_runtime = self.load_hook_runtime_state().await?;
+        self.refresh_session_state().await?;
         let generation = merge_generation(&self.default_generation, &generation);
         debug!(
             session_id = %self.engine.conversation().session_id,
@@ -1495,15 +1476,7 @@ where
             .pending_run_meta
             .clone()
             .ok_or_else(|| anyhow::anyhow!("missing pending run metadata"))?;
-        self.session_persona = self.load_session_persona_binding().await?;
-        self.session_control = self.load_session_control_state().await?;
-        self.session_goal = self.load_session_goal().await?;
-        self.session_operator = self.load_session_operator_config().await?;
-        self.session_reply_targets = self.load_session_reply_targets().await?;
-        self.session_capability_scope = self.load_session_capability_scope().await?;
-        self.session_credential_scope = self.load_session_credential_scope().await?;
-        self.session_execution_identity = self.load_session_execution_identity().await?;
-        self.hook_runtime = self.load_hook_runtime_state().await?;
+        self.refresh_session_state().await?;
         debug!(
             session_id = %self.engine.conversation().session_id,
             thread_id = self.engine.conversation().thread_id.as_deref(),
@@ -1680,15 +1653,7 @@ where
             .pending_run_meta
             .clone()
             .ok_or_else(|| anyhow::anyhow!("missing pending run metadata"))?;
-        self.session_persona = self.load_session_persona_binding().await?;
-        self.session_control = self.load_session_control_state().await?;
-        self.session_goal = self.load_session_goal().await?;
-        self.session_operator = self.load_session_operator_config().await?;
-        self.session_reply_targets = self.load_session_reply_targets().await?;
-        self.session_capability_scope = self.load_session_capability_scope().await?;
-        self.session_credential_scope = self.load_session_credential_scope().await?;
-        self.session_execution_identity = self.load_session_execution_identity().await?;
-        self.hook_runtime = self.load_hook_runtime_state().await?;
+        self.refresh_session_state().await?;
         debug!(
             session_id = %self.engine.conversation().session_id,
             thread_id = self.engine.conversation().thread_id.as_deref(),
@@ -1887,24 +1852,26 @@ where
         self.engine.set_system_sections(sections);
     }
 
-    async fn load_hook_runtime_state(&self) -> Result<HookRuntimeState> {
+    /// Refreshes every session-scoped state slot from a single journal read —
+    /// one consistent snapshot instead of nine independent full loads.
+    async fn refresh_session_state(&mut self) -> Result<()> {
         let stored = self
             .deps
             .sessions
             .load(&self.engine.conversation().session_id)
             .await?;
-        hook_runtime_state_from_metadata(&serde_json::to_value(&stored.metadata)?)
-            .map_err(Into::into)
-    }
-
-    async fn load_session_persona_binding(&self) -> Result<Option<SessionPersonaBinding>> {
-        let stored = self
-            .deps
-            .sessions
-            .load(&self.engine.conversation().session_id)
-            .await?;
-        session_persona_binding_from_metadata(&serde_json::to_value(&stored.metadata)?)
-            .map_err(Into::into)
+        let metadata = serde_json::to_value(&stored.metadata)?;
+        self.session_persona = session_persona_binding_from_metadata(&metadata)?;
+        self.session_control = session_control_state_from_metadata(&metadata)?;
+        self.session_goal = session_goal_from_metadata(&metadata)?;
+        self.session_operator = session_operator_config_from_metadata(&metadata)?;
+        self.session_reply_targets =
+            session_reply_targets_from_metadata(&metadata)?.unwrap_or_default();
+        self.session_capability_scope = session_capability_scope_from_metadata(&metadata)?;
+        self.session_credential_scope = session_credential_scope_from_metadata(&metadata)?;
+        self.session_execution_identity = session_execution_identity_from_metadata(&metadata)?;
+        self.hook_runtime = hook_runtime_state_from_metadata(&metadata)?;
+        Ok(())
     }
 
     async fn run_session_start_hooks(
@@ -2449,77 +2416,6 @@ where
         scope
     }
 
-    async fn load_session_capability_scope(&self) -> Result<CapabilityScope> {
-        let stored = self
-            .deps
-            .sessions
-            .load(&self.engine.conversation().session_id)
-            .await?;
-        session_capability_scope_from_metadata(&serde_json::to_value(&stored.metadata)?)
-            .map_err(Into::into)
-    }
-
-    async fn load_session_credential_scope(&self) -> Result<CredentialScope> {
-        let stored = self
-            .deps
-            .sessions
-            .load(&self.engine.conversation().session_id)
-            .await?;
-        session_credential_scope_from_metadata(&serde_json::to_value(&stored.metadata)?)
-            .map_err(Into::into)
-    }
-
-    async fn load_session_execution_identity(&self) -> Result<SessionExecutionIdentity> {
-        let stored = self
-            .deps
-            .sessions
-            .load(&self.engine.conversation().session_id)
-            .await?;
-        session_execution_identity_from_metadata(&serde_json::to_value(&stored.metadata)?)
-            .map_err(Into::into)
-    }
-
-    async fn load_session_control_state(&self) -> Result<SessionControlState> {
-        let stored = self
-            .deps
-            .sessions
-            .load(&self.engine.conversation().session_id)
-            .await?;
-        session_control_state_from_metadata(&serde_json::to_value(&stored.metadata)?)
-            .map_err(Into::into)
-    }
-
-    async fn load_session_goal(&self) -> Result<Option<SessionGoal>> {
-        let stored = self
-            .deps
-            .sessions
-            .load(&self.engine.conversation().session_id)
-            .await?;
-        session_goal_from_metadata(&serde_json::to_value(&stored.metadata)?).map_err(Into::into)
-    }
-
-    async fn load_session_operator_config(&self) -> Result<SessionOperatorConfig> {
-        let stored = self
-            .deps
-            .sessions
-            .load(&self.engine.conversation().session_id)
-            .await?;
-        session_operator_config_from_metadata(&serde_json::to_value(&stored.metadata)?)
-            .map_err(Into::into)
-    }
-
-    async fn load_session_reply_targets(&self) -> Result<Vec<ReplyHandle>> {
-        let stored = self
-            .deps
-            .sessions
-            .load(&self.engine.conversation().session_id)
-            .await?;
-        Ok(
-            session_reply_targets_from_metadata(&serde_json::to_value(&stored.metadata)?)?
-                .unwrap_or_default(),
-        )
-    }
-
     fn restoration_provider(&self) -> RuntimeRestorationProvider {
         let effective_tool_surface = self.effective_tool_surface();
         RuntimeRestorationProvider {
@@ -2804,10 +2700,6 @@ where
                 .unwrap_or_default(),
             "persisted runtime outcome"
         );
-        self.cursor = SessionRestoreCursor {
-            last_offset: Some(self.engine.next_offset().saturating_sub(1)),
-            line_count: self.engine.journal().len() + self.engine.checkpoints().len(),
-        };
         Ok(())
     }
 
