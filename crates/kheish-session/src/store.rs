@@ -447,25 +447,24 @@ impl FileSessionStore {
 
     /// Loads the latest persisted value for one metadata key without materializing the full session.
     pub async fn load_metadata_value(&self, session_id: &str, key: &str) -> Result<Option<Value>> {
-        let path = resolve_storage_path_for_read(&self.root, session_id, "jsonl");
-        if !path.exists() {
-            return Ok(None);
-        }
-
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read session file {}", path.display()))?;
-        let mut latest = None;
-        for (_, envelope) in self.parse_session_lines(&path, &raw, 0)? {
-            if let PersistedSessionRecord::Metadata {
-                key: record_key,
-                value,
-            } = envelope.record
-                && record_key == key
-            {
-                latest = Some(value);
+        // Metadata is last-wins per key: scanning backwards, the first match
+        // is the latest value, so a multi-gigabyte journal costs only a tail
+        // read instead of a full parse.
+        self.scan_tail_windows(session_id, 32, |records, reached_start| {
+            for envelope in records.into_iter().rev() {
+                if let PersistedSessionRecord::Metadata {
+                    key: record_key,
+                    value,
+                } = envelope.record
+                    && record_key == key
+                {
+                    return Ok(Some(Some(value)));
+                }
             }
-        }
-        Ok(latest)
+            Ok(reached_start.then_some(None))
+        })
+        .await
+        .map(Option::flatten)
     }
 
     /// Parses every session line, tolerating exactly one torn line at the tail.
@@ -539,18 +538,22 @@ impl FileSessionStore {
         serde_json::from_value(raw).map_err(Into::into)
     }
 
-    /// Loads at least the last `count` persisted records by reading backwards
-    /// from the end of the file, without parsing the whole transcript.
-    async fn load_record_tail(
+    /// Walks growing tail windows of the journal, each starting on a line
+    /// boundary and always extending to the end of the file, until `visit`
+    /// yields a result or a window covers the whole file. `visit` receives the
+    /// window's parsed records (oldest first) and whether the window reached
+    /// the file start; returning `Ok(None)` grows the window.
+    async fn scan_tail_windows<T>(
         &self,
         session_id: &str,
-        count: usize,
-    ) -> Result<Vec<PersistedSessionRecord>> {
+        initial_demanded_lines: usize,
+        mut visit: impl FnMut(Vec<SessionRecordEnvelope>, bool) -> Result<Option<T>>,
+    ) -> Result<Option<T>> {
         use std::io::{Read, Seek, SeekFrom};
 
         let path = resolve_storage_path_for_read(&self.root, session_id, "jsonl");
         if !path.exists() {
-            return Ok(Vec::new());
+            return Ok(None);
         }
         let file = fs::File::open(&path)
             .with_context(|| format!("failed to read session file {}", path.display()))?;
@@ -559,13 +562,13 @@ impl FileSessionStore {
             .with_context(|| format!("failed to stat session file {}", path.display()))?
             .len();
         if len == 0 {
-            return Ok(Vec::new());
+            return visit(Vec::new(), true);
         }
 
         const CHUNK: u64 = 64 * 1024;
         // One newline per record line, plus one for the boundary line we drop
         // and one spare for a torn tail.
-        let mut demanded = count.saturating_add(2);
+        let mut demanded = initial_demanded_lines.saturating_add(2);
         loop {
             let mut window: Vec<u8> = Vec::new();
             let mut newlines = 0usize;
@@ -607,14 +610,42 @@ impl FileSessionStore {
                     path.display()
                 )
             })?;
-            if parsed.len() >= count || reached_start {
-                return Ok(parsed
-                    .into_iter()
-                    .map(|(_, envelope)| envelope.record)
-                    .collect());
+            let records = parsed
+                .into_iter()
+                .map(|(_, envelope)| envelope)
+                .collect::<Vec<_>>();
+            if let Some(result) = visit(records, reached_start)? {
+                return Ok(Some(result));
             }
+            anyhow::ensure!(
+                !reached_start,
+                "tail window visitor must resolve once the window covers the whole file"
+            );
             demanded = demanded.saturating_mul(2);
         }
+    }
+
+    /// Loads at least the last `count` persisted records by reading backwards
+    /// from the end of the file, without parsing the whole transcript.
+    async fn load_record_tail(
+        &self,
+        session_id: &str,
+        count: usize,
+    ) -> Result<Vec<PersistedSessionRecord>> {
+        Ok(self
+            .scan_tail_windows(session_id, count, move |records, reached_start| {
+                if records.len() >= count || reached_start {
+                    return Ok(Some(
+                        records
+                            .into_iter()
+                            .map(|envelope| envelope.record)
+                            .collect::<Vec<_>>(),
+                    ));
+                }
+                Ok(None)
+            })
+            .await?
+            .unwrap_or_default())
     }
 
     #[cfg(test)]
@@ -1115,6 +1146,71 @@ mod tests {
         assert_eq!(
             store.load_record_sequence(session_id).await?,
             vec![first, second, third]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_metadata_value_scans_backwards_and_returns_the_latest_value() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = FileSessionStore::new(root.path());
+        let session_id = "session-metadata-backward";
+
+        // The early-only key forces the backward scan to grow its window past
+        // the padding until it reaches the file start.
+        store
+            .append(
+                session_id,
+                PersistedSessionRecord::Metadata {
+                    key: "early_only".to_string(),
+                    value: json!("first-and-only"),
+                },
+            )
+            .await?;
+        for revision in 0..200 {
+            store
+                .append(
+                    session_id,
+                    PersistedSessionRecord::Metadata {
+                        key: "hot_key".to_string(),
+                        value: json!({ "revision": revision, "padding": "x".repeat(512) }),
+                    },
+                )
+                .await?;
+        }
+        store
+            .append(
+                session_id,
+                PersistedSessionRecord::Metadata {
+                    key: "tombstoned".to_string(),
+                    value: json!(null),
+                },
+            )
+            .await?;
+
+        let hot = store
+            .load_metadata_value(session_id, "hot_key")
+            .await?
+            .expect("hot key should resolve");
+        assert_eq!(hot["revision"], json!(199), "last-wins must be preserved");
+        assert_eq!(
+            store.load_metadata_value(session_id, "early_only").await?,
+            Some(json!("first-and-only"))
+        );
+        assert_eq!(
+            store.load_metadata_value(session_id, "tombstoned").await?,
+            Some(json!(null)),
+            "an explicit null tombstone must be returned, not skipped"
+        );
+        assert_eq!(
+            store.load_metadata_value(session_id, "missing").await?,
+            None
+        );
+        assert_eq!(
+            store
+                .load_metadata_value("no-such-session", "hot_key")
+                .await?,
+            None
         );
         Ok(())
     }

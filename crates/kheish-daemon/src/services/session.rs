@@ -450,11 +450,9 @@ impl SessionService {
         &self,
         session_id: &str,
     ) -> Result<SessionControlState> {
-        let stored = self.sessions.load(session_id).await?;
-        stored
-            .metadata
-            .get(SESSION_CONTROL_STATE_METADATA_KEY)
-            .cloned()
+        self.sessions
+            .load_metadata_value(session_id, SESSION_CONTROL_STATE_METADATA_KEY)
+            .await?
             .map(serde_json::from_value)
             .transpose()
             .map(|state| state.unwrap_or_default())
@@ -484,11 +482,9 @@ impl SessionService {
         &self,
         session_id: &str,
     ) -> Result<SessionRoutePolicy> {
-        let stored = self.sessions.load(session_id).await?;
-        stored
-            .metadata
-            .get(SESSION_ROUTE_POLICY_METADATA_KEY)
-            .cloned()
+        self.sessions
+            .load_metadata_value(session_id, SESSION_ROUTE_POLICY_METADATA_KEY)
+            .await?
             .map(serde_json::from_value)
             .transpose()
             .map(|state| state.unwrap_or_default())
@@ -518,12 +514,10 @@ impl SessionService {
         &self,
         session_id: &str,
     ) -> Result<SessionOperatorConfig> {
-        let stored = self.sessions.load(session_id).await?;
-        stored
-            .metadata
-            .get(SESSION_OPERATOR_CONFIG_METADATA_KEY)
+        self.sessions
+            .load_metadata_value(session_id, SESSION_OPERATOR_CONFIG_METADATA_KEY)
+            .await?
             .filter(|value| !value.is_null())
-            .cloned()
             .map(serde_json::from_value)
             .transpose()
             .map(|state| state.unwrap_or_default())
@@ -557,11 +551,9 @@ impl SessionService {
         &self,
         session_id: &str,
     ) -> Result<CapabilityScope> {
-        let stored = self.sessions.load(session_id).await?;
-        stored
-            .metadata
-            .get(SESSION_CAPABILITY_SCOPE_METADATA_KEY)
-            .cloned()
+        self.sessions
+            .load_metadata_value(session_id, SESSION_CAPABILITY_SCOPE_METADATA_KEY)
+            .await?
             .map(serde_json::from_value)
             .transpose()
             .map(|scope| scope.unwrap_or_default())
@@ -595,11 +587,9 @@ impl SessionService {
         &self,
         session_id: &str,
     ) -> Result<CredentialScope> {
-        let stored = self.sessions.load(session_id).await?;
-        stored
-            .metadata
-            .get(SESSION_CREDENTIAL_SCOPE_METADATA_KEY)
-            .cloned()
+        self.sessions
+            .load_metadata_value(session_id, SESSION_CREDENTIAL_SCOPE_METADATA_KEY)
+            .await?
             .map(serde_json::from_value)
             .transpose()
             .map(|scope| scope.unwrap_or_default())
@@ -633,11 +623,9 @@ impl SessionService {
         &self,
         session_id: &str,
     ) -> Result<SessionExecutionIdentity> {
-        let stored = self.sessions.load(session_id).await?;
-        stored
-            .metadata
-            .get(SESSION_EXECUTION_IDENTITY_METADATA_KEY)
-            .cloned()
+        self.sessions
+            .load_metadata_value(session_id, SESSION_EXECUTION_IDENTITY_METADATA_KEY)
+            .await?
             .map(serde_json::from_value)
             .transpose()
             .map(|identity| identity.unwrap_or_default())
@@ -671,12 +659,10 @@ impl SessionService {
         &self,
         session_id: &str,
     ) -> Result<Option<SessionPersonaBinding>> {
-        let stored = self.sessions.load(session_id).await?;
-        stored
-            .metadata
-            .get(SESSION_PERSONA_BINDING_METADATA_KEY)
+        self.sessions
+            .load_metadata_value(session_id, SESSION_PERSONA_BINDING_METADATA_KEY)
+            .await?
             .filter(|value| !value.is_null())
-            .cloned()
             .map(serde_json::from_value)
             .transpose()
             .map_err(Into::into)
@@ -712,11 +698,9 @@ impl SessionService {
         &self,
         session_id: &str,
     ) -> Result<HookRuntimeState> {
-        let stored = self.sessions.load(session_id).await?;
-        stored
-            .metadata
-            .get(HOOK_RUNTIME_STATE_METADATA_KEY)
-            .cloned()
+        self.sessions
+            .load_metadata_value(session_id, HOOK_RUNTIME_STATE_METADATA_KEY)
+            .await?
             .map(serde_json::from_value)
             .transpose()
             .map(|state| state.unwrap_or_default())
@@ -773,12 +757,13 @@ impl SessionService {
         &self,
         session_id: &str,
     ) -> Result<Option<Vec<ReplyHandle>>> {
-        let stored = self.sessions.load(session_id).await?;
-        match stored.metadata.get(SESSION_REPLY_TARGETS_METADATA_KEY) {
+        match self
+            .sessions
+            .load_metadata_value(session_id, SESSION_REPLY_TARGETS_METADATA_KEY)
+            .await?
+        {
             Some(value) if value.is_null() => Ok(Some(Vec::new())),
-            Some(value) => serde_json::from_value(value.clone())
-                .map(Some)
-                .map_err(Into::into),
+            Some(value) => serde_json::from_value(value).map(Some).map_err(Into::into),
             None => Ok(None),
         }
     }
