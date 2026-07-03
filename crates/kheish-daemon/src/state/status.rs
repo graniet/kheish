@@ -20,10 +20,10 @@ use crate::{
     DaemonControlPlaneStatusView, DaemonEventStatusView, DaemonHealthSeverity, DaemonHealthView,
     DaemonHealthWarningView, DaemonProviderReadinessView, DaemonProviderRouteReadinessView,
     DaemonReadinessState, DaemonRunStatusSummaryView, DaemonScheduleStatusSummaryView,
-    DaemonSessionStatusSummaryView, DaemonStateRootLockStatusView, DaemonStatusProbeState,
-    DaemonStatusView, DaemonStorageProbeView, DaemonStorageStatusView, DaemonTaskStatusSummaryView,
-    DeliveryQueueStatusView, HookStatusView, ResolvedModelRoute, RouteDiagnosticSeverity,
-    RunMemoryStatusView, RuntimeSettingsView,
+    DaemonSessionStatusSummaryView, DaemonSessionStorageStatusView, DaemonStateRootLockStatusView,
+    DaemonStatusProbeState, DaemonStatusView, DaemonStorageProbeView, DaemonStorageStatusView,
+    DaemonTaskStatusSummaryView, DeliveryQueueStatusView, HookStatusView, ResolvedModelRoute,
+    RouteDiagnosticSeverity, RunMemoryStatusView, RuntimeSettingsView,
 };
 
 use super::DaemonState;
@@ -189,9 +189,16 @@ where
             let path = workspace_root.clone();
             tokio::task::spawn_blocking(move || write_probe_status("workspace_root", &path, now))
         };
-        let (state_root_probe, workspace_root_probe) = tokio::join!(
+        let session_storage_handle = {
+            let sessions_root = state_root.join("sessions");
+            tokio::task::spawn_blocking(move || {
+                kheish_session::FileSessionStore::new(sessions_root).session_storage_sizes()
+            })
+        };
+        let (state_root_probe, workspace_root_probe, session_storage) = tokio::join!(
             join_write_probe("state_root", &state_root, state_root_handle),
             join_write_probe("workspace_root", &workspace_root, workspace_root_handle),
+            join_session_storage_status(session_storage_handle),
         );
         let probes = vec![state_root_probe, workspace_root_probe];
         let write_error_count = probes.iter().filter(|probe| !probe.writable).count();
@@ -205,6 +212,7 @@ where
                 self.state_root_lock_held,
             )),
             asset_repair: asset_startup_repair_status_view(self.assets.startup_repair_report()),
+            session_storage,
         }
     }
 
@@ -1218,6 +1226,61 @@ async fn join_write_probe(
     join_write_probe_with_timeout(name, path, handle, STATUS_WRITE_PROBE_TIMEOUT).await
 }
 
+/// A session whose on-disk footprint exceeds this deserves an operator
+/// warning: run starts slow down and `sessions vacuum` reclaims the space.
+const OVERSIZED_SESSION_STORAGE_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Bound on the oversized-session identifiers surfaced in one snapshot.
+const OVERSIZED_SESSION_SAMPLE_LIMIT: usize = 16;
+
+async fn join_session_storage_status(
+    handle: tokio::task::JoinHandle<anyhow::Result<Vec<kheish_session::SessionStorageSize>>>,
+) -> Option<DaemonSessionStorageStatusView> {
+    let sizes = match tokio::time::timeout(STATUS_WRITE_PROBE_TIMEOUT, handle).await {
+        Ok(Ok(Ok(sizes))) => sizes,
+        Ok(Ok(Err(error))) => {
+            tracing::warn!(error = %error, "failed to measure session storage sizes");
+            return None;
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "session storage measurement task failed");
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!("session storage measurement timed out");
+            return None;
+        }
+    };
+    let mut view = DaemonSessionStorageStatusView {
+        session_count: sizes.len(),
+        oversized_threshold_bytes: OVERSIZED_SESSION_STORAGE_BYTES,
+        ..DaemonSessionStorageStatusView::default()
+    };
+    for size in &sizes {
+        let total = size.total_bytes();
+        view.total_bytes += total;
+        if total > view.largest_session_bytes {
+            view.largest_session_bytes = total;
+            view.largest_session_id = Some(size.session_id.clone());
+        }
+        if total >= OVERSIZED_SESSION_STORAGE_BYTES {
+            view.oversized_session_count += 1;
+            if view.oversized_session_ids.len() < OVERSIZED_SESSION_SAMPLE_LIMIT {
+                view.oversized_session_ids.push(size.session_id.clone());
+            }
+        }
+    }
+    if view.oversized_session_count > 0 {
+        tracing::warn!(
+            oversized_session_count = view.oversized_session_count,
+            sample = ?view.oversized_session_ids,
+            threshold_bytes = OVERSIZED_SESSION_STORAGE_BYTES,
+            "session storage exceeds the per-session threshold; compact offline with `kheish-daemon sessions vacuum <session-id>`"
+        );
+    }
+    Some(view)
+}
+
 async fn join_write_probe_with_timeout(
     name: &str,
     path: &Path,
@@ -1540,6 +1603,7 @@ mod tests {
             }],
             state_root_lock: None,
             asset_repair: AssetStartupRepairStatusView::default(),
+            session_storage: None,
         };
         let provider_readiness = DaemonProviderReadinessView {
             route_count: 1,

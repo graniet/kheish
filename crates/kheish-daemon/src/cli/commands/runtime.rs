@@ -3091,6 +3091,7 @@ mod tests {
             }],
             state_root_lock: None,
             asset_repair: kheish_daemon::AssetStartupRepairStatusView::default(),
+            session_storage: None,
         };
         status
             .health

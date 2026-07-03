@@ -20,6 +20,30 @@ use crate::{
 /// The current JSONL envelope version stored on disk.
 pub const CURRENT_SESSION_ENVELOPE_VERSION: u32 = 2;
 
+/// A single metadata value larger than this is logged as abnormal growth.
+const OVERSIZED_METADATA_VALUE_BYTES: usize = 1024 * 1024;
+
+/// The on-disk footprint of one persisted session.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionStorageSize {
+    /// The session identifier.
+    pub session_id: String,
+    /// Bytes of the append-only journal.
+    pub journal_bytes: u64,
+    /// Bytes of the per-key metadata sidecars.
+    pub metadata_bytes: u64,
+    /// Bytes of the terminal-task archive.
+    pub task_archive_bytes: u64,
+}
+
+impl SessionStorageSize {
+    /// Returns the combined footprint across all storage files.
+    #[must_use]
+    pub fn total_bytes(&self) -> u64 {
+        self.journal_bytes + self.metadata_bytes + self.task_archive_bytes
+    }
+}
+
 /// An audit trail entry for permission decisions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionAuditRecord {
@@ -283,6 +307,15 @@ impl FileSessionStore {
         let dir = self.metadata_sidecar_dir(session_id);
         let path = dir.join(format!("{}.json", safe_storage_name(key)));
         let bytes = serde_json::to_vec(value)?;
+        if bytes.len() > OVERSIZED_METADATA_VALUE_BYTES {
+            tracing::warn!(
+                session_id,
+                key,
+                bytes = bytes.len(),
+                "metadata value exceeds {} bytes; the state stored under this key is growing abnormally",
+                OVERSIZED_METADATA_VALUE_BYTES
+            );
+        }
         if let Ok(existing) = fs::read(&path)
             && existing == bytes
         {
@@ -552,6 +585,28 @@ impl FileSessionStore {
         self.ensure_parent_dir(&path)?;
         append_json_lines_sync(&path, entries)
             .with_context(|| format!("failed to append to {}", path.display()))
+    }
+
+    /// Measures the on-disk footprint of every persisted session. Sizes are
+    /// best-effort: a file racing a delete counts as zero.
+    pub fn session_storage_sizes(&self) -> Result<Vec<SessionStorageSize>> {
+        let file_len = |path: &Path| fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+        let mut sizes = Vec::new();
+        for (session_id, journal_path) in self.session_file_entries()? {
+            let mut size = SessionStorageSize {
+                journal_bytes: file_len(&journal_path),
+                task_archive_bytes: file_len(&self.task_archive_path(&session_id)),
+                ..SessionStorageSize::default()
+            };
+            if let Ok(entries) = fs::read_dir(self.metadata_sidecar_dir(&session_id)) {
+                for entry in entries.flatten() {
+                    size.metadata_bytes += entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+                }
+            }
+            size.session_id = session_id;
+            sizes.push(size);
+        }
+        Ok(sizes)
     }
 
     /// Loads every archived task record of one session, in archival order.
@@ -1903,6 +1958,74 @@ mod tests {
         store.delete(session_id)?;
         assert!(!path.exists());
         assert!(store.load_task_archive(session_id).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_storage_sizes_cover_journal_sidecars_and_archive() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = FileSessionStore::new(root.path());
+        let session_id = "session-sizes";
+
+        store
+            .append(
+                session_id,
+                PersistedSessionRecord::Event {
+                    entry: LogEntry {
+                        offset: 0,
+                        timestamp_ms: 0,
+                        event: SessionEvent::InputReceived {
+                            input: InputEnvelope::text(
+                                "memory", "test", session_id, "user-1", "hello",
+                            ),
+                        },
+                    },
+                },
+            )
+            .await?;
+        store
+            .append(
+                session_id,
+                PersistedSessionRecord::Metadata {
+                    key: "summary".to_string(),
+                    value: json!("x".repeat(64)),
+                },
+            )
+            .await?;
+        store
+            .append_task_archive(
+                session_id,
+                &[kheish_types::ArchivedTaskRecord {
+                    task: kheish_types::TaskRecord {
+                        id: "task-1".to_string(),
+                        title: "Task".to_string(),
+                        description: String::new(),
+                        status: kheish_types::TaskStatus::Completed,
+                        owner_agent_id: None,
+                        blocked_by: Vec::new(),
+                        blocks: Vec::new(),
+                        output: Some("done".to_string()),
+                        metadata: json!(null),
+                        created_at_ms: 1,
+                        updated_at_ms: 2,
+                    },
+                    archived_at_ms: 3,
+                    reason: kheish_types::TaskArchiveReason::Terminal,
+                }],
+            )
+            .await?;
+
+        let sizes = store.session_storage_sizes()?;
+        assert_eq!(sizes.len(), 1);
+        let size = &sizes[0];
+        assert_eq!(size.session_id, session_id);
+        assert!(size.journal_bytes > 0);
+        assert!(size.metadata_bytes > 64);
+        assert!(size.task_archive_bytes > 0);
+        assert_eq!(
+            size.total_bytes(),
+            size.journal_bytes + size.metadata_bytes + size.task_archive_bytes
+        );
         Ok(())
     }
 

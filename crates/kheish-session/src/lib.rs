@@ -18,7 +18,7 @@ pub use path::{
 pub use store::{
     CURRENT_SESSION_ENVELOPE_VERSION, FileSessionStore, PermissionAuditRecord,
     PersistedSessionRecord, SessionMigration, SessionRecordEnvelope, SessionRestoreCursor,
-    StoredOutputRecord, StoredSession,
+    SessionStorageSize, StoredOutputRecord, StoredSession,
 };
 pub use transcript::{
     NormalizedTranscriptMessage, ParsedToolCall, ParsedToolResult, TranscriptGraph, TranscriptNode,

@@ -3100,6 +3100,36 @@ pub struct DaemonStorageStatusView {
     /// Bounded asset startup repair summary captured when the asset store was loaded.
     #[serde(default)]
     pub asset_repair: AssetStartupRepairStatusView,
+    /// Aggregated session storage footprint, absent when measuring failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_storage: Option<DaemonSessionStorageStatusView>,
+}
+
+/// Aggregated on-disk session storage footprint exposed through `/v1/status`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonSessionStorageStatusView {
+    /// Number of sessions measured.
+    #[serde(default)]
+    pub session_count: usize,
+    /// Total bytes across journals, metadata sidecars, and task archives.
+    #[serde(default)]
+    pub total_bytes: u64,
+    /// Identifier of the largest session on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub largest_session_id: Option<String>,
+    /// Footprint of the largest session on disk.
+    #[serde(default)]
+    pub largest_session_bytes: u64,
+    /// Per-session threshold above which a session is reported oversized.
+    #[serde(default)]
+    pub oversized_threshold_bytes: u64,
+    /// Number of sessions above the threshold; compact them offline with
+    /// `sessions vacuum`.
+    #[serde(default)]
+    pub oversized_session_count: usize,
+    /// Bounded sample of oversized session identifiers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub oversized_session_ids: Vec<String>,
 }
 
 /// Bounded startup repair summary for daemon-owned assets.
