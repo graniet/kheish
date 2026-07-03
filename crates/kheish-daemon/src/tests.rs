@@ -54157,6 +54157,92 @@ async fn daemon_startup_reclaims_orphaned_daemon_owned_worktrees() -> Result<()>
 }
 
 #[tokio::test]
+async fn daemon_boots_when_an_open_agents_worktree_vanished() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-state");
+    init_test_git_repo(&state_root)?;
+    let (address, shutdown) = echoing_delay_daemon(&state_root, Duration::from_millis(25)).await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+
+    let root = client
+        .post(format!("{base}/v1/sessions"))
+        .json(&CreateSessionRequest {
+            session_id: Some("worktree-vanish-root".to_string()),
+            thread_id: None,
+            persona_id: None,
+            credential_scope: None,
+            capability_scope: None,
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionView>()
+        .await?;
+    let mut request = bare_sidechain_request(
+        "worktree-vanish-child",
+        Some("thread-worktree-vanish"),
+        None,
+    );
+    request.fork_context.isolation = Some("worktree".to_string());
+    let child = client
+        .post(format!("{base}/v1/agents/{}/sidechains", root.agent_id))
+        .json(&request)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionView>()
+        .await?;
+    let ownership = child
+        .snapshot
+        .agent
+        .daemon_owned_worktree
+        .clone()
+        .expect("daemon-owned worktree metadata");
+    let worktree_path = PathBuf::from(&ownership.path);
+    assert!(worktree_path.join(".git").exists());
+
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+
+    // The agent record is still open, but its worktree disappeared behind the
+    // daemon's back (external cleanup, tmp reaper, manual rm). Boot must
+    // degrade to a warning instead of refusing to start.
+    fs::remove_dir_all(&worktree_path)?;
+    let prune = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&state_root)
+        .args(["worktree", "prune"])
+        .output()?;
+    assert!(prune.status.success());
+
+    let (restart_address, restart_shutdown) =
+        echoing_delay_daemon(&state_root, Duration::from_millis(25)).await?;
+    let restart_base = format!("http://{restart_address}");
+    let status: DaemonStatusView = client
+        .get(format!("{restart_base}/v1/status"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(
+        status.ready,
+        "daemon must boot despite the vanished worktree"
+    );
+    let child_after = client
+        .get(format!("{restart_base}/v1/sessions/worktree-vanish-child"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionView>()
+        .await?;
+    assert!(child_after.snapshot.agent.closed_at_ms.is_none());
+    let _ = restart_shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
 async fn daemon_does_not_remove_explicit_reserved_worktree_without_ownership() -> Result<()> {
     let temp = tempdir()?;
     let state_root = temp.path().join("daemon-state");

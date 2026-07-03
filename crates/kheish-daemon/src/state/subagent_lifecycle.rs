@@ -489,15 +489,20 @@ where
             if record.closed_at_ms.is_some() {
                 continue;
             }
-            if let Some(ownership) = record.daemon_owned_worktree.as_ref() {
-                self.verify_daemon_owned_worktree(ownership)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed to restore daemon-owned worktree for agent {}",
-                            record.id.0
-                        )
-                    })?;
+            if let Some(ownership) = record.daemon_owned_worktree.as_ref()
+                && let Err(error) = self.verify_daemon_owned_worktree(ownership).await
+            {
+                // A worktree that vanished or lost its git registration must
+                // not brick the whole daemon boot. The record is kept as-is:
+                // the daemon simply never treats that path as removable
+                // (worktree removal already no-ops on missing paths), and the
+                // agent's tools fail at use time like any other I/O error.
+                warn!(
+                    agent_id = %record.id.0,
+                    worktree = %ownership.path,
+                    error = %error,
+                    "daemon-owned worktree failed verification during restore; continuing without it"
+                );
             }
         }
         self.orchestrator.restore_registered_agents().await
