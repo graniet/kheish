@@ -69,7 +69,17 @@ When a public thread behaves unexpectedly after restart, inspect the restored ch
 
 ## Oversized session journals
 
-Current builds store session metadata (control state, persona binding, operator config, and the rest of the last-wins keys) in per-key sidecar files under `sessions/__safe/<name>.meta/`, so metadata rewrites replace one small file instead of growing the journal. Journals written by older builds appended a full control-state snapshot per task mutation; only the last snapshot per metadata key matters, so a long-running autonomous session could accumulate gigabytes of superseded snapshots and slow every run start. Compact such a journal offline:
+Current builds store session metadata (control state, persona binding, operator config, and the rest of the last-wins keys) in per-key sidecar files under `sessions/__safe/<name>.meta/`, so metadata rewrites replace one small file instead of growing the journal. Journals written by older builds appended a full control-state snapshot per task mutation; only the last snapshot per metadata key matters, so a long-running autonomous session could accumulate gigabytes of superseded snapshots and slow every run start.
+
+You do not have to discover this by accident. `/v1/status` reports every session's on-disk footprint under `.storage.session_storage`:
+
+- `session_count` and `total_bytes` across journals, metadata sidecars, and task archives
+- `largest_session_id` / `largest_session_bytes`
+- `oversized_session_count` and a bounded `oversized_session_ids` sample for sessions above `oversized_threshold_bytes` (100 MiB)
+
+Any oversized session also logs a daemon warning that names the session and suggests the vacuum command below. Independently, a single metadata value larger than 1 MiB logs a write-time warning with the session and key, so abnormal growth of one hot key shows up long before the journal becomes a problem.
+
+Compact an oversized journal offline:
 
 ```bash
 # Requires the daemon to be stopped: the command takes the state-root lock
@@ -77,7 +87,9 @@ Current builds store session metadata (control state, persona binding, operator 
 ./target/debug/kheish-daemon sessions vacuum <session-id> --state-root <state-root>
 ```
 
-The rewrite is verified against the original before an atomic swap, and the pre-vacuum journal is preserved next to it as `<name>.jsonl.vacuum-bak` (remove that backup before vacuuming the same session again). Events, checkpoints, audits, and outputs are all kept in order; only superseded metadata snapshots are dropped, so the loaded session state is byte-for-byte equivalent. The lock-based exclusivity is enforced on unix (same mechanism as `serve`).
+The command prints a JSON report: `bytes_before`/`bytes_after`, `kept_by_type` counts per record type, `metadata_keys_kept`, `metadata_records_dropped`, `torn_tail_dropped`, and the `backup_path`. The rewrite is verified against the original before an atomic swap, and the pre-vacuum journal is preserved next to it as `<name>.jsonl.vacuum-bak` (remove that backup — it is full-size — before vacuuming the same session again). Events, checkpoints, audits, and outputs are all kept in order; only superseded metadata snapshots are dropped, so the loaded session state is byte-for-byte equivalent. The lock-based exclusivity is enforced on unix (same mechanism as `serve`).
+
+As a field reference: a production session whose journal had grown to 1.4 GB of superseded control-state snapshots compacted to 12 MB in about 11 seconds, and its runs went from stalling for hours before the first tool call to executing normally after restart.
 
 One deliberate non-guarantee: running an older daemon build against a state root that already has metadata sidecars is not supported. The old build appends metadata inline, the newer build's sidecars keep precedence on read, and those inline writes are shadowed. Stay on one build per state root, or accept that a downgrade's metadata writes are lost on upgrade.
 
@@ -162,7 +174,7 @@ The daemon also repairs its compact session-persona cache from persisted session
 
 ## Evidence Note
 
-- Code verified: `crates/kheish-daemon/src/services/run.rs`, `crates/kheish-daemon/src/services/task.rs`, `crates/kheish-daemon/src/state/task_workflow.rs`, `crates/kheish-daemon/src/state/playbook_workflow.rs`.
-- CLI/API verified: commands named in the evidence-first order exist in `crates/kheish-daemon/src/main.rs` and route through `crates/kheish-daemon/src/api/handlers.rs`.
-- Daemon live tested for this note: no; deterministic daemon restart tests cover the documented shell-task failure state.
+- Code verified: `crates/kheish-daemon/src/services/run.rs`, `crates/kheish-daemon/src/services/task.rs`, `crates/kheish-daemon/src/state/task_workflow.rs`, `crates/kheish-daemon/src/state/playbook_workflow.rs`, `crates/kheish-session/src/vacuum.rs`, `crates/kheish-daemon/src/state/status.rs` (session storage snapshot).
+- CLI/API verified: commands named in the evidence-first order exist in `crates/kheish-daemon/src/main.rs` and route through `crates/kheish-daemon/src/api/handlers.rs`; `sessions vacuum` is covered end to end (real binary, lock refusal, compaction, reboot) in `crates/kheish-daemon/tests/routes_file_cli_e2e.rs`.
+- Daemon live tested for this note: yes for the oversized-journal section — a production 1.4 GB journal was vacuumed to 12 MB and the daemon restarted cleanly on the compacted root; deterministic daemon restart tests cover the documented shell-task failure state.
 - Provider-specific tested for this note: no; restart recovery is daemon-local and provider-neutral.

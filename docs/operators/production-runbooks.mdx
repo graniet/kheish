@@ -413,6 +413,7 @@ Use these starting thresholds for production-like deployments:
 | Readiness | `GET /readyz` | one non-2xx sample | two consecutive non-2xx samples within 60 seconds |
 | Health | `/v1/status` `.health.ok` | `false` for one sample | `false` for two consecutive samples |
 | Storage | `/v1/status` `.storage.ok`, `.storage.probes[]` | any warning diagnostic | `false` immediately |
+| Session storage growth | `/v1/status` `.storage.session_storage.oversized_session_count`, `.largest_session_bytes` | any oversized session (above 100 MiB) — plan a `sessions vacuum` window | oversized session still growing after a vacuum, or run starts visibly degrading |
 | Provider readiness | `/v1/status` `.provider_readiness.active_route_ready`, `.provider_readiness.routes[]` | default route warning for 5 minutes | default route error for 5 minutes |
 | Run queue lag | `/v1/status` `.runs.queued`, `.runs.oldest_queued_run_age_ms`, `.health.warnings[]` with `queued_run_lag` | older than 30 minutes behind active session work | older than 2 hours behind active session work |
 | Stale active runs | `/v1/status` `.runs.running`, `.runs.oldest_non_terminal_run_idle_ms`, `.health.warnings[]` with stale-run codes | older than 2 hours without events | older than 6 hours without events |
