@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The workspace is rustc-warning-clean; gate regressions. (Clippy is a separate, advisory job
+  # below — the tree is not yet clippy-clean, see that job's note.)
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable # edition 2024 needs rustc >= 1.85; stable satisfies it
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  build-test:
+    name: build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2 # cache cargo registry + target
+      - run: cargo build --workspace --locked
+      # AGENTS.md "Recommended Test Matrix" (library unit tests). The daemon additionally runs its
+      # binary unit tests (--bins) so the CLI / serve-path tests are covered. Live provider tests
+      # live in tests/ (excluded by --lib/--bins) and self-skip without API keys, so no secrets are
+      # required here.
+      - run: cargo test -p kheish-types -p kheish-core -p kheish-runtime --lib --locked
+      - run: cargo test -p kheish-coding-tools --lib --locked
+      - run: cargo test -p kheish-daemon --lib --bins --locked
+
+  clippy:
+    name: clippy (advisory)
+    runs-on: ubuntu-latest
+    # NOT green on the current tree: a deny-by-default `clippy::never_loop` plus a backlog of
+    # warn-level lints. Kept non-blocking until that debt is paid; flip to a required gate once
+    # `cargo clippy --workspace --all-targets -- -D warnings` is clean.
+    continue-on-error: true
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
