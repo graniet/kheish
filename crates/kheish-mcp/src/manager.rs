@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::RwLock as StdRwLock;
 
 use anyhow::{Context, Result, anyhow};
 use kheish_auth::{AuthManager, AuthProvider, AuthSlotId};
@@ -10,6 +9,7 @@ use kheish_runtime::{
     McpInstructionBlock, McpRuntimeSurface, RuntimeObserver, ToolExecutionOutput, ToolRuntime,
     external_action_trace, failed_external_action_outcome, redact_text,
 };
+use parking_lot::RwLock as SyncRwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::RwLock;
@@ -194,7 +194,7 @@ pub struct McpManager {
     observer: Arc<dyn RuntimeObserver>,
     servers: Arc<RwLock<BTreeMap<String, ManagedServer>>>,
     tools: Arc<BTreeMap<String, DiscoveredMcpTool>>,
-    runtime_surface: Arc<StdRwLock<McpRuntimeSurface>>,
+    runtime_surface: Arc<SyncRwLock<McpRuntimeSurface>>,
 }
 
 impl McpManager {
@@ -433,7 +433,7 @@ impl McpManager {
             observer,
             servers: Arc::new(RwLock::new(managed)),
             tools: Arc::new(tools),
-            runtime_surface: Arc::new(StdRwLock::new(McpRuntimeSurface::default())),
+            runtime_surface: Arc::new(SyncRwLock::new(McpRuntimeSurface::default())),
         };
         manager.refresh_runtime_surface().await;
         Ok(manager)
@@ -448,7 +448,7 @@ impl McpManager {
             observer: Arc::new(kheish_runtime::NoopObserver),
             servers: Arc::new(RwLock::new(BTreeMap::new())),
             tools: Arc::new(BTreeMap::new()),
-            runtime_surface: Arc::new(StdRwLock::new(McpRuntimeSurface::default())),
+            runtime_surface: Arc::new(SyncRwLock::new(McpRuntimeSurface::default())),
         })
     }
 
@@ -578,7 +578,7 @@ impl McpManager {
     }
 
     /// Returns the live model-facing MCP surface maintained by runtime state changes.
-    pub fn runtime_surface_handle(&self) -> Arc<StdRwLock<McpRuntimeSurface>> {
+    pub fn runtime_surface_handle(&self) -> Arc<SyncRwLock<McpRuntimeSurface>> {
         self.runtime_surface.clone()
     }
 
@@ -666,10 +666,7 @@ impl McpManager {
 
     async fn refresh_runtime_surface(&self) {
         let snapshot = self.runtime_snapshot().await;
-        *self
-            .runtime_surface
-            .write()
-            .expect("mcp runtime surface rwlock poisoned") = snapshot.runtime_surface();
+        *self.runtime_surface.write() = snapshot.runtime_surface();
     }
 
     /// Executes one discovered MCP tool.
@@ -1398,7 +1395,7 @@ fn filter_discovered_tools(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock};
+    use std::sync::{Arc, OnceLock};
 
     use anyhow::Result;
     use kheish_auth::{
@@ -1406,6 +1403,7 @@ mod tests {
         register_ephemeral_debug_redaction_token,
     };
     use kheish_runtime::{McpRuntimeSurface, NoopObserver};
+    use parking_lot::{Mutex as SyncMutex, RwLock as SyncRwLock};
     use serde_json::json;
     use tokio::sync::RwLock;
 
@@ -1419,12 +1417,9 @@ mod tests {
         LoadedMcpServerConfig, McpHttpAuth, McpServerConfig, McpServerSource, McpServerTransport,
     };
 
-    fn auth_env_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-        let guard = LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .expect("auth env mutex poisoned");
+    fn auth_env_guard() -> parking_lot::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<SyncMutex<()>> = OnceLock::new();
+        let guard = LOCK.get_or_init(|| SyncMutex::new(())).lock();
         unsafe {
             std::env::set_var(
                 AUTH_STORE_MASTER_KEY_ENV,
@@ -1511,7 +1506,7 @@ mod tests {
                 },
             )]))),
             tools: Arc::new(BTreeMap::new()),
-            runtime_surface: Arc::new(StdRwLock::new(McpRuntimeSurface::default())),
+            runtime_surface: Arc::new(SyncRwLock::new(McpRuntimeSurface::default())),
         };
 
         let error = manager
@@ -1565,7 +1560,7 @@ mod tests {
                 },
             )]))),
             tools: Arc::new(BTreeMap::new()),
-            runtime_surface: Arc::new(StdRwLock::new(McpRuntimeSurface::default())),
+            runtime_surface: Arc::new(SyncRwLock::new(McpRuntimeSurface::default())),
         };
 
         let error = manager
@@ -1668,7 +1663,7 @@ mod tests {
                 },
             )]))),
             tools: Arc::new(BTreeMap::new()),
-            runtime_surface: Arc::new(StdRwLock::new(McpRuntimeSurface::default())),
+            runtime_surface: Arc::new(SyncRwLock::new(McpRuntimeSurface::default())),
         };
 
         assert_eq!(
@@ -1737,7 +1732,7 @@ mod tests {
                 },
             )]))),
             tools: Arc::new(BTreeMap::new()),
-            runtime_surface: Arc::new(StdRwLock::new(McpRuntimeSurface::default())),
+            runtime_surface: Arc::new(SyncRwLock::new(McpRuntimeSurface::default())),
         };
 
         assert_eq!(
@@ -1894,7 +1889,7 @@ mod tests {
                 },
             )]))),
             tools: Arc::new(BTreeMap::new()),
-            runtime_surface: Arc::new(StdRwLock::new(McpRuntimeSurface::default())),
+            runtime_surface: Arc::new(SyncRwLock::new(McpRuntimeSurface::default())),
         };
 
         let error = manager
@@ -2012,7 +2007,7 @@ mod tests {
                 },
             )]))),
             tools: Arc::new(BTreeMap::new()),
-            runtime_surface: Arc::new(StdRwLock::new(McpRuntimeSurface::default())),
+            runtime_surface: Arc::new(SyncRwLock::new(McpRuntimeSurface::default())),
         };
 
         let blocks = manager.instruction_blocks().await;

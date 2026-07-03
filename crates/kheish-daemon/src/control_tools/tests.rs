@@ -1,5 +1,6 @@
+use parking_lot::Mutex;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -99,13 +100,7 @@ impl DaemonToolControl for FakeControl {
     }
 
     async fn load_session_goal(&self, session_id: &str) -> Result<Option<SessionGoal>> {
-        Ok(self
-            .state
-            .lock()
-            .expect("fake control mutex poisoned")
-            .session_goals
-            .get(session_id)
-            .cloned())
+        Ok(self.state.lock().session_goals.get(session_id).cloned())
     }
 
     async fn create_session_goal(
@@ -116,7 +111,7 @@ impl DaemonToolControl for FakeControl {
         token_budget: Option<u64>,
         replace_if_inactive: bool,
     ) -> Result<SessionGoal> {
-        let mut state = self.state.lock().expect("fake control mutex poisoned");
+        let mut state = self.state.lock();
         if let Some(existing) = state.session_goals.get(session_id) {
             if existing.status == SessionGoalStatus::Active || !replace_if_inactive {
                 return Err(anyhow!(
@@ -155,7 +150,7 @@ impl DaemonToolControl for FakeControl {
     }
 
     async fn complete_session_goal(&self, session_id: &str, run_id: &str) -> Result<SessionGoal> {
-        let mut state = self.state.lock().expect("fake control mutex poisoned");
+        let mut state = self.state.lock();
         let goal = state
             .session_goals
             .get_mut(session_id)
@@ -166,7 +161,7 @@ impl DaemonToolControl for FakeControl {
     }
 
     async fn pause_session_goal(&self, session_id: &str, _run_id: &str) -> Result<SessionGoal> {
-        let mut state = self.state.lock().expect("fake control mutex poisoned");
+        let mut state = self.state.lock();
         let goal = state
             .session_goals
             .get_mut(session_id)
@@ -181,7 +176,7 @@ impl DaemonToolControl for FakeControl {
         owner_agent_id: &str,
         request: BackgroundShellTaskRequest,
     ) -> Result<TaskRecord> {
-        let mut state = self.state.lock().expect("fake control mutex poisoned");
+        let mut state = self.state.lock();
         let session_state = state
             .session_control
             .entry(session_id.to_string())
@@ -220,18 +215,14 @@ impl DaemonToolControl for FakeControl {
         tail_bytes: usize,
         include_full_output: bool,
     ) -> Result<TaskOutputView> {
-        self.state
-            .lock()
-            .expect("fake control mutex poisoned")
-            .task_output_requests
-            .push((
-                session_id.to_string(),
-                task_id.to_string(),
-                wait,
-                timeout.as_millis() as u64,
-                tail_bytes,
-                include_full_output,
-            ));
+        self.state.lock().task_output_requests.push((
+            session_id.to_string(),
+            task_id.to_string(),
+            wait,
+            timeout.as_millis() as u64,
+            tail_bytes,
+            include_full_output,
+        ));
         let task = self
             .load_session_control_state(session_id)
             .await?
@@ -264,7 +255,7 @@ impl DaemonToolControl for FakeControl {
         reason: Option<String>,
         _actor_agent_id: Option<String>,
     ) -> Result<TaskRecord> {
-        let mut state = self.state.lock().expect("fake control mutex poisoned");
+        let mut state = self.state.lock();
         let task = state
             .session_control
             .entry(session_id.to_string())
@@ -285,7 +276,6 @@ impl DaemonToolControl for FakeControl {
     ) -> Result<SpawnAgentToolResponse> {
         self.state
             .lock()
-            .expect("fake control mutex poisoned")
             .spawn_requests
             .push((parent_agent_id.to_string(), request.clone()));
         Ok(SpawnAgentToolResponse {
@@ -308,13 +298,7 @@ impl DaemonToolControl for FakeControl {
     }
 
     async fn latest_run_output(&self, run_id: &str) -> Result<Option<String>> {
-        Ok(self
-            .state
-            .lock()
-            .expect("fake control mutex poisoned")
-            .run_outputs
-            .get(run_id)
-            .cloned())
+        Ok(self.state.lock().run_outputs.get(run_id).cloned())
     }
 
     async fn message_agent(
@@ -324,7 +308,6 @@ impl DaemonToolControl for FakeControl {
     ) -> Result<PostMailboxResponse> {
         self.state
             .lock()
-            .expect("fake control mutex poisoned")
             .mailbox_requests
             .push((from_agent_id.to_string(), request));
         Ok(PostMailboxResponse {
@@ -342,15 +325,11 @@ impl DaemonToolControl for FakeControl {
         requester_tool_call_id: Option<&str>,
         request: UserQuestionRequest,
     ) -> Result<ParentClarificationToolResponse> {
-        self.state
-            .lock()
-            .expect("fake control mutex poisoned")
-            .parent_clarification_requests
-            .push((
-                session_id.to_string(),
-                requester_agent_id.to_string(),
-                request.clone(),
-            ));
+        self.state.lock().parent_clarification_requests.push((
+            session_id.to_string(),
+            requester_agent_id.to_string(),
+            request.clone(),
+        ));
         Ok(ParentClarificationToolResponse {
             parent_agent_id: "agent-parent".to_string(),
             parent_session_id: "session-parent".to_string(),
@@ -371,7 +350,6 @@ impl DaemonToolControl for FakeControl {
         Ok(self
             .state
             .lock()
-            .expect("fake control mutex poisoned")
             .session_operators
             .get(session_id)
             .cloned()
@@ -384,11 +362,11 @@ impl DaemonToolControl for FakeControl {
         run_id: Option<&str>,
         request: OperatorNotificationRequest,
     ) -> Result<OperatorNotificationToolResponse> {
-        self.state
-            .lock()
-            .expect("fake control mutex poisoned")
-            .operator_notifications
-            .push((session_id.to_string(), run_id.map(str::to_string), request));
+        self.state.lock().operator_notifications.push((
+            session_id.to_string(),
+            run_id.map(str::to_string),
+            request,
+        ));
         Ok(OperatorNotificationToolResponse {
             queued: true,
             target_count: 1,
@@ -404,7 +382,7 @@ impl DaemonToolControl for FakeControl {
         agent_id: &str,
         _timeout: Duration,
     ) -> Result<ManagedAgentSnapshot> {
-        let mut state = self.state.lock().expect("fake control mutex poisoned");
+        let mut state = self.state.lock();
         state.waited_agents.push(agent_id.to_string());
         state
             .agents
@@ -415,12 +393,7 @@ impl DaemonToolControl for FakeControl {
     }
 
     async fn list_agents(&self, _caller_agent_id: &str) -> Result<Vec<ManagedAgentSnapshot>> {
-        Ok(self
-            .state
-            .lock()
-            .expect("fake control mutex poisoned")
-            .agents
-            .clone())
+        Ok(self.state.lock().agents.clone())
     }
 
     async fn list_agent_summaries(
@@ -430,7 +403,6 @@ impl DaemonToolControl for FakeControl {
         Ok(self
             .state
             .lock()
-            .expect("fake control mutex poisoned")
             .agents
             .iter()
             .map(|snapshot| crate::AgentSummaryView::from_record(&snapshot.agent, 0, true))
@@ -444,7 +416,6 @@ impl DaemonToolControl for FakeControl {
     ) -> Result<ManagedAgentSnapshot> {
         self.state
             .lock()
-            .expect("fake control mutex poisoned")
             .agents
             .iter()
             .find(|snapshot| snapshot.agent.id.0 == agent_id)
@@ -460,7 +431,6 @@ impl DaemonToolControl for FakeControl {
         Ok(self
             .state
             .lock()
-            .expect("fake control mutex poisoned")
             .assistant_messages
             .get(&(session_id.to_string(), message_id.to_string()))
             .cloned())
@@ -470,7 +440,6 @@ impl DaemonToolControl for FakeControl {
         Ok(self
             .state
             .lock()
-            .expect("fake control mutex poisoned")
             .skills
             .values()
             .map(SkillSummary::from)
@@ -478,23 +447,11 @@ impl DaemonToolControl for FakeControl {
     }
 
     async fn get_skill(&self, name: &str) -> Result<Option<SkillDefinition>> {
-        Ok(self
-            .state
-            .lock()
-            .expect("fake control mutex poisoned")
-            .skills
-            .get(name)
-            .cloned())
+        Ok(self.state.lock().skills.get(name).cloned())
     }
 
     async fn get_learning_skill(&self, name: &str) -> Result<Option<crate::LearningSkillView>> {
-        Ok(self
-            .state
-            .lock()
-            .expect("fake control mutex poisoned")
-            .learning_skills
-            .get(name)
-            .cloned())
+        Ok(self.state.lock().learning_skills.get(name).cloned())
     }
 
     async fn load_asset_attachment(
@@ -528,7 +485,6 @@ impl DaemonToolControl for FakeControl {
         Ok(self
             .state
             .lock()
-            .expect("fake control mutex poisoned")
             .channel_thread_messages
             .get(&(channel_id.to_string(), thread_root_message_id.to_string()))
             .cloned()
@@ -542,16 +498,12 @@ impl DaemonToolControl for FakeControl {
         actor_id: &str,
         emoji: &str,
     ) -> Result<crate::ChannelMessageView> {
-        self.state
-            .lock()
-            .expect("fake control mutex poisoned")
-            .channel_reaction_requests
-            .push((
-                channel_id.to_string(),
-                message_id.to_string(),
-                actor_id.to_string(),
-                emoji.to_string(),
-            ));
+        self.state.lock().channel_reaction_requests.push((
+            channel_id.to_string(),
+            message_id.to_string(),
+            actor_id.to_string(),
+            emoji.to_string(),
+        ));
         Ok(crate::ChannelMessageView {
             message_id: message_id.to_string(),
             channel_id: channel_id.to_string(),
@@ -576,15 +528,11 @@ impl DaemonToolControl for FakeControl {
         channel_id: &str,
         request: crate::CreateChannelStimulusRequest,
     ) -> Result<crate::ChannelStimulusView> {
-        self.state
-            .lock()
-            .expect("fake control mutex poisoned")
-            .channel_stimulus_requests
-            .push((
-                session_id.to_string(),
-                channel_id.to_string(),
-                request.clone(),
-            ));
+        self.state.lock().channel_stimulus_requests.push((
+            session_id.to_string(),
+            channel_id.to_string(),
+            request.clone(),
+        ));
         Ok(crate::ChannelStimulusView {
             stimulus_id: "stimulus-1".to_string(),
             channel_id: channel_id.to_string(),
@@ -621,7 +569,6 @@ impl DaemonToolControl for FakeControl {
     ) -> Result<GenerateImageToolResponse> {
         self.state
             .lock()
-            .expect("fake control mutex poisoned")
             .generate_image_requests
             .push((session_id.to_string(), request.clone()));
         let asset = AttachmentRef {
@@ -655,15 +602,11 @@ impl DaemonToolControl for FakeControl {
         tool_call_id: Option<&str>,
         request: GenerateAudioToolRequest,
     ) -> Result<GenerateAudioToolResponse> {
-        self.state
-            .lock()
-            .expect("fake control mutex poisoned")
-            .generate_audio_requests
-            .push((
-                session_id.to_string(),
-                tool_call_id.map(ToOwned::to_owned),
-                request.clone(),
-            ));
+        self.state.lock().generate_audio_requests.push((
+            session_id.to_string(),
+            tool_call_id.map(ToOwned::to_owned),
+            request.clone(),
+        ));
         let asset = AttachmentRef {
             id: "asset-generated-audio-1".to_string(),
             media_type: "audio/mpeg".to_string(),
@@ -697,7 +640,6 @@ impl DaemonToolControl for FakeControl {
     ) -> Result<EditImageToolResponse> {
         self.state
             .lock()
-            .expect("fake control mutex poisoned")
             .edit_image_requests
             .push((session_id.to_string(), request.clone()));
         let asset = AttachmentRef {
@@ -732,7 +674,6 @@ impl DaemonToolControl for FakeControl {
         Ok(self
             .state
             .lock()
-            .expect("fake control mutex poisoned")
             .session_control
             .get(session_id)
             .cloned()
@@ -746,14 +687,13 @@ impl DaemonToolControl for FakeControl {
     ) -> Result<SessionControlState> {
         self.state
             .lock()
-            .expect("fake control mutex poisoned")
             .session_control
             .insert(session_id.to_string(), state.clone());
         Ok(state)
     }
 
     async fn enter_session_plan_mode(&self, session_id: &str) -> Result<SessionControlState> {
-        let mut state = self.state.lock().expect("fake control mutex poisoned");
+        let mut state = self.state.lock();
         let previous_mode = state
             .session_permission_modes
             .get(session_id)
@@ -788,7 +728,7 @@ impl DaemonToolControl for FakeControl {
         plan: String,
         summary: Option<String>,
     ) -> Result<ExitPlanModeOutcome> {
-        let mut state = self.state.lock().expect("fake control mutex poisoned");
+        let mut state = self.state.lock();
         let session_state = state
             .session_control
             .entry(session_id.to_string())
@@ -833,7 +773,7 @@ impl DaemonToolControl for FakeControl {
     }
 
     async fn create_schedule(&self, request: ScheduleCreateRequest) -> Result<ScheduleView> {
-        let mut state = self.state.lock().expect("fake control mutex poisoned");
+        let mut state = self.state.lock();
         let schedule_id = format!("schedule-{}", state.schedules.len() + 1);
         let request_summary = summarize_schedule_create_request(&request);
         let definition_digest = crate::scheduler::schedule_definition_digest(&request).ok();
@@ -874,7 +814,7 @@ impl DaemonToolControl for FakeControl {
     }
 
     async fn list_schedules(&self, session_id: Option<&str>) -> Result<Vec<ScheduleView>> {
-        let state = self.state.lock().expect("fake control mutex poisoned");
+        let state = self.state.lock();
         Ok(state
             .schedules
             .values()
@@ -891,7 +831,6 @@ impl DaemonToolControl for FakeControl {
     async fn get_schedule(&self, schedule_id: &str) -> Result<ScheduleView> {
         self.state
             .lock()
-            .expect("fake control mutex poisoned")
             .schedules
             .get(schedule_id)
             .cloned()
@@ -928,7 +867,7 @@ fn update_fake_schedule(
     schedule_id: &str,
     update: impl FnOnce(&mut ScheduleView),
 ) -> Result<ScheduleView> {
-    let mut state = state.lock().expect("fake control mutex poisoned");
+    let mut state = state.lock();
     let schedule = state
         .schedules
         .get_mut(schedule_id)
@@ -1158,11 +1097,7 @@ fn user_question_tool_descriptors_include_valid_json_shape() -> Result<()> {
 #[tokio::test]
 async fn agent_tools_delegate_to_daemon_control() -> Result<()> {
     let control = Arc::new(FakeControl::new());
-    control
-        .state
-        .lock()
-        .expect("fake control mutex poisoned")
-        .agents = vec![sample_snapshot("agent-child", AgentStatus::Idle)];
+    control.state.lock().agents = vec![sample_snapshot("agent-child", AgentStatus::Idle)];
     let handle = bind_control(&control);
 
     let spawn = SpawnAgentTool::new(handle.clone());
@@ -1268,7 +1203,7 @@ async fn agent_tools_delegate_to_daemon_control() -> Result<()> {
         0
     );
 
-    let state = control.state.lock().expect("fake control mutex poisoned");
+    let state = control.state.lock();
     assert_eq!(state.spawn_requests.len(), 1);
     let request = &state.spawn_requests[0].1;
     assert_eq!(
@@ -1371,7 +1306,7 @@ async fn generate_audio_tool_forwards_route_overrides() -> Result<()> {
         )
         .await?;
 
-    let state = control.state.lock().expect("fake control mutex poisoned");
+    let state = control.state.lock();
     let (session_id, tool_call_id, request) = state
         .generate_audio_requests
         .first()
@@ -1426,7 +1361,7 @@ async fn generate_image_tool_forwards_route_overrides() -> Result<()> {
         )
         .await?;
 
-    let state = control.state.lock().expect("fake control mutex poisoned");
+    let state = control.state.lock();
     let (session_id, request) = state
         .generate_image_requests
         .first()
@@ -1509,7 +1444,7 @@ async fn edit_image_tool_forwards_route_overrides() -> Result<()> {
         )
         .await?;
 
-    let state = control.state.lock().expect("fake control mutex poisoned");
+    let state = control.state.lock();
     let (session_id, request) = state
         .edit_image_requests
         .first()
@@ -1539,7 +1474,7 @@ async fn edit_image_tool_marks_omitted_asset_ids_for_daemon_inference() -> Resul
         )
         .await?;
 
-    let state = control.state.lock().expect("fake control mutex poisoned");
+    let state = control.state.lock();
     let (_, request) = state
         .edit_image_requests
         .first()
@@ -1565,7 +1500,7 @@ async fn edit_image_tool_preserves_explicit_empty_asset_ids_without_inference() 
         )
         .await?;
 
-    let state = control.state.lock().expect("fake control mutex poisoned");
+    let state = control.state.lock();
     let (_, request) = state
         .edit_image_requests
         .first()
@@ -1591,7 +1526,7 @@ async fn edit_image_tool_preserves_null_asset_ids_without_inference() -> Result<
         )
         .await?;
 
-    let state = control.state.lock().expect("fake control mutex poisoned");
+    let state = control.state.lock();
     let (_, request) = state
         .edit_image_requests
         .first()
@@ -1618,21 +1553,16 @@ async fn notify_operator_requires_enabled_session_operator_and_queues_message() 
         .expect_err("notify_operator should fail when disabled");
     assert!(disabled.to_string().contains("not enabled"));
 
-    control
-        .state
-        .lock()
-        .expect("fake control mutex poisoned")
-        .session_operators
-        .insert(
-            "session-a".to_string(),
-            SessionOperatorConfig {
-                enabled: true,
-                display_name: Some("Operator".to_string()),
-                communication_style: Some("short and human".to_string()),
-                allow_notify: true,
-                allow_questions: true,
-            },
-        );
+    control.state.lock().session_operators.insert(
+        "session-a".to_string(),
+        SessionOperatorConfig {
+            enabled: true,
+            display_name: Some("Operator".to_string()),
+            communication_style: Some("short and human".to_string()),
+            allow_notify: true,
+            allow_questions: true,
+        },
+    );
 
     let response = tool
         .execute(
@@ -1647,7 +1577,7 @@ async fn notify_operator_requires_enabled_session_operator_and_queues_message() 
     assert_eq!(response.output["queued"], json!(true));
     assert_eq!(response.output["target_count"], json!(1));
 
-    let state = control.state.lock().expect("fake control mutex poisoned");
+    let state = control.state.lock();
     assert_eq!(state.operator_notifications.len(), 1);
     let (session_id, run_id, request) = &state.operator_notifications[0];
     assert_eq!(session_id, "session-a");
@@ -1664,20 +1594,15 @@ async fn notify_operator_requires_enabled_session_operator_and_queues_message() 
 #[tokio::test]
 async fn ask_operator_reuses_structured_user_question_marker() -> Result<()> {
     let control = Arc::new(FakeControl::new());
-    control
-        .state
-        .lock()
-        .expect("fake control mutex poisoned")
-        .session_operators
-        .insert(
-            "session-a".to_string(),
-            SessionOperatorConfig {
-                enabled: true,
-                allow_notify: true,
-                allow_questions: true,
-                ..SessionOperatorConfig::default()
-            },
-        );
+    control.state.lock().session_operators.insert(
+        "session-a".to_string(),
+        SessionOperatorConfig {
+            enabled: true,
+            allow_notify: true,
+            allow_questions: true,
+            ..SessionOperatorConfig::default()
+        },
+    );
     let response = super::operator::AskOperatorTool::new(bind_control(&control))
         .execute(
             FakeControl::context("session-a", "agent-parent"),
@@ -1745,7 +1670,7 @@ async fn spawn_agent_rejects_oversized_inline_wait_before_spawning() -> Result<(
             .contains("spawn_agent inline wait maximum")
     );
 
-    let state = control.state.lock().expect("fake control mutex poisoned");
+    let state = control.state.lock();
     assert!(state.spawn_requests.is_empty());
     assert!(state.waited_agents.is_empty());
     Ok(())
@@ -1769,7 +1694,7 @@ async fn spawn_agent_allows_background_timeout_without_inline_wait() -> Result<(
         )
         .await?;
 
-    let state = control.state.lock().expect("fake control mutex poisoned");
+    let state = control.state.lock();
     assert_eq!(state.spawn_requests.len(), 1);
     assert!(state.waited_agents.is_empty());
     Ok(())
@@ -1847,33 +1772,28 @@ async fn emit_output_tool_exposes_artifacts_when_no_visible_parts_are_provided()
 #[tokio::test]
 async fn read_channel_thread_tool_returns_thread_messages() -> Result<()> {
     let control = Arc::new(FakeControl::new());
-    control
-        .state
-        .lock()
-        .expect("fake control mutex poisoned")
-        .channel_thread_messages
-        .insert(
-            (
-                "channel-domains".to_string(),
-                "channel-message-1".to_string(),
-            ),
-            vec![crate::ChannelMessageView {
-                message_id: "channel-message-2".to_string(),
-                channel_id: "channel-domains".to_string(),
-                thread_root_message_id: Some("channel-message-1".to_string()),
-                reply_to_message_id: Some("channel-message-1".to_string()),
-                sender: ActorRef {
-                    id: "marketing-room".to_string(),
-                    display_name: Some("Marketing".to_string()),
-                },
-                sender_session_id: Some("marketing-room".to_string()),
-                addressed_member_ids: Vec::new(),
-                output: RichOutput::text("Looks promising."),
-                created_at_ms: 42,
-                reactions: Vec::new(),
-                metadata: json!({}),
-            }],
-        );
+    control.state.lock().channel_thread_messages.insert(
+        (
+            "channel-domains".to_string(),
+            "channel-message-1".to_string(),
+        ),
+        vec![crate::ChannelMessageView {
+            message_id: "channel-message-2".to_string(),
+            channel_id: "channel-domains".to_string(),
+            thread_root_message_id: Some("channel-message-1".to_string()),
+            reply_to_message_id: Some("channel-message-1".to_string()),
+            sender: ActorRef {
+                id: "marketing-room".to_string(),
+                display_name: Some("Marketing".to_string()),
+            },
+            sender_session_id: Some("marketing-room".to_string()),
+            addressed_member_ids: Vec::new(),
+            output: RichOutput::text("Looks promising."),
+            created_at_ms: 42,
+            reactions: Vec::new(),
+            metadata: json!({}),
+        }],
+    );
     let handle = bind_control(&control);
 
     let response = super::channels::ReadChannelThreadTool::new(handle)
@@ -1909,7 +1829,7 @@ async fn set_channel_reaction_tool_uses_current_session_as_actor() -> Result<()>
         .await?;
 
     assert_eq!(response.output["message_id"], "channel-message-2");
-    let state = control.state.lock().expect("fake control mutex poisoned");
+    let state = control.state.lock();
     assert_eq!(
         state.channel_reaction_requests,
         vec![(
@@ -1948,7 +1868,7 @@ async fn create_channel_stimulus_tool_accepts_full_declared_schema_and_uses_curr
         .await?;
 
     assert_eq!(response.output["stimulus_id"], "stimulus-1");
-    let state = control.state.lock().expect("fake control mutex poisoned");
+    let state = control.state.lock();
     assert_eq!(state.channel_stimulus_requests.len(), 1);
     let (session_id, channel_id, request) = &state.channel_stimulus_requests[0];
     assert_eq!(session_id, "atlas-room");
@@ -1965,15 +1885,10 @@ async fn create_channel_stimulus_tool_accepts_full_declared_schema_and_uses_curr
 #[tokio::test]
 async fn skill_tools_list_and_activate_inline_skills() -> Result<()> {
     let control = Arc::new(FakeControl::new());
-    control
-        .state
-        .lock()
-        .expect("fake control mutex poisoned")
-        .skills
-        .insert(
-            "report:summary".to_string(),
-            sample_skill("report:summary", SkillExecutionContext::Inline),
-        );
+    control.state.lock().skills.insert(
+        "report:summary".to_string(),
+        sample_skill("report:summary", SkillExecutionContext::Inline),
+    );
     let handle = bind_control(&control);
     let context = FakeControl::context("session-a", "agent-parent");
 
@@ -2006,21 +1921,16 @@ async fn list_skills_tool_filters_skills_hidden_by_execution_scope() -> Result<(
     let control = Arc::new(FakeControl::new());
     let mut context = FakeControl::context("session-a", "agent-parent");
     context.metadata["visible_skills"] = json!(["report:summary"]);
-    control
-        .state
-        .lock()
-        .expect("fake control mutex poisoned")
-        .skills
-        .extend([
-            (
-                "report:summary".to_string(),
-                sample_skill("report:summary", SkillExecutionContext::Inline),
-            ),
-            (
-                "review:artifact".to_string(),
-                sample_skill("review:artifact", SkillExecutionContext::Inline),
-            ),
-        ]);
+    control.state.lock().skills.extend([
+        (
+            "report:summary".to_string(),
+            sample_skill("report:summary", SkillExecutionContext::Inline),
+        ),
+        (
+            "review:artifact".to_string(),
+            sample_skill("review:artifact", SkillExecutionContext::Inline),
+        ),
+    ]);
 
     let listed = ListSkillsTool::new(bind_control(&control))
         .execute(context, json!({}))
@@ -2035,7 +1945,7 @@ async fn list_skills_tool_filters_skills_hidden_by_execution_scope() -> Result<(
 async fn use_skill_tool_forks_when_skill_requires_child_context() -> Result<()> {
     let control = Arc::new(FakeControl::new());
     {
-        let mut state = control.state.lock().expect("fake control mutex poisoned");
+        let mut state = control.state.lock();
         state.agents = vec![sample_snapshot("agent-child", AgentStatus::Idle)];
         state.run_outputs.insert(
             "run-child".to_string(),
@@ -2067,7 +1977,7 @@ async fn use_skill_tool_forks_when_skill_requires_child_context() -> Result<()> 
         response.output["spawn"]["final_output"],
         "PROMOTED_PROCEDURAL_SKILL_OK:reports/today.md"
     );
-    let state = control.state.lock().expect("fake control mutex poisoned");
+    let state = control.state.lock();
     assert_eq!(state.spawn_requests.len(), 1);
     let request = &state.spawn_requests[0].1;
     assert_eq!(request.agent_type.as_deref(), Some("verification"));
@@ -2082,7 +1992,7 @@ async fn use_skill_tool_forks_when_skill_requires_child_context() -> Result<()> 
 async fn use_skill_tool_forces_worktree_isolation_for_promoted_learning_skills() -> Result<()> {
     let control = Arc::new(FakeControl::new());
     {
-        let mut state = control.state.lock().expect("fake control mutex poisoned");
+        let mut state = control.state.lock();
         state.agents = vec![sample_snapshot("agent-child", AgentStatus::Idle)];
         let skill = sample_skill("learning:review", SkillExecutionContext::Fork);
         state
@@ -2135,7 +2045,7 @@ async fn use_skill_tool_forces_worktree_isolation_for_promoted_learning_skills()
         )
         .await?;
 
-    let state = control.state.lock().expect("fake control mutex poisoned");
+    let state = control.state.lock();
     let request = &state.spawn_requests[0].1;
     assert_eq!(request.isolation, Some(SpawnIsolation::Worktree));
     assert!(
@@ -2153,7 +2063,7 @@ async fn use_skill_tool_rejects_promoted_skill_when_loaded_definition_differs_fr
 -> Result<()> {
     let control = Arc::new(FakeControl::new());
     {
-        let mut state = control.state.lock().expect("fake control mutex poisoned");
+        let mut state = control.state.lock();
         let mut skill = sample_skill("learning:review", SkillExecutionContext::Fork);
         skill.description = "Tampered loaded description".to_string();
         state
@@ -2220,7 +2130,7 @@ async fn use_skill_tool_rejects_promoted_skill_when_loaded_definition_differs_fr
 async fn use_skill_tool_accepts_integer_like_float_timeout() -> Result<()> {
     let control = Arc::new(FakeControl::new());
     {
-        let mut state = control.state.lock().expect("fake control mutex poisoned");
+        let mut state = control.state.lock();
         state.agents = vec![sample_snapshot("agent-child", AgentStatus::Idle)];
         state.skills.insert(
             "review:artifact".to_string(),
@@ -2240,7 +2150,7 @@ async fn use_skill_tool_accepts_integer_like_float_timeout() -> Result<()> {
         )
         .await?;
 
-    let state = control.state.lock().expect("fake control mutex poisoned");
+    let state = control.state.lock();
     assert_eq!(state.spawn_requests.len(), 1);
     assert_eq!(state.spawn_requests[0].1.timeout_ms, Some(10));
     Ok(())
@@ -2336,7 +2246,6 @@ async fn use_skill_tool_rejects_inline_execution_overrides_that_require_a_child_
     control
         .state
         .lock()
-        .expect("fake control mutex poisoned")
         .skills
         .insert(skill.name.clone(), skill);
 
@@ -2359,15 +2268,10 @@ async fn use_skill_tool_rejects_inline_execution_overrides_that_require_a_child_
 #[tokio::test]
 async fn use_skill_tool_rejects_skills_hidden_by_execution_scope() {
     let control = Arc::new(FakeControl::new());
-    control
-        .state
-        .lock()
-        .expect("fake control mutex poisoned")
-        .skills
-        .insert(
-            "report:summary".to_string(),
-            sample_skill("report:summary", SkillExecutionContext::Inline),
-        );
+    control.state.lock().skills.insert(
+        "report:summary".to_string(),
+        sample_skill("report:summary", SkillExecutionContext::Inline),
+    );
     let mut context = FakeControl::context("session-a", "agent-parent");
     context.metadata["visible_skills"] = json!(["review:artifact"]);
 
@@ -2415,7 +2319,7 @@ async fn spawn_agent_tool_rebases_relative_cwd_within_workspace() -> Result<()> 
             }),
         )
         .await?;
-    let state = control.state.lock().expect("fake control mutex poisoned");
+    let state = control.state.lock();
     let request = &state.spawn_requests[0].1;
     assert_eq!(
         request.cwd.as_deref(),
@@ -2446,7 +2350,7 @@ async fn spawn_agent_tool_leaves_worktree_cwd_for_daemon_allocation() -> Result<
         )
         .await?;
 
-    let state = control.state.lock().expect("fake control mutex poisoned");
+    let state = control.state.lock();
     let request = &state.spawn_requests[0].1;
     assert_eq!(request.isolation, Some(SpawnIsolation::Worktree));
     assert!(
@@ -2501,7 +2405,7 @@ async fn spawn_agent_tool_propagates_spawn_request_id_from_tool_call_context() -
             }),
         )
         .await?;
-    let state = control.state.lock().expect("fake control mutex poisoned");
+    let state = control.state.lock();
     let request = &state.spawn_requests[0].1;
     assert_eq!(request.spawn_request_id.as_deref(), Some("call-1"));
     Ok(())
@@ -2525,7 +2429,7 @@ async fn spawn_agent_tool_scopes_spawn_request_id_to_the_parent_run_when_present
         )
         .await?;
 
-    let state = control.state.lock().expect("fake control mutex poisoned");
+    let state = control.state.lock();
     let request = &state.spawn_requests[0].1;
     assert_eq!(request.spawned_by_run_id.as_deref(), Some("run-42"));
     assert_eq!(request.spawn_request_id.as_deref(), Some("run-42:call-1"));
@@ -2617,7 +2521,7 @@ async fn task_and_plan_tools_persist_session_control_state() -> Result<()> {
         .await?;
     assert_eq!(task_output.output["retrieval_status"], "not_ready");
     {
-        let state = control.state.lock().expect("fake control mutex poisoned");
+        let state = control.state.lock();
         assert_eq!(state.task_output_requests.len(), 1);
         assert_eq!(state.task_output_requests[0].3, 30_000);
         assert_eq!(
@@ -2639,7 +2543,7 @@ async fn task_and_plan_tools_persist_session_control_state() -> Result<()> {
         .await?;
     assert_eq!(float_task_output.output["retrieval_status"], "success");
     {
-        let state = control.state.lock().expect("fake control mutex poisoned");
+        let state = control.state.lock();
         assert_eq!(state.task_output_requests.len(), 2);
         assert_eq!(state.task_output_requests[1].3, 12);
         assert_eq!(state.task_output_requests[1].4, 128);
@@ -2659,7 +2563,7 @@ async fn task_and_plan_tools_persist_session_control_state() -> Result<()> {
         .await?;
     assert_eq!(full_task_output.output["retrieval_status"], "success");
     {
-        let state = control.state.lock().expect("fake control mutex poisoned");
+        let state = control.state.lock();
         assert_eq!(state.task_output_requests.len(), 3);
         assert_eq!(
             state.task_output_requests[2].4,
@@ -2729,7 +2633,7 @@ async fn task_and_plan_tools_persist_session_control_state() -> Result<()> {
         .await?;
     assert_eq!(deleted.output["id"], task_id);
 
-    let state = control.state.lock().expect("fake control mutex poisoned");
+    let state = control.state.lock();
     let session_state = state
         .session_control
         .get("session-a")
@@ -2766,7 +2670,7 @@ async fn live_background_shell_tasks_reject_generic_terminal_update_and_delete()
     let handle = bind_control(&control);
     let context = FakeControl::context("session-shell", "agent-parent");
     {
-        let mut state = control.state.lock().expect("fake control mutex poisoned");
+        let mut state = control.state.lock();
         state
             .session_control
             .entry("session-shell".to_string())
@@ -2855,7 +2759,7 @@ async fn wake_after_accepts_integer_like_float_delay_seconds() -> Result<()> {
 async fn enter_plan_mode_persists_plan_state_and_keeps_the_original_restore_mode() -> Result<()> {
     let control = Arc::new(FakeControl::new());
     {
-        let mut state = control.state.lock().expect("fake control mutex poisoned");
+        let mut state = control.state.lock();
         state.session_permission_modes.insert(
             "session-a".to_string(),
             Some(PermissionMode::BypassPermissions),
@@ -2884,7 +2788,7 @@ async fn enter_plan_mode_persists_plan_state_and_keeps_the_original_restore_mode
         .await?;
 
     {
-        let state = control.state.lock().expect("fake control mutex poisoned");
+        let state = control.state.lock();
         let session_state = state
             .session_control
             .get("session-a")
@@ -2926,7 +2830,7 @@ async fn enter_plan_mode_persists_plan_state_and_keeps_the_original_restore_mode
         Some("bypassPermissions")
     );
 
-    let state = control.state.lock().expect("fake control mutex poisoned");
+    let state = control.state.lock();
     let session_state = state
         .session_control
         .get("session-a")
@@ -2951,11 +2855,7 @@ async fn enter_plan_mode_persists_plan_state_and_keeps_the_original_restore_mode
 #[tokio::test]
 async fn get_agent_tool_returns_one_snapshot() -> Result<()> {
     let control = Arc::new(FakeControl::new());
-    control
-        .state
-        .lock()
-        .expect("fake control mutex poisoned")
-        .agents = vec![sample_snapshot("agent-child", AgentStatus::Idle)];
+    control.state.lock().agents = vec![sample_snapshot("agent-child", AgentStatus::Idle)];
     let handle = bind_control(&control);
     let result = GetAgentTool::new(handle)
         .execute(
@@ -3967,32 +3867,27 @@ fn ask_user_question_rejects_invalid_questions_field_shape() {
 #[tokio::test]
 async fn task_update_auto_claims_and_notifies_owner_changes() -> Result<()> {
     let control = Arc::new(FakeControl::new());
-    control
-        .state
-        .lock()
-        .expect("fake control mutex poisoned")
-        .session_control
-        .insert(
-            "session-a".to_string(),
-            SessionControlState {
-                plan_mode: false,
-                pre_plan_mode: None,
-                tasks: vec![TaskRecord {
-                    id: "task-1".to_string(),
-                    title: "Investigate".to_string(),
-                    description: String::new(),
-                    status: TaskStatus::Pending,
-                    owner_agent_id: None,
-                    blocked_by: Vec::new(),
-                    blocks: Vec::new(),
-                    output: None,
-                    metadata: Value::Null,
-                    created_at_ms: 1,
-                    updated_at_ms: 1,
-                }],
-                ..SessionControlState::default()
-            },
-        );
+    control.state.lock().session_control.insert(
+        "session-a".to_string(),
+        SessionControlState {
+            plan_mode: false,
+            pre_plan_mode: None,
+            tasks: vec![TaskRecord {
+                id: "task-1".to_string(),
+                title: "Investigate".to_string(),
+                description: String::new(),
+                status: TaskStatus::Pending,
+                owner_agent_id: None,
+                blocked_by: Vec::new(),
+                blocks: Vec::new(),
+                output: None,
+                metadata: Value::Null,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            }],
+            ..SessionControlState::default()
+        },
+    );
     let handle = bind_control(&control);
     let tool = TaskUpdateTool::new(handle.clone());
 
@@ -4012,7 +3907,7 @@ async fn task_update_auto_claims_and_notifies_owner_changes() -> Result<()> {
         .await?;
     assert_eq!(reassigned.output["owner_agent_id"], "agent-child");
 
-    let state = control.state.lock().expect("fake control mutex poisoned");
+    let state = control.state.lock();
     assert_eq!(state.mailbox_requests.len(), 1);
     assert_eq!(
         state.mailbox_requests[0].1.message_type.as_deref(),

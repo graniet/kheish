@@ -1,5 +1,6 @@
+use parking_lot::RwLock;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use kheish_types::{
     CompletionRequirement, SessionControlState, SessionGoal, SessionPersonaBinding,
@@ -87,10 +88,7 @@ impl SystemPromptBuilder {
 
     /// Returns the current prompt settings snapshot.
     pub fn settings(&self) -> SystemPromptSettings {
-        self.settings
-            .read()
-            .expect("system prompt settings rwlock poisoned")
-            .clone()
+        self.settings.read().clone()
     }
 
     /// Returns the immutable environment snapshot used for prompt generation.
@@ -100,10 +98,7 @@ impl SystemPromptBuilder {
 
     /// Replaces the runtime prompt settings.
     pub fn set_settings(&self, settings: SystemPromptSettings) {
-        *self
-            .settings
-            .write()
-            .expect("system prompt settings rwlock poisoned") = settings;
+        *self.settings.write() = settings;
     }
 
     /// Builds the effective system prompt sections for one agent turn.

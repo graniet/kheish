@@ -174,7 +174,8 @@ impl DeliveryService {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex as StdMutex};
+    use parking_lot::Mutex as SyncMutex;
+    use std::sync::Arc;
 
     use anyhow::Result;
     use async_trait::async_trait;
@@ -189,7 +190,7 @@ mod tests {
 
     #[derive(Default)]
     struct CapturingOutputPlugin {
-        deliveries: Arc<StdMutex<Vec<ResponseEnvelope>>>,
+        deliveries: Arc<SyncMutex<Vec<ResponseEnvelope>>>,
     }
 
     #[async_trait]
@@ -203,10 +204,7 @@ mod tests {
         }
 
         async fn deliver(&self, response: ResponseEnvelope) -> Result<()> {
-            self.deliveries
-                .lock()
-                .expect("test output delivery mutex poisoned")
-                .push(response);
+            self.deliveries.lock().push(response);
             Ok(())
         }
     }
@@ -266,7 +264,7 @@ mod tests {
     #[tokio::test]
     async fn delivery_service_delivers_through_the_output_host() -> Result<()> {
         let temp = tempdir()?;
-        let deliveries = Arc::new(StdMutex::new(Vec::new()));
+        let deliveries = Arc::new(SyncMutex::new(Vec::new()));
         let plugin = CapturingOutputPlugin {
             deliveries: deliveries.clone(),
         };
@@ -299,9 +297,7 @@ mod tests {
             })
             .await?;
 
-        let deliveries = deliveries
-            .lock()
-            .expect("test output delivery mutex poisoned");
+        let deliveries = deliveries.lock();
         assert_eq!(deliveries.len(), 1);
         assert_eq!(deliveries[0].content, "hello");
         Ok(())

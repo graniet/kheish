@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::Path;
-use std::sync::Mutex;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -14,6 +13,7 @@ use kheish_types::{
     CanonicalStateSnapshot, InputEnvelope, MessageRecord, ModelFinishReason, PermissionDecision,
     Role, RunSnapshot, ToolCallRecord, ToolDefinition, ToolResultRecord,
 };
+use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -994,7 +994,6 @@ impl ModelDriver for FixtureModel {
     async fn next_turn(&self, _request: ModelRequest) -> Result<ModelTurn> {
         self.turns
             .lock()
-            .expect("fixture model mutex poisoned")
             .pop_front()
             .ok_or_else(|| anyhow!("no scripted model turn remaining"))
     }

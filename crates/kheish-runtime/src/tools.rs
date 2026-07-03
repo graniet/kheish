@@ -1,5 +1,6 @@
+use parking_lot::{Mutex, RwLock};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
@@ -295,7 +296,7 @@ impl ToolTurnBudget {
     }
 
     fn try_accept_call(&self) -> bool {
-        let mut state = self.state.lock().expect("tool turn budget mutex poisoned");
+        let mut state = self.state.lock();
         if state.accepted_calls >= self.limits.max_calls_per_turn.max(1) {
             return false;
         }
@@ -308,7 +309,7 @@ impl ToolTurnBudget {
         output_bytes: usize,
         envelope_bytes: usize,
     ) -> Result<(), ToolTurnBudgetQuota> {
-        let mut state = self.state.lock().expect("tool turn budget mutex poisoned");
+        let mut state = self.state.lock();
         let output_limit = self.limits.max_cumulative_output_bytes.max(1);
         let envelope_limit = self.limits.max_cumulative_result_envelope_bytes.max(1);
         let Some(next_output) = state.cumulative_output_bytes.checked_add(output_bytes) else {
@@ -377,19 +378,13 @@ impl ToolRuntime {
 
     /// Returns the currently configured runtime limits.
     pub fn limits(&self) -> ToolRuntimeLimits {
-        self.limits
-            .read()
-            .expect("tool runtime limits rwlock poisoned")
-            .clone()
+        self.limits.read().clone()
     }
 
     /// Replaces the runtime limits used by future tool batches.
     pub fn set_limits(&self, limits: ToolRuntimeLimits) -> Result<()> {
         limits.validate()?;
-        *self
-            .limits
-            .write()
-            .expect("tool runtime limits rwlock poisoned") = limits;
+        *self.limits.write() = limits;
         Ok(())
     }
 
@@ -1839,9 +1834,10 @@ impl ToolInputKind {
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex;
     use std::collections::BTreeMap;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use anyhow::{Result, anyhow};
@@ -1980,10 +1976,7 @@ mod tests {
             descriptor: &ToolDescriptor,
             _call: &kheish_types::ToolCallRecord,
         ) -> Result<()> {
-            self.0
-                .lock()
-                .expect("hook mutex poisoned")
-                .push(format!("before:{}", descriptor.name));
+            self.0.lock().push(format!("before:{}", descriptor.name));
             Ok(())
         }
 
@@ -1993,10 +1986,7 @@ mod tests {
             _call: &kheish_types::ToolCallRecord,
             _result: &kheish_types::ToolResultRecord,
         ) -> Result<()> {
-            self.0
-                .lock()
-                .expect("hook mutex poisoned")
-                .push(format!("after:{}", descriptor.name));
+            self.0.lock().push(format!("after:{}", descriptor.name));
             Ok(())
         }
     }

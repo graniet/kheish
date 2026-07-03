@@ -1,7 +1,8 @@
+use parking_lot::RwLock;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -165,7 +166,7 @@ pub struct AgentRuntimeDependencies<M> {
     /// Connected MCP server instructions exposed to the runtime.
     pub mcp_server_instructions: Vec<McpInstructionBlock>,
     /// Live MCP surface used by future turns after credential-backed servers change.
-    pub mcp_surface: Arc<StdRwLock<McpRuntimeSurface>>,
+    pub mcp_surface: Arc<RwLock<McpRuntimeSurface>>,
 }
 
 impl<M> Clone for AgentRuntimeDependencies<M> {
@@ -193,10 +194,7 @@ impl<M> Clone for AgentRuntimeDependencies<M> {
 
 impl<M> AgentRuntimeDependencies<M> {
     fn mcp_surface_snapshot(&self) -> McpRuntimeSurface {
-        self.mcp_surface
-            .read()
-            .expect("mcp runtime surface rwlock poisoned")
-            .clone()
+        self.mcp_surface.read().clone()
     }
 }
 
@@ -1123,6 +1121,7 @@ where
         );
         engine.set_system_sections(system_sections);
         engine.set_hook_dispatcher(Some(deps.hooks.clone()));
+        engine.set_journal_sink(Some(deps.sessions.clone()));
         Self {
             engine,
             deps,
@@ -1166,6 +1165,7 @@ where
             restore.policy.clone(),
             restore.conversation.thread_id.clone(),
         );
+        engine.set_journal_sink(Some(deps.sessions.clone()));
         let stored_metadata = serde_json::to_value(&stored.metadata)?;
         let session_control = session_control_state_from_metadata(&stored_metadata)?;
         let session_goal = session_goal_from_metadata(&stored_metadata)?;
@@ -2564,8 +2564,15 @@ where
             RunStatus::WaitingForUserQuestion { .. } => "waiting_for_user_question",
         };
         let mut records = Vec::new();
+        // Entries up to journal_flushed_len were already made durable by the
+        // incremental journal sink; only the unflushed tail needs writing.
+        let persisted_event_count = self
+            .engine
+            .journal_flushed_len()
+            .max(previous_event_count)
+            .min(self.engine.journal().len());
         records.extend(
-            self.engine.journal()[previous_event_count..]
+            self.engine.journal()[persisted_event_count..]
                 .iter()
                 .cloned()
                 .map(|entry| PersistedSessionRecord::Event { entry }),
@@ -2806,7 +2813,12 @@ where
 
     async fn persist_hook_progress(&mut self, previous_event_count: usize) -> Result<()> {
         let session_id = self.engine.conversation().session_id.clone();
-        let mut records = self.engine.journal()[previous_event_count..]
+        let persisted_event_count = self
+            .engine
+            .journal_flushed_len()
+            .max(previous_event_count)
+            .min(self.engine.journal().len());
+        let mut records = self.engine.journal()[persisted_event_count..]
             .iter()
             .cloned()
             .map(|entry| PersistedSessionRecord::Event { entry })
@@ -3019,9 +3031,10 @@ async fn git_branch(workspace_root: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex;
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use anyhow::Result;
@@ -3077,13 +3090,7 @@ mod tests {
             _request: crate::model::ModelRuntimeRequest,
             sink: crate::model::ModelEventSink,
         ) -> std::result::Result<(), ProviderError> {
-            match self
-                .0
-                .lock()
-                .expect("provider mutex poisoned")
-                .pop_front()
-                .expect("scripted response")
-            {
+            match self.0.lock().pop_front().expect("scripted response") {
                 Ok(events) => {
                     for event in events {
                         sink.emit(event).expect("sink should remain open");
@@ -3123,7 +3130,6 @@ mod tests {
             Ok(self
                 .outcomes
                 .lock()
-                .expect("scripted hook dispatcher mutex poisoned")
                 .get(&invocation.event)
                 .cloned()
                 .unwrap_or_default())
@@ -3185,7 +3191,6 @@ mod tests {
             let has_dispatch_record = !stored.outputs.is_empty();
             self.checks
                 .lock()
-                .expect("local-first checks mutex poisoned")
                 .push((has_assistant_output, has_dispatch_record));
             anyhow::ensure!(
                 has_assistant_output,
@@ -3207,7 +3212,7 @@ mod tests {
         std::env::temp_dir().join(format!("{prefix}-{}-{unique}", std::process::id()))
     }
 
-    fn empty_mcp_surface() -> Arc<std::sync::RwLock<McpRuntimeSurface>> {
+    fn empty_mcp_surface() -> Arc<parking_lot::RwLock<McpRuntimeSurface>> {
         mcp_surface(
             Vec::new(),
             Vec::new(),
@@ -3223,8 +3228,8 @@ mod tests {
         credentialed_servers: Vec<String>,
         tool_servers: BTreeMap<String, String>,
         server_instructions: Vec<McpInstructionBlock>,
-    ) -> Arc<std::sync::RwLock<McpRuntimeSurface>> {
-        Arc::new(std::sync::RwLock::new(McpRuntimeSurface {
+    ) -> Arc<parking_lot::RwLock<McpRuntimeSurface>> {
+        Arc::new(parking_lot::RwLock::new(McpRuntimeSurface {
             active_tools,
             connected_servers,
             credentialed_servers,
@@ -3593,10 +3598,7 @@ mod tests {
 
         runtime.process_input(input).await?;
 
-        assert_eq!(
-            *checks.lock().expect("local-first checks mutex poisoned"),
-            vec![(true, false)]
-        );
+        assert_eq!(*checks.lock(), vec![(true, false)]);
         let stored = sessions.load("local-first-session").await?;
         assert_eq!(stored.outputs.len(), 1);
         assert_eq!(stored.outputs[0].plugin, "local-first");

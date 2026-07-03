@@ -552,11 +552,7 @@ where
         }
 
         let output_stats = output_file.lock().await.stats().await.unwrap_or_default();
-        let stop_reason = handle
-            .stop_reason
-            .lock()
-            .expect("background shell stop reason mutex poisoned")
-            .clone();
+        let stop_reason = handle.stop_reason.lock().clone();
         self.finish_background_shell_task(
             &session_id,
             &owner_agent_id,

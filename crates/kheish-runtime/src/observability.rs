@@ -1,5 +1,6 @@
+use parking_lot::Mutex;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
@@ -404,25 +405,18 @@ impl InMemoryObserver {
 
     /// Returns a copy of all recorded trace events.
     pub fn traces(&self) -> Vec<TraceEvent> {
-        self.traces.lock().expect("traces mutex poisoned").clone()
+        self.traces.lock().clone()
     }
 
     /// Returns a copy of all recorded debug artifacts.
     pub fn debug_artifacts(&self) -> Vec<DebugArtifact> {
-        self.artifacts
-            .lock()
-            .expect("artifacts mutex poisoned")
-            .clone()
+        self.artifacts.lock().clone()
     }
 
     /// Returns a metrics snapshot.
     pub fn metrics(&self) -> MetricsSnapshot {
         MetricsSnapshot {
-            counters: self
-                .counters
-                .lock()
-                .expect("counters mutex poisoned")
-                .clone(),
+            counters: self.counters.lock().clone(),
         }
     }
 
@@ -440,21 +434,15 @@ impl InMemoryObserver {
 
 impl RuntimeObserver for InMemoryObserver {
     fn record(&self, event: TraceEvent) {
-        self.traces
-            .lock()
-            .expect("traces mutex poisoned")
-            .push(event);
+        self.traces.lock().push(event);
     }
 
     fn record_debug_artifact(&self, artifact: DebugArtifact) {
-        self.artifacts
-            .lock()
-            .expect("artifacts mutex poisoned")
-            .push(artifact);
+        self.artifacts.lock().push(artifact);
     }
 
     fn increment_counter(&self, name: &str, delta: u64) {
-        let mut counters = self.counters.lock().expect("counters mutex poisoned");
+        let mut counters = self.counters.lock();
         *counters.entry(name.to_string()).or_default() += delta;
     }
 

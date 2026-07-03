@@ -1,5 +1,6 @@
 mod live_support;
 
+use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -7,7 +8,7 @@ use std::io::{Read as _, Write as _};
 use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -2762,10 +2763,7 @@ async fn legacy_serve_route_scopes_gate_public_route_ids_on_a_real_daemon() -> R
     );
     tokio::time::sleep(Duration::from_millis(250)).await;
     assert_eq!(
-        captured_requests
-            .lock()
-            .expect("captured requests mutex poisoned")
-            .len(),
+        captured_requests.lock().len(),
         0,
         "blocked legacy route should not reach the upstream provider"
     );
@@ -2876,10 +2874,7 @@ async fn legacy_serve_additional_image_backend_respects_session_credential_scope
         completed.status
     );
     tokio::time::sleep(Duration::from_millis(250)).await;
-    let primary_requests = primary_requests
-        .lock()
-        .expect("request capture mutex poisoned")
-        .clone();
+    let primary_requests = primary_requests.lock().clone();
     assert_eq!(
         primary_requests
             .iter()
@@ -2895,10 +2890,7 @@ async fn legacy_serve_additional_image_backend_respects_session_credential_scope
         "follow-up provider turn should include the blocked image route error"
     );
     assert_eq!(
-        google_requests
-            .lock()
-            .expect("request capture mutex poisoned")
-            .len(),
+        google_requests.lock().len(),
         0,
         "blocked legacy image backend should not reach the upstream provider"
     );
@@ -5850,11 +5842,7 @@ async fn record_openai_request(
     State(state): State<OpenAiMockServerState>,
     body: String,
 ) -> ([(header::HeaderName, &'static str); 1], String) {
-    state
-        .captured_requests
-        .lock()
-        .expect("request capture mutex poisoned")
-        .push(body);
+    state.captured_requests.lock().push(body);
     (
         [(header::CONTENT_TYPE, "text/event-stream")],
         state.response_body,
@@ -5899,11 +5887,7 @@ async fn record_openai_compaction_guard_request(
     State(state): State<OpenAiCompactionGuardState>,
     body: String,
 ) -> Response {
-    state
-        .captured_requests
-        .lock()
-        .expect("request capture mutex poisoned")
-        .push(body.clone());
+    state.captured_requests.lock().push(body.clone());
     let is_compaction = body.contains("Your task is to create a detailed summary");
     if is_compaction && body.contains("\"previous_response_id\"") {
         return (
@@ -5921,10 +5905,7 @@ async fn record_openai_compaction_guard_request(
             .into_response();
     }
     let input_tokens = {
-        let mut count = state
-            .request_count
-            .lock()
-            .expect("request count mutex poisoned");
+        let mut count = state.request_count.lock();
         *count = count.saturating_add(1);
         count.saturating_mul(90_000)
     };
@@ -5953,7 +5934,6 @@ async fn record_unexpected_anthropic_compaction_guard_request(
     state
         .captured_requests
         .lock()
-        .expect("request capture mutex poisoned")
         .push(format!("__ANTHROPIC_MESSAGES__\n{body}"));
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -6005,11 +5985,7 @@ async fn record_openai_reactive_compaction_request(
     State(state): State<OpenAiReactiveCompactionState>,
     body: String,
 ) -> Response {
-    state
-        .captured_requests
-        .lock()
-        .expect("request capture mutex poisoned")
-        .push(body.clone());
+    state.captured_requests.lock().push(body.clone());
 
     if body.contains("Your task is to create a detailed summary") {
         return (
@@ -6024,10 +6000,7 @@ async fn record_openai_reactive_compaction_request(
             .into_response();
     }
 
-    let mut count = state
-        .main_request_count
-        .lock()
-        .expect("main request count mutex poisoned");
+    let mut count = state.main_request_count.lock();
     *count = count.saturating_add(1);
     let current = *count;
     drop(count);
@@ -6188,13 +6161,10 @@ async fn spawn_raw_status_mock_server(
                     }
                     body_bytes.extend_from_slice(&buffer[..read]);
                 }
-                captured_requests
-                    .lock()
-                    .expect("request capture mutex poisoned")
-                    .push(format!(
-                        "{request_text}{}",
-                        String::from_utf8(body_bytes).expect("body must be utf-8")
-                    ));
+                captured_requests.lock().push(format!(
+                    "{request_text}{}",
+                    String::from_utf8(body_bytes).expect("body must be utf-8")
+                ));
                 let response = format!(
                     "HTTP/1.1 {status_code} {status_reason}\r\nContent-Length: {}\r\ncontent-type: {content_type}\r\n\r\n{response_body}",
                     response_body.len(),
@@ -6262,9 +6232,7 @@ async fn spawn_lossy_raw_mock_server(
             }
             body_bytes.extend_from_slice(&buffer[..read]);
         }
-        *captured_request
-            .lock()
-            .expect("request capture mutex poisoned") =
+        *captured_request.lock() =
             format!("{request_text}{}", String::from_utf8_lossy(&body_bytes));
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\ncontent-type: {content_type}\r\n\r\n{response_body}",
@@ -6338,13 +6306,10 @@ async fn spawn_openai_split_utf8_mock_server(
                     }
                     body_bytes.extend_from_slice(&buffer[..read]);
                 }
-                captured_requests
-                    .lock()
-                    .expect("request capture mutex poisoned")
-                    .push(format!(
-                        "{request_text}{}",
-                        String::from_utf8(body_bytes).expect("body must be utf-8")
-                    ));
+                captured_requests.lock().push(format!(
+                    "{request_text}{}",
+                    String::from_utf8(body_bytes).expect("body must be utf-8")
+                ));
 
                 let response = concat!(
                     "event: response.output_item.added\n",
@@ -6442,13 +6407,10 @@ async fn spawn_anthropic_split_utf8_mock_server(
                     }
                     body_bytes.extend_from_slice(&buffer[..read]);
                 }
-                captured_requests
-                    .lock()
-                    .expect("request capture mutex poisoned")
-                    .push(format!(
-                        "{request_text}{}",
-                        String::from_utf8(body_bytes).expect("body must be utf-8")
-                    ));
+                captured_requests.lock().push(format!(
+                    "{request_text}{}",
+                    String::from_utf8(body_bytes).expect("body must be utf-8")
+                ));
 
                 let response = concat!(
                     "event: message_start\n",
@@ -6500,10 +6462,7 @@ async fn wait_for_captured_requests(
 ) -> Result<Vec<String>> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let current = captured_requests
-            .lock()
-            .expect("request capture mutex poisoned")
-            .clone();
+        let current = captured_requests.lock().clone();
         if current.len() >= expected {
             return Ok(current);
         }
@@ -6578,15 +6537,8 @@ impl FakeExternalSidecar {
             if !sidecar_request_authorized(&headers, &state.token) {
                 return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
             }
-            state
-                .deliveries
-                .lock()
-                .expect("sidecar delivery mutex poisoned")
-                .push(payload);
-            let mut failures = state
-                .retryable_failures_remaining
-                .lock()
-                .expect("sidecar failure mutex poisoned");
+            state.deliveries.lock().push(payload);
+            let mut failures = state.retryable_failures_remaining.lock();
             if *failures > 0 {
                 *failures -= 1;
                 return Json(json!({
@@ -6595,10 +6547,7 @@ impl FakeExternalSidecar {
                 }))
                 .into_response();
             }
-            let terminal_status = *state
-                .terminal_http_status
-                .lock()
-                .expect("sidecar terminal status mutex poisoned");
+            let terminal_status = *state.terminal_http_status.lock();
             if let Some(status) = terminal_status {
                 return (
                     StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -6645,34 +6594,21 @@ impl FakeExternalSidecar {
     }
 
     fn set_retryable_failures(&self, count: usize) {
-        *self
-            .retryable_failures_remaining
-            .lock()
-            .expect("sidecar failure mutex poisoned") = count;
+        *self.retryable_failures_remaining.lock() = count;
     }
 
     fn set_terminal_http_status(&self, status: Option<u16>) {
-        *self
-            .terminal_http_status
-            .lock()
-            .expect("sidecar terminal status mutex poisoned") = status;
+        *self.terminal_http_status.lock() = status;
     }
 
     fn delivery_count(&self) -> usize {
-        self.deliveries
-            .lock()
-            .expect("sidecar delivery mutex poisoned")
-            .len()
+        self.deliveries.lock().len()
     }
 
     async fn wait_for_deliveries(&self, expected: usize) -> Result<Vec<Value>> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
-            let current = self
-                .deliveries
-                .lock()
-                .expect("sidecar delivery mutex poisoned")
-                .clone();
+            let current = self.deliveries.lock().clone();
             if current.len() >= expected {
                 return Ok(current);
             }
@@ -6815,15 +6751,8 @@ async fn spawn_telegram_output_mock_server(
         State(state): State<TelegramOutputMockState>,
         Json(payload): Json<Value>,
     ) -> impl IntoResponse {
-        state
-            .posts
-            .lock()
-            .expect("telegram output mock posts mutex poisoned")
-            .push(payload);
-        let mut failures = state
-            .failures_remaining
-            .lock()
-            .expect("telegram output mock failures mutex poisoned");
+        state.posts.lock().push(payload);
+        let mut failures = state.failures_remaining.lock();
         if *failures > 0 {
             *failures -= 1;
             return (
@@ -6866,10 +6795,7 @@ async fn wait_for_telegram_output_posts(
 ) -> Result<Vec<Value>> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let current = posts
-            .lock()
-            .expect("telegram output posts mutex poisoned")
-            .clone();
+        let current = posts.lock().clone();
         if current.len() >= expected {
             return Ok(current);
         }
@@ -6889,7 +6815,6 @@ async fn spawn_telegram_polling_mock_server() -> Result<(String, Arc<Mutex<Vec<V
         let updates = state
             .updates
             .lock()
-            .expect("telegram polling mock mutex poisoned")
             .iter()
             .filter(|update| {
                 update
@@ -6927,18 +6852,15 @@ fn push_telegram_polling_update(
     chat_id: i64,
     text: &str,
 ) {
-    updates
-        .lock()
-        .expect("telegram polling mock mutex poisoned")
-        .push(json!({
-            "update_id": update_id,
-            "message": {
-                "message_id": update_id,
-                "chat": { "id": chat_id },
-                "text": text,
-                "from": { "id": 1000 + update_id }
-            }
-        }));
+    updates.lock().push(json!({
+        "update_id": update_id,
+        "message": {
+            "message_id": update_id,
+            "chat": { "id": chat_id },
+            "text": text,
+            "from": { "id": 1000 + update_id }
+        }
+    }));
 }
 
 fn signed_http_connector_headers(path: &str, body: &str, secret: &str) -> (String, String) {
@@ -7034,17 +6956,12 @@ fn record_route_request(
     queue: &Arc<Mutex<VecDeque<String>>>,
     content_type: &'static str,
 ) -> Response {
-    state
-        .captured_requests
-        .lock()
-        .expect("request capture mutex poisoned")
-        .push(CapturedRouteRequest {
-            path: path.to_string(),
-            body: String::from_utf8_lossy(&body).into_owned(),
-        });
+    state.captured_requests.lock().push(CapturedRouteRequest {
+        path: path.to_string(),
+        body: String::from_utf8_lossy(&body).into_owned(),
+    });
     let response_body = queue
         .lock()
-        .expect("response queue mutex poisoned")
         .pop_front()
         .unwrap_or_else(|| panic!("missing mock response for {path}"));
     (
@@ -7173,18 +7090,13 @@ async fn record_delayed_openai_route_text_request(
     State(state): State<DelayedOpenAiRouteMockState>,
     body: Bytes,
 ) -> impl IntoResponse {
-    state
-        .captured_requests
-        .lock()
-        .expect("request capture mutex poisoned")
-        .push(CapturedRouteRequest {
-            path: "/v1/responses".to_string(),
-            body: String::from_utf8_lossy(&body).into_owned(),
-        });
+    state.captured_requests.lock().push(CapturedRouteRequest {
+        path: "/v1/responses".to_string(),
+        body: String::from_utf8_lossy(&body).into_owned(),
+    });
     let response = state
         .text_responses
         .lock()
-        .expect("response queue mutex poisoned")
         .pop_front()
         .unwrap_or_else(|| panic!("missing delayed mock response for /v1/responses"));
     tokio::time::sleep(Duration::from_millis(response.delay_ms)).await;
@@ -7225,10 +7137,7 @@ async fn wait_for_captured_route_requests(
 ) -> Result<Vec<CapturedRouteRequest>> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let current = captured_requests
-            .lock()
-            .expect("request capture mutex poisoned")
-            .clone();
+        let current = captured_requests.lock().clone();
         if current.len() >= expected {
             return Ok(current);
         }
@@ -7254,10 +7163,7 @@ async fn wait_for_captured_route_request_containing(
 ) -> Result<CapturedRouteRequest> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let current = captured_requests
-            .lock()
-            .expect("request capture mutex poisoned")
-            .clone();
+        let current = captured_requests.lock().clone();
         if let Some(request) = current
             .into_iter()
             .find(|request| request.body.contains(needle))
@@ -7763,10 +7669,7 @@ async fn assert_routes_file_image_edit_infers_single_attached_image_on_a_real_da
     assert!(edit_request.body.contains("gpt-image-1.5"));
     assert!(edit_request.body.contains(source_file_name));
     assert!(
-        openai_requests
-            .lock()
-            .expect("request capture mutex poisoned")
-            .is_empty(),
+        openai_requests.lock().is_empty(),
         "default openai route unexpectedly received provider traffic"
     );
 
@@ -8671,7 +8574,7 @@ async fn runtime_and_event_stream_cli_commands_work_against_a_real_daemon() -> R
         "doctor routes should warn when the loaded routes file changed on disk: {drifted_doctor_routes}"
     );
     assert!(
-        captured_requests.lock().expect("requests mutex").is_empty(),
+        captured_requests.lock().is_empty(),
         "route drift diagnostics should not dispatch provider requests"
     );
 
@@ -9048,7 +8951,6 @@ async fn runtime_config_transactions_restart_and_pinning_work_against_a_real_dae
 
     let request_models = captured_requests
         .lock()
-        .expect("requests mutex")
         .iter()
         .filter(|request| request.path == "/v1/responses")
         .map(|request| {
@@ -9076,7 +8978,7 @@ async fn runtime_config_transactions_restart_and_pinning_work_against_a_real_dae
         "run should keep its pinned model after runtime route change: {request_models:?}"
     );
 
-    let before_queued_request_count = captured_requests.lock().expect("requests mutex").len();
+    let before_queued_request_count = captured_requests.lock().len();
     let before_reset_route: RuntimeSettingsView =
         run_cli_json(&bin, &base_url, ["runtime", "get"])?;
     let reset_route: RuntimeSettingsView = run_cli_json(
@@ -11484,13 +11386,7 @@ async fn routes_default_semantic_capture_autopublished_learning_survives_restart
         semantic_learnings[0].verification_status,
         kheish_types::LearningVerificationStatus::Verified
     );
-    assert_eq!(
-        captured_requests
-            .lock()
-            .expect("captured requests lock")
-            .len(),
-        1
-    );
+    assert_eq!(captured_requests.lock().len(), 1);
 
     let memory_context: Value = client
         .get(format!(
@@ -13708,10 +13604,7 @@ async fn routes_file_cli_auth_refs_run_against_a_real_daemon() -> Result<()> {
         "route readiness failures should be rejected before enqueueing a run"
     );
     tokio::time::sleep(Duration::from_millis(250)).await;
-    let request_count_after_blocked_submit = captured_requests
-        .lock()
-        .expect("request capture mutex poisoned")
-        .len();
+    let request_count_after_blocked_submit = captured_requests.lock().len();
     assert_eq!(
         request_count_after_blocked_submit, 4,
         "route readiness guard should not dispatch a provider request"
@@ -13784,10 +13677,7 @@ async fn routes_file_cli_auth_refs_run_against_a_real_daemon() -> Result<()> {
         blocked_runs_after_schedule.is_empty(),
         "scheduled route readiness failures should not persist a run"
     );
-    let request_count_after_blocked_schedule = captured_requests
-        .lock()
-        .expect("request capture mutex poisoned")
-        .len();
+    let request_count_after_blocked_schedule = captured_requests.lock().len();
     assert_eq!(
         request_count_after_blocked_schedule, 4,
         "scheduled route readiness guard should not dispatch a provider request"
@@ -13978,10 +13868,7 @@ async fn scheduled_route_removed_after_restart_fails_before_persisting_run() -> 
         "removed route scheduler failure should not persist a run"
     );
     assert!(
-        captured_requests
-            .lock()
-            .expect("request capture mutex poisoned")
-            .is_empty(),
+        captured_requests.lock().is_empty(),
         "removed route scheduler failure should not dispatch provider requests"
     );
 
@@ -14043,10 +13930,7 @@ async fn waiting_run_route_removed_after_restart_fails_before_provider_dispatch(
     .await?;
     assert_eq!(waiting.request.provider.as_deref(), Some("openai"));
     assert_eq!(
-        captured_requests
-            .lock()
-            .expect("request capture mutex poisoned")
-            .len(),
+        captured_requests.lock().len(),
         1,
         "first model request should create the approval"
     );
@@ -14109,10 +13993,7 @@ async fn waiting_run_route_removed_after_restart_fails_before_provider_dispatch(
         "waiting run should fail on the removed pinned route before rerouting: {failed:#?}"
     );
     assert_eq!(
-        captured_requests
-            .lock()
-            .expect("request capture mutex poisoned")
-            .len(),
+        captured_requests.lock().len(),
         1,
         "removed pinned route must not fall back to the active route/provider"
     );
@@ -14529,10 +14410,7 @@ async fn routes_file_cli_credential_scopes_gate_auth_refs_and_sidechains_on_a_re
     );
     tokio::time::sleep(Duration::from_millis(250)).await;
     assert_eq!(
-        captured_requests
-            .lock()
-            .expect("captured requests mutex poisoned")
-            .len(),
+        captured_requests.lock().len(),
         1,
         "blocked route should not reach the upstream provider"
     );
@@ -14890,10 +14768,7 @@ async fn routes_file_cli_credential_scopes_gate_inline_api_key_routes_on_a_real_
     );
     tokio::time::sleep(Duration::from_millis(250)).await;
     assert_eq!(
-        captured_requests
-            .lock()
-            .expect("captured requests mutex poisoned")
-            .len(),
+        captured_requests.lock().len(),
         0,
         "blocked inline route should not reach the upstream provider"
     );
@@ -14975,10 +14850,7 @@ async fn routes_file_cli_credential_scopes_gate_inline_api_key_routes_on_a_real_
     );
     tokio::time::sleep(Duration::from_millis(250)).await;
     assert_eq!(
-        captured_requests
-            .lock()
-            .expect("captured requests mutex poisoned")
-            .len(),
+        captured_requests.lock().len(),
         1,
         "revoked inline subject should not reach the upstream provider again"
     );
@@ -19489,10 +19361,7 @@ async fn routes_default_channel_stimulus_tool_opens_agent_authored_main_subject_
                 &base_url,
                 ["channels", "stimuli", "list", "channel-ideas"],
             )?;
-            let requests = captured_requests
-                .lock()
-                .expect("captured route requests mutex poisoned")
-                .clone();
+            let requests = captured_requests.lock().clone();
             bail!(
                 "timed out waiting for the autonomous subject on channel-ideas\nmessages={messages:#?}\nstimuli={stimuli:#?}\nrequests={requests:#?}\nlogs=\n{}",
                 daemon.logs()
@@ -21025,10 +20894,7 @@ async fn routes_default_channel_schedule_binding_posts_progress_into_the_bound_t
             break schedule.schedule_id;
         }
         if Instant::now() >= scheduled_deadline {
-            let requests = captured_requests
-                .lock()
-                .expect("captured route requests mutex poisoned")
-                .clone();
+            let requests = captured_requests.lock().clone();
             let messages: Vec<ChannelMessageView> = run_cli_json(
                 &bin,
                 &base_url,
@@ -21718,10 +21584,7 @@ async fn board_references_enforce_session_access_and_schedule_validation_on_a_re
         "invalid board-reference schedule should not be persisted"
     );
     assert!(
-        captured_requests
-            .lock()
-            .expect("request capture mutex poisoned")
-            .is_empty(),
+        captured_requests.lock().is_empty(),
         "provider should not receive denied board-reference work"
     );
 
@@ -22185,10 +22048,7 @@ async fn boards_cross_board_mismatches_and_missing_history_surface_clean_errors_
     );
 
     assert!(
-        captured_requests
-            .lock()
-            .expect("request capture mutex poisoned")
-            .is_empty(),
+        captured_requests.lock().is_empty(),
         "provider should not receive cross-board or missing-history board failures"
     );
 
@@ -22306,10 +22166,7 @@ async fn boards_reject_invalid_state_schema_on_a_real_daemon() -> Result<()> {
         run_cli_json(&bin, &base_url, ["boards", "revisions", "board-schema"])?;
     assert!(revisions.is_empty());
     assert!(
-        captured_requests
-            .lock()
-            .expect("request capture mutex poisoned")
-            .is_empty(),
+        captured_requests.lock().is_empty(),
         "provider should not receive invalid board-state requests"
     );
 
@@ -23034,10 +22891,7 @@ async fn boards_restart_repairs_invalid_render_or_state_records_on_a_real_daemon
     );
 
     assert!(
-        captured_requests
-            .lock()
-            .expect("request capture mutex poisoned")
-            .is_empty(),
+        captured_requests.lock().is_empty(),
         "startup repair should not dispatch provider requests"
     );
 
@@ -23128,10 +22982,7 @@ async fn assets_references_cli_reports_board_refs_on_a_real_daemon() -> Result<(
             && reference.parent_id.as_deref() == Some("asset-ref-board")
     }));
     assert!(
-        captured_requests
-            .lock()
-            .expect("request capture mutex poisoned")
-            .is_empty(),
+        captured_requests.lock().is_empty(),
         "asset reference inspection should not dispatch provider requests"
     );
 
@@ -23343,10 +23194,7 @@ async fn assets_delete_and_gc_respect_reference_graph_on_a_real_daemon() -> Resu
         "orphan GC should ignore non daemon-owned filenames"
     );
     assert!(
-        captured_requests
-            .lock()
-            .expect("request capture mutex poisoned")
-            .is_empty(),
+        captured_requests.lock().is_empty(),
         "asset delete/GC should not dispatch provider requests"
     );
 
@@ -23444,10 +23292,7 @@ async fn asset_derived_integrity_blocks_session_input_before_provider_on_a_real_
         "tampered derived text should fail before persisting a run"
     );
     assert!(
-        captured_requests
-            .lock()
-            .expect("request capture mutex poisoned")
-            .is_empty(),
+        captured_requests.lock().is_empty(),
         "tampered derived text should not dispatch a provider request"
     );
 
@@ -26941,10 +26786,7 @@ async fn routes_default_audio_transcription_materializes_into_a_session_against_
 
     let transcription_request = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            let current = transcription_request
-                .lock()
-                .expect("transcription request mutex poisoned")
-                .clone();
+            let current = transcription_request.lock().clone();
             if !current.is_empty() {
                 break Ok::<String, anyhow::Error>(current);
             }
@@ -27062,10 +26904,7 @@ async fn routes_default_audio_transcription_rejects_video_only_mp4_before_upload
     );
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
-        transcription_request
-            .lock()
-            .expect("transcription request mutex poisoned")
-            .is_empty(),
+        transcription_request.lock().is_empty(),
         "video-only MP4 should be rejected before provider upload"
     );
 
@@ -27135,10 +26974,7 @@ async fn openai_compaction_requests_stay_hermetic_against_a_real_daemon() -> Res
         )?;
         assert_eq!(completed.status, DaemonRunStatus::Completed);
 
-        let requests = captured_requests
-            .lock()
-            .expect("request capture mutex poisoned")
-            .clone();
+        let requests = captured_requests.lock().clone();
         if requests
             .iter()
             .any(|request| request.contains("Your task is to create a detailed summary"))
@@ -27152,10 +26988,7 @@ async fn openai_compaction_requests_stay_hermetic_against_a_real_daemon() -> Res
         compaction_seen,
         "expected a compaction request to be emitted against the real daemon"
     );
-    let requests = captured_requests
-        .lock()
-        .expect("request capture mutex poisoned")
-        .clone();
+    let requests = captured_requests.lock().clone();
     let compaction_request = requests
         .iter()
         .find(|request| request.contains("Your task is to create a detailed summary"))
@@ -27243,10 +27076,7 @@ async fn openai_context_window_failure_rebuilds_without_stale_response_resume() 
         assert_eq!(completed.status, DaemonRunStatus::Completed);
     }
 
-    let requests = captured_requests
-        .lock()
-        .expect("request capture mutex poisoned")
-        .clone();
+    let requests = captured_requests.lock().clone();
     assert!(
         requests
             .iter()
@@ -27645,10 +27475,7 @@ async fn routes_file_image_generation_follows_the_selected_route_on_a_real_daemo
         .ok_or_else(|| anyhow!("missing image generation request on the openrouter route"))?;
     assert!(image_request.body.contains("\"model\":\"gpt-image-1.5\""));
     assert!(
-        openai_requests
-            .lock()
-            .expect("request capture mutex poisoned")
-            .is_empty(),
+        openai_requests.lock().is_empty(),
         "default openai route unexpectedly received provider traffic"
     );
 
@@ -27742,10 +27569,7 @@ async fn routes_file_image_edit_follows_the_selected_route_on_a_real_daemon() ->
     assert!(edit_request.body.contains("name=\"model\""));
     assert!(edit_request.body.contains("gpt-image-1.5"));
     assert!(
-        openai_requests
-            .lock()
-            .expect("request capture mutex poisoned")
-            .is_empty(),
+        openai_requests.lock().is_empty(),
         "default openai route unexpectedly received provider traffic"
     );
 
@@ -30266,10 +30090,7 @@ async fn external_connector_rejects_oversized_ingress_on_a_real_daemon() -> Resu
             .is_some_and(|reason| reason.contains("content exceeds"))
     );
     assert!(
-        captured_requests
-            .lock()
-            .expect("request capture mutex poisoned")
-            .is_empty(),
+        captured_requests.lock().is_empty(),
         "oversized ingress should be rejected before any provider traffic"
     );
     Ok(())
@@ -32048,7 +31869,7 @@ async fn connector_ingress_returns_conflict_when_session_policy_disagrees_with_e
         "unexpected conflict body: {body}"
     );
 
-    let requests = captured_requests.lock().expect("poisoned");
+    let requests = captured_requests.lock();
     assert!(
         requests.is_empty(),
         "connector ingress conflicts should fail before reaching the provider"

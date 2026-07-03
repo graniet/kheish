@@ -1163,9 +1163,10 @@ fn preferred_extension_for_media_type(media_type: &str) -> Result<&'static str> 
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex;
     use std::collections::BTreeMap;
     use std::fs;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use anyhow::{Result, anyhow, bail};
     use async_trait::async_trait;
@@ -1330,10 +1331,7 @@ mod tests {
             _request: &GenerateImageToolRequest,
             _model_override: Option<&str>,
         ) -> Result<GeneratedImageBatch> {
-            *self
-                .generate_calls
-                .lock()
-                .expect("generate calls mutex poisoned") += 1;
+            *self.generate_calls.lock() += 1;
             bail!("{} image backend unavailable", self.provider)
         }
 
@@ -1376,7 +1374,6 @@ mod tests {
         ) -> Result<GeneratedImageBatch> {
             self.calls
                 .lock()
-                .expect("capture mutex poisoned")
                 .generate_model_overrides
                 .push(model_override.map(ToOwned::to_owned));
             Ok(GeneratedImageBatch {
@@ -1399,7 +1396,7 @@ mod tests {
             request: &ImageEditBackendRequest,
             model_override: Option<&str>,
         ) -> Result<GeneratedImageBatch> {
-            let mut calls = self.calls.lock().expect("capture mutex poisoned");
+            let mut calls = self.calls.lock();
             calls
                 .edit_model_overrides
                 .push(model_override.map(ToOwned::to_owned));
@@ -1688,10 +1685,7 @@ mod tests {
             )
             .await?;
 
-        assert_eq!(
-            *primary_calls.lock().expect("primary calls mutex poisoned"),
-            1
-        );
+        assert_eq!(*primary_calls.lock(), 1);
         assert_eq!(response.route_id.as_deref(), Some("backup"));
         assert_eq!(response.provider, "backup");
         assert_eq!(response.model, "backup-image-model");
@@ -1958,18 +1952,9 @@ mod tests {
 
         assert_eq!(response.provider, "google");
         assert_eq!(response.model, "gemini-3-pro-image-preview");
-        assert!(
-            openai_calls
-                .lock()
-                .expect("capture mutex poisoned")
-                .generate_model_overrides
-                .is_empty()
-        );
+        assert!(openai_calls.lock().generate_model_overrides.is_empty());
         assert_eq!(
-            google_calls
-                .lock()
-                .expect("capture mutex poisoned")
-                .generate_model_overrides,
+            google_calls.lock().generate_model_overrides,
             vec![Some("gemini-3-pro-image-preview".to_string())]
         );
         Ok(())
@@ -2041,11 +2026,7 @@ mod tests {
         }
 
         assert!(
-            calls
-                .lock()
-                .expect("capture mutex poisoned")
-                .generate_model_overrides
-                .is_empty(),
+            calls.lock().generate_model_overrides.is_empty(),
             "invalid requests should be rejected before backend dispatch"
         );
         Ok(())
@@ -2181,14 +2162,8 @@ mod tests {
 
         assert_eq!(response.provider, "google");
         assert_eq!(response.model, "gemini-3-pro-image-preview");
-        assert!(
-            openai_calls
-                .lock()
-                .expect("capture mutex poisoned")
-                .edit_model_overrides
-                .is_empty()
-        );
-        let google_calls = google_calls.lock().expect("capture mutex poisoned");
+        assert!(openai_calls.lock().edit_model_overrides.is_empty());
+        let google_calls = google_calls.lock();
         assert_eq!(
             google_calls.edit_model_overrides,
             vec![Some("gemini-3-pro-image-preview".to_string())]
@@ -2241,11 +2216,7 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(
-            calls
-                .lock()
-                .expect("capture mutex poisoned")
-                .edit_model_overrides
-                .is_empty(),
+            calls.lock().edit_model_overrides.is_empty(),
             "tampered source image should be rejected before backend dispatch"
         );
         Ok(())
@@ -2292,20 +2263,8 @@ mod tests {
 
         assert_eq!(response.provider, "openai");
         assert_eq!(response.model, "openai");
-        assert!(
-            default_calls
-                .lock()
-                .expect("capture mutex poisoned")
-                .generate_model_overrides
-                .is_empty()
-        );
-        assert_eq!(
-            preferred_calls
-                .lock()
-                .expect("capture mutex poisoned")
-                .generate_model_overrides,
-            vec![None]
-        );
+        assert!(default_calls.lock().generate_model_overrides.is_empty());
+        assert_eq!(preferred_calls.lock().generate_model_overrides, vec![None]);
         Ok(())
     }
 

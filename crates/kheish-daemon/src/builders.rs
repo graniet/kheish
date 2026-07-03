@@ -1,8 +1,9 @@
 //! Daemon service builders and provider bootstrap helpers.
 
+use parking_lot::RwLock;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -673,7 +674,7 @@ where
     let mcp_surface = mcp_manager
         .as_ref()
         .map(|manager| manager.runtime_surface_handle())
-        .unwrap_or_else(|| Arc::new(StdRwLock::new(mcp_snapshot.runtime_surface())));
+        .unwrap_or_else(|| Arc::new(RwLock::new(mcp_snapshot.runtime_surface())));
     let hook_tools = Arc::new(tools.clone_without_hook_dispatcher());
     let system_prompt = Arc::new(SystemPromptBuilder::new(
         SystemPromptEnvironment::new(

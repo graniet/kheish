@@ -1,8 +1,9 @@
+use parking_lot::RwLock;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result, bail};
 use kheish_runtime::redact_text;
@@ -367,19 +368,13 @@ impl RunMemoryControl {
 
     /// Returns the current policy snapshot.
     pub fn policy(&self) -> RunMemoryPolicyConfig {
-        self.policy
-            .read()
-            .expect("run-memory policy rwlock poisoned")
-            .clone()
+        self.policy.read().clone()
     }
 
     /// Replaces the current policy after validation.
     pub fn set_policy(&self, policy: RunMemoryPolicyConfig) -> Result<()> {
         policy.validate()?;
-        *self
-            .policy
-            .write()
-            .expect("run-memory policy rwlock poisoned") = policy;
+        *self.policy.write() = policy;
         Ok(())
     }
 
@@ -390,17 +385,11 @@ impl RunMemoryControl {
 
     /// Returns the last bounded maintenance report.
     pub fn maintenance(&self) -> RunMemoryMaintenanceStatusView {
-        self.maintenance
-            .read()
-            .expect("run-memory maintenance rwlock poisoned")
-            .clone()
+        self.maintenance.read().clone()
     }
 
     pub(crate) fn record_maintenance(&self, report: RunMemoryMaintenanceStatusView) {
-        *self
-            .maintenance
-            .write()
-            .expect("run-memory maintenance rwlock poisoned") = report;
+        *self.maintenance.write() = report;
     }
 
     pub(crate) fn record_stored(&self) {

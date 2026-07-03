@@ -1,10 +1,10 @@
 //! Connector configuration and route codecs for daemon-managed ingress and egress.
 
+use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::RwLock;
 
 use anyhow::{Context, Result};
 use kheish_auth::{AuthManager, AuthSlotId};
@@ -218,82 +218,43 @@ impl ConnectorRegistry {
 
     /// Installs a previously resolved registry snapshot without resolving secrets or env again.
     pub fn replace_with_resolved(&self, resolved: ConnectorRegistry) {
-        let state = resolved
-            .inner
-            .read()
-            .expect("connector registry rwlock poisoned")
-            .clone();
+        let state = resolved.inner.read().clone();
         self.replace_resolved(state);
     }
 
     /// Returns the named Slack connector.
     pub fn external(&self, name: &str) -> Option<ResolvedExternalConnector> {
-        self.inner
-            .read()
-            .expect("connector registry rwlock poisoned")
-            .external
-            .get(name)
-            .cloned()
+        self.inner.read().external.get(name).cloned()
     }
 
     /// Returns all resolved external connectors.
     pub fn external_connectors(&self) -> Vec<ResolvedExternalConnector> {
-        self.inner
-            .read()
-            .expect("connector registry rwlock poisoned")
-            .external
-            .values()
-            .cloned()
-            .collect()
+        self.inner.read().external.values().cloned().collect()
     }
 
     /// Returns the named Slack connector.
     pub fn slack(&self, name: &str) -> Option<ResolvedSlackConnector> {
-        self.inner
-            .read()
-            .expect("connector registry rwlock poisoned")
-            .slack
-            .get(name)
-            .cloned()
+        self.inner.read().slack.get(name).cloned()
     }
 
     /// Returns the named Telegram connector.
     pub fn telegram(&self, name: &str) -> Option<ResolvedTelegramConnector> {
-        self.inner
-            .read()
-            .expect("connector registry rwlock poisoned")
-            .telegram
-            .get(name)
-            .cloned()
+        self.inner.read().telegram.get(name).cloned()
     }
 
     /// Returns all resolved Telegram connectors.
     pub fn telegram_connectors(&self) -> Vec<ResolvedTelegramConnector> {
-        self.inner
-            .read()
-            .expect("connector registry rwlock poisoned")
-            .telegram
-            .values()
-            .cloned()
-            .collect()
+        self.inner.read().telegram.values().cloned().collect()
     }
 
     /// Returns the named HTTP webhook connector.
     pub fn http(&self, name: &str) -> Option<ResolvedHttpInputConnector> {
-        self.inner
-            .read()
-            .expect("connector registry rwlock poisoned")
-            .http
-            .get(name)
-            .cloned()
+        self.inner.read().http.get(name).cloned()
     }
 
     /// Replaces the entire resolved runtime connector state and notifies subscribers.
     fn replace_resolved(&self, state: ResolvedConnectorState) {
-        *self
-            .inner
-            .write()
-            .expect("connector registry rwlock poisoned") = state;
+        *self.inner.write() = state;
         let next_revision = self.revision_tx.borrow().saturating_add(1);
         let _ = self.revision_tx.send(next_revision);
     }

@@ -91,9 +91,9 @@ pub fn generate_auth_store_master_key_base64() -> String {
 }
 
 #[cfg(test)]
-pub(crate) fn auth_store_env_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+pub(crate) fn auth_store_env_lock() -> &'static parking_lot::Mutex<()> {
+    static LOCK: std::sync::OnceLock<parking_lot::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| parking_lot::Mutex::new(()))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,9 +326,7 @@ mod tests {
 
     #[test]
     fn encrypted_store_round_trip_requires_the_master_key() -> Result<()> {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempdir()?;
         let path = temp.path().join("auth-store.json");
         let store = FileAuthStore::new(&path);
@@ -373,9 +371,7 @@ mod tests {
 
     #[test]
     fn encrypted_store_rejects_invalid_master_key_shape() -> Result<()> {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempdir()?;
         let path = temp.path().join("auth-store.json");
         let store = FileAuthStore::new(&path);
@@ -393,9 +389,7 @@ mod tests {
 
     #[test]
     fn save_requires_a_master_key() -> Result<()> {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempdir()?;
         let path = temp.path().join("auth-store.json");
         let store = FileAuthStore::new(&path);
@@ -417,9 +411,7 @@ mod tests {
 
     #[test]
     fn load_auth_store_master_key_from_env_rejects_invalid_values() {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         unsafe {
             std::env::set_var(AUTH_STORE_MASTER_KEY_ENV, "too-short");
         }
@@ -435,9 +427,7 @@ mod tests {
 
     #[test]
     fn generated_master_key_round_trips_through_file_store() -> Result<()> {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempdir()?;
         let store = FileAuthStore::new(temp.path().join("auth-store.json"));
         unsafe {
@@ -455,9 +445,7 @@ mod tests {
 
     #[test]
     fn load_auth_store_master_key_from_file_env() -> Result<()> {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempdir()?;
         let key_path = temp.path().join("auth-store.key");
         std::fs::write(&key_path, "0123456789abcdef0123456789abcdef\n")?;
@@ -474,9 +462,7 @@ mod tests {
 
     #[test]
     fn load_auth_store_master_key_rejects_conflicting_env_and_file() -> Result<()> {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempdir()?;
         let key_path = temp.path().join("auth-store.key");
         std::fs::write(&key_path, generate_auth_store_master_key_base64())?;

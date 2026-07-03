@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use kheish_core::{LoopPolicy, ModelDriver, RunOutcome};
@@ -11,6 +11,7 @@ use kheish_types::{
     ApprovalResolution, ConversationKey, InputEnvelope, ModelGenerationConfig,
     UserQuestionResolution,
 };
+use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
@@ -133,12 +134,7 @@ where
             if record.closed_at_ms.is_some() {
                 continue;
             }
-            if self
-                .sessions
-                .lock()
-                .expect("session registry mutex poisoned")
-                .contains_key(&record.id)
-            {
+            if self.sessions.lock().contains_key(&record.id) {
                 continue;
             }
             let runtime = AgentRuntime::restore(
@@ -958,45 +954,28 @@ where
         });
         self.sessions
             .lock()
-            .expect("session registry mutex poisoned")
             .insert(record.id, SessionHandle { sender });
         Ok(())
     }
 
     /// Returns true when the agent still has an active runtime handle.
     pub fn has_runtime(&self, agent_id: &AgentId) -> bool {
-        self.sessions
-            .lock()
-            .expect("session registry mutex poisoned")
-            .contains_key(agent_id)
+        self.sessions.lock().contains_key(agent_id)
     }
 
     /// Returns the number of live agent runtime handles currently registered.
     pub fn runtime_count(&self) -> usize {
-        self.sessions
-            .lock()
-            .expect("session registry mutex poisoned")
-            .len()
+        self.sessions.lock().len()
     }
 
     /// Returns the agent identifiers with live runtime handles.
     pub fn runtime_ids(&self) -> BTreeSet<AgentId> {
-        self.sessions
-            .lock()
-            .expect("session registry mutex poisoned")
-            .keys()
-            .cloned()
-            .collect()
+        self.sessions.lock().keys().cloned().collect()
     }
 
     /// Closes the runtime handle for one settled agent.
     pub fn close_runtime(&self, agent_id: &AgentId) -> bool {
-        let closed = self
-            .sessions
-            .lock()
-            .expect("session registry mutex poisoned")
-            .remove(agent_id)
-            .is_some();
+        let closed = self.sessions.lock().remove(agent_id).is_some();
         if closed {
             info!(agent_id = %agent_id.0, "closed agent runtime handle");
         }
@@ -1006,7 +985,6 @@ where
     fn session_handle(&self, agent_id: &AgentId) -> Result<SessionHandle> {
         self.sessions
             .lock()
-            .expect("session registry mutex poisoned")
             .get(agent_id)
             .cloned()
             .ok_or_else(|| anyhow!("unknown agent {}", agent_id.0))

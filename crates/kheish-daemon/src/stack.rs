@@ -6137,11 +6137,11 @@ mod tests {
 
     #[derive(Default)]
     struct RuntimeMcpControlPlaneState {
-        secrets: std::sync::Mutex<BTreeMap<String, kheish_auth::AuthSlotStatus>>,
-        personas: std::sync::Mutex<BTreeMap<String, crate::PersonaView>>,
-        sessions: std::sync::Mutex<BTreeMap<String, crate::SessionView>>,
-        playbooks: std::sync::Mutex<BTreeMap<String, crate::PlaybookView>>,
-        schedules: std::sync::Mutex<Vec<crate::ScheduleView>>,
+        secrets: parking_lot::Mutex<BTreeMap<String, kheish_auth::AuthSlotStatus>>,
+        personas: parking_lot::Mutex<BTreeMap<String, crate::PersonaView>>,
+        sessions: parking_lot::Mutex<BTreeMap<String, crate::SessionView>>,
+        playbooks: parking_lot::Mutex<BTreeMap<String, crate::PlaybookView>>,
+        schedules: parking_lot::Mutex<Vec<crate::ScheduleView>>,
     }
 
     impl RuntimeMcpControlPlane {
@@ -6285,7 +6285,7 @@ mod tests {
             &self,
             persona_id: &str,
         ) -> Result<crate::SessionPersonaSummaryView> {
-            let personas = self.state.personas.lock().expect("personas lock");
+            let personas = self.state.personas.lock();
             let persona = personas
                 .get(persona_id)
                 .ok_or_else(|| anyhow!("persona {persona_id} not found"))?;
@@ -6303,7 +6303,7 @@ mod tests {
         ) -> Result<crate::PlaybookView> {
             let digest = crate::playbooks::playbook_manifest_digest(&request.manifest)?;
             let now_ms = crate::now_ms();
-            let mut playbooks = self.state.playbooks.lock().expect("playbooks lock");
+            let mut playbooks = self.state.playbooks.lock();
             let entry = playbooks
                 .entry(request.manifest.playbook_id.clone())
                 .or_insert_with(|| crate::PlaybookView {
@@ -6345,7 +6345,7 @@ mod tests {
             request: crate::PublishPlaybookRequest,
         ) -> Result<crate::PlaybookView> {
             let now_ms = crate::now_ms();
-            let mut playbooks = self.state.playbooks.lock().expect("playbooks lock");
+            let mut playbooks = self.state.playbooks.lock();
             let view = playbooks
                 .get_mut(playbook_id)
                 .ok_or_else(|| anyhow!("playbook {playbook_id} not found"))?;
@@ -6378,9 +6378,7 @@ mod tests {
         {
             match path {
                 "/v1/runtime" => encode_response(self.runtime.clone()),
-                "/v1/schedules" => {
-                    encode_response(self.state.schedules.lock().expect("schedules lock").clone())
-                }
+                "/v1/schedules" => encode_response(self.state.schedules.lock().clone()),
                 _ => bail!("unexpected GET {path}"),
             }
         }
@@ -6399,7 +6397,6 @@ mod tests {
                     .state
                     .secrets
                     .lock()
-                    .expect("secrets lock")
                     .get(*slot)
                     .cloned()
                     .map(encode_response)
@@ -6408,7 +6405,6 @@ mod tests {
                     .state
                     .personas
                     .lock()
-                    .expect("personas lock")
                     .get(*persona_id)
                     .cloned()
                     .map(encode_response)
@@ -6417,7 +6413,6 @@ mod tests {
                     .state
                     .sessions
                     .lock()
-                    .expect("sessions lock")
                     .get(*session_id)
                     .cloned()
                     .map(encode_response)
@@ -6426,7 +6421,6 @@ mod tests {
                     .state
                     .playbooks
                     .lock()
-                    .expect("playbooks lock")
                     .get(*playbook_id)
                     .cloned()
                     .map(encode_response)
@@ -6458,7 +6452,6 @@ mod tests {
                 self.state
                     .secrets
                     .lock()
-                    .expect("secrets lock")
                     .insert(status.slot_id.0.clone(), status.clone());
                 return encode_response(status);
             }
@@ -6470,7 +6463,6 @@ mod tests {
                 self.state
                     .personas
                     .lock()
-                    .expect("personas lock")
                     .insert(persona.persona_id.clone(), persona.clone());
                 return encode_response(persona);
             }
@@ -6482,7 +6474,6 @@ mod tests {
                 self.state
                     .sessions
                     .lock()
-                    .expect("sessions lock")
                     .insert(session.session_id.clone(), session.clone());
                 return encode_response(session);
             }
@@ -6490,7 +6481,7 @@ mod tests {
                 let request = serde_json::from_value::<crate::ScheduleCreateRequest>(
                     serde_json::to_value(body)?,
                 )?;
-                let mut schedules = self.state.schedules.lock().expect("schedules lock");
+                let mut schedules = self.state.schedules.lock();
                 let schedule = crate::scheduler::build_schedule_record(
                     format!("schedule-{}", schedules.len() + 1),
                     crate::now_ms(),
@@ -6517,7 +6508,7 @@ mod tests {
                         serde_json::to_value(body)?,
                     )?;
                     let persona = self.session_persona_summary(&request.persona_id)?;
-                    let mut sessions = self.state.sessions.lock().expect("sessions lock");
+                    let mut sessions = self.state.sessions.lock();
                     let session = sessions
                         .get_mut(*session_id)
                         .ok_or_else(|| anyhow!("session {session_id} not found"))?;
@@ -6528,7 +6519,7 @@ mod tests {
                     let request = serde_json::from_value::<crate::SetSessionCapabilityScopeRequest>(
                         serde_json::to_value(body)?,
                     )?;
-                    let mut sessions = self.state.sessions.lock().expect("sessions lock");
+                    let mut sessions = self.state.sessions.lock();
                     let session = sessions
                         .get_mut(*session_id)
                         .ok_or_else(|| anyhow!("session {session_id} not found"))?;
@@ -6541,7 +6532,7 @@ mod tests {
                     let request = serde_json::from_value::<crate::SetSessionCredentialScopeRequest>(
                         serde_json::to_value(body)?,
                     )?;
-                    let mut sessions = self.state.sessions.lock().expect("sessions lock");
+                    let mut sessions = self.state.sessions.lock();
                     let session = sessions
                         .get_mut(*session_id)
                         .ok_or_else(|| anyhow!("session {session_id} not found"))?;
@@ -6554,7 +6545,7 @@ mod tests {
                     let request = serde_json::from_value::<crate::SetSessionRoutePolicyRequest>(
                         serde_json::to_value(body)?,
                     )?;
-                    let mut sessions = self.state.sessions.lock().expect("sessions lock");
+                    let mut sessions = self.state.sessions.lock();
                     let session = sessions
                         .get_mut(*session_id)
                         .ok_or_else(|| anyhow!("session {session_id} not found"))?;
@@ -6565,7 +6556,7 @@ mod tests {
                     let request = serde_json::from_value::<crate::SetSessionOperatorConfigRequest>(
                         serde_json::to_value(body)?,
                     )?;
-                    let mut sessions = self.state.sessions.lock().expect("sessions lock");
+                    let mut sessions = self.state.sessions.lock();
                     let session = sessions
                         .get_mut(*session_id)
                         .ok_or_else(|| anyhow!("session {session_id} not found"))?;
@@ -6576,7 +6567,7 @@ mod tests {
                     let request = serde_json::from_value::<crate::SetSessionReplyTargetsRequest>(
                         serde_json::to_value(body)?,
                     )?;
-                    let mut sessions = self.state.sessions.lock().expect("sessions lock");
+                    let mut sessions = self.state.sessions.lock();
                     let session = sessions
                         .get_mut(*session_id)
                         .ok_or_else(|| anyhow!("session {session_id} not found"))?;
@@ -6615,9 +6606,9 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingControlPlane {
-        deletes: std::sync::Mutex<Vec<String>>,
-        posts: std::sync::Mutex<Vec<String>>,
-        schedules: std::sync::Mutex<Vec<crate::ScheduleView>>,
+        deletes: parking_lot::Mutex<Vec<String>>,
+        posts: parking_lot::Mutex<Vec<String>>,
+        schedules: parking_lot::Mutex<Vec<crate::ScheduleView>>,
     }
 
     #[async_trait::async_trait]
@@ -6627,7 +6618,7 @@ mod tests {
             T: DeserializeOwned + Send,
         {
             if path == "/v1/schedules" {
-                return encode_response(self.schedules.lock().unwrap().clone());
+                return encode_response(self.schedules.lock().clone());
             }
             bail!("unexpected GET {path}")
         }
@@ -6644,12 +6635,11 @@ mod tests {
             B: Serialize + Sync + ?Sized,
             T: DeserializeOwned + Send,
         {
-            self.posts.lock().unwrap().push(path.to_string());
+            self.posts.lock().push(path.to_string());
             if path.starts_with("/v1/schedules/") && path.ends_with("/cancel") {
                 let schedule = self
                     .schedules
                     .lock()
-                    .unwrap()
                     .first()
                     .cloned()
                     .ok_or_else(|| anyhow!("missing test schedule"))?;
@@ -6675,13 +6665,13 @@ mod tests {
         where
             T: DeserializeOwned + Send,
         {
-            self.deletes.lock().unwrap().push(path.to_string());
+            self.deletes.lock().push(path.to_string());
             encode_response(json!({ "accepted": true }))
         }
     }
 
     struct LiveSecretControlPlane {
-        posts: std::sync::Mutex<Vec<String>>,
+        posts: parking_lot::Mutex<Vec<String>>,
         provider: kheish_auth::AuthProvider,
         updated_at_ms: u64,
         allow_secret_posts: bool,
@@ -6690,7 +6680,7 @@ mod tests {
     impl Default for LiveSecretControlPlane {
         fn default() -> Self {
             Self {
-                posts: std::sync::Mutex::new(Vec::new()),
+                posts: parking_lot::Mutex::new(Vec::new()),
                 provider: kheish_auth::AuthProvider::Generic,
                 updated_at_ms: 1,
                 allow_secret_posts: false,
@@ -6731,7 +6721,7 @@ mod tests {
             B: Serialize + Sync + ?Sized,
             T: DeserializeOwned + Send,
         {
-            self.posts.lock().unwrap().push(path.to_string());
+            self.posts.lock().push(path.to_string());
             if self.allow_secret_posts && path == "/v1/runtime/secrets" {
                 return encode_response(self.secret_status());
             }
@@ -6769,8 +6759,8 @@ mod tests {
 
     #[derive(Default)]
     struct RacePersonaControlPlane {
-        persona_gets: std::sync::Mutex<usize>,
-        writes: std::sync::Mutex<Vec<String>>,
+        persona_gets: parking_lot::Mutex<usize>,
+        writes: parking_lot::Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -6790,7 +6780,7 @@ mod tests {
             T: DeserializeOwned + Send,
         {
             if path == "/v1/personas/race-persona" {
-                let mut gets = self.persona_gets.lock().unwrap();
+                let mut gets = self.persona_gets.lock();
                 *gets += 1;
                 if *gets == 1 {
                     return Ok(None);
@@ -6816,7 +6806,7 @@ mod tests {
             B: Serialize + Sync + ?Sized,
             T: DeserializeOwned + Send,
         {
-            self.writes.lock().unwrap().push(path.to_string());
+            self.writes.lock().push(path.to_string());
             bail!("unexpected POST {path}")
         }
 
@@ -6825,7 +6815,7 @@ mod tests {
             B: Serialize + Sync + ?Sized,
             T: DeserializeOwned + Send,
         {
-            self.writes.lock().unwrap().push(path.to_string());
+            self.writes.lock().push(path.to_string());
             bail!("unexpected PUT {path}")
         }
 
@@ -6839,8 +6829,8 @@ mod tests {
 
     struct ClaimObservedConnectorControlPlane {
         ledger_path: PathBuf,
-        observed_pending_claim: std::sync::Mutex<bool>,
-        created: std::sync::Mutex<bool>,
+        observed_pending_claim: parking_lot::Mutex<bool>,
+        created: parking_lot::Mutex<bool>,
     }
 
     #[async_trait::async_trait]
@@ -6860,7 +6850,7 @@ mod tests {
             T: DeserializeOwned + Send,
         {
             if path == "/v1/runtime/connectors/http/claimed" {
-                if *self.created.lock().unwrap() {
+                if *self.created.lock() {
                     return encode_response(Some(test_http_connector_view()));
                 }
                 return Ok(None);
@@ -6892,8 +6882,8 @@ mod tests {
             if !stack.pending_resources.contains_key(&key.to_string()) {
                 bail!("connector write happened before pending ledger claim was persisted");
             }
-            *self.observed_pending_claim.lock().unwrap() = true;
-            *self.created.lock().unwrap() = true;
+            *self.observed_pending_claim.lock() = true;
+            *self.created.lock() = true;
             encode_response(test_http_connector_view())
         }
 
@@ -6907,7 +6897,7 @@ mod tests {
 
     struct RaceConnectorCreateControlPlane {
         ledger_path: PathBuf,
-        observed_pending_claim: std::sync::Mutex<bool>,
+        observed_pending_claim: parking_lot::Mutex<bool>,
     }
 
     #[async_trait::async_trait]
@@ -6965,7 +6955,7 @@ mod tests {
             if !stack.pending_resources.contains_key(&key.to_string()) {
                 bail!("connector create-if-absent happened before pending claim was persisted");
             }
-            *self.observed_pending_claim.lock().unwrap() = true;
+            *self.observed_pending_claim.lock() = true;
             bail!("http connector race already exists")
         }
 
@@ -6978,7 +6968,7 @@ mod tests {
     }
 
     struct CommittedThenErroredConnectorControlPlane {
-        created: std::sync::Mutex<bool>,
+        created: parking_lot::Mutex<bool>,
     }
 
     #[async_trait::async_trait]
@@ -6998,7 +6988,7 @@ mod tests {
             T: DeserializeOwned + Send,
         {
             if path == "/v1/runtime/connectors/http/committed" {
-                if *self.created.lock().unwrap() {
+                if *self.created.lock() {
                     return encode_response(Some(test_http_connector_view_named("committed")));
                 }
                 return Ok(None);
@@ -7031,7 +7021,7 @@ mod tests {
             if kind != "http" || name != "committed" {
                 bail!("unexpected connector create {kind}/{name}");
             }
-            *self.created.lock().unwrap() = true;
+            *self.created.lock() = true;
             bail!("connector registry reload failed after durable create")
         }
 
@@ -10156,7 +10146,7 @@ spec:
                 .iter()
                 .all(|action| action.resource_type != "secret")
         );
-        assert!(client.posts.lock().unwrap().is_empty());
+        assert!(client.posts.lock().is_empty());
         let ledger = ApplyLedger::load_or_new(&stack_ledger_path(temp.path()))
             .await
             .unwrap();
@@ -10229,7 +10219,7 @@ spec:
             "{:?}",
             report.verification
         );
-        assert!(client.posts.lock().unwrap().is_empty());
+        assert!(client.posts.lock().is_empty());
         let ledger = ApplyLedger::load_or_new(&ledger_path).await.unwrap();
         assert_eq!(
             ledger.owner_of_resource(&secret_key),
@@ -10287,7 +10277,7 @@ spec:
             message.contains("KheishStack apply refused because the plan contains errors"),
             "{message}"
         );
-        assert!(client.posts.lock().unwrap().is_empty());
+        assert!(client.posts.lock().is_empty());
         assert!(!stack_ledger_path(temp.path()).exists());
     }
 
@@ -10499,7 +10489,7 @@ spec:
                 && action.operation == "update"
         }));
         assert_eq!(
-            drifted_client.posts.lock().unwrap().as_slice(),
+            drifted_client.posts.lock().as_slice(),
             ["/v1/runtime/secrets"]
         );
         assert!(
@@ -10706,7 +10696,7 @@ spec:
             ),
             "{message}"
         );
-        assert!(client.writes.lock().unwrap().is_empty());
+        assert!(client.writes.lock().is_empty());
         let ledger = ApplyLedger::load_or_new(&stack_ledger_path(temp.path()))
             .await
             .unwrap();
@@ -10753,8 +10743,8 @@ spec:
         let ledger_path = stack_ledger_path(temp.path());
         let client = ClaimObservedConnectorControlPlane {
             ledger_path: ledger_path.clone(),
-            observed_pending_claim: std::sync::Mutex::new(false),
-            created: std::sync::Mutex::new(false),
+            observed_pending_claim: parking_lot::Mutex::new(false),
+            created: parking_lot::Mutex::new(false),
         };
 
         let report = apply_stack(
@@ -10771,7 +10761,7 @@ spec:
         .unwrap();
 
         assert!(
-            *client.observed_pending_claim.lock().unwrap(),
+            *client.observed_pending_claim.lock(),
             "connector PUT did not observe a persisted pending claim"
         );
         assert!(
@@ -10830,7 +10820,7 @@ spec:
         let ledger_path = stack_ledger_path(temp.path());
         let client = RaceConnectorCreateControlPlane {
             ledger_path: ledger_path.clone(),
-            observed_pending_claim: std::sync::Mutex::new(false),
+            observed_pending_claim: parking_lot::Mutex::new(false),
         };
 
         let error = apply_stack(
@@ -10848,7 +10838,7 @@ spec:
         let message = format!("{error:#}");
 
         assert!(
-            *client.observed_pending_claim.lock().unwrap(),
+            *client.observed_pending_claim.lock(),
             "connector create-if-absent did not observe a persisted pending claim"
         );
         assert!(
@@ -10898,7 +10888,7 @@ spec:
         .unwrap();
         let ledger_path = stack_ledger_path(temp.path());
         let client = CommittedThenErroredConnectorControlPlane {
-            created: std::sync::Mutex::new(false),
+            created: parking_lot::Mutex::new(false),
         };
 
         let error = apply_stack(
@@ -11020,7 +11010,7 @@ spec: {}
                 action.resource_type == "persona" && action.operation == "blocked"
             })
         );
-        let deletes = client.deletes.lock().unwrap().clone();
+        let deletes = client.deletes.lock().clone();
         assert_eq!(
             deletes,
             vec!["/v1/runtime/connectors/http/partial-down-webhook".to_string()]
@@ -11094,7 +11084,7 @@ spec: {}
                 .iter()
                 .any(|action| action.operation == "blocked")
         );
-        let deletes = client.deletes.lock().unwrap().clone();
+        let deletes = client.deletes.lock().clone();
         assert_eq!(
             deletes,
             vec!["/v1/runtime/connectors/http/partial-prune-webhook".to_string()]
@@ -11181,7 +11171,7 @@ spec: {}
         schedule.queued_fire_at_ms = None;
 
         let client = RecordingControlPlane::default();
-        client.schedules.lock().unwrap().push(schedule);
+        client.schedules.lock().push(schedule);
 
         let report = apply_stack(
             &client,
@@ -11201,7 +11191,7 @@ spec: {}
                 action.resource_type == "schedule" && action.operation == "cancel"
             })
         );
-        assert!(client.posts.lock().unwrap().is_empty());
+        assert!(client.posts.lock().is_empty());
         let ledger = ApplyLedger::load_or_new(&ledger_path).await.unwrap();
         assert!(
             ledger
@@ -11281,7 +11271,7 @@ spec: {}
         .unwrap()
         .view;
         let client = RecordingControlPlane::default();
-        client.schedules.lock().unwrap().push(schedule);
+        client.schedules.lock().push(schedule);
 
         apply_stack(
             &client,
@@ -11296,7 +11286,7 @@ spec: {}
         .await
         .unwrap();
 
-        let posts = client.posts.lock().unwrap().clone();
+        let posts = client.posts.lock().clone();
         assert!(
             posts
                 .iter()

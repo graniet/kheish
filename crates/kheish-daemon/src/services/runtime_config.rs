@@ -1,7 +1,8 @@
 //! Durable daemon runtime-configuration revisions.
 
+use parking_lot::RwLock;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use kheish_session::write_json_pretty_atomically;
@@ -84,18 +85,11 @@ impl RuntimeConfigService {
     }
 
     pub(crate) fn current(&self) -> Option<RuntimeConfigRevisionView> {
-        self.document
-            .read()
-            .expect("runtime config rwlock poisoned")
-            .current
-            .clone()
+        self.document.read().current.clone()
     }
 
     pub(crate) fn metadata(&self) -> RuntimeConfigMetadataView {
-        let document = self
-            .document
-            .read()
-            .expect("runtime config rwlock poisoned");
+        let document = self.document.read();
         RuntimeConfigMetadataView {
             revision: document
                 .current
@@ -114,10 +108,7 @@ impl RuntimeConfigService {
     }
 
     pub(crate) fn list_revisions(&self) -> RuntimeConfigRevisionListResponse {
-        let document = self
-            .document
-            .read()
-            .expect("runtime config rwlock poisoned");
+        let document = self.document.read();
         let mut revisions = document.history.clone();
         if let Some(current) = document.current.clone() {
             revisions.push(current);
@@ -133,7 +124,6 @@ impl RuntimeConfigService {
         let current = self
             .document
             .read()
-            .expect("runtime config rwlock poisoned")
             .current
             .as_ref()
             .map(|revision| revision.revision)
@@ -148,10 +138,7 @@ impl RuntimeConfigService {
     }
 
     pub(crate) fn previous_revision(&self) -> Result<RuntimeConfigRevisionView> {
-        let document = self
-            .document
-            .read()
-            .expect("runtime config rwlock poisoned");
+        let document = self.document.read();
         document.history.last().cloned().ok_or_else(|| {
             DaemonProblem::runtime_revision_not_found(
                 "runtime config has no previous revision to roll back to",
@@ -161,10 +148,7 @@ impl RuntimeConfigService {
     }
 
     pub(crate) fn revision(&self, revision_id: u64) -> Result<RuntimeConfigRevisionView> {
-        let document = self
-            .document
-            .read()
-            .expect("runtime config rwlock poisoned");
+        let document = self.document.read();
         if let Some(current) = &document.current
             && current.revision == revision_id
         {
@@ -187,11 +171,7 @@ impl RuntimeConfigService {
         &self,
         mut revision: RuntimeConfigRevisionView,
     ) -> Result<RuntimeConfigRevisionView> {
-        let current_document = self
-            .document
-            .read()
-            .expect("runtime config rwlock poisoned")
-            .clone();
+        let current_document = self.document.read().clone();
         let mut next_document = current_document;
         revision.revision = next_document
             .current
@@ -208,10 +188,7 @@ impl RuntimeConfigService {
         }
         validate_document(&next_document)?;
         self.store.save(&next_document)?;
-        *self
-            .document
-            .write()
-            .expect("runtime config rwlock poisoned") = next_document;
+        *self.document.write() = next_document;
         Ok(revision)
     }
 }

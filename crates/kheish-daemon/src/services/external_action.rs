@@ -1,10 +1,11 @@
 //! Signed append-only audit storage for external action traces.
 
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
@@ -448,9 +449,7 @@ impl ExternalActionService {
 
         let bucket = audit_bucket(trace);
         let bucket_state = self.bucket_state(&bucket)?;
-        let mut state = bucket_state
-            .lock()
-            .map_err(|_| anyhow!("external action bucket mutex poisoned"))?;
+        let mut state = bucket_state.lock();
         if !state.initialized {
             let verified = read_verified_records_with_checkpoint(
                 &self.read_path_for_bucket(&bucket),
@@ -588,10 +587,7 @@ impl ExternalActionService {
     }
 
     fn bucket_state(&self, bucket: &str) -> Result<Arc<Mutex<BucketState>>> {
-        let mut buckets = self
-            .buckets
-            .lock()
-            .map_err(|_| anyhow!("external action bucket registry mutex poisoned"))?;
+        let mut buckets = self.buckets.lock();
         Ok(buckets
             .entry(bucket.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(BucketState::default())))
@@ -1176,9 +1172,10 @@ fn ed25519_signer_from_secret_bytes(
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex;
     use std::ffi::OsString;
     use std::fs;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::OnceLock;
 
     use anyhow::{Result, anyhow};
     use hmac::Mac;
@@ -1751,9 +1748,7 @@ mod tests {
     #[test]
     fn external_action_service_migrates_legacy_records_without_key_using_auth_store_master_key()
     -> Result<()> {
-        let _env_guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _env_guard = auth_store_env_lock().lock();
         let temp = tempdir()?;
         let legacy_key = b"0123456789abcdef0123456789abcdef";
         let legacy_record = write_legacy_run(temp.path(), "run-legacy-no-key", legacy_key)?;

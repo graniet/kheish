@@ -1,4 +1,5 @@
-use std::sync::{Arc, RwLock, Weak};
+use parking_lot::RwLock;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -751,16 +752,12 @@ impl DaemonToolControlHandle {
 
     /// Binds the handle to the live daemon state.
     pub fn bind(&self, control: &Arc<dyn DaemonToolControl>) {
-        *self
-            .inner
-            .write()
-            .expect("daemon tool control rwlock poisoned") = Some(Arc::downgrade(control));
+        *self.inner.write() = Some(Arc::downgrade(control));
     }
 
     pub(super) fn resolve(&self) -> Result<Arc<dyn DaemonToolControl>> {
         self.inner
             .read()
-            .expect("daemon tool control rwlock poisoned")
             .as_ref()
             .and_then(Weak::upgrade)
             .ok_or_else(|| anyhow!("daemon control is not available"))

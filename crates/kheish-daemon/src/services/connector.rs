@@ -1,10 +1,10 @@
 //! Runtime connector persistence and resolution service for the daemon control plane.
 
+use parking_lot::RwLock;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::RwLock as StdRwLock;
 
 use anyhow::{Context, Result, bail};
 use tokio::sync::Mutex;
@@ -191,7 +191,7 @@ pub(crate) struct ConnectorService {
     auth_manager: Arc<AuthManager>,
     file_settings: ConnectorSettings,
     daemon_settings: Mutex<ConnectorSettings>,
-    runtime_disabled_connectors: StdRwLock<BTreeSet<(ConnectorKind, String)>>,
+    runtime_disabled_connectors: RwLock<BTreeSet<(ConnectorKind, String)>>,
     registry: Arc<ConnectorRegistry>,
 }
 
@@ -224,7 +224,7 @@ impl ConnectorService {
             auth_manager,
             file_settings,
             daemon_settings: Mutex::new(daemon_settings),
-            runtime_disabled_connectors: StdRwLock::new(BTreeSet::new()),
+            runtime_disabled_connectors: RwLock::new(BTreeSet::new()),
             registry,
         })
     }
@@ -255,10 +255,7 @@ impl ConnectorService {
             .map(|record| connector_runtime_id(&record))
             .collect::<Vec<_>>();
         if !referenced.is_empty() {
-            let mut disabled = self
-                .runtime_disabled_connectors
-                .write()
-                .expect("connector runtime disabled set rwlock poisoned");
+            let mut disabled = self.runtime_disabled_connectors.write();
             disabled.extend(referenced);
         }
         let before = connector_count(&daemon_settings);
@@ -497,7 +494,6 @@ impl ConnectorService {
         mutate(&mut next);
         self.runtime_disabled_connectors
             .write()
-            .expect("connector runtime disabled set rwlock poisoned")
             .remove(&(kind, name.to_string()));
         self.persist_and_rebuild(&mut guard, next).await
     }
@@ -521,7 +517,6 @@ impl ConnectorService {
         mutate(&mut next);
         self.runtime_disabled_connectors
             .write()
-            .expect("connector runtime disabled set rwlock poisoned")
             .remove(&(kind, name.to_string()));
         self.persist_and_rebuild(&mut guard, next).await
     }
@@ -565,10 +560,7 @@ impl ConnectorService {
             &mut daemon_settings,
             self.auth_manager.as_ref(),
         );
-        let disabled = self
-            .runtime_disabled_connectors
-            .read()
-            .expect("connector runtime disabled set rwlock poisoned");
+        let disabled = self.runtime_disabled_connectors.read();
         retain_connectors_not_runtime_disabled(&mut file_settings, &disabled);
         retain_connectors_not_runtime_disabled(&mut daemon_settings, &disabled);
         merged_connector_settings(&file_settings, &daemon_settings)

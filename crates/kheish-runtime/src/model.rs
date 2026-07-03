@@ -1,5 +1,6 @@
+use parking_lot::Mutex;
 use std::fmt::{Display, Formatter};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
@@ -252,7 +253,7 @@ impl<P> ModelRuntime<P> {
     /// Returns a snapshot of consumed model budget.
     pub fn budget_snapshot(&self) -> ModelBudgetSnapshot {
         ModelBudgetSnapshot {
-            consumed: self.consumed.lock().expect("budget mutex poisoned").clone(),
+            consumed: self.consumed.lock().clone(),
             budget: self.budget.clone(),
         }
     }
@@ -521,7 +522,7 @@ where
 
 impl<P> ModelRuntime<P> {
     fn consume_budget(&self, usage: &ModelUsage) -> Result<()> {
-        let mut consumed = self.consumed.lock().expect("budget mutex poisoned");
+        let mut consumed = self.consumed.lock();
         accumulate_usage(&mut consumed, usage);
         if consumed.output_tokens > self.budget.max_total_output_tokens {
             bail!("model output token budget exceeded");
@@ -787,8 +788,9 @@ fn parse_max_tokens_context_overflow_adjustment(message: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex;
     use std::collections::{BTreeMap, VecDeque};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use anyhow::Result;
     use async_trait::async_trait;
@@ -864,14 +866,10 @@ mod tests {
             request: super::ModelRuntimeRequest,
             sink: super::ModelEventSink,
         ) -> std::result::Result<(), ProviderError> {
-            self.attempts
-                .lock()
-                .expect("attempt mutex poisoned")
-                .push(request.attempt);
+            self.attempts.lock().push(request.attempt);
             match self
                 .streams
                 .lock()
-                .expect("provider mutex poisoned")
                 .pop_front()
                 .expect("missing scripted provider response")
             {
@@ -894,11 +892,7 @@ mod tests {
             sink: super::ModelEventSink,
         ) -> std::result::Result<(), ProviderError> {
             loop {
-                let action = self
-                    .actions
-                    .lock()
-                    .expect("provider mutex poisoned")
-                    .pop_front();
+                let action = self.actions.lock().pop_front();
                 let Some(action) = action else {
                     return Ok(());
                 };
@@ -946,10 +940,7 @@ mod tests {
             .await?;
 
         assert_eq!(turn.assistant_message.content, "done");
-        assert_eq!(
-            attempts.lock().expect("attempt mutex poisoned").as_slice(),
-            &[1, 2]
-        );
+        assert_eq!(attempts.lock().as_slice(), &[1, 2]);
         assert!(
             observer
                 .traces()

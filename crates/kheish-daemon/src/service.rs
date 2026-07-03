@@ -1,10 +1,10 @@
 //! Daemon service assembly and HTTP router construction.
 
+use parking_lot::RwLock;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::RwLock as StdRwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
@@ -495,7 +495,7 @@ impl DaemonService {
         observer: Arc<dyn kheish_runtime::RuntimeObserver>,
         tools: Arc<ToolRuntime>,
         mcp: McpRuntimeSnapshot,
-        mcp_surface: Arc<StdRwLock<McpRuntimeSurface>>,
+        mcp_surface: Arc<RwLock<McpRuntimeSurface>>,
         mcp_manager: Option<Arc<McpManager>>,
         model_control: Option<Arc<dyn DaemonModelControl>>,
         events: DaemonEventBus,
@@ -989,6 +989,12 @@ impl DaemonService {
             .await?;
         state.restore_channel_lease_worker_on_boot().await?;
         state.reap_close_on_settle_agents().await?;
+        if let Err(error) = state.gc_orphaned_daemon_worktrees_on_boot().await {
+            warn!(
+                error = ?error,
+                "failed to reclaim orphaned daemon-owned worktrees during daemon startup"
+            );
+        }
         if let Err(error) = state.prune_expired_debug_evidence_on_boot().await {
             warn!(
                 error = ?error,

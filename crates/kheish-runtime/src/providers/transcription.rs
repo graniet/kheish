@@ -1005,7 +1005,8 @@ fn provider_audit_error(error: anyhow::Error) -> ProviderError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
 
     use anyhow::Result;
 
@@ -1028,10 +1029,7 @@ mod tests {
         }
 
         fn debug_artifacts(&self) -> Vec<DebugArtifact> {
-            self.artifacts
-                .lock()
-                .expect("artifacts mutex poisoned")
-                .clone()
+            self.artifacts.lock().clone()
         }
     }
 
@@ -1043,10 +1041,7 @@ mod tests {
         fn record(&self, _event: TraceEvent) {}
 
         fn record_debug_artifact(&self, artifact: DebugArtifact) {
-            self.artifacts
-                .lock()
-                .expect("artifacts mutex poisoned")
-                .push(artifact);
+            self.artifacts.lock().push(artifact);
         }
 
         fn increment_counter(&self, _name: &str, _delta: u64) {}
@@ -1127,7 +1122,7 @@ mod tests {
         assert_eq!(response.provider, "openai");
         assert_eq!(response.model, "gpt-4o-transcribe");
         assert_eq!(response.text, "hello from transcription");
-        let body = captured.lock().expect("captured request mutex poisoned");
+        let body = captured.lock();
         assert!(body.contains("gpt-4o-transcribe"));
         assert!(body.contains("response_format"));
         assert!(body.contains("Prefer exact transcript"));
@@ -1369,7 +1364,7 @@ mod tests {
         assert_eq!(timestamps.segments.len(), 1);
         assert_eq!(timestamps.segments[0].text, "hello world");
 
-        let request_body = captured.lock().expect("captured request mutex poisoned");
+        let request_body = captured.lock();
         assert!(request_body.contains("response_format"));
         assert!(request_body.contains("verbose_json"));
         assert!(request_body.contains("timestamp_granularities[]"));
@@ -1422,7 +1417,7 @@ mod tests {
         assert_eq!(segments[0].speaker.as_deref(), Some("speaker_0"));
         assert_eq!(segments[1].start_ms, 1_300);
 
-        let request_body = captured.lock().expect("captured request mutex poisoned");
+        let request_body = captured.lock();
         assert!(request_body.contains("gpt-4o-transcribe-diarize"));
         assert!(request_body.contains("diarized_json"));
         assert!(request_body.contains("chunking_strategy"));

@@ -1,10 +1,11 @@
 //! Daemon-owned asset storage and attachment rendering helpers.
 
+use parking_lot::{Condvar, Mutex};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -252,7 +253,7 @@ struct AssetCatalog {
 }
 
 struct PendingImport {
-    state: StdMutex<PendingImportState>,
+    state: Mutex<PendingImportState>,
     ready: Condvar,
 }
 
@@ -266,7 +267,7 @@ struct PendingImportState {
 impl PendingImport {
     fn new() -> Self {
         Self {
-            state: StdMutex::new(PendingImportState::default()),
+            state: Mutex::new(PendingImportState::default()),
             ready: Condvar::new(),
         }
     }
@@ -284,7 +285,7 @@ enum ImportReservation {
 /// A durable file-backed asset store rooted under the daemon state directory.
 pub(crate) struct FileAssetStore {
     root: PathBuf,
-    catalog: StdMutex<AssetCatalog>,
+    catalog: Mutex<AssetCatalog>,
     startup_repair_report: AssetStartupRepairReport,
     next_id: AtomicU64,
 }
@@ -345,7 +346,7 @@ impl FileAssetStore {
         }
         Ok(Self {
             root,
-            catalog: StdMutex::new(catalog),
+            catalog: Mutex::new(catalog),
             startup_repair_report,
             next_id: AtomicU64::new(max_suffix.saturating_add(1)),
         })
@@ -401,15 +402,9 @@ impl FileAssetStore {
                 self.append_asset_provenance_if_needed(existing, provenance)
             }
             ImportReservation::Wait(pending) => {
-                let mut state = pending
-                    .state
-                    .lock()
-                    .expect("asset import reservation mutex poisoned");
+                let mut state = pending.state.lock();
                 while !state.settled {
-                    state = pending
-                        .ready
-                        .wait(state)
-                        .expect("asset import reservation wait poisoned");
+                    pending.ready.wait(&mut state);
                 }
                 if let Some(record) = state.record.clone() {
                     return self.append_asset_provenance_if_needed(record, provenance);
@@ -434,17 +429,12 @@ impl FileAssetStore {
 
     /// Returns one stored asset by identifier when it exists.
     pub(crate) fn get(&self, asset_id: &str) -> Option<StoredAssetRecord> {
-        self.catalog
-            .lock()
-            .expect("asset catalog mutex poisoned")
-            .by_id
-            .get(asset_id)
-            .cloned()
+        self.catalog.lock().by_id.get(asset_id).cloned()
     }
 
     /// Returns one stored asset by raw storage URI when it exists.
     pub(crate) fn get_by_uri(&self, uri: &str) -> Option<StoredAssetRecord> {
-        let catalog = self.catalog.lock().expect("asset catalog mutex poisoned");
+        let catalog = self.catalog.lock();
         let asset_id = catalog.by_uri.get(uri)?;
         catalog.by_id.get(asset_id).cloned()
     }
@@ -530,7 +520,6 @@ impl FileAssetStore {
             .filter(|value| !value.is_empty());
         self.catalog
             .lock()
-            .expect("asset catalog mutex poisoned")
             .by_id
             .values()
             .filter(|record| {
@@ -585,7 +574,7 @@ impl FileAssetStore {
             "text asset {} must be text/plain",
             text_asset.id
         );
-        let mut catalog = self.catalog.lock().expect("asset catalog mutex poisoned");
+        let mut catalog = self.catalog.lock();
         let record = catalog
             .by_id
             .get_mut(asset_id)
@@ -619,7 +608,7 @@ impl FileAssetStore {
             !derivation_id.trim().is_empty(),
             "derivation_id is required"
         );
-        let mut catalog = self.catalog.lock().expect("asset catalog mutex poisoned");
+        let mut catalog = self.catalog.lock();
         let record = catalog
             .by_id
             .get_mut(asset_id)
@@ -651,7 +640,7 @@ impl FileAssetStore {
     /// Removes one asset catalog entry and records a durable tombstone for its identifier.
     pub(crate) fn delete_asset_with_reason(&self, asset_id: &str, reason: &str) -> Result<bool> {
         let record = {
-            let catalog = self.catalog.lock().expect("asset catalog mutex poisoned");
+            let catalog = self.catalog.lock();
             let Some(record) = catalog.by_id.get(asset_id).cloned() else {
                 return Ok(false);
             };
@@ -671,7 +660,7 @@ impl FileAssetStore {
             },
         )?;
         {
-            let mut catalog = self.catalog.lock().expect("asset catalog mutex poisoned");
+            let mut catalog = self.catalog.lock();
             let Some(removed) = catalog.by_id.remove(asset_id) else {
                 return Ok(false);
             };
@@ -739,7 +728,7 @@ impl FileAssetStore {
     /// Returns payload files in raw/text/preview directories that are not referenced by metadata.
     pub(crate) fn orphan_payload_files(&self) -> Result<Vec<AssetDeletionFileRecord>> {
         let referenced_uris = {
-            let catalog = self.catalog.lock().expect("asset catalog mutex poisoned");
+            let catalog = self.catalog.lock();
             let mut referenced_uris = std::collections::BTreeSet::new();
             for record in catalog.by_id.values() {
                 referenced_uris.insert(record.uri.clone());
@@ -826,7 +815,7 @@ impl FileAssetStore {
     }
 
     fn reserve_import(&self, digest_key: &str) -> ImportReservation {
-        let mut catalog = self.catalog.lock().expect("asset catalog mutex poisoned");
+        let mut catalog = self.catalog.lock();
         if let Some(existing) = catalog
             .by_digest
             .get(digest_key)
@@ -937,15 +926,12 @@ impl FileAssetStore {
 
         match result {
             Ok(record) => {
-                let mut catalog = self.catalog.lock().expect("asset catalog mutex poisoned");
+                let mut catalog = self.catalog.lock();
                 catalog.inflight_by_digest.remove(&digest_key);
                 catalog.by_digest.insert(digest_key, id);
                 catalog.by_uri.insert(record.uri.clone(), record.id.clone());
                 catalog.by_id.insert(record.id.clone(), record.clone());
-                let mut state = pending
-                    .state
-                    .lock()
-                    .expect("asset import reservation mutex poisoned");
+                let mut state = pending.state.lock();
                 state.settled = true;
                 state.record = Some(record.clone());
                 pending.ready.notify_all();
@@ -961,14 +947,11 @@ impl FileAssetStore {
                 }
                 let _ = fs::remove_file(&meta_path);
 
-                let mut catalog = self.catalog.lock().expect("asset catalog mutex poisoned");
+                let mut catalog = self.catalog.lock();
                 catalog.inflight_by_digest.remove(&digest_key);
                 drop(catalog);
 
-                let mut state = pending
-                    .state
-                    .lock()
-                    .expect("asset import reservation mutex poisoned");
+                let mut state = pending.state.lock();
                 state.settled = true;
                 state.error = Some(error.to_string());
                 pending.ready.notify_all();
@@ -985,7 +968,7 @@ impl FileAssetStore {
         let Some(provenance) = provenance else {
             return Ok(record);
         };
-        let mut catalog = self.catalog.lock().expect("asset catalog mutex poisoned");
+        let mut catalog = self.catalog.lock();
         record = catalog.by_id.get(&record.id).cloned().unwrap_or(record);
         if record.provenance.contains(&provenance) {
             return Ok(record);

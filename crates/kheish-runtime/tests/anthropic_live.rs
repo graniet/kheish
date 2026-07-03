@@ -1,4 +1,5 @@
-use std::sync::{Arc, Mutex, OnceLock};
+use parking_lot::Mutex;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -639,9 +640,7 @@ fn first_env(names: &[&str]) -> Option<String> {
     names.iter().find_map(|name| std::env::var(name).ok())
 }
 
-fn live_test_guard() -> std::sync::MutexGuard<'static, ()> {
+fn live_test_guard() -> parking_lot::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    LOCK.get_or_init(|| Mutex::new(())).lock()
 }

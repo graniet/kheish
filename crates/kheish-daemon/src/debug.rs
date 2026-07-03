@@ -1,8 +1,9 @@
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aes_gcm_siv::aead::{Aead, KeyInit};
@@ -48,14 +49,9 @@ const DEFAULT_DEBUG_GC_INTERVAL_MS: u64 = 60 * 60 * 1_000;
 const MIN_DEBUG_ARTIFACT_BYTES: u64 = 512;
 
 #[cfg(test)]
-pub(crate) fn debug_capture_env_lock() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn debug_capture_env_lock() -> parking_lot::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
-    // A test that panics while holding the guard must not cascade into
-    // PoisonError aborts across the rest of the suite; the lock only
-    // serializes env-var mutation, so recovering the guard is safe.
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    LOCK.get_or_init(|| Mutex::new(())).lock()
 }
 
 /// One stored debug artifact descriptor.
@@ -300,10 +296,7 @@ impl FileDebugStore {
         let Some(run_id) = artifact.run_id.as_deref() else {
             return Ok(());
         };
-        let _guard = self
-            .lock
-            .lock()
-            .expect("debug store mutex poisoned during artifact append");
+        let _guard = self.lock.lock();
         let run_root = self.prepare_run_root_for_write(run_id)?;
         let mut view = self.load_view_unlocked(run_id)?.unwrap_or(RunDebugView {
             run_id: run_id.to_string(),
@@ -366,10 +359,7 @@ impl FileDebugStore {
 
     /// Loads one run debug summary when present.
     pub fn load_view(&self, run_id: &str) -> Result<Option<RunDebugView>> {
-        let _guard = self
-            .lock
-            .lock()
-            .expect("debug store mutex poisoned during manifest read");
+        let _guard = self.lock.lock();
         self.load_view_unlocked(run_id)
     }
 
@@ -383,28 +373,19 @@ impl FileDebugStore {
 
     /// Returns true when one run has a debug bundle on disk.
     pub fn has_run(&self, run_id: &str) -> bool {
-        let _guard = self
-            .lock
-            .lock()
-            .expect("debug store mutex poisoned during existence check");
+        let _guard = self.lock.lock();
         self.view_path(run_id).exists()
     }
 
     /// Returns the current on-disk byte size of one run debug bundle.
     pub fn run_bytes(&self, run_id: &str) -> Result<u64> {
-        let _guard = self
-            .lock
-            .lock()
-            .expect("debug store mutex poisoned during byte scan");
+        let _guard = self.lock.lock();
         directory_bytes(&self.run_root_for_read(run_id))
     }
 
     /// Reads one stored artifact body as UTF-8 text.
     pub fn read_artifact(&self, run_id: &str, artifact_id: &str) -> Result<String> {
-        let _guard = self
-            .lock
-            .lock()
-            .expect("debug store mutex poisoned during artifact read");
+        let _guard = self.lock.lock();
         let view = self
             .load_view_unlocked(run_id)?
             .ok_or_else(|| anyhow!("debug capture is off for run {run_id}"))?;
@@ -435,10 +416,7 @@ impl FileDebugStore {
 
     /// Deletes all debug artifacts for one run and reports whether a bundle existed.
     pub fn delete_run(&self, run_id: &str) -> Result<bool> {
-        let _guard = self
-            .lock
-            .lock()
-            .expect("debug store mutex poisoned during run delete");
+        let _guard = self.lock.lock();
         let path = self.run_root_for_read(run_id);
         remove_debug_bundle_dir(&path)
     }
@@ -455,10 +433,7 @@ impl FileDebugStore {
             return Ok(DebugStorePruneResult::default());
         }
         let cutoff_ms = now_ms.saturating_sub(self.policy.ttl_ms);
-        let _guard = self
-            .lock
-            .lock()
-            .expect("debug store mutex poisoned during expired bundle prune");
+        let _guard = self.lock.lock();
         let candidates = self
             .bundle_records_unlocked()?
             .into_iter()
@@ -484,10 +459,7 @@ impl FileDebugStore {
         if max_store_bytes == 0 {
             return Ok(None);
         }
-        let _guard = self
-            .lock
-            .lock()
-            .expect("debug store mutex poisoned during store budget prune");
+        let _guard = self.lock.lock();
         let records = self.bundle_records_unlocked()?;
         let mut total_debug_bytes = records
             .iter()
@@ -1109,10 +1081,7 @@ fn truncate_json_lines_artifact(
 fn debug_store_lock_for_root(root: &Path) -> Arc<Mutex<()>> {
     static LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
     let key = normalized_debug_store_root(root);
-    let mut locks = LOCKS
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock()
-        .expect("debug store lock registry poisoned");
+    let mut locks = LOCKS.get_or_init(|| Mutex::new(BTreeMap::new())).lock();
     if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
         return lock;
     }
@@ -1317,7 +1286,7 @@ mod tests {
 
     use super::*;
 
-    fn without_debug_capture_key() -> std::sync::MutexGuard<'static, ()> {
+    fn without_debug_capture_key() -> parking_lot::MutexGuard<'static, ()> {
         let guard = debug_capture_env_lock();
         unsafe {
             std::env::remove_var(DEBUG_CAPTURE_KEY_ENV);

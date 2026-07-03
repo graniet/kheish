@@ -1,8 +1,9 @@
 //! Daemon-owned policy settings, evaluation, and queueing for learning publication workflows.
 
+use parking_lot::RwLock;
 use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use kheish_types::{
@@ -111,10 +112,7 @@ impl LearningPolicyService {
 
     /// Returns the currently persisted automation settings.
     pub(crate) fn settings(&self) -> LearningAutomationPolicyConfig {
-        self.settings
-            .read()
-            .expect("learning policy settings rwlock poisoned")
-            .clone()
+        self.settings.read().clone()
     }
 
     /// Validates one replacement automation policy without activating it.
@@ -131,10 +129,7 @@ impl LearningPolicyService {
         settings: LearningAutomationPolicyConfig,
     ) -> Result<LearningAutomationPolicyConfig> {
         validate_learning_policy_config(&settings)?;
-        *self
-            .settings
-            .write()
-            .expect("learning policy settings rwlock poisoned") = settings.clone();
+        *self.settings.write() = settings.clone();
         self.notify.notify_waiters();
         Ok(settings)
     }

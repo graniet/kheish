@@ -1,7 +1,7 @@
+use parking_lot::Mutex as SyncMutex;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::future::Future;
-use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Result, anyhow};
@@ -115,7 +115,6 @@ impl Drop for ParentClarificationCompletionGuard<'_> {
         self.service
             .parent_clarification_inflight
             .lock()
-            .expect("parent clarification completion mutex poisoned")
             .remove(&self.run_id);
         self.service.parent_clarification_notify.notify_waiters();
     }
@@ -147,11 +146,11 @@ pub(crate) struct RunService {
     session_runs: Mutex<BTreeMap<String, SessionRunState>>,
     pending_goal_continuations: Mutex<BTreeMap<String, BTreeSet<String>>>,
     pending_idle_submissions: Mutex<BTreeMap<String, String>>,
-    event_append_lock: StdMutex<()>,
-    indexes: StdMutex<RunIndexes>,
-    pending_questions: StdMutex<BTreeMap<String, PendingQuestionView>>,
+    event_append_lock: SyncMutex<()>,
+    indexes: SyncMutex<RunIndexes>,
+    pending_questions: SyncMutex<BTreeMap<String, PendingQuestionView>>,
     pending_question_notify: Notify,
-    parent_clarification_inflight: StdMutex<BTreeSet<String>>,
+    parent_clarification_inflight: SyncMutex<BTreeSet<String>>,
     parent_clarification_notify: Notify,
     next_run_id: AtomicU64,
 }
@@ -184,11 +183,11 @@ impl RunService {
             session_runs: Mutex::new(session_runs),
             pending_goal_continuations: Mutex::new(BTreeMap::new()),
             pending_idle_submissions: Mutex::new(BTreeMap::new()),
-            event_append_lock: StdMutex::new(()),
-            indexes: StdMutex::new(indexes),
-            pending_questions: StdMutex::new(pending_questions),
+            event_append_lock: SyncMutex::new(()),
+            indexes: SyncMutex::new(indexes),
+            pending_questions: SyncMutex::new(pending_questions),
             pending_question_notify: Notify::new(),
-            parent_clarification_inflight: StdMutex::new(BTreeSet::new()),
+            parent_clarification_inflight: SyncMutex::new(BTreeSet::new()),
             parent_clarification_notify: Notify::new(),
             next_run_id,
         }
@@ -272,7 +271,6 @@ impl RunService {
         let run_ids_by_fire_at_ms = self
             .indexes
             .lock()
-            .expect("run indexes mutex poisoned")
             .scheduled_by_fire
             .get(schedule_id)
             .cloned()
@@ -286,7 +284,6 @@ impl RunService {
     pub(crate) fn has_pending_mailbox_delivery(&self, session_id: &str) -> bool {
         self.indexes
             .lock()
-            .expect("run indexes mutex poisoned")
             .mailbox_by_session
             .get(session_id)
             .is_some_and(|run_ids| !run_ids.is_empty())
@@ -1132,7 +1129,6 @@ impl RunService {
             let acquired = self
                 .parent_clarification_inflight
                 .lock()
-                .expect("parent clarification completion mutex poisoned")
                 .insert(run_id.to_string());
             if acquired {
                 return ParentClarificationCompletionGuard {
@@ -1260,10 +1256,7 @@ impl RunService {
 
     /// Persists one run event only when the exact event is not already present.
     pub(crate) fn append_run_event_once(&self, view: &RunView, event: RunEvent) -> Result<()> {
-        let _guard = self
-            .event_append_lock
-            .lock()
-            .expect("run event append mutex poisoned");
+        let _guard = self.event_append_lock.lock();
         self.append_run_event_once_locked(view, event)
     }
 
@@ -1348,7 +1341,7 @@ impl RunService {
     }
 
     fn rebuild_indexes_from_runs(&self, runs: &BTreeMap<String, RunRecord>) {
-        *self.indexes.lock().expect("run indexes mutex poisoned") = build_run_indexes(runs);
+        *self.indexes.lock() = build_run_indexes(runs);
     }
 
     /// Lists the pending structured user questions, optionally scoped to one session.
@@ -1358,7 +1351,6 @@ impl RunService {
     ) -> Vec<PendingQuestionView> {
         self.pending_questions
             .lock()
-            .expect("pending question index mutex poisoned")
             .values()
             .filter(|question| {
                 session_id
@@ -1379,10 +1371,7 @@ impl RunService {
         &self,
         now_ms: u64,
     ) -> PendingQuestionExpirationSnapshot {
-        let pending_questions = self
-            .pending_questions
-            .lock()
-            .expect("pending question index mutex poisoned");
+        let pending_questions = self.pending_questions.lock();
         let mut snapshot = PendingQuestionExpirationSnapshot::default();
         for question in pending_questions.values() {
             let Some(expires_at_ms) = question.request.expires_at_ms else {
@@ -2212,10 +2201,7 @@ impl RunService {
 
     /// Loads the persisted event log for one run.
     pub(crate) fn run_events(&self, run_id: &str) -> Result<Vec<RunEventEntry>> {
-        let _guard = self
-            .event_append_lock
-            .lock()
-            .expect("run event append mutex poisoned");
+        let _guard = self.event_append_lock.lock();
         let record = self
             .run_store
             .load_run(run_id)?
@@ -2308,10 +2294,7 @@ impl RunService {
             if clear_pending_question_state {
                 clear_pending_questions(&mut record.view);
             }
-            let event_guard = self
-                .event_append_lock
-                .lock()
-                .expect("run event append mutex poisoned");
+            let event_guard = self.event_append_lock.lock();
             if let Err(error) = self.run_store.save_run(record) {
                 *record = previous;
                 return Err(error);
@@ -2339,7 +2322,7 @@ impl RunService {
     }
 
     fn refresh_record_indexes(&self, previous: Option<&RunRecord>, updated: &RunRecord) {
-        let mut indexes = self.indexes.lock().expect("run indexes mutex poisoned");
+        let mut indexes = self.indexes.lock();
         if let Some(previous) = previous {
             deindex_run_record(previous, &mut indexes);
         }
@@ -2347,10 +2330,7 @@ impl RunService {
     }
 
     fn sync_pending_question_index(&self, run: &RunView) {
-        let mut pending = self
-            .pending_questions
-            .lock()
-            .expect("pending question index mutex poisoned");
+        let mut pending = self.pending_questions.lock();
         pending.retain(|_, question| question.run_id.as_deref() != Some(run.run_id.as_str()));
         if run.status != DaemonRunStatus::WaitingForUserQuestion {
             return;
@@ -5378,10 +5358,7 @@ mod tests {
             AtomicU64::new(0),
         );
 
-        let _guard = service
-            .event_append_lock
-            .lock()
-            .expect("run event append mutex poisoned");
+        let _guard = service.event_append_lock.lock();
         service.append_resume_events_locked(&record.view, Some(audit))?;
 
         let events = run_store

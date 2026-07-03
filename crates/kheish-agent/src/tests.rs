@@ -1,10 +1,11 @@
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, VecDeque};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use anyhow::Result;
     use async_trait::async_trait;
+    use parking_lot::Mutex;
     use serde_json::json;
 
     use crate::{
@@ -36,13 +37,7 @@ mod tests {
             _request: kheish_runtime::ModelRuntimeRequest,
             sink: kheish_runtime::ModelEventSink,
         ) -> std::result::Result<(), ProviderError> {
-            match self
-                .0
-                .lock()
-                .expect("provider mutex poisoned")
-                .pop_front()
-                .expect("scripted response")
-            {
+            match self.0.lock().pop_front().expect("scripted response") {
                 Ok(events) => {
                     for event in events {
                         sink.emit(event).expect("sink should remain open");
@@ -167,7 +162,7 @@ mod tests {
                 credentialed_mcp_servers: Vec::new(),
                 mcp_tool_servers: BTreeMap::new(),
                 mcp_server_instructions: Vec::new(),
-                mcp_surface: Arc::new(std::sync::RwLock::new(McpRuntimeSurface::default())),
+                mcp_surface: Arc::new(parking_lot::RwLock::new(McpRuntimeSurface::default())),
             },
             supervisor.clone(),
         );

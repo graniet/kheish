@@ -1,7 +1,8 @@
 //! Route-aware model routing for the daemon control plane.
 
+use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
@@ -690,19 +691,12 @@ impl DynamicModelRoute {
     }
 
     pub(crate) fn current_model(&self) -> String {
-        self.state
-            .read()
-            .expect("dynamic model route rwlock poisoned")
-            .selected_model
-            .clone()
+        self.state.read().selected_model.clone()
     }
 
     pub(crate) fn driver_for_model(&self, model: &str) -> Result<Arc<dyn ModelDriver>> {
         {
-            let state = self
-                .state
-                .read()
-                .expect("dynamic model route rwlock poisoned");
+            let state = self.state.read();
             if let Some(driver) = state.drivers.get(model) {
                 return Ok(driver.clone());
             }
@@ -715,19 +709,13 @@ impl DynamicModelRoute {
             self.observer.clone(),
             self.debug.clone(),
         )?;
-        let mut state = self
-            .state
-            .write()
-            .expect("dynamic model route rwlock poisoned");
+        let mut state = self.state.write();
         state.drivers.insert(model.to_string(), driver.clone());
         Ok(driver)
     }
 
     pub(crate) fn set_selected_model(&self, model: &str) {
-        self.state
-            .write()
-            .expect("dynamic model route rwlock poisoned")
-            .selected_model = model.to_string();
+        self.state.write().selected_model = model.to_string();
     }
 }
 
@@ -754,12 +742,7 @@ impl RoutedModelDriver {
     }
 
     fn active_route(&self) -> Arc<DynamicModelRoute> {
-        let active_route_id = self
-            .active_selection
-            .read()
-            .expect("routed model driver selection rwlock poisoned")
-            .route_id
-            .clone();
+        let active_route_id = self.active_selection.read().route_id.clone();
         self.routes
             .iter()
             .find(|route| route.route_id() == active_route_id)
@@ -813,11 +796,7 @@ impl RoutedModelDriver {
         if scope.and_then(|scope| scope.provider.as_deref()).is_some() {
             return route.current_model();
         }
-        self.active_selection
-            .read()
-            .expect("routed model driver selection rwlock poisoned")
-            .model
-            .clone()
+        self.active_selection.read().model.clone()
     }
 }
 
@@ -937,12 +916,7 @@ impl RoutedModelControl {
     }
 
     fn active_route(&self) -> Option<Arc<DynamicModelRoute>> {
-        let active_route_id = self
-            .active_selection
-            .read()
-            .expect("routed model control selection rwlock poisoned")
-            .route_id
-            .clone();
+        let active_route_id = self.active_selection.read().route_id.clone();
         self.routes
             .iter()
             .find(|route| route.route_id() == active_route_id)
@@ -953,11 +927,7 @@ impl RoutedModelControl {
 
 impl DaemonModelControl for RoutedModelControl {
     fn current_model(&self) -> String {
-        self.active_selection
-            .read()
-            .expect("routed model control selection rwlock poisoned")
-            .model
-            .clone()
+        self.active_selection.read().model.clone()
     }
 
     fn available_routes(&self) -> Vec<ResolvedModelRoute> {
@@ -985,12 +955,7 @@ impl DaemonModelControl for RoutedModelControl {
             return diagnostics;
         }
 
-        let active_route_id = self
-            .active_selection
-            .read()
-            .expect("routed model control selection rwlock poisoned")
-            .route_id
-            .clone();
+        let active_route_id = self.active_selection.read().route_id.clone();
         if !self
             .routes
             .iter()
@@ -1041,10 +1006,7 @@ impl DaemonModelControl for RoutedModelControl {
             .ok_or_else(|| anyhow!("daemon has no model route `{}`", resolved.route_id))?;
         route.driver_for_model(&model)?;
         route.set_selected_model(&model);
-        *self
-            .active_selection
-            .write()
-            .expect("routed model control selection rwlock poisoned") = ActiveModelSelection {
+        *self.active_selection.write() = ActiveModelSelection {
             route_id: resolved.route_id,
             model: model.clone(),
         };

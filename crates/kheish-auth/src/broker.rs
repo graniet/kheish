@@ -5,12 +5,12 @@ use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use kheish_types::CredentialScope;
+use parking_lot::RwLock;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -315,10 +315,7 @@ impl CredentialBroker {
         if !scope.is_empty() && !scope.allows_route(route_id) {
             bail!("credential scope blocks route {route_id}");
         }
-        let mut state = self
-            .state
-            .write()
-            .expect("credential broker state rwlock poisoned");
+        let mut state = self.state.write();
         prune_state(&mut state, now_ms());
         let subject_epoch = remember_subject_locked(&mut state, &subject.subject_id);
         ensure_subject_not_revoked_locked(&state, &subject.subject_id, subject_epoch)?;
@@ -363,10 +360,7 @@ impl CredentialBroker {
         let mut token_bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut token_bytes);
         let token_digest = digest_bytes(&token_bytes);
-        let mut state = self
-            .state
-            .write()
-            .expect("credential broker state rwlock poisoned");
+        let mut state = self.state.write();
         prune_state(&mut state, now_ms());
         let subject_epoch = remember_subject_locked(&mut state, &grant.subject.subject_id);
         ensure_subject_not_revoked_locked(&state, &grant.subject.subject_id, subject_epoch)?;
@@ -427,10 +421,7 @@ impl CredentialBroker {
         rand::thread_rng().fill_bytes(&mut token_bytes);
         let token = URL_SAFE_NO_PAD.encode(token_bytes);
         let token_digest = digest_str(&token);
-        let mut state = self
-            .state
-            .write()
-            .expect("credential broker state rwlock poisoned");
+        let mut state = self.state.write();
         prune_state(&mut state, now_ms());
         let subject_epoch = remember_subject_locked(&mut state, &subject.subject_id);
         ensure_subject_not_revoked_locked(&state, &subject.subject_id, subject_epoch)?;
@@ -480,10 +471,7 @@ impl CredentialBroker {
             .insert(lease.id.clone(), lease.clone());
         self.persist_state(&state)?;
         drop(state);
-        let mut leases = self
-            .connector_leases
-            .write()
-            .expect("credential broker connector leases rwlock poisoned");
+        let mut leases = self.connector_leases.write();
         prune_connector_leases(&mut leases, now_ms());
         leases.insert(token_digest, lease.clone());
         register_ephemeral_debug_redaction_token(token.clone());
@@ -521,10 +509,7 @@ impl CredentialBroker {
         let token_digest = digest_str(token);
         let now = now_ms();
         let lease = {
-            let mut leases = self
-                .connector_leases
-                .write()
-                .expect("credential broker connector leases rwlock poisoned");
+            let mut leases = self.connector_leases.write();
             prune_connector_leases(&mut leases, now);
             leases
                 .get(&token_digest)
@@ -582,10 +567,7 @@ impl CredentialBroker {
         }
         let normalized_scopes = normalize_entries(scopes);
         let scopes_hash = stable_id(&normalized_scopes);
-        let mut state = self
-            .state
-            .write()
-            .expect("credential broker state rwlock poisoned");
+        let mut state = self.state.write();
         prune_state(&mut state, now_ms());
         let subject_epoch = remember_subject_locked(&mut state, &subject.subject_id);
         ensure_subject_not_revoked_locked(&state, &subject.subject_id, subject_epoch)?;
@@ -627,10 +609,7 @@ impl CredentialBroker {
         let mut token_bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut token_bytes);
         let token_digest = digest_bytes(&token_bytes);
-        let mut state = self
-            .state
-            .write()
-            .expect("credential broker state rwlock poisoned");
+        let mut state = self.state.write();
         prune_state(&mut state, now_ms());
         let subject_epoch = remember_subject_locked(&mut state, &grant.subject.subject_id);
         ensure_subject_not_revoked_locked(&state, &grant.subject.subject_id, subject_epoch)?;
@@ -661,10 +640,7 @@ impl CredentialBroker {
 
     /// Revokes the subject for all future auth resolution and active leases.
     pub fn revoke_subject(&self, subject_id: &str) -> Result<AuthSubjectStatus> {
-        let mut state = self
-            .state
-            .write()
-            .expect("credential broker state rwlock poisoned");
+        let mut state = self.state.write();
         let now = now_ms();
         prune_state(&mut state, now);
         anyhow::ensure!(
@@ -699,10 +675,7 @@ impl CredentialBroker {
     /// Returns one operator-facing subject status.
     pub fn subject_status(&self, subject_id: &str) -> Option<AuthSubjectStatus> {
         let now = now_ms();
-        let state = self
-            .state
-            .read()
-            .expect("credential broker state rwlock poisoned");
+        let state = self.state.read();
         if !known_subject_locked(&state, subject_id) {
             return None;
         }
@@ -758,10 +731,7 @@ impl CredentialBroker {
 
     /// Revokes one concrete lease identifier until the provided expiry timestamp.
     pub fn revoke_lease(&self, lease_id: &str, expires_at_ms: u64) -> Result<()> {
-        let mut state = self
-            .state
-            .write()
-            .expect("credential broker state rwlock poisoned");
+        let mut state = self.state.write();
         let now = now_ms();
         prune_state(&mut state, now);
         state
@@ -772,10 +742,7 @@ impl CredentialBroker {
 
     /// Revokes active route, connector, and MCP leases bound to one daemon-managed auth slot.
     pub fn revoke_slot_leases(&self, slot_id: &AuthSlotId) -> Result<usize> {
-        let mut state = self
-            .state
-            .write()
-            .expect("credential broker state rwlock poisoned");
+        let mut state = self.state.write();
         let now = now_ms();
         prune_state(&mut state, now);
         let lease_revocations = state
@@ -805,10 +772,7 @@ impl CredentialBroker {
 
     /// Re-enables one daemon-managed auth slot after a fresh credential write.
     pub fn unrevoke_slot(&self, slot_id: &AuthSlotId) -> Result<()> {
-        let mut state = self
-            .state
-            .write()
-            .expect("credential broker state rwlock poisoned");
+        let mut state = self.state.write();
         let now = now_ms();
         prune_state(&mut state, now);
         if state.revoked_slots.remove(&slot_id.0).is_some() {
@@ -820,10 +784,7 @@ impl CredentialBroker {
     /// Returns whether one daemon-managed auth slot has been explicitly revoked.
     pub fn is_slot_revoked(&self, slot_id: &AuthSlotId) -> bool {
         let now = now_ms();
-        let state = self
-            .state
-            .read()
-            .expect("credential broker state rwlock poisoned");
+        let state = self.state.read();
         state
             .revoked_slots
             .get(&slot_id.0)
@@ -834,10 +795,7 @@ impl CredentialBroker {
     /// Returns one operator-facing status for an issued lease when known.
     pub fn lease_status(&self, lease_id: &str) -> Option<CredentialLeaseStatus> {
         let now = now_ms();
-        let state = self
-            .state
-            .read()
-            .expect("credential broker state rwlock poisoned");
+        let state = self.state.read();
         let lease = state
             .issued_connector_leases
             .get(lease_id)
@@ -867,10 +825,7 @@ impl CredentialBroker {
         now_ms: u64,
         context: &str,
     ) -> Result<()> {
-        let state = self
-            .state
-            .read()
-            .expect("credential broker state rwlock poisoned");
+        let state = self.state.read();
         anyhow::ensure!(
             !lease_is_revoked_locked(&state, lease, now_ms),
             "{context} is revoked"

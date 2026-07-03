@@ -1,8 +1,8 @@
+use parking_lot::Mutex as SyncMutex;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -29,7 +29,7 @@ pub(crate) struct TaskService {
 pub(crate) struct BackgroundShellTaskHandle {
     pub(crate) cancelled: Arc<AtomicBool>,
     pub(crate) wake: Arc<Notify>,
-    pub(crate) stop_reason: Arc<StdMutex<Option<String>>>,
+    pub(crate) stop_reason: Arc<SyncMutex<Option<String>>>,
 }
 
 /// Describes the terminal state observed by one background shell task runner.
@@ -62,7 +62,7 @@ impl BackgroundShellTaskHandle {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
             wake: Arc::new(Notify::new()),
-            stop_reason: Arc::new(StdMutex::new(None)),
+            stop_reason: Arc::new(SyncMutex::new(None)),
         }
     }
 }
@@ -461,10 +461,7 @@ impl TaskService {
         let Some(handle) = handle else {
             return false;
         };
-        let mut stop_reason = handle
-            .stop_reason
-            .lock()
-            .expect("background shell stop reason mutex poisoned");
+        let mut stop_reason = handle.stop_reason.lock();
         if !handle.cancelled.load(Ordering::Acquire) {
             *stop_reason = reason;
             handle.cancelled.store(true, Ordering::Release);
@@ -613,27 +610,13 @@ mod tests {
                 .await
         );
         assert!(handle.cancelled.load(Ordering::Relaxed));
-        assert_eq!(
-            handle
-                .stop_reason
-                .lock()
-                .expect("test stop reason mutex poisoned")
-                .as_deref(),
-            Some("cancelled")
-        );
+        assert_eq!(handle.stop_reason.lock().as_deref(), Some("cancelled"));
         assert!(
             service
                 .request_background_shell_stop("session-1", "task-1", Some("duplicate".to_string()))
                 .await
         );
-        assert_eq!(
-            handle
-                .stop_reason
-                .lock()
-                .expect("test stop reason mutex poisoned")
-                .as_deref(),
-            Some("cancelled")
-        );
+        assert_eq!(handle.stop_reason.lock().as_deref(), Some("cancelled"));
 
         service
             .remove_background_shell_task("session-1", "task-1")
@@ -703,13 +686,7 @@ mod tests {
                 .await
         );
         assert!(handle.cancelled.load(Ordering::Relaxed));
-        assert!(
-            handle
-                .stop_reason
-                .lock()
-                .expect("test stop reason mutex poisoned")
-                .is_none()
-        );
+        assert!(handle.stop_reason.lock().is_none());
 
         service
             .remove_background_shell_task("session-1", "task-1")
@@ -734,11 +711,7 @@ mod tests {
             let observer = tokio::spawn(async move {
                 loop {
                     if observer_handle.cancelled.load(Ordering::Acquire) {
-                        return observer_handle
-                            .stop_reason
-                            .lock()
-                            .expect("test stop reason mutex poisoned")
-                            .clone();
+                        return observer_handle.stop_reason.lock().clone();
                     }
                     tokio::task::yield_now().await;
                 }

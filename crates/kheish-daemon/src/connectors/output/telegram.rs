@@ -652,7 +652,8 @@ fn safe_telegram_progress_file_id(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
 
     use axum::http::StatusCode as AxumStatusCode;
     use axum::{Json, Router, extract::State, routing::post};
@@ -819,10 +820,7 @@ mod tests {
             State(posts): State<Arc<Mutex<Vec<Value>>>>,
             Json(payload): Json<Value>,
         ) -> Json<Value> {
-            posts
-                .lock()
-                .expect("telegram sink mutex poisoned")
-                .push(payload);
+            posts.lock().push(payload);
             Json(json!({ "ok": true, "result": { "message_id": 1 } }))
         }
 
@@ -850,7 +848,7 @@ mod tests {
         )
         .await?;
 
-        let posts = posts.lock().expect("telegram sink mutex poisoned");
+        let posts = posts.lock();
         assert_eq!(posts.len(), 3);
         for post in posts.iter() {
             let text = post.get("text").and_then(Value::as_str).unwrap_or_default();
@@ -872,23 +870,9 @@ mod tests {
             State(state): State<StateData>,
             Json(payload): Json<Value>,
         ) -> (AxumStatusCode, Json<Value>) {
-            state
-                .posts
-                .lock()
-                .expect("telegram progress sink mutex poisoned")
-                .push(payload);
-            let mut failures = state
-                .failures_remaining
-                .lock()
-                .expect("telegram progress failures mutex poisoned");
-            if *failures > 0
-                && state
-                    .posts
-                    .lock()
-                    .expect("telegram progress sink mutex poisoned")
-                    .len()
-                    == 2
-            {
+            state.posts.lock().push(payload);
+            let mut failures = state.failures_remaining.lock();
+            if *failures > 0 && state.posts.lock().len() == 2 {
                 *failures -= 1;
                 return (
                     AxumStatusCode::INTERNAL_SERVER_ERROR,
@@ -981,11 +965,7 @@ mod tests {
             .expect_err("first delivery should fail on second chunk");
         <TelegramOutputPlugin as OutputPlugin>::deliver(&plugin, envelope).await?;
 
-        let posts = state
-            .posts
-            .lock()
-            .expect("telegram progress sink mutex poisoned")
-            .clone();
+        let posts = state.posts.lock().clone();
         let first_chunk_count = posts
             .iter()
             .filter(|post| {

@@ -1,5 +1,6 @@
 //! Configurable daemon hook execution and persistence.
 
+use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
@@ -7,7 +8,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex as StdMutex, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -528,17 +529,13 @@ impl HookCallbackRegistry {
         let callback = Arc::new(move |invocation: HookInvocation| {
             Box::pin(callback(invocation)) as HookCallbackFuture
         }) as HookCallbackFn;
-        self.callbacks
-            .write()
-            .expect("hook callback registry rwlock poisoned")
-            .insert(name.into(), callback);
+        self.callbacks.write().insert(name.into(), callback);
     }
 
     async fn call(&self, name: &str, invocation: HookInvocation) -> Result<HookDispatchOutcome> {
         let callback = self
             .callbacks
             .read()
-            .expect("hook callback registry rwlock poisoned")
             .get(name)
             .cloned()
             .ok_or_else(|| anyhow!("unknown hook callback {name}"))?;
@@ -570,7 +567,7 @@ pub struct DaemonHookDispatcher {
     callbacks: HookCallbackRegistry,
     store: FileHookSettingsStore,
     dead_letters: FileHookDeadLetterStore,
-    dead_letter_write_lock: Arc<StdMutex<()>>,
+    dead_letter_write_lock: Arc<Mutex<()>>,
     model: Arc<dyn ModelDriver>,
     model_control: Option<Arc<dyn DaemonModelControl>>,
     default_provider: Option<String>,
@@ -616,7 +613,7 @@ impl DaemonHookDispatcher {
             callbacks: HookCallbackRegistry::default(),
             store,
             dead_letters: FileHookDeadLetterStore::new(state_root),
-            dead_letter_write_lock: Arc::new(StdMutex::new(())),
+            dead_letter_write_lock: Arc::new(Mutex::new(())),
             model,
             model_control,
             default_provider,
@@ -640,20 +637,14 @@ impl DaemonHookDispatcher {
 
     /// Returns the current persisted hook settings.
     pub fn settings(&self) -> HookSettings {
-        self.settings
-            .read()
-            .expect("hook settings rwlock poisoned")
-            .clone()
+        self.settings.read().clone()
     }
 
     /// Replaces and persists the daemon hook settings.
     pub fn set_settings(&self, settings: HookSettings) -> Result<HookSettings> {
         validate_hook_settings(&settings)?;
         self.store.save(&settings)?;
-        *self
-            .settings
-            .write()
-            .expect("hook settings rwlock poisoned") = settings.clone();
+        *self.settings.write() = settings.clone();
         Ok(settings)
     }
 
@@ -701,10 +692,7 @@ impl DaemonHookDispatcher {
         dead_letter_id: &str,
         reason: &str,
     ) -> Result<Option<HookDeadLetterView>> {
-        let _guard = self
-            .dead_letter_write_lock
-            .lock()
-            .expect("hook dead-letter write lock poisoned");
+        let _guard = self.dead_letter_write_lock.lock();
         let mut records = self.dead_letters.load_recent(usize::MAX)?;
         let Some(source_index) = records
             .iter()
@@ -956,10 +944,7 @@ impl DaemonHookDispatcher {
             resolved_at_ms: None,
             resolution_reason: None,
         };
-        let _guard = self
-            .dead_letter_write_lock
-            .lock()
-            .expect("hook dead-letter write lock poisoned");
+        let _guard = self.dead_letter_write_lock.lock();
         self.dead_letters.append(&record)
     }
 
@@ -1461,7 +1446,6 @@ impl HookDispatcher for DaemonHookDispatcher {
         let hooks = self
             .settings
             .read()
-            .expect("hook settings rwlock poisoned")
             .event_hooks(invocation.event.clone())
             .iter()
             .filter(|hook| matcher_matches(hook.matcher.as_deref(), invocation.subject.as_deref()))
@@ -2885,10 +2869,11 @@ where
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex;
     use std::collections::{BTreeSet, VecDeque};
     use std::net::{IpAddr, SocketAddr};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
 
     use super::{
         DaemonHookDispatcher, FileHookSettingsStore, HookDefinitionView, aggregate_permission,
@@ -2936,7 +2921,6 @@ mod tests {
             let content = self
                 .responses
                 .lock()
-                .expect("scripted model mutex poisoned")
                 .pop_front()
                 .ok_or_else(|| anyhow!("no scripted response remaining"))?;
             Ok(ModelTurn {
@@ -4426,9 +4410,8 @@ mod tests {
                     let payload_for_handler = payload_for_handler.clone();
                     let key_for_handler = key_for_handler.clone();
                     async move {
-                        *payload_for_handler.lock().expect("payload mutex poisoned") =
-                            Some(payload);
-                        *key_for_handler.lock().expect("key mutex poisoned") = headers
+                        *payload_for_handler.lock() = Some(payload);
+                        *key_for_handler.lock() = headers
                             .get("Idempotency-Key")
                             .and_then(|value| value.to_str().ok())
                             .map(ToOwned::to_owned);
@@ -4455,7 +4438,6 @@ mod tests {
 
         let payload = seen_payload
             .lock()
-            .expect("payload mutex poisoned")
             .clone()
             .expect("hook server saw payload");
         assert_eq!(
@@ -4470,7 +4452,6 @@ mod tests {
         assert!(
             seen_idempotency_key
                 .lock()
-                .expect("key mutex poisoned")
                 .as_deref()
                 .is_some_and(|value| value.starts_with("hook-execution-"))
         );

@@ -1,10 +1,11 @@
 #![allow(dead_code)]
 
+use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -199,10 +200,7 @@ impl FakeConnectorServer {
             State(state): State<FakeConnectorState>,
             Json(payload): Json<Value>,
         ) -> (axum::http::StatusCode, Json<Value>) {
-            let mut failures = state
-                .http_failures_remaining
-                .lock()
-                .expect("fake connector state poisoned");
+            let mut failures = state.http_failures_remaining.lock();
             if *failures > 0 {
                 *failures -= 1;
                 return (
@@ -211,11 +209,7 @@ impl FakeConnectorServer {
                 );
             }
             drop(failures);
-            state
-                .http_posts
-                .lock()
-                .expect("fake connector state poisoned")
-                .push(payload);
+            state.http_posts.lock().push(payload);
             (axum::http::StatusCode::OK, Json(json!({ "ok": true })))
         }
 
@@ -223,36 +217,16 @@ impl FakeConnectorServer {
             State(state): State<FakeConnectorState>,
             Json(payload): Json<Value>,
         ) -> Json<Value> {
-            state
-                .slack_posts
-                .lock()
-                .expect("fake connector state poisoned")
-                .push(payload);
+            state.slack_posts.lock().push(payload);
             Json(json!({ "ok": true, "ts": "1710000000.000777" }))
         }
 
         async fn slack_upload_descriptor(State(state): State<FakeConnectorState>) -> Json<Value> {
-            let file_id = format!(
-                "F{}",
-                state
-                    .slack_posts
-                    .lock()
-                    .expect("fake connector state poisoned")
-                    .len()
-                    + 1
-            );
-            state
-                .slack_posts
-                .lock()
-                .expect("fake connector state poisoned")
-                .push(json!({
-                    "kind": "upload_descriptor"
-                }));
-            let base_url = state
-                .upload_base_url
-                .lock()
-                .expect("fake connector state poisoned")
-                .clone();
+            let file_id = format!("F{}", state.slack_posts.lock().len() + 1);
+            state.slack_posts.lock().push(json!({
+                "kind": "upload_descriptor"
+            }));
+            let base_url = state.upload_base_url.lock().clone();
             Json(json!({
                 "ok": true,
                 "upload_url": format!("{base_url}/upload/{file_id}"),
@@ -265,17 +239,13 @@ impl FakeConnectorServer {
             headers: HeaderMap,
             body: Bytes,
         ) -> Json<Value> {
-            state
-                .slack_posts
-                .lock()
-                .expect("fake connector state poisoned")
-                .push(json!({
-                    "kind": "complete_upload",
-                    "content_type": headers
-                        .get(axum::http::header::CONTENT_TYPE)
-                        .and_then(|value| value.to_str().ok()),
-                    "raw_body": String::from_utf8_lossy(&body),
-                }));
+            state.slack_posts.lock().push(json!({
+                "kind": "complete_upload",
+                "content_type": headers
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                "raw_body": String::from_utf8_lossy(&body),
+            }));
             Json(json!({ "ok": true }))
         }
 
@@ -285,18 +255,14 @@ impl FakeConnectorServer {
             headers: HeaderMap,
             body: Bytes,
         ) -> Json<Value> {
-            state
-                .slack_posts
-                .lock()
-                .expect("fake connector state poisoned")
-                .push(json!({
-                    "kind": "uploaded_bytes",
-                    "file_id": file_id,
-                    "content_type": headers
-                        .get(axum::http::header::CONTENT_TYPE)
-                        .and_then(|value| value.to_str().ok()),
-                    "byte_length": body.len(),
-                }));
+            state.slack_posts.lock().push(json!({
+                "kind": "uploaded_bytes",
+                "file_id": file_id,
+                "content_type": headers
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                "byte_length": body.len(),
+            }));
             Json(json!({ "ok": true }))
         }
 
@@ -308,7 +274,6 @@ impl FakeConnectorServer {
             let file = state
                 .slack_files
                 .lock()
-                .expect("fake connector state poisoned")
                 .get(&file_id)
                 .cloned()
                 .ok_or(axum::http::StatusCode::NOT_FOUND)?;
@@ -334,11 +299,7 @@ impl FakeConnectorServer {
             AxumPath(_token): AxumPath<String>,
             Json(payload): Json<Value>,
         ) -> Json<Value> {
-            state
-                .telegram_posts
-                .lock()
-                .expect("fake connector state poisoned")
-                .push(payload);
+            state.telegram_posts.lock().push(payload);
             Json(json!({ "ok": true, "result": { "message_id": 1 } }))
         }
 
@@ -348,18 +309,14 @@ impl FakeConnectorServer {
             headers: HeaderMap,
             body: Bytes,
         ) -> Json<Value> {
-            state
-                .telegram_posts
-                .lock()
-                .expect("fake connector state poisoned")
-                .push(json!({
-                    "method": method,
-                    "content_type": headers
-                        .get(axum::http::header::CONTENT_TYPE)
-                        .and_then(|value| value.to_str().ok()),
-                    "raw_body": String::from_utf8_lossy(&body),
-                    "byte_length": body.len(),
-                }));
+            state.telegram_posts.lock().push(json!({
+                "method": method,
+                "content_type": headers
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                "raw_body": String::from_utf8_lossy(&body),
+                "byte_length": body.len(),
+            }));
             Json(json!({ "ok": true, "result": { "message_id": 1 } }))
         }
 
@@ -376,7 +333,6 @@ impl FakeConnectorServer {
             let file = state
                 .telegram_files_by_id
                 .lock()
-                .expect("fake connector state poisoned")
                 .get(&payload.file_id)
                 .cloned();
             match file {
@@ -410,7 +366,6 @@ impl FakeConnectorServer {
             let file = state
                 .telegram_files_by_path
                 .lock()
-                .expect("fake connector state poisoned")
                 .get(&path)
                 .cloned()
                 .ok_or(axum::http::StatusCode::NOT_FOUND)?;
@@ -438,7 +393,6 @@ impl FakeConnectorServer {
             let updates = state
                 .telegram_updates
                 .lock()
-                .expect("fake connector state poisoned")
                 .iter()
                 .filter(|update| {
                     update
@@ -455,10 +409,7 @@ impl FakeConnectorServer {
         let state = FakeConnectorState::default();
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
-        *state
-            .upload_base_url
-            .lock()
-            .expect("fake connector state poisoned") = format!("http://{address}");
+        *state.upload_base_url.lock() = format!("http://{address}");
         let router = Router::new()
             .route("/hook", post(http_sink))
             .route("/chat.postMessage", post(slack_sink))
@@ -495,7 +446,7 @@ impl FakeConnectorServer {
     ) -> Result<Vec<Value>> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let current = store.lock().expect("fake connector state poisoned").clone();
+            let current = store.lock().clone();
             if current.len() >= expected {
                 return Ok(current);
             }
@@ -516,11 +467,7 @@ impl FakeConnectorServer {
     }
 
     pub fn set_http_failures(&self, count: usize) {
-        *self
-            .state
-            .http_failures_remaining
-            .lock()
-            .expect("fake connector state poisoned") = count;
+        *self.state.http_failures_remaining.lock() = count;
     }
 
     pub async fn wait_for_slack_posts(
@@ -540,29 +487,21 @@ impl FakeConnectorServer {
     }
 
     pub fn register_slack_file(&self, file_name: &str, media_type: &str, bytes: &[u8]) -> Value {
-        let mut next_file_id = self
-            .state
-            .next_file_id
-            .lock()
-            .expect("fake connector state poisoned");
+        let mut next_file_id = self.state.next_file_id.lock();
         let file_id = format!("slack-file-{}", *next_file_id);
         *next_file_id += 1;
         drop(next_file_id);
-        self.state
-            .slack_files
-            .lock()
-            .expect("fake connector state poisoned")
-            .insert(
-                file_id.clone(),
-                FakeConnectorFile {
-                    file_name: file_name.to_string(),
-                    media_type: media_type.to_string(),
-                    bytes: bytes.to_vec(),
-                    telegram_path: None,
-                    slack_bearer_token: Some(FAKE_SLACK_BOT_TOKEN.to_string()),
-                    telegram_bot_token: None,
-                },
-            );
+        self.state.slack_files.lock().insert(
+            file_id.clone(),
+            FakeConnectorFile {
+                file_name: file_name.to_string(),
+                media_type: media_type.to_string(),
+                bytes: bytes.to_vec(),
+                telegram_path: None,
+                slack_bearer_token: Some(FAKE_SLACK_BOT_TOKEN.to_string()),
+                telegram_bot_token: None,
+            },
+        );
         json!({
             "id": file_id.clone(),
             "name": file_name,
@@ -578,11 +517,7 @@ impl FakeConnectorServer {
         media_type: &str,
         bytes: &[u8],
     ) -> String {
-        let mut next_file_id = self
-            .state
-            .next_file_id
-            .lock()
-            .expect("fake connector state poisoned");
+        let mut next_file_id = self.state.next_file_id.lock();
         let suffix = *next_file_id;
         *next_file_id += 1;
         drop(next_file_id);
@@ -599,12 +534,10 @@ impl FakeConnectorServer {
         self.state
             .telegram_files_by_id
             .lock()
-            .expect("fake connector state poisoned")
             .insert(file_id.clone(), file.clone());
         self.state
             .telegram_files_by_path
             .lock()
-            .expect("fake connector state poisoned")
             .insert(file_path, file);
         file_id
     }
@@ -627,28 +560,20 @@ impl FakeConnectorServer {
         from_id: i64,
         text: &str,
     ) -> i64 {
-        let mut next_update_id = self
-            .state
-            .next_telegram_update_id
-            .lock()
-            .expect("fake connector state poisoned");
+        let mut next_update_id = self.state.next_telegram_update_id.lock();
         let update_id = *next_update_id;
         *next_update_id += 1;
         drop(next_update_id);
-        self.state
-            .telegram_updates
-            .lock()
-            .expect("fake connector state poisoned")
-            .push(json!({
-                "update_id": update_id,
-                "message": {
-                    "message_id": message_id,
-                    "message_thread_id": message_thread_id,
-                    "text": text,
-                    "chat": { "id": chat_id },
-                    "from": { "id": from_id }
-                }
-            }));
+        self.state.telegram_updates.lock().push(json!({
+            "update_id": update_id,
+            "message": {
+                "message_id": message_id,
+                "message_thread_id": message_thread_id,
+                "text": text,
+                "chat": { "id": chat_id },
+                "from": { "id": from_id }
+            }
+        }));
         update_id
     }
 
@@ -663,33 +588,25 @@ impl FakeConnectorServer {
         media_type: &str,
         file_size: usize,
     ) -> i64 {
-        let mut next_update_id = self
-            .state
-            .next_telegram_update_id
-            .lock()
-            .expect("fake connector state poisoned");
+        let mut next_update_id = self.state.next_telegram_update_id.lock();
         let update_id = *next_update_id;
         *next_update_id += 1;
         drop(next_update_id);
-        self.state
-            .telegram_updates
-            .lock()
-            .expect("fake connector state poisoned")
-            .push(json!({
-                "update_id": update_id,
-                "message": {
-                    "message_id": message_id,
-                    "caption": caption,
-                    "document": {
-                        "file_id": file_id,
-                        "file_name": file_name,
-                        "mime_type": media_type,
-                        "file_size": file_size,
-                    },
-                    "chat": { "id": chat_id },
-                    "from": { "id": from_id }
-                }
-            }));
+        self.state.telegram_updates.lock().push(json!({
+            "update_id": update_id,
+            "message": {
+                "message_id": message_id,
+                "caption": caption,
+                "document": {
+                    "file_id": file_id,
+                    "file_name": file_name,
+                    "mime_type": media_type,
+                    "file_size": file_size,
+                },
+                "chat": { "id": chat_id },
+                "from": { "id": from_id }
+            }
+        }));
         update_id
     }
 
@@ -702,33 +619,25 @@ impl FakeConnectorServer {
         file_id: &str,
         file_size: usize,
     ) -> i64 {
-        let mut next_update_id = self
-            .state
-            .next_telegram_update_id
-            .lock()
-            .expect("fake connector state poisoned");
+        let mut next_update_id = self.state.next_telegram_update_id.lock();
         let update_id = *next_update_id;
         *next_update_id += 1;
         drop(next_update_id);
-        self.state
-            .telegram_updates
-            .lock()
-            .expect("fake connector state poisoned")
-            .push(json!({
-                "update_id": update_id,
-                "message": {
-                    "message_id": message_id,
-                    "caption": caption,
-                    "photo": [{
-                        "file_id": file_id,
-                        "width": 4,
-                        "height": 4,
-                        "file_size": file_size,
-                    }],
-                    "chat": { "id": chat_id },
-                    "from": { "id": from_id }
-                }
-            }));
+        self.state.telegram_updates.lock().push(json!({
+            "update_id": update_id,
+            "message": {
+                "message_id": message_id,
+                "caption": caption,
+                "photo": [{
+                    "file_id": file_id,
+                    "width": 4,
+                    "height": 4,
+                    "file_size": file_size,
+                }],
+                "chat": { "id": chat_id },
+                "from": { "id": from_id }
+            }
+        }));
         update_id
     }
 }
@@ -1941,11 +1850,9 @@ pub fn agent_hook(template: &str) -> HookDefinition {
     }
 }
 
-pub fn live_test_guard() -> std::sync::MutexGuard<'static, ()> {
+pub fn live_test_guard() -> parking_lot::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    LOCK.get_or_init(|| Mutex::new(())).lock()
 }
 
 pub async fn error_for_status_with_body(response: reqwest::Response) -> Result<reqwest::Response> {

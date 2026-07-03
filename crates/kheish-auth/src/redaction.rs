@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, VecDeque};
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::OnceLock;
 
+use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
 
 use crate::{AuthProvider, AuthSlotRecord};
@@ -31,7 +32,7 @@ where
             next.insert(token);
         }
     }
-    *store.write().expect("auth redaction rwlock poisoned") = next;
+    *store.write() = next;
 }
 
 /// Registers one short-lived broker token for debug redaction.
@@ -39,9 +40,7 @@ pub fn register_ephemeral_debug_redaction_token(token: impl Into<String>) {
     let Some(token) = normalize_redaction_token(token.into()) else {
         return;
     };
-    let mut tokens = ephemeral_tokens()
-        .lock()
-        .expect("auth ephemeral redaction mutex poisoned");
+    let mut tokens = ephemeral_tokens().lock();
     if tokens.set.insert(token.clone()) {
         tokens.order.push_back(token);
     }
@@ -57,18 +56,10 @@ pub fn register_ephemeral_debug_redaction_token(token: impl Into<String>) {
 pub fn debug_redaction_tokens() -> Vec<String> {
     let mut tokens = auth_store_tokens()
         .read()
-        .expect("auth redaction rwlock poisoned")
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
-    tokens.extend(
-        ephemeral_tokens()
-            .lock()
-            .expect("auth ephemeral redaction mutex poisoned")
-            .set
-            .iter()
-            .cloned(),
-    );
+    tokens.extend(ephemeral_tokens().lock().set.iter().cloned());
     tokens.into_iter().collect()
 }
 
@@ -163,18 +154,17 @@ fn normalize_redaction_token(token: String) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::OnceLock;
 
+    use parking_lot::Mutex;
     use serde_json::json;
 
     use super::*;
     use crate::{AuthMode, AuthSlotId};
 
-    fn redaction_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    fn redaction_test_lock() -> parking_lot::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("redaction test mutex poisoned")
+        LOCK.get_or_init(|| Mutex::new(())).lock()
     }
 
     #[test]

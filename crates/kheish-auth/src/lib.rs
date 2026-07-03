@@ -64,10 +64,8 @@ mod tests {
         store::auth_store_env_lock,
     };
 
-    fn ensure_auth_store_master_key() -> std::sync::MutexGuard<'static, ()> {
-        let guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+    fn ensure_auth_store_master_key() -> parking_lot::MutexGuard<'static, ()> {
+        let guard = auth_store_env_lock().lock();
         unsafe {
             std::env::set_var(
                 AUTH_STORE_MASTER_KEY_ENV,

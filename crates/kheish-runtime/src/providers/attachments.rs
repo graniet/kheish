@@ -1,9 +1,10 @@
 //! Shared attachment helpers used by provider adapters.
 
+use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
@@ -69,7 +70,6 @@ impl AttachmentRenderCache {
     pub(crate) fn get_image(&self, key: &str) -> Option<PreparedImageAttachment> {
         self.inner
             .lock()
-            .expect("attachment render cache mutex poisoned")
             .values
             .get(key)
             .and_then(|entry| match &entry.value {
@@ -82,7 +82,6 @@ impl AttachmentRenderCache {
     pub(crate) fn get_document_text(&self, key: &str) -> Option<String> {
         self.inner
             .lock()
-            .expect("attachment render cache mutex poisoned")
             .values
             .get(key)
             .and_then(|entry| match &entry.value {
@@ -102,10 +101,7 @@ impl AttachmentRenderCache {
     }
 
     fn insert(&self, key: String, value: CachedAttachmentValue) {
-        let mut state = self
-            .inner
-            .lock()
-            .expect("attachment render cache mutex poisoned");
+        let mut state = self.inner.lock();
         let size_bytes = cached_value_size_bytes(&value);
         if !state.values.contains_key(&key) {
             state.order.push_back(key.clone());

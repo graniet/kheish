@@ -816,7 +816,8 @@ fn select_thread_anchor(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
 
     use axum::body::Bytes;
     use axum::extract::{Path as AxumPath, State};
@@ -1012,7 +1013,6 @@ mod tests {
             state
                 .posts
                 .lock()
-                .expect("fake slack posts mutex poisoned")
                 .push(json!({ "kind": "chat_postMessage", "payload": payload }));
             Json(json!({ "ok": true, "ts": "1710000000.000777" }))
         }
@@ -1022,30 +1022,22 @@ mod tests {
             AxumPath(file_id): AxumPath<String>,
             body: Bytes,
         ) -> Json<Value> {
-            state
-                .posts
-                .lock()
-                .expect("fake slack posts mutex poisoned")
-                .push(json!({
-                    "kind": "uploaded_bytes",
-                    "file_id": file_id,
-                    "byte_length": body.len(),
-                }));
+            state.posts.lock().push(json!({
+                "kind": "uploaded_bytes",
+                "file_id": file_id,
+                "byte_length": body.len(),
+            }));
             Json(json!({ "ok": true }))
         }
 
         async fn complete_upload(State(state): State<FakeSlackOutputState>) -> Response {
-            let mut failures = state
-                .complete_failures_remaining
-                .lock()
-                .expect("fake slack failures mutex poisoned");
+            let mut failures = state.complete_failures_remaining.lock();
             if *failures > 0 {
                 *failures -= 1;
                 drop(failures);
                 state
                     .posts
                     .lock()
-                    .expect("fake slack posts mutex poisoned")
                     .push(json!({ "kind": "complete_upload_failed" }));
                 return (
                     AxumStatusCode::TOO_MANY_REQUESTS,
@@ -1058,7 +1050,6 @@ mod tests {
             state
                 .posts
                 .lock()
-                .expect("fake slack posts mutex poisoned")
                 .push(json!({ "kind": "complete_upload" }));
             (AxumStatusCode::OK, Json(json!({ "ok": true }))).into_response()
         }
@@ -1083,7 +1074,6 @@ mod tests {
                             state
                                 .posts
                                 .lock()
-                                .expect("fake slack posts mutex poisoned")
                                 .push(json!({ "kind": "upload_descriptor" }));
                             Json(json!({
                                 "ok": true,
@@ -1175,11 +1165,7 @@ mod tests {
             .expect_err("first delivery should fail after upload bytes");
         <SlackOutputPlugin as OutputPlugin>::deliver(&plugin, envelope).await?;
 
-        let posts = state
-            .posts
-            .lock()
-            .expect("fake slack posts mutex poisoned")
-            .clone();
+        let posts = state.posts.lock().clone();
         let count_kind = |kind: &str| {
             posts
                 .iter()
@@ -1207,15 +1193,11 @@ mod tests {
                 .get(reqwest::header::AUTHORIZATION)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string);
-            state
-                .posts
-                .lock()
-                .expect("fake slack posts mutex poisoned")
-                .push(json!({
-                    "kind": "chat_postMessage",
-                    "authorization": authorization,
-                    "payload": payload,
-                }));
+            state.posts.lock().push(json!({
+                "kind": "chat_postMessage",
+                "authorization": authorization,
+                "payload": payload,
+            }));
             Json(json!({ "ok": true, "ts": "1710000000.000777" }))
         }
 
@@ -1313,11 +1295,7 @@ mod tests {
             .await?;
         }
 
-        let posts = state
-            .posts
-            .lock()
-            .expect("fake slack posts mutex poisoned")
-            .clone();
+        let posts = state.posts.lock().clone();
         let authorizations = posts
             .iter()
             .filter_map(|post| post.get("authorization").and_then(Value::as_str))
@@ -1341,7 +1319,6 @@ mod tests {
             state
                 .posts
                 .lock()
-                .expect("fake slack posts mutex poisoned")
                 .push(json!({ "kind": "chat_postMessage", "payload": payload }));
             Json(json!({ "ok": true, "ts": "1710000000.000888" }))
         }
@@ -1351,15 +1328,11 @@ mod tests {
             AxumPath(file_id): AxumPath<String>,
             body: Bytes,
         ) -> Json<Value> {
-            state
-                .posts
-                .lock()
-                .expect("fake slack posts mutex poisoned")
-                .push(json!({
-                    "kind": "uploaded_bytes",
-                    "file_id": file_id,
-                    "byte_length": body.len(),
-                }));
+            state.posts.lock().push(json!({
+                "kind": "uploaded_bytes",
+                "file_id": file_id,
+                "byte_length": body.len(),
+            }));
             Json(json!({ "ok": true }))
         }
 
@@ -1367,7 +1340,6 @@ mod tests {
             state
                 .posts
                 .lock()
-                .expect("fake slack posts mutex poisoned")
                 .push(json!({ "kind": "complete_upload_ambiguous" }));
             Json(json!({ "ok": false, "error": "internal_error" }))
         }
@@ -1389,7 +1361,6 @@ mod tests {
                             state
                                 .posts
                                 .lock()
-                                .expect("fake slack posts mutex poisoned")
                                 .push(json!({ "kind": "upload_descriptor" }));
                             Json(json!({
                                 "ok": true,
@@ -1494,11 +1465,7 @@ mod tests {
             "unexpected second error: {second_error_chain}"
         );
 
-        let posts = state
-            .posts
-            .lock()
-            .expect("fake slack posts mutex poisoned")
-            .clone();
+        let posts = state.posts.lock().clone();
         let count_kind = |kind: &str| {
             posts
                 .iter()
@@ -1523,7 +1490,6 @@ mod tests {
             state
                 .posts
                 .lock()
-                .expect("fake slack posts mutex poisoned")
                 .push(json!({ "kind": "chat_postMessage", "payload": payload }));
             Json(json!({ "ok": true, "ts": "1710000000.000999" }))
         }
@@ -1533,15 +1499,11 @@ mod tests {
             AxumPath(file_id): AxumPath<String>,
             body: Bytes,
         ) -> Json<Value> {
-            state
-                .posts
-                .lock()
-                .expect("fake slack posts mutex poisoned")
-                .push(json!({
-                    "kind": "uploaded_bytes",
-                    "file_id": file_id,
-                    "byte_length": body.len(),
-                }));
+            state.posts.lock().push(json!({
+                "kind": "uploaded_bytes",
+                "file_id": file_id,
+                "byte_length": body.len(),
+            }));
             Json(json!({ "ok": true }))
         }
 
@@ -1549,7 +1511,6 @@ mod tests {
             state
                 .posts
                 .lock()
-                .expect("fake slack posts mutex poisoned")
                 .push(json!({ "kind": "complete_upload_invalid" }));
             Json(json!({ "ok": false, "error": "invalid_arguments" }))
         }
@@ -1571,7 +1532,6 @@ mod tests {
                             state
                                 .posts
                                 .lock()
-                                .expect("fake slack posts mutex poisoned")
                                 .push(json!({ "kind": "upload_descriptor" }));
                             Json(json!({
                                 "ok": true,
@@ -1667,11 +1627,7 @@ mod tests {
             "unexpected error: {error_chain}"
         );
 
-        let posts = state
-            .posts
-            .lock()
-            .expect("fake slack posts mutex poisoned")
-            .clone();
+        let posts = state.posts.lock().clone();
         let count_kind = |kind: &str| {
             posts
                 .iter()

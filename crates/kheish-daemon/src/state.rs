@@ -28,13 +28,12 @@ mod tool_control;
 mod transcription_workflow;
 mod views;
 
+use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
-use std::sync::RwLock as StdRwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -313,9 +312,9 @@ pub(crate) struct DaemonState<M> {
     schedule_dispatch_worker_enabled: bool,
     task_service: TaskService,
     subagent_service: SubagentService,
-    tool_control_state: StdMutex<Option<Arc<dyn control_tools::DaemonToolControl>>>,
-    mcp: StdMutex<McpRuntimeSnapshot>,
-    mcp_surface: Arc<StdRwLock<McpRuntimeSurface>>,
+    tool_control_state: Mutex<Option<Arc<dyn control_tools::DaemonToolControl>>>,
+    mcp: Mutex<McpRuntimeSnapshot>,
+    mcp_surface: Arc<RwLock<McpRuntimeSurface>>,
     mcp_manager: Option<Arc<McpManager>>,
     auth_manager: Arc<AuthManager>,
     skills: Arc<SharedSkillRegistry>,
@@ -406,7 +405,7 @@ where
         playbooks: BTreeMap<String, crate::PlaybookRecord>,
         flows: BTreeMap<String, FlowRecord>,
         mcp: McpRuntimeSnapshot,
-        mcp_surface: Arc<StdRwLock<McpRuntimeSurface>>,
+        mcp_surface: Arc<RwLock<McpRuntimeSurface>>,
         mcp_manager: Option<Arc<McpManager>>,
         auth_manager: Arc<AuthManager>,
         skills: Arc<SharedSkillRegistry>,
@@ -560,8 +559,8 @@ where
             schedule_dispatch_worker_enabled: scheduler_enabled,
             task_service: TaskService::new(),
             subagent_service: SubagentService::new(store.root().to_path_buf()),
-            tool_control_state: StdMutex::new(None),
-            mcp: StdMutex::new(mcp),
+            tool_control_state: Mutex::new(None),
+            mcp: Mutex::new(mcp),
             mcp_surface,
             mcp_manager,
             auth_manager,
@@ -601,10 +600,7 @@ where
     }
 
     pub(crate) fn bind_tool_control_state(&self, tool_control_state: Arc<dyn DaemonToolControl>) {
-        *self
-            .tool_control_state
-            .lock()
-            .expect("daemon tool control mutex poisoned") = Some(tool_control_state);
+        *self.tool_control_state.lock() = Some(tool_control_state);
     }
 
     pub(crate) fn connectors(&self) -> &Arc<ConnectorRegistry> {
@@ -959,11 +955,7 @@ where
                 "secret `{slot_id}` is still referenced by one or more runtime connectors"
             );
         }
-        let mcp_snapshot = self
-            .mcp
-            .lock()
-            .expect("mcp runtime snapshot mutex poisoned")
-            .clone();
+        let mcp_snapshot = self.mcp.lock().clone();
         if mcp_snapshot.servers.iter().any(|server| {
             server
                 .credential_secret_refs
@@ -1000,14 +992,8 @@ where
         }
         let snapshot = manager.runtime_snapshot().await;
         let surface = snapshot.runtime_surface();
-        *self
-            .mcp
-            .lock()
-            .expect("mcp runtime snapshot mutex poisoned") = snapshot;
-        *self
-            .mcp_surface
-            .write()
-            .expect("mcp runtime surface rwlock poisoned") = surface;
+        *self.mcp.lock() = snapshot;
+        *self.mcp_surface.write() = surface;
         info!(
             secret_ref,
             changed, "updated MCP servers after auth secret change"

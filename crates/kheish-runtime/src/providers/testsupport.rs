@@ -1,6 +1,7 @@
 #![cfg(test)]
 
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -63,10 +64,7 @@ pub(crate) async fn spawn_mock_server(
             }
             body_bytes.extend_from_slice(&buffer[..read]);
         }
-        *captured_request_body
-            .lock()
-            .expect("request capture mutex poisoned") =
-            String::from_utf8(body_bytes).expect("body must be utf-8");
+        *captured_request_body.lock() = String::from_utf8(body_bytes).expect("body must be utf-8");
 
         let response = format!(
             "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\n{headers}\r\n{body}",
@@ -136,10 +134,7 @@ pub(crate) async fn spawn_chunked_mock_server(
             }
             body_bytes.extend_from_slice(&buffer[..read]);
         }
-        *captured_request_body
-            .lock()
-            .expect("request capture mutex poisoned") =
-            String::from_utf8(body_bytes).expect("body must be utf-8");
+        *captured_request_body.lock() = String::from_utf8(body_bytes).expect("body must be utf-8");
 
         let response_head =
             format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n{headers}\r\n");

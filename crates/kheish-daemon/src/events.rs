@@ -1,11 +1,12 @@
 //! Daemon event transport and observer integration.
 
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
 use std::fs::{self, OpenOptions};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::services::ExternalActionService;
@@ -148,7 +149,7 @@ pub struct DaemonEventEnvelope {
 #[derive(Clone)]
 pub(crate) struct DaemonEventBus {
     sender: broadcast::Sender<DaemonEventEnvelope>,
-    state: Arc<StdMutex<DaemonEventBusState>>,
+    state: Arc<Mutex<DaemonEventBusState>>,
     history_capacity: usize,
     start_id: u64,
     next_epoch_start_id: u64,
@@ -242,7 +243,7 @@ impl DaemonEventBus {
         let (sender, _) = broadcast::channel(history_capacity);
         Self {
             sender,
-            state: Arc::new(StdMutex::new(DaemonEventBusState {
+            state: Arc::new(Mutex::new(DaemonEventBusState {
                 history: VecDeque::with_capacity(history_capacity),
                 next_id: start_id,
                 last_evicted_by_session: BTreeMap::new(),
@@ -259,10 +260,7 @@ impl DaemonEventBus {
     }
 
     pub(crate) fn publish(&self, event: DaemonEvent) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.state.lock();
         if state.next_id >= self.next_epoch_start_id {
             error!(
                 next_id = state.next_id,
@@ -290,10 +288,7 @@ impl DaemonEventBus {
 
     pub(crate) fn subscribe_after(&self, after_id: Option<u64>) -> DaemonEventSubscription {
         let receiver = self.subscribe();
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.state.lock();
         let oldest_history_id = state.history.front().map(|envelope| envelope.id);
         let newest_history_id = state.history.back().map(|envelope| envelope.id);
         let max_visible_id = newest_history_id.unwrap_or_else(|| self.start_id.saturating_sub(1));
@@ -353,10 +348,7 @@ impl DaemonEventBus {
     }
 
     pub(crate) fn status_snapshot(&self) -> DaemonEventStatusView {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = self.state.lock();
         let retained_event_count = state.history.len();
         let replay_buffer_utilization_percent = if self.history_capacity == 0 {
             0
@@ -520,7 +512,7 @@ fn persist_event_epoch(epoch_path: &Path, epoch: u64) -> anyhow::Result<()> {
 pub(crate) struct DaemonEventSubscription {
     receiver: broadcast::Receiver<DaemonEventEnvelope>,
     replay: Vec<DaemonEventEnvelope>,
-    state: Arc<StdMutex<DaemonEventBusState>>,
+    state: Arc<Mutex<DaemonEventBusState>>,
     effective_after_id: Option<u64>,
     live_after_id: Option<u64>,
     stream_gap: Option<StreamGapInfo>,
@@ -539,8 +531,8 @@ pub(crate) struct DaemonObserver {
     debug: DebugControl,
     debug_store: FileDebugStore,
     external_actions: Option<ExternalActionService>,
-    external_action_failure: StdMutex<Option<String>>,
-    counters: StdMutex<BTreeMap<String, u64>>,
+    external_action_failure: Mutex<Option<String>>,
+    counters: Mutex<BTreeMap<String, u64>>,
 }
 
 impl DaemonObserver {
@@ -559,7 +551,7 @@ impl DaemonObserver {
                 None
             }
         };
-        let external_action_failure = StdMutex::new(
+        let external_action_failure = Mutex::new(
             external_actions
                 .is_none()
                 .then_some("external action audit failed to initialize".to_string()),
@@ -570,20 +562,16 @@ impl DaemonObserver {
             external_actions,
             debug_store,
             external_action_failure,
-            counters: StdMutex::new(BTreeMap::new()),
+            counters: Mutex::new(BTreeMap::new()),
         })
     }
 
-    fn lock_external_action_failure(&self) -> std::sync::MutexGuard<'_, Option<String>> {
-        self.external_action_failure
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn lock_external_action_failure(&self) -> parking_lot::MutexGuard<'_, Option<String>> {
+        self.external_action_failure.lock()
     }
 
-    fn lock_counters(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, u64>> {
-        self.counters
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn lock_counters(&self) -> parking_lot::MutexGuard<'_, BTreeMap<String, u64>> {
+        self.counters.lock()
     }
 }
 
@@ -696,7 +684,6 @@ pub(crate) fn sse_stream(
         };
         stream_state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .scope_eviction_after(session_filter.as_deref(), run_filter.as_deref(), after_id)
             .is_some()
     });
@@ -752,7 +739,7 @@ struct LiveSseState {
     live_after_id: Option<u64>,
     last_matching_id: Option<u64>,
     last_delivered_id: Option<u64>,
-    state: Arc<StdMutex<DaemonEventBusState>>,
+    state: Arc<Mutex<DaemonEventBusState>>,
     pending_filtered_gap: Option<u64>,
     pending_event: Option<Event>,
     pending_event_id: Option<u64>,
@@ -782,15 +769,11 @@ async fn next_live_sse_event(
                     continue;
                 };
                 if let Some(skipped) = state.pending_filtered_gap.take() {
-                    let scoped_eviction = state
-                        .state
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .scope_eviction_after(
-                            state.session_filter.as_deref(),
-                            state.run_filter.as_deref(),
-                            previous_matching_id,
-                        );
+                    let scoped_eviction = state.state.lock().scope_eviction_after(
+                        state.session_filter.as_deref(),
+                        state.run_filter.as_deref(),
+                        previous_matching_id,
+                    );
                     state.last_matching_id = Some(envelope.id);
                     if let Some(scoped_eviction) = scoped_eviction
                         && let Some((gap, gap_id)) = stream_gap_event_after(
@@ -818,11 +801,7 @@ async fn next_live_sse_event(
                 return Some((Ok(event), state));
             }
             Err(BroadcastStreamRecvError::Lagged(skipped)) => {
-                state
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .record_stream_lag(skipped);
+                state.state.lock().record_stream_lag(skipped);
                 if state.session_filter.is_none() && state.run_filter.is_none() {
                     let resume_after_id =
                         safe_live_resume_after_id(&state.state, state.last_delivered_id);
@@ -839,15 +818,11 @@ async fn next_live_sse_event(
                     }
                     continue;
                 }
-                let scoped_eviction = state
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .scope_eviction_after(
-                        state.session_filter.as_deref(),
-                        state.run_filter.as_deref(),
-                        state.last_matching_id.unwrap_or(0),
-                    );
+                let scoped_eviction = state.state.lock().scope_eviction_after(
+                    state.session_filter.as_deref(),
+                    state.run_filter.as_deref(),
+                    state.last_matching_id.unwrap_or(0),
+                );
                 let skipped = state
                     .pending_filtered_gap
                     .unwrap_or(0)
@@ -929,12 +904,11 @@ fn stream_gap_scope(session_filter: Option<&str>, run_filter: Option<&str>) -> S
 }
 
 fn safe_live_resume_after_id(
-    state: &Arc<StdMutex<DaemonEventBusState>>,
+    state: &Arc<Mutex<DaemonEventBusState>>,
     last_delivered_id: Option<u64>,
 ) -> Option<u64> {
     let resume_after_id = state
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .history
         .front()
         .map(|envelope| envelope.id.saturating_sub(1));
@@ -1044,10 +1018,7 @@ mod tests {
 
         let _subscription = bus.subscribe_after(Some(0));
         {
-            let mut state = bus
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut state = bus.state.lock();
             state.record_stream_lag(5);
         }
 
@@ -1133,10 +1104,7 @@ mod tests {
         bus.publish(interrupted("s2"));
 
         let subscription = bus.subscribe_after(Some(0));
-        let state = subscription
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = subscription.state.lock();
         assert_eq!(
             state.scope_eviction_after(Some("s1"), None, 0),
             Some(ScopeEvictionStatus::KnownLoss { resume_after_id: 1 })
@@ -1152,10 +1120,7 @@ mod tests {
         }
 
         let subscription = bus.subscribe_after(Some(0));
-        let state = subscription
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = subscription.state.lock();
         assert!(state.last_evicted_by_session.len() <= bus.scope_eviction_retention() as usize);
         assert!(state.scope_eviction_floor_id > 0);
         assert_eq!(

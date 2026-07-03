@@ -3469,8 +3469,9 @@ pub fn resolve_openrouter_tts_model(model: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex;
     use std::collections::BTreeMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use anyhow::Result;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3535,10 +3536,7 @@ mod tests {
         }
 
         fn debug_artifacts(&self) -> Vec<DebugArtifact> {
-            self.artifacts
-                .lock()
-                .expect("artifacts mutex poisoned")
-                .clone()
+            self.artifacts.lock().clone()
         }
     }
 
@@ -3550,10 +3548,7 @@ mod tests {
         fn record(&self, _event: TraceEvent) {}
 
         fn record_debug_artifact(&self, artifact: DebugArtifact) {
-            self.artifacts
-                .lock()
-                .expect("artifacts mutex poisoned")
-                .push(artifact);
+            self.artifacts.lock().push(artifact);
         }
 
         fn increment_counter(&self, _name: &str, _delta: u64) {}
@@ -4011,7 +4006,7 @@ mod tests {
         assert_eq!(response.images.len(), 2);
         assert!(response.images.iter().all(|image| image.bytes == png_bytes));
 
-        let captured = captured.lock().expect("request capture mutex poisoned");
+        let captured = captured.lock();
         assert_eq!(captured.len(), 2);
         for request in captured.iter() {
             assert_eq!(request.method, "POST");
@@ -4144,7 +4139,7 @@ mod tests {
         assert_eq!(response.images.len(), 1);
         assert_eq!(response.images[0].bytes, png_bytes);
 
-        let captured = captured.lock().expect("request capture mutex poisoned");
+        let captured = captured.lock();
         let body: Value = serde_json::from_slice(&captured[0].body)?;
         assert_eq!(
             body["messages"][0]["content"][0]["text"],
@@ -4185,7 +4180,7 @@ mod tests {
         assert_eq!(response.model, DEFAULT_OPENROUTER_TRANSCRIPTION_MODEL);
         assert_eq!(response.text, "Bonjour le monde");
 
-        let captured = captured.lock().expect("request capture mutex poisoned");
+        let captured = captured.lock();
         assert_eq!(captured[0].path, "/v1/audio/transcriptions");
         let body: Value = serde_json::from_slice(&captured[0].body)?;
         assert_eq!(body["model"], DEFAULT_OPENROUTER_TRANSCRIPTION_MODEL);
@@ -4495,7 +4490,7 @@ mod tests {
         assert_eq!(response.bytes, b"pcm-audio".to_vec());
         assert_eq!(response.transcript, None);
 
-        let captured = captured.lock().expect("request capture mutex poisoned");
+        let captured = captured.lock();
         assert_eq!(captured[0].path, "/v1/audio/speech");
         let body: Value = serde_json::from_slice(&captured[0].body)?;
         assert_eq!(body["model"], DEFAULT_OPENROUTER_TTS_MODEL);
@@ -4643,10 +4638,7 @@ mod tests {
                 let request = read_request(&mut socket)
                     .await
                     .expect("request read should succeed");
-                captured_requests
-                    .lock()
-                    .expect("request capture mutex poisoned")
-                    .push(request);
+                captured_requests.lock().push(request);
                 write_response(&mut socket, &response)
                     .await
                     .expect("response write should succeed");
@@ -4669,10 +4661,7 @@ mod tests {
             let request = read_request(&mut socket)
                 .await
                 .expect("request read should succeed");
-            captured_requests
-                .lock()
-                .expect("request capture mutex poisoned")
-                .push(request);
+            captured_requests.lock().push(request);
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {declared_content_length}\r\nContent-Type: audio/mpeg\r\n\r\nx"
             );

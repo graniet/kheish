@@ -1,8 +1,8 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -10,6 +10,7 @@ use futures_util::{SinkExt, StreamExt, stream::BoxStream};
 use kheish_auth::{AuthManager, AuthSlotId, ExecutionCredentialContext};
 use kheish_codec::digest_serialize;
 use kheish_runtime::{redact_json_value, redact_text};
+use parking_lot::Mutex as SyncMutex;
 use rmcp::ClientHandler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ClientCapabilities, ClientJsonRpcMessage,
@@ -411,9 +412,9 @@ fn mcp_http_body_limit_error(
 }
 
 fn bounded_sse_stream(response: reqwest::Response) -> BoxStream<'static, Result<Sse, SseError>> {
-    let state = Arc::new(StdMutex::new(SseByteLimitState::default()));
+    let state = Arc::new(SyncMutex::new(SseByteLimitState::default()));
     let byte_stream = response.bytes_stream().map(move |chunk| {
-        let mut state = state.lock().expect("SSE byte-limit mutex poisoned");
+        let mut state = state.lock();
         match chunk {
             Ok(bytes) => {
                 if let Err(error) = state.observe(&bytes) {
@@ -1131,7 +1132,7 @@ pub(crate) fn load_codex_bearer_token(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+    use std::sync::{Arc, OnceLock};
 
     use anyhow::anyhow;
     use kheish_auth::{
@@ -1139,6 +1140,7 @@ mod tests {
         register_ephemeral_debug_redaction_token,
     };
     use kheish_types::CredentialScope;
+    use parking_lot::Mutex as SyncMutex;
 
     use rmcp::model::{ClientJsonRpcMessage, ClientRequest, PingRequest, RequestId};
     use rmcp::transport::Transport;
@@ -1152,12 +1154,9 @@ mod tests {
     };
     use crate::config::{McpHttpAuth, McpServerConfig, McpServerTransport};
 
-    fn auth_env_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-        let guard = LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .expect("auth env mutex poisoned");
+    fn auth_env_guard() -> parking_lot::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<SyncMutex<()>> = OnceLock::new();
+        let guard = LOCK.get_or_init(|| SyncMutex::new(())).lock();
         unsafe {
             std::env::set_var(
                 AUTH_STORE_MASTER_KEY_ENV,

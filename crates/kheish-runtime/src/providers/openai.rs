@@ -3377,10 +3377,11 @@ fn sniff_generated_image_media_type(bytes: &[u8]) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex;
     use std::collections::BTreeMap;
     use std::fs;
     use std::sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     };
     use std::time::Duration;
@@ -3481,10 +3482,7 @@ mod tests {
         }
 
         fn debug_artifacts(&self) -> Vec<DebugArtifact> {
-            self.artifacts
-                .lock()
-                .expect("artifacts mutex poisoned")
-                .clone()
+            self.artifacts.lock().clone()
         }
     }
 
@@ -3496,10 +3494,7 @@ mod tests {
         fn record(&self, _event: TraceEvent) {}
 
         fn record_debug_artifact(&self, artifact: DebugArtifact) {
-            self.artifacts
-                .lock()
-                .expect("artifacts mutex poisoned")
-                .push(artifact);
+            self.artifacts.lock().push(artifact);
         }
 
         fn increment_counter(&self, _name: &str, _delta: u64) {}
@@ -3519,10 +3514,7 @@ mod tests {
 
     impl RuntimeObserver for FailingAuditObserver {
         fn record(&self, event: TraceEvent) {
-            self.traces
-                .lock()
-                .expect("traces mutex poisoned")
-                .push(event);
+            self.traces.lock().push(event);
         }
 
         fn external_action_audit_failure(&self) -> Option<String> {
@@ -3704,8 +3696,7 @@ mod tests {
             )
             .await?;
 
-        let payload: Value =
-            serde_json::from_str(&captured.lock().expect("payload mutex poisoned"))?;
+        let payload: Value = serde_json::from_str(&captured.lock())?;
         assert_eq!(payload["model"], "gpt-test");
         assert_eq!(payload["store"], true);
         assert_eq!(payload["max_output_tokens"], 256);
@@ -3784,7 +3775,7 @@ mod tests {
 
         assert!(error.message.contains("external action audit failed"));
         assert!(
-            captured.lock().expect("captured mutex poisoned").is_empty(),
+            captured.lock().is_empty(),
             "provider should not send an HTTP request after audit failure"
         );
         Ok(())
@@ -4974,7 +4965,7 @@ mod tests {
         assert_eq!(response.media_type, "audio/wav");
         assert_eq!(response.bytes, b"wav-audio".to_vec());
 
-        let body: Value = serde_json::from_str(&captured.lock().expect("body mutex poisoned"))?;
+        let body: Value = serde_json::from_str(&captured.lock())?;
         assert_eq!(body["model"], DEFAULT_OPENAI_TTS_MODEL);
         assert_eq!(body["voice"], "coral");
         assert_eq!(body["response_format"], "wav");
@@ -5634,12 +5625,7 @@ mod tests {
 
         assert_eq!(response.images.len(), 1);
         assert_eq!(response.images[0].media_type, "image/jpeg");
-        let body = serde_json::from_str::<Value>(
-            &captured
-                .lock()
-                .expect("request capture mutex poisoned")
-                .clone(),
-        )?;
+        let body = serde_json::from_str::<Value>(&captured.lock().clone())?;
         assert_eq!(body["model"], "grok-imagine-image");
         assert_eq!(body["response_format"], "b64_json");
         assert!(body.get("image").is_none());

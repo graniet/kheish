@@ -1,12 +1,13 @@
 #![allow(clippy::too_many_lines)]
 
+use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex, OnceLock, RwLock,
+    Arc, OnceLock,
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -180,7 +181,7 @@ fn ensure_auth_store_master_key() {
 }
 
 struct DebugCaptureEnvGuard {
-    _guard: std::sync::MutexGuard<'static, ()>,
+    _guard: parking_lot::MutexGuard<'static, ()>,
 }
 
 impl DebugCaptureEnvGuard {
@@ -420,26 +421,20 @@ impl crate::image_generation::ImageGenerationBackend for RecordingImageBackend {
         request: &crate::image_generation::ImageEditBackendRequest,
         _model_override: Option<&str>,
     ) -> Result<crate::image_generation::GeneratedImageBatch> {
-        self.recorded_file_names
-            .lock()
-            .expect("recorded file names lock poisoned")
-            .push(
-                request
-                    .images
-                    .iter()
-                    .map(|image| image.file_name.clone())
-                    .collect(),
-            );
-        self.recorded_media_types
-            .lock()
-            .expect("recorded media types lock poisoned")
-            .push(
-                request
-                    .images
-                    .iter()
-                    .map(|image| image.media_type.clone())
-                    .collect(),
-            );
+        self.recorded_file_names.lock().push(
+            request
+                .images
+                .iter()
+                .map(|image| image.file_name.clone())
+                .collect(),
+        );
+        self.recorded_media_types.lock().push(
+            request
+                .images
+                .iter()
+                .map(|image| image.media_type.clone())
+                .collect(),
+        );
         Ok(crate::image_generation::GeneratedImageBatch {
             provider: "openai".to_string(),
             model: "recording-image-model".to_string(),
@@ -479,19 +474,13 @@ impl crate::transcription::AudioTranscriptionBackend for ScriptedTranscriptionBa
     ) -> Result<kheish_runtime::AudioTranscriptionResponse> {
         self.recorded_media_types
             .lock()
-            .expect("recorded media types lock poisoned")
             .push(request.media_type.clone());
         self.recorded_file_names
             .lock()
-            .expect("recorded file names lock poisoned")
             .push(request.file_name.clone());
-        self.recorded_prompts
-            .lock()
-            .expect("recorded prompts lock poisoned")
-            .push(request.prompt.clone());
+        self.recorded_prompts.lock().push(request.prompt.clone());
         self.recorded_languages
             .lock()
-            .expect("recorded languages lock poisoned")
             .push(request.language.clone());
         let timestamps = (!request.timestamp_granularities.is_empty()).then(|| {
             kheish_runtime::AudioTranscriptionTimestamps {
@@ -837,10 +826,7 @@ impl DaemonModelControl for ScriptedModelControl {
     }
 
     fn current_model(&self) -> String {
-        self.model
-            .read()
-            .expect("scripted model control rwlock poisoned")
-            .clone()
+        self.model.read().clone()
     }
 
     fn set_route(&self, provider: Option<&str>, model: String) -> Result<String> {
@@ -849,10 +835,7 @@ impl DaemonModelControl for ScriptedModelControl {
         {
             bail!("unknown provider route '{provider}'");
         }
-        *self
-            .model
-            .write()
-            .expect("scripted model control rwlock poisoned") = model.clone();
+        *self.model.write() = model.clone();
         Ok(model)
     }
 
@@ -1165,7 +1148,7 @@ impl ModelProvider for ScriptedProvider {
         sink: ModelEventSink,
     ) -> std::result::Result<(), ProviderError> {
         let step = {
-            let mut queue = self.0.lock().expect("provider mutex poisoned");
+            let mut queue = self.0.lock();
             queue.pop_front().expect("scripted response")
         };
         match step {
@@ -1263,7 +1246,6 @@ impl ModelProvider for LoopbackWebFetchProvider {
             let address = *self
                 .address
                 .lock()
-                .expect("address mutex poisoned")
                 .as_ref()
                 .expect("daemon address should be set before model call");
             sink.emit(ModelStreamEvent::MessageId {
@@ -3087,6 +3069,50 @@ async fn echoing_delay_daemon_with_policy(
     .await
 }
 
+/// Reads frames until one matches `wanted`, returning its SSE id and payload.
+/// Unlike [`next_sse_event`], the buffer persists across skipped frames, so
+/// events arriving in the same chunk are never dropped, and callers can open a
+/// follow-up stream with `Last-Event-ID` set to the returned id.
+async fn next_sse_event_named(
+    response: &mut reqwest::Response,
+    wanted: &str,
+) -> Result<(Option<u64>, DaemonEvent)> {
+    let mut buffer = String::new();
+    loop {
+        if let Some(frame_end) = buffer.find("\n\n") {
+            let frame = buffer[..frame_end].to_string();
+            let remainder = buffer[(frame_end + 2)..].to_string();
+            buffer = remainder;
+            let mut event_name = None;
+            let mut event_id = None;
+            let mut data = String::new();
+            for line in frame.lines() {
+                let line = line.trim_end_matches('\r');
+                if let Some(value) = line.strip_prefix("event: ") {
+                    event_name = Some(value.to_string());
+                } else if let Some(value) = line.strip_prefix("id: ") {
+                    event_id = value.trim().parse::<u64>().ok();
+                } else if let Some(value) = line.strip_prefix("data: ") {
+                    data.push_str(value);
+                }
+            }
+            if event_name.as_deref() == Some(wanted) {
+                let event = serde_json::from_str::<DaemonEvent>(&data)?;
+                return Ok((event_id, event));
+            }
+            continue;
+        }
+
+        let chunk = tokio::time::timeout(Duration::from_secs(5), response.chunk())
+            .await
+            .context("timed out waiting for SSE chunk")??;
+        let Some(chunk) = chunk else {
+            anyhow::bail!("SSE stream ended before the expected event was received");
+        };
+        buffer.push_str(std::str::from_utf8(&chunk)?);
+    }
+}
+
 async fn next_sse_event(response: &mut reqwest::Response) -> Result<(String, DaemonEvent)> {
     let mut buffer = String::new();
     loop {
@@ -3843,10 +3869,7 @@ async fn spawn_openai_mock_server(
             }
             body_bytes.extend_from_slice(&buffer[..read]);
         }
-        *captured_request_body
-            .lock()
-            .expect("request capture mutex poisoned") =
-            String::from_utf8(body_bytes).expect("body must be utf-8");
+        *captured_request_body.lock() = String::from_utf8(body_bytes).expect("body must be utf-8");
 
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\ncontent-type: text/event-stream\r\n\r\n{body}",
@@ -3911,9 +3934,7 @@ async fn spawn_openai_mock_server_with_request_capture(
             }
             body_bytes.extend_from_slice(&buffer[..read]);
         }
-        *captured_request
-            .lock()
-            .expect("request capture mutex poisoned") = format!(
+        *captured_request.lock() = format!(
             "{request_text}{}",
             String::from_utf8(body_bytes).expect("body must be utf-8")
         );
@@ -3987,7 +4008,6 @@ async fn spawn_openai_mock_server_sequence(
             }
             captured_requests
                 .lock()
-                .expect("request capture mutex poisoned")
                 .push(String::from_utf8(body_bytes).expect("body must be utf-8"));
 
             let response = format!(
@@ -4056,7 +4076,6 @@ async fn spawn_google_mock_server_sequence(
             }
             captured_requests
                 .lock()
-                .expect("request capture mutex poisoned")
                 .push(String::from_utf8(body_bytes).expect("body must be utf-8"));
 
             let body = body.to_string();
@@ -16868,7 +16887,7 @@ async fn daemon_web_fetch_blocks_loopback_through_real_tool_runtime() -> Result<
         |tools| register_default_coding_tools(tools, CodingToolConfig::new(&state_root), None),
     )
     .await?;
-    *address_slot.lock().expect("address mutex poisoned") = Some(address);
+    *address_slot.lock() = Some(address);
 
     let client = Client::new();
     let base = format!("http://{address}");
@@ -24038,7 +24057,7 @@ async fn daemon_openai_path_runs_end_to_end_with_mock_provider() -> Result<()> {
             .any(|output| output.content.contains("hello from openai"))
     );
 
-    let payload = serde_json::from_str::<Value>(&captured.lock().expect("capture mutex poisoned"))?;
+    let payload = serde_json::from_str::<Value>(&captured.lock())?;
     assert_eq!(payload["model"], "gpt-test");
     assert!(
         payload["instructions"]
@@ -24251,10 +24270,7 @@ async fn daemon_google_path_runs_end_to_end_with_mock_provider_and_image_generat
     );
     assert!(!raw.bytes().await?.is_empty());
 
-    let captured = captured_requests
-        .lock()
-        .expect("request capture mutex poisoned")
-        .clone();
+    let captured = captured_requests.lock().clone();
     assert_eq!(captured.len(), 3);
     let first_request = serde_json::from_str::<Value>(&captured[0])?;
     let image_request = serde_json::from_str::<Value>(&captured[1])?;
@@ -24578,10 +24594,7 @@ async fn daemon_google_path_includes_dxf_preview_images_for_multimodal_document_
         serde_json::to_string_pretty(&completed)?
     );
 
-    let captured = captured_requests
-        .lock()
-        .expect("request capture mutex poisoned")
-        .clone();
+    let captured = captured_requests.lock().clone();
     let (request, parts) = captured
         .iter()
         .find_map(|raw| {
@@ -24793,10 +24806,7 @@ async fn daemon_google_path_runs_end_to_end_with_mock_provider_and_image_edit() 
         .await?;
     assert_eq!(edited_asset.media_type, "image/png");
 
-    let captured = captured_requests
-        .lock()
-        .expect("request capture mutex poisoned")
-        .clone();
+    let captured = captured_requests.lock().clone();
     assert_eq!(captured.len(), 3);
     let image_request = serde_json::from_str::<Value>(&captured[1])?;
     assert_eq!(
@@ -24932,10 +24942,7 @@ async fn daemon_recovers_recent_run_memory_into_the_next_provider_request() -> R
     )
     .await?;
 
-    let captured_requests = captured_requests
-        .lock()
-        .expect("request capture mutex poisoned")
-        .clone();
+    let captured_requests = captured_requests.lock().clone();
     assert_eq!(captured_requests.len(), 2);
     let second_payload = serde_json::from_str::<Value>(&captured_requests[1])?;
     let instructions = second_payload["instructions"]
@@ -25053,10 +25060,7 @@ async fn daemon_ranks_relevant_run_memory_over_newer_irrelevant_memory() -> Resu
     )
     .await?;
 
-    let captured_requests = captured_requests
-        .lock()
-        .expect("request capture mutex poisoned")
-        .clone();
+    let captured_requests = captured_requests.lock().clone();
     assert_eq!(captured_requests.len(), 3);
     let follow_up_payload = serde_json::from_str::<Value>(&captured_requests[2])?;
     let instructions = follow_up_payload["instructions"]
@@ -25150,10 +25154,7 @@ async fn daemon_wraps_recovered_run_memory_as_historical_data() -> Result<()> {
     )
     .await?;
 
-    let captured_requests = captured_requests
-        .lock()
-        .expect("request capture mutex poisoned")
-        .clone();
+    let captured_requests = captured_requests.lock().clone();
     assert_eq!(captured_requests.len(), 2);
     let follow_up_payload = serde_json::from_str::<Value>(&captured_requests[1])?;
     let instructions = follow_up_payload["instructions"]
@@ -25468,10 +25469,7 @@ async fn daemon_respects_configured_run_memory_retention_at_retrieval_time() -> 
     )
     .await?;
 
-    let captured_requests = captured_requests
-        .lock()
-        .expect("request capture mutex poisoned")
-        .clone();
+    let captured_requests = captured_requests.lock().clone();
     assert_eq!(captured_requests.len(), 2);
     let follow_up_payload = serde_json::from_str::<Value>(&captured_requests[1])?;
     let instructions = follow_up_payload["instructions"]
@@ -25982,10 +25980,7 @@ async fn daemon_publishes_session_learning_and_injects_it_into_the_next_provider
     )
     .await?;
 
-    let captured_requests = captured_requests
-        .lock()
-        .expect("request capture mutex poisoned")
-        .clone();
+    let captured_requests = captured_requests.lock().clone();
     assert_eq!(captured_requests.len(), 2);
     let second_payload = serde_json::from_str::<Value>(&captured_requests[1])?;
     let instructions = second_payload["instructions"]
@@ -26218,10 +26213,7 @@ async fn daemon_reports_learned_context_prompt_budget_omissions() -> Result<()> 
         .await?;
     wait_for_run_status(&client, &base, &run.run_id, &[DaemonRunStatus::Completed]).await?;
 
-    let captured_after_ranked = captured_requests
-        .lock()
-        .expect("request capture mutex poisoned")
-        .clone();
+    let captured_after_ranked = captured_requests.lock().clone();
     assert_eq!(captured_after_ranked.len(), 1);
     let payload = serde_json::from_str::<Value>(&captured_after_ranked[0])?;
     let instructions = payload["instructions"]
@@ -26389,10 +26381,7 @@ async fn daemon_preserves_learned_context_after_user_question_resume() -> Result
     )
     .await?;
 
-    let captured_requests = captured_requests
-        .lock()
-        .expect("request capture mutex poisoned")
-        .clone();
+    let captured_requests = captured_requests.lock().clone();
     assert_eq!(captured_requests.len(), 2);
     for (index, request) in captured_requests.iter().enumerate() {
         let payload = serde_json::from_str::<Value>(request)?;
@@ -26783,10 +26772,7 @@ async fn daemon_ranks_learned_context_against_pending_input_before_prompt_inject
     .await?;
     wait_for_run_status(&client, &base, &run.run_id, &[DaemonRunStatus::Completed]).await?;
 
-    let captured_after_ranked = captured_requests
-        .lock()
-        .expect("request capture mutex poisoned")
-        .clone();
+    let captured_after_ranked = captured_requests.lock().clone();
     assert_eq!(captured_after_ranked.len(), 1);
     let payload = serde_json::from_str::<Value>(&captured_after_ranked[0])?;
     let instructions = payload["instructions"]
@@ -26838,10 +26824,7 @@ async fn daemon_ranks_learned_context_against_pending_input_before_prompt_inject
         &[DaemonRunStatus::Completed],
     )
     .await?;
-    let captured_after_unrelated = captured_requests
-        .lock()
-        .expect("request capture mutex poisoned")
-        .clone();
+    let captured_after_unrelated = captured_requests.lock().clone();
     assert_eq!(captured_after_unrelated.len(), 2);
     let unrelated_payload = serde_json::from_str::<Value>(&captured_after_unrelated[1])?;
     let unrelated_instructions = unrelated_payload["instructions"]
@@ -27208,10 +27191,7 @@ async fn daemon_recovers_recent_run_memory_after_restart() -> Result<()> {
     )
     .await?;
 
-    let captured_requests = captured_requests
-        .lock()
-        .expect("request capture mutex poisoned")
-        .clone();
+    let captured_requests = captured_requests.lock().clone();
     assert_eq!(captured_requests.len(), 2);
     let second_payload = serde_json::from_str::<Value>(&captured_requests[1])?;
     let instructions = second_payload["instructions"]
@@ -27347,10 +27327,7 @@ async fn daemon_ignores_corrupted_run_memory_records() -> Result<()> {
     )
     .await?;
 
-    let captured_requests = captured_requests
-        .lock()
-        .expect("request capture mutex poisoned")
-        .clone();
+    let captured_requests = captured_requests.lock().clone();
     assert_eq!(captured_requests.len(), 2);
     let second_payload = serde_json::from_str::<Value>(&captured_requests[1])?;
     let instructions = second_payload["instructions"]
@@ -28056,10 +28033,7 @@ async fn daemon_omits_recovered_memory_when_model_context_budget_is_exhausted() 
     )
     .await?;
 
-    let captured_requests = captured_requests
-        .lock()
-        .expect("request capture mutex poisoned")
-        .clone();
+    let captured_requests = captured_requests.lock().clone();
     assert_eq!(captured_requests.len(), 2);
     let second_payload = serde_json::from_str::<Value>(&captured_requests[1])?;
     let instructions = second_payload["instructions"]
@@ -28243,10 +28217,7 @@ async fn daemon_prunes_tracked_run_memory_files_and_index_entries() -> Result<()
     )
     .await?;
 
-    let captured_requests = captured_requests
-        .lock()
-        .expect("request capture mutex poisoned")
-        .clone();
+    let captured_requests = captured_requests.lock().clone();
     assert_eq!(captured_requests.len(), total_seed_runs + 1);
     let follow_up_payload = serde_json::from_str::<Value>(
         captured_requests
@@ -28616,10 +28587,7 @@ session_policy = { create_if_missing = true }
         "unexpected error body: {body}"
     );
     assert!(
-        captured
-            .lock()
-            .expect("request capture mutex poisoned")
-            .is_empty(),
+        captured.lock().is_empty(),
         "provider should not receive an empty connector submission"
     );
 
@@ -29233,10 +29201,7 @@ session_policy = { create_if_missing = true }
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert!(response.text().await?.contains("channel_id is not allowed"));
     assert!(
-        captured
-            .lock()
-            .expect("request capture mutex poisoned")
-            .is_empty(),
+        captured.lock().is_empty(),
         "provider should not receive rejected Slack submissions"
     );
 
@@ -29479,10 +29444,7 @@ session_policy = { create_if_missing = true }
 
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
-        captured
-            .lock()
-            .expect("request capture mutex poisoned")
-            .is_empty(),
+        captured.lock().is_empty(),
         "unsupported Slack events should not submit provider runs"
     );
 
@@ -29933,10 +29895,7 @@ async fn daemon_telegram_connector_accepts_callback_query_and_acks_it() -> Resul
         State(captured): State<Arc<Mutex<Vec<Value>>>>,
         Json(payload): Json<Value>,
     ) -> Json<Value> {
-        captured
-            .lock()
-            .expect("callback capture mutex poisoned")
-            .push(payload);
+        captured.lock().push(payload);
         Json(json!({ "ok": true, "result": true }))
     }
 
@@ -30027,9 +29986,7 @@ session_policy = {{ create_if_missing = true }}
         Some("telegram:callback:555")
     );
     {
-        let acks = callback_acks
-            .lock()
-            .expect("callback capture mutex poisoned");
+        let acks = callback_acks.lock();
         assert_eq!(acks.len(), 1);
         assert_eq!(
             acks[0].get("callback_query_id").and_then(Value::as_str),
@@ -30086,9 +30043,7 @@ session_policy = {{ create_if_missing = true }}
         .await?;
     assert_eq!(outside_allowlist.status(), StatusCode::BAD_REQUEST);
 
-    let acks = callback_acks
-        .lock()
-        .expect("callback capture mutex poisoned");
+    let acks = callback_acks.lock();
     assert_eq!(
         acks.len(),
         1,
@@ -30372,10 +30327,7 @@ async fn daemon_openai_account_auth_runs_end_to_end_with_mock_provider() -> Resu
         .ok_or_else(|| anyhow!("missing run for openai-account-demo"))?;
     let run = wait_for_run_status(&client, &base, &run_id, &[DaemonRunStatus::Completed]).await?;
     assert_eq!(run.status, DaemonRunStatus::Completed);
-    let captured_request = captured_request
-        .lock()
-        .expect("request capture mutex poisoned")
-        .clone();
+    let captured_request = captured_request.lock().clone();
     assert!(
         captured_request.contains("Authorization: Bearer fresh-access-token")
             || captured_request.contains("authorization: Bearer fresh-access-token"),
@@ -30531,10 +30483,7 @@ async fn daemon_anthropic_account_auth_runs_end_to_end_with_mock_provider() -> R
         "expired route auth should refresh before blocking provider work: {}",
         serde_json::to_string_pretty(&status.provider_readiness)?
     );
-    let captured_request = captured_request
-        .lock()
-        .expect("request capture mutex poisoned")
-        .clone();
+    let captured_request = captured_request.lock().clone();
     assert!(
         captured_request.contains("Authorization: Bearer anthropic-fresh-access-token")
             || captured_request.contains("authorization: Bearer anthropic-fresh-access-token"),
@@ -42307,8 +42256,14 @@ async fn daemon_exposes_runtime_reconfiguration_and_global_sse() -> Result<()> {
     );
     assert_eq!(status.health.generated_at_ms, status.snapshot_at_ms);
 
+    // Subscribe from the epoch cursor: events are recorded into the bus
+    // history before they broadcast, so the runtime_updated event below is
+    // delivered through replay even if it fires before this subscription
+    // registers. Without the cursor this test races the subscription under
+    // parallel-suite load.
     let mut stream = client
         .get(format!("{base}/v1/events/stream"))
+        .header("Last-Event-ID", "0")
         .send()
         .await?
         .error_for_status()?;
@@ -42326,8 +42281,7 @@ async fn daemon_exposes_runtime_reconfiguration_and_global_sse() -> Result<()> {
         .await?;
     assert_eq!(updated.permission_mode, PermissionMode::DontAsk);
 
-    let (event_name, event) = next_sse_event(&mut stream).await?;
-    assert_eq!(event_name, "runtime_updated");
+    let (first_event_id, event) = next_sse_event_named(&mut stream, "runtime_updated").await?;
     match event {
         DaemonEvent::RuntimeUpdated { runtime } => {
             assert_eq!(runtime.permission_mode, PermissionMode::DontAsk);
@@ -42335,9 +42289,13 @@ async fn daemon_exposes_runtime_reconfiguration_and_global_sse() -> Result<()> {
         }
         other => panic!("unexpected SSE event: {other:?}"),
     }
+    let first_event_id = first_event_id.expect("runtime_updated events should carry an SSE id");
 
+    // Resume after the first mutation's event so the second subscription only
+    // sees the model change, replayed or live.
     let mut stream = client
         .get(format!("{base}/v1/events/stream"))
+        .header("Last-Event-ID", first_event_id.to_string())
         .send()
         .await?
         .error_for_status()?;
@@ -42356,8 +42314,7 @@ async fn daemon_exposes_runtime_reconfiguration_and_global_sse() -> Result<()> {
         .await?;
     assert_eq!(updated.model.as_deref(), Some("scripted-model-v2"));
 
-    let (event_name, event) = next_sse_event(&mut stream).await?;
-    assert_eq!(event_name, "runtime_updated");
+    let (_, event) = next_sse_event_named(&mut stream, "runtime_updated").await?;
     match event {
         DaemonEvent::RuntimeUpdated { runtime } => {
             assert_eq!(runtime.model.as_deref(), Some("scripted-model-v2"));
@@ -45480,13 +45437,7 @@ async fn daemon_derivation_force_refresh_recomputes_and_updates_cache() -> Resul
         .await?;
     assert_eq!(duplicate.cache_status, Some(DerivationCacheStatus::Hit));
     assert_eq!(duplicate.derivation_id, first.derivation_id);
-    assert_eq!(
-        recorded_file_names
-            .lock()
-            .expect("recorded file names lock poisoned")
-            .len(),
-        1
-    );
+    assert_eq!(recorded_file_names.lock().len(), 1);
 
     let forced = client
         .post(format!("{base}/v1/derivations?force_refresh=true"))
@@ -45499,10 +45450,7 @@ async fn daemon_derivation_force_refresh_recomputes_and_updates_cache() -> Resul
     assert_eq!(forced.cache_status, Some(DerivationCacheStatus::Miss));
     assert_ne!(forced.derivation_id, first.derivation_id);
     assert_eq!(
-        recorded_file_names
-            .lock()
-            .expect("recorded file names lock poisoned")
-            .len(),
+        recorded_file_names.lock().len(),
         2,
         "force refresh should bypass existing canonical text reuse and call the backend again"
     );
@@ -45517,13 +45465,7 @@ async fn daemon_derivation_force_refresh_recomputes_and_updates_cache() -> Resul
         .await?;
     assert_eq!(replayed.cache_status, Some(DerivationCacheStatus::Hit));
     assert_eq!(replayed.derivation_id, forced.derivation_id);
-    assert_eq!(
-        recorded_file_names
-            .lock()
-            .expect("recorded file names lock poisoned")
-            .len(),
-        2
-    );
+    assert_eq!(recorded_file_names.lock().len(), 2);
 
     let forced_text = client
         .get(format!("{base}/v1/assets/{}/raw", forced.result_asset_id))
@@ -45556,10 +45498,7 @@ async fn daemon_derivation_force_refresh_recomputes_and_updates_cache() -> Resul
     );
     assert_eq!(restarted_replay.derivation_id, forced.derivation_id);
     assert_eq!(
-        recorded_file_names
-            .lock()
-            .expect("recorded file names lock poisoned")
-            .len(),
+        recorded_file_names.lock().len(),
         2,
         "restart cache rebuild should keep the successful forced recompute preferred"
     );
@@ -45642,17 +45581,11 @@ async fn daemon_derivation_transcription_options_are_forwarded_and_cache_scoped(
         crate::transcription::TRANSCRIPTION_SINGLE_PART_COUNT
     );
     assert_eq!(
-        recorded_prompts
-            .lock()
-            .expect("recorded prompts lock poisoned")
-            .as_slice(),
+        recorded_prompts.lock().as_slice(),
         [Some("prefer the project glossary".to_string())]
     );
     assert_eq!(
-        recorded_languages
-            .lock()
-            .expect("recorded languages lock poisoned")
-            .as_slice(),
+        recorded_languages.lock().as_slice(),
         [Some("en".to_string())]
     );
     let refreshed_audio = client
@@ -45689,10 +45622,7 @@ async fn daemon_derivation_transcription_options_are_forwarded_and_cache_scoped(
     assert_eq!(duplicate.derivation_id, first.derivation_id);
     assert_eq!(duplicate.cache_status, Some(DerivationCacheStatus::Hit));
     assert_eq!(
-        recorded_prompts
-            .lock()
-            .expect("recorded prompts lock poisoned")
-            .len(),
+        recorded_prompts.lock().len(),
         1,
         "same normalized transcription options should hit cache"
     );
@@ -45722,10 +45652,7 @@ async fn daemon_derivation_transcription_options_are_forwarded_and_cache_scoped(
     );
     assert_ne!(changed_language.derivation_id, first.derivation_id);
     assert_eq!(
-        recorded_languages
-            .lock()
-            .expect("recorded languages lock poisoned")
-            .as_slice(),
+        recorded_languages.lock().as_slice(),
         [Some("en".to_string()), Some("fr".to_string())]
     );
 
@@ -46914,13 +46841,7 @@ async fn daemon_implicit_transcription_cache_changes_when_backend_identity_chang
         )?,
         "FIRST_BACKEND_TRANSCRIPT"
     );
-    assert_eq!(
-        first_file_names
-            .lock()
-            .expect("first file names lock poisoned")
-            .len(),
-        1
-    );
+    assert_eq!(first_file_names.lock().len(), 1);
     let _ = shutdown.send(());
 
     let second_file_names = Arc::new(Mutex::new(Vec::new()));
@@ -46981,13 +46902,7 @@ async fn daemon_implicit_transcription_cache_changes_when_backend_identity_chang
         )?,
         "SECOND_BACKEND_TRANSCRIPT"
     );
-    assert_eq!(
-        second_file_names
-            .lock()
-            .expect("second file names lock poisoned")
-            .len(),
-        1
-    );
+    assert_eq!(second_file_names.lock().len(), 1);
 
     let replayed = client
         .post(format!("{restart_base}/v1/derivations"))
@@ -47005,13 +46920,7 @@ async fn daemon_implicit_transcription_cache_changes_when_backend_identity_chang
         .await?;
     assert_eq!(replayed.cache_status, Some(DerivationCacheStatus::Hit));
     assert_eq!(replayed.derivation_id, second.derivation_id);
-    assert_eq!(
-        second_file_names
-            .lock()
-            .expect("second file names lock poisoned")
-            .len(),
-        1
-    );
+    assert_eq!(second_file_names.lock().len(), 1);
 
     let _ = restart_shutdown.send(());
     Ok(())
@@ -50722,20 +50631,8 @@ async fn daemon_observation_materialization_transcribes_raw_audio_when_backend_i
         .text()
         .await?;
     assert_eq!(canonical_text.trim(), "STT_OBSERVATION_TRANSCRIPT_OK");
-    assert_eq!(
-        recorded_media_types
-            .lock()
-            .expect("recorded media types lock poisoned")
-            .as_slice(),
-        ["audio/wav"]
-    );
-    assert_eq!(
-        recorded_file_names
-            .lock()
-            .expect("recorded file names lock poisoned")
-            .as_slice(),
-        ["segment.wav"]
-    );
+    assert_eq!(recorded_media_types.lock().as_slice(), ["audio/wav"]);
+    assert_eq!(recorded_file_names.lock().as_slice(), ["segment.wav"]);
     let derivations = client
         .get(format!("{base}/v1/derivations"))
         .send()
@@ -50911,18 +50808,9 @@ async fn daemon_observation_derivation_regenerates_transcript_when_route_changes
         output.contains("OPENAI_OBSERVATION_TRANSCRIPT_OK"),
         "unexpected preferred-route transcript: {output}"
     );
-    assert_eq!(
-        openai_media_types
-            .lock()
-            .expect("openai media types lock poisoned")
-            .as_slice(),
-        ["audio/wav"]
-    );
+    assert_eq!(openai_media_types.lock().as_slice(), ["audio/wav"]);
     assert!(
-        openrouter_media_types
-            .lock()
-            .expect("openrouter media types lock poisoned")
-            .is_empty(),
+        openrouter_media_types.lock().is_empty(),
         "default route should not have been used while materializing with provider=openai"
     );
 
@@ -50962,10 +50850,7 @@ async fn daemon_observation_derivation_regenerates_transcript_when_route_changes
         "OPENROUTER_OBSERVATION_TRANSCRIPT_OK"
     );
     assert_eq!(
-        openrouter_media_types
-            .lock()
-            .expect("openrouter media types lock poisoned")
-            .as_slice(),
+        openrouter_media_types.lock().as_slice(),
         ["audio/wav"],
         "observation derivation should regenerate through the default transcription route"
     );
@@ -51074,18 +50959,8 @@ async fn daemon_observation_materialization_respects_transcription_credential_sc
         "unexpected run error: {}",
         serde_json::to_string_pretty(&failed)?
     );
-    assert!(
-        recorded_media_types
-            .lock()
-            .expect("recorded media types lock poisoned")
-            .is_empty()
-    );
-    assert!(
-        recorded_file_names
-            .lock()
-            .expect("recorded file names lock poisoned")
-            .is_empty()
-    );
+    assert!(recorded_media_types.lock().is_empty());
+    assert!(recorded_file_names.lock().is_empty());
 
     let _ = shutdown.send(());
     Ok(())
@@ -51181,20 +51056,8 @@ async fn daemon_session_input_transcribes_inline_audio_assets_when_backend_is_co
         .json::<AssetView>()
         .await?;
     assert!(refreshed.text_uri.is_some());
-    assert_eq!(
-        recorded_media_types
-            .lock()
-            .expect("recorded media types lock poisoned")
-            .as_slice(),
-        ["audio/wav"]
-    );
-    assert_eq!(
-        recorded_file_names
-            .lock()
-            .expect("recorded file names lock poisoned")
-            .as_slice(),
-        ["voice-note.wav"]
-    );
+    assert_eq!(recorded_media_types.lock().as_slice(), ["audio/wav"]);
+    assert_eq!(recorded_file_names.lock().as_slice(), ["voice-note.wav"]);
     let derivations = client
         .get(format!("{base}/v1/derivations"))
         .send()
@@ -52841,17 +52704,11 @@ async fn daemon_http_runs_preserve_multi_image_edit_order() -> Result<()> {
     assert_eq!(completed.status, DaemonRunStatus::Completed);
 
     assert_eq!(
-        recorded_file_names
-            .lock()
-            .expect("recorded file names lock poisoned")
-            .as_slice(),
+        recorded_file_names.lock().as_slice(),
         &[vec!["plan.png".to_string(), "reference.jpg".to_string()]]
     );
     assert_eq!(
-        recorded_media_types
-            .lock()
-            .expect("recorded media types lock poisoned")
-            .as_slice(),
+        recorded_media_types.lock().as_slice(),
         &[vec!["image/png".to_string(), "image/jpeg".to_string()]]
     );
 
@@ -54195,6 +54052,93 @@ async fn daemon_managed_sidechain_worktree_is_created_and_removed() -> Result<()
     );
 
     let _ = shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_startup_reclaims_orphaned_daemon_owned_worktrees() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-state");
+    init_test_git_repo(&state_root)?;
+    let (address, shutdown) = echoing_delay_daemon(&state_root, Duration::from_millis(25)).await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+
+    let root = client
+        .post(format!("{base}/v1/sessions"))
+        .json(&CreateSessionRequest {
+            session_id: Some("worktree-gc-root".to_string()),
+            thread_id: None,
+            persona_id: None,
+            credential_scope: None,
+            capability_scope: None,
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionView>()
+        .await?;
+
+    let mut request = bare_sidechain_request("worktree-gc-child", Some("thread-worktree-gc"), None);
+    request.fork_context.isolation = Some("worktree".to_string());
+
+    let child = client
+        .post(format!("{base}/v1/agents/{}/sidechains", root.agent_id))
+        .json(&request)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionView>()
+        .await?;
+    let ownership = child
+        .snapshot
+        .agent
+        .daemon_owned_worktree
+        .clone()
+        .expect("daemon-owned worktree metadata");
+    let worktree_path = PathBuf::from(&ownership.path);
+    assert!(worktree_path.join(".git").exists());
+
+    let ended = client
+        .post(format!("{base}/v1/sessions/worktree-gc-child/end"))
+        .json(&EndSessionRequest {
+            reason: Some("done".to_string()),
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionView>()
+        .await?;
+    assert!(ended.snapshot.agent.closed_at_ms.is_some());
+    assert!(!worktree_path.exists());
+    let _ = shutdown.send(());
+
+    // Simulate a crash between settle and cleanup: the closed agent record
+    // still carries the ownership metadata, so recreate the worktree it
+    // points at as git would have left it.
+    let recreate = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&state_root)
+        .args(["worktree", "add", "--detach"])
+        .arg(&worktree_path)
+        .arg("HEAD")
+        .output()?;
+    assert!(
+        recreate.status.success(),
+        "failed to recreate orphan worktree: {}",
+        String::from_utf8_lossy(&recreate.stderr)
+    );
+    assert!(worktree_path.join(".git").exists());
+
+    // A fresh daemon on the same state reclaims the orphan at startup.
+    let (_restart_address, restart_shutdown) =
+        echoing_delay_daemon(&state_root, Duration::from_millis(25)).await?;
+    assert!(
+        !worktree_path.exists(),
+        "startup GC should reclaim the orphaned daemon-owned worktree"
+    );
+
+    let _ = restart_shutdown.send(());
     Ok(())
 }
 

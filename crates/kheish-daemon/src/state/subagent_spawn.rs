@@ -1037,6 +1037,99 @@ where
         )
     }
 
+    /// Removes daemon-owned worktrees left behind by a crash between an
+    /// agent settling and its end-of-session cleanup. Only worktrees whose
+    /// agent record is already settled or closed are reclaimed — a live
+    /// (interruptible, resumable) sidechain keeps its worktree so a later
+    /// continuation can reuse it. Best-effort: failures are logged, never
+    /// fatal to startup.
+    pub(crate) async fn gc_orphaned_daemon_worktrees_on_boot(&self) -> Result<()> {
+        let Ok(workspace_root) = self.canonical_workspace_root() else {
+            return Ok(());
+        };
+        let worktree_root = workspace_root.join(AGENT_WORKTREE_DIR);
+        if !worktree_root.exists() {
+            return Ok(());
+        }
+        let mut removed = 0usize;
+        let mut kept = 0usize;
+        for agent in self.supervisor.list() {
+            let Some(ownership) = agent.daemon_owned_worktree.clone() else {
+                continue;
+            };
+            let path = Path::new(&ownership.path);
+            if !path.exists() {
+                continue;
+            }
+            let settled = agent.settled_at_ms.is_some() || agent.closed_at_ms.is_some();
+            if !settled {
+                kept += 1;
+                continue;
+            }
+            let reclaimed = match self.remove_daemon_owned_git_worktree(&ownership).await {
+                Ok(()) => true,
+                Err(remove_error) => {
+                    // The registration may already be gone (e.g. a manual
+                    // `git worktree prune`); fall back to the creation-rollback
+                    // path, which handles both registered and bare directories
+                    // under the reserved root.
+                    match self.reserved_daemon_worktree_path(path) {
+                        Ok(reserved) => {
+                            match self
+                                .remove_failed_daemon_worktree_creation(
+                                    Path::new(&ownership.source_root),
+                                    &reserved,
+                                )
+                                .await
+                            {
+                                Ok(()) => true,
+                                Err(fallback_error) => {
+                                    warn!(
+                                        agent_id = %agent.id.0,
+                                        path = %ownership.path,
+                                        error = %remove_error,
+                                        fallback_error = %fallback_error,
+                                        "failed to reclaim orphaned daemon-owned worktree"
+                                    );
+                                    false
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            warn!(
+                                agent_id = %agent.id.0,
+                                path = %ownership.path,
+                                error = %error,
+                                "orphaned worktree path failed reservation check; leaving it"
+                            );
+                            false
+                        }
+                    }
+                }
+            };
+            if reclaimed {
+                removed += 1;
+            }
+        }
+        // Drop git's administrative records for worktree directories that no
+        // longer exist, so the source repo's worktree list stays accurate.
+        if workspace_root.join(".git").exists()
+            && let Err(error) = self
+                .run_git_command(&workspace_root, &["worktree", "prune"])
+                .await
+        {
+            warn!(error = %error, "git worktree prune failed during startup GC");
+        }
+        if removed > 0 || kept > 0 {
+            tracing::info!(
+                removed,
+                live = kept,
+                "daemon-owned worktree GC finished at startup"
+            );
+        }
+        Ok(())
+    }
+
     async fn rollback_pre_spawn_receipt(
         &self,
         spawn_receipt_key: Option<&str>,

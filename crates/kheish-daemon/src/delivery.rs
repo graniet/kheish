@@ -2513,10 +2513,11 @@ impl OutputPlugin for QueuedOutputPlugin {
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex;
     use std::collections::BTreeMap;
     use std::fs;
     use std::io::Write as _;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use anyhow::{Result, anyhow};
@@ -2625,13 +2626,13 @@ mod tests {
     #[async_trait]
     impl DeliveryTransport for FlakyTransport {
         async fn deliver(&self, response: ResponseEnvelope) -> Result<()> {
-            let mut failures_left = self.failures_left.lock().expect("poisoned");
+            let mut failures_left = self.failures_left.lock();
             if *failures_left > 0 {
                 *failures_left -= 1;
                 return Err(anyhow!("temporary failure"));
             }
             drop(failures_left);
-            self.delivered.lock().expect("poisoned").push(response);
+            self.delivered.lock().push(response);
             Ok(())
         }
     }
@@ -2709,7 +2710,7 @@ mod tests {
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            if delivered.lock().expect("poisoned").len() == 1 {
+            if delivered.lock().len() == 1 {
                 break;
             }
             anyhow::ensure!(
@@ -2780,7 +2781,7 @@ mod tests {
         let worker = restarted.clone().spawn_worker();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            if delivered.lock().expect("poisoned").len() == 1 {
+            if delivered.lock().len() == 1 {
                 break;
             }
             anyhow::ensure!(
@@ -3902,7 +3903,7 @@ mod tests {
             .cloned()
             .ok_or_else(|| anyhow!("delivery should remain pending before success"))?;
         queue.process_one(third).await?;
-        assert_eq!(delivered.lock().expect("poisoned").len(), 1);
+        assert_eq!(delivered.lock().len(), 1);
         let target_state = queue.target_backpressure.lock().await;
         let reset = target_state
             .targets

@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicU64, Ordering},
 };
 
 use anyhow::{Result, anyhow};
 use kheish_runtime::{RuntimeObserver, TraceEvent, TraceEventKind};
 use kheish_types::ConversationKey;
+use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::types::{
@@ -96,7 +97,7 @@ impl AgentSupervisor {
 
     /// Installs an append-only audit sink used for daemon-backed durable audit recovery.
     pub fn set_audit_sink(&self, sink: Arc<dyn AgentSupervisorAuditSink>) {
-        *self.audit_sink.lock().expect("audit sink mutex poisoned") = Some(sink);
+        *self.audit_sink.lock() = Some(sink);
     }
 
     /// Restores a supervisor from a serializable snapshot.
@@ -133,14 +134,11 @@ impl AgentSupervisor {
 
     /// Validates the current topology invariants.
     pub fn validate_topology(&self) -> Result<()> {
-        let agents = self.agents.lock().expect("agents mutex poisoned");
+        let agents = self.agents.lock();
         validate_agents(&agents)?;
-        let terminal_snapshots = self
-            .terminal_snapshots
-            .lock()
-            .expect("terminal snapshot mutex poisoned");
+        let terminal_snapshots = self.terminal_snapshots.lock();
         validate_terminal_snapshots(&agents, &terminal_snapshots)?;
-        let mailboxes = self.mailboxes.lock().expect("mailboxes mutex poisoned");
+        let mailboxes = self.mailboxes.lock();
         for agent_id in mailboxes.keys() {
             anyhow::ensure!(
                 agents.contains_key(agent_id),
@@ -148,10 +146,7 @@ impl AgentSupervisor {
                 agent_id.0
             );
         }
-        let mailbox_dead_letters = self
-            .mailbox_dead_letters
-            .lock()
-            .expect("mailbox dead letter mutex poisoned");
+        let mailbox_dead_letters = self.mailbox_dead_letters.lock();
         for agent_id in mailbox_dead_letters.keys() {
             anyhow::ensure!(
                 agents.contains_key(agent_id),
@@ -159,7 +154,7 @@ impl AgentSupervisor {
                 agent_id.0
             );
         }
-        let next_id = *self.next_id.lock().expect("next_id mutex poisoned");
+        let next_id = *self.next_id.lock();
         validate_next_id(next_id, &agents)?;
         Ok(())
     }
@@ -176,11 +171,11 @@ impl AgentSupervisor {
         spawned_by_run_id: Option<String>,
         spawn_request_id: Option<String>,
     ) -> Result<AgentRecord> {
-        let mut next_id = self.next_id.lock().expect("next_id mutex poisoned");
+        let mut next_id = self.next_id.lock();
         *next_id += 1;
         let numeric_id = *next_id;
         let id = AgentId(format!("agent-{}", numeric_id));
-        let mut agents = self.agents.lock().expect("agents mutex poisoned");
+        let mut agents = self.agents.lock();
         if let Some(existing) = agents
             .values()
             .find(|record| record.conversation.session_id == conversation.session_id)
@@ -290,10 +285,7 @@ impl AgentSupervisor {
         record.sidechain_session_id = Some(record.conversation.session_id.clone());
         record.fork_context = Some(fork_context);
         record.daemon_owned_worktree = daemon_owned_worktree;
-        self.agents
-            .lock()
-            .expect("agents mutex poisoned")
-            .insert(record.id.clone(), record.clone());
+        self.agents.lock().insert(record.id.clone(), record.clone());
         self.record_audit("forked", &record, None, Some(record.status.clone()), None);
         info!(
             agent_id = %record.id.0,
@@ -315,26 +307,17 @@ impl AgentSupervisor {
 
     /// Returns a copy of an existing agent record.
     pub fn get(&self, id: &AgentId) -> Option<AgentRecord> {
-        self.agents
-            .lock()
-            .expect("agents mutex poisoned")
-            .get(id)
-            .cloned()
+        self.agents.lock().get(id).cloned()
     }
 
     /// Returns a copy of every known agent record.
     pub fn list(&self) -> Vec<AgentRecord> {
-        self.agents
-            .lock()
-            .expect("agents mutex poisoned")
-            .values()
-            .cloned()
-            .collect()
+        self.agents.lock().values().cloned().collect()
     }
 
     /// Returns cheap aggregate counts without cloning mailbox payloads or terminal snapshots.
     pub fn status_snapshot(&self) -> AgentSupervisorStatusSnapshot {
-        let agents = self.agents.lock().expect("agents mutex poisoned");
+        let agents = self.agents.lock();
         let mut snapshot = AgentSupervisorStatusSnapshot {
             total: agents.len(),
             ..Default::default()
@@ -357,30 +340,16 @@ impl AgentSupervisor {
             }
         }
 
-        snapshot.terminal_snapshot_count = self
-            .terminal_snapshots
-            .lock()
-            .expect("terminal snapshot mutex poisoned")
-            .len();
-        snapshot.mailbox_message_count = self
-            .mailboxes
-            .lock()
-            .expect("mailboxes mutex poisoned")
-            .values()
-            .map(Vec::len)
-            .sum();
+        snapshot.terminal_snapshot_count = self.terminal_snapshots.lock().len();
+        snapshot.mailbox_message_count = self.mailboxes.lock().values().map(Vec::len).sum();
         snapshot.audit_sink_error_count = self.audit_sink_error_count.load(Ordering::Relaxed);
-        snapshot.last_audit_sink_error = self
-            .audit_sink_last_error
-            .lock()
-            .expect("audit sink last error mutex poisoned")
-            .clone();
+        snapshot.last_audit_sink_error = self.audit_sink_last_error.lock().clone();
         snapshot
     }
 
     /// Updates an agent status.
     pub fn set_status(&self, id: &AgentId, status: AgentStatus) -> Result<()> {
-        let mut agents = self.agents.lock().expect("agents mutex poisoned");
+        let mut agents = self.agents.lock();
         let Some(agent) = agents.get_mut(id) else {
             return Err(anyhow!("unknown agent {}", id.0));
         };
@@ -428,7 +397,7 @@ impl AgentSupervisor {
 
     /// Appends a subtask to an agent.
     pub fn assign_subtask(&self, id: &AgentId, subtask: SubtaskSpec) -> Result<()> {
-        let mut agents = self.agents.lock().expect("agents mutex poisoned");
+        let mut agents = self.agents.lock();
         let Some(agent) = agents.get_mut(id) else {
             return Err(anyhow!("unknown agent {}", id.0));
         };
@@ -452,7 +421,6 @@ impl AgentSupervisor {
         );
         self.mailboxes
             .lock()
-            .expect("mailboxes mutex poisoned")
             .entry(message.to.clone())
             .or_default()
             .push(message);
@@ -460,7 +428,7 @@ impl AgentSupervisor {
 
     /// Posts a mailbox message only when an equivalent pending message is absent.
     pub fn post_if_absent(&self, message: MailboxMessage) -> bool {
-        let mut mailboxes = self.mailboxes.lock().expect("mailboxes mutex poisoned");
+        let mut mailboxes = self.mailboxes.lock();
         let messages = mailboxes.entry(message.to.clone()).or_default();
         if messages
             .iter()
@@ -481,38 +449,23 @@ impl AgentSupervisor {
 
     /// Drains all pending mailbox messages for an agent.
     pub fn drain_mailbox(&self, id: &AgentId) -> Vec<MailboxMessage> {
-        self.mailboxes
-            .lock()
-            .expect("mailboxes mutex poisoned")
-            .remove(id)
-            .unwrap_or_default()
+        self.mailboxes.lock().remove(id).unwrap_or_default()
     }
 
     /// Returns a copy of the pending mailbox messages for an agent.
     pub fn peek_mailbox(&self, id: &AgentId) -> Vec<MailboxMessage> {
-        self.mailboxes
-            .lock()
-            .expect("mailboxes mutex poisoned")
-            .get(id)
-            .cloned()
-            .unwrap_or_default()
+        self.mailboxes.lock().get(id).cloned().unwrap_or_default()
     }
 
     /// Returns the number of pending mailbox messages for an agent.
     pub fn mailbox_len(&self, id: &AgentId) -> usize {
-        self.mailboxes
-            .lock()
-            .expect("mailboxes mutex poisoned")
-            .get(id)
-            .map(Vec::len)
-            .unwrap_or(0)
+        self.mailboxes.lock().get(id).map(Vec::len).unwrap_or(0)
     }
 
     /// Returns pending mailbox message counts keyed by destination agent.
     pub fn mailbox_counts(&self) -> BTreeMap<AgentId, usize> {
         self.mailboxes
             .lock()
-            .expect("mailboxes mutex poisoned")
             .iter()
             .map(|(agent_id, messages)| (agent_id.clone(), messages.len()))
             .collect()
@@ -520,7 +473,7 @@ impl AgentSupervisor {
 
     /// Removes a prefix of pending mailbox messages after they have been durably scheduled.
     pub fn ack_mailbox_prefix(&self, id: &AgentId, count: usize) {
-        let mut mailboxes = self.mailboxes.lock().expect("mailboxes mutex poisoned");
+        let mut mailboxes = self.mailboxes.lock();
         let Some(messages) = mailboxes.get_mut(id) else {
             return;
         };
@@ -533,7 +486,7 @@ impl AgentSupervisor {
 
     /// Removes pending mailbox messages matching the provided message ids.
     pub fn ack_mailbox_message_ids(&self, id: &AgentId, message_ids: &[String]) -> usize {
-        let mut mailboxes = self.mailboxes.lock().expect("mailboxes mutex poisoned");
+        let mut mailboxes = self.mailboxes.lock();
         let Some(messages) = mailboxes.get_mut(id) else {
             return 0;
         };
@@ -553,7 +506,7 @@ impl AgentSupervisor {
 
     /// Removes one matching pending mailbox message after the same payload is already durable.
     pub fn ack_mailbox_message(&self, id: &AgentId, expected: &MailboxMessage) -> bool {
-        let mut mailboxes = self.mailboxes.lock().expect("mailboxes mutex poisoned");
+        let mut mailboxes = self.mailboxes.lock();
         let Some(messages) = mailboxes.get_mut(id) else {
             return false;
         };
@@ -572,11 +525,7 @@ impl AgentSupervisor {
 
     /// Removes all pending mailbox messages for one agent and returns them.
     pub fn clear_mailbox(&self, id: &AgentId) -> Vec<MailboxMessage> {
-        self.mailboxes
-            .lock()
-            .expect("mailboxes mutex poisoned")
-            .remove(id)
-            .unwrap_or_default()
+        self.mailboxes.lock().remove(id).unwrap_or_default()
     }
 
     /// Moves pending mailbox messages into the dead-letter queue.
@@ -596,7 +545,6 @@ impl AgentSupervisor {
         }
         self.mailbox_dead_letters
             .lock()
-            .expect("mailbox dead letter mutex poisoned")
             .entry(id.clone())
             .or_default()
             .extend(dead_letters);
@@ -613,7 +561,6 @@ impl AgentSupervisor {
     pub fn mailbox_dead_letters(&self, id: &AgentId) -> Vec<MailboxMessage> {
         self.mailbox_dead_letters
             .lock()
-            .expect("mailbox dead letter mutex poisoned")
             .get(id)
             .cloned()
             .unwrap_or_default()
@@ -624,7 +571,7 @@ impl AgentSupervisor {
     where
         F: FnOnce(&mut AgentRecord),
     {
-        let mut agents = self.agents.lock().expect("agents mutex poisoned");
+        let mut agents = self.agents.lock();
         let Some(agent) = agents.get_mut(id) else {
             return Err(anyhow!("unknown agent {}", id.0));
         };
@@ -643,7 +590,7 @@ impl AgentSupervisor {
         requested_nickname: Option<&str>,
     ) -> Result<AgentRecord> {
         let updated = {
-            let mut agents = self.agents.lock().expect("agents mutex poisoned");
+            let mut agents = self.agents.lock();
             let Some(current) = agents.get(id) else {
                 return Err(anyhow!("unknown agent {}", id.0));
             };
@@ -681,10 +628,7 @@ impl AgentSupervisor {
             None,
         );
 
-        let mut terminal_snapshots = self
-            .terminal_snapshots
-            .lock()
-            .expect("terminal snapshot mutex poisoned");
+        let mut terminal_snapshots = self.terminal_snapshots.lock();
         if let Some(snapshot) = terminal_snapshots.get_mut(id) {
             snapshot.agent.nickname = updated.nickname.clone();
         }
@@ -695,7 +639,6 @@ impl AgentSupervisor {
     pub fn children_of(&self, parent: &AgentId) -> Vec<AgentRecord> {
         self.agents
             .lock()
-            .expect("agents mutex poisoned")
             .values()
             .filter(|record| record.parent.as_ref() == Some(parent))
             .cloned()
@@ -704,13 +647,13 @@ impl AgentSupervisor {
 
     /// Returns all descendants of one agent in stable order.
     pub fn descendants_of(&self, parent: &AgentId) -> Vec<AgentRecord> {
-        let agents = self.agents.lock().expect("agents mutex poisoned");
+        let agents = self.agents.lock();
         collect_descendants(&agents, parent)
     }
 
     /// Returns the depth of one agent within the parent/child tree.
     pub fn depth_of(&self, id: &AgentId) -> Option<usize> {
-        let agents = self.agents.lock().expect("agents mutex poisoned");
+        let agents = self.agents.lock();
         let mut depth = 0usize;
         let mut current = agents.get(id)?;
         while let Some(parent) = current.parent.as_ref() {
@@ -722,7 +665,7 @@ impl AgentSupervisor {
 
     /// Returns the root ancestor for one agent.
     pub fn root_of(&self, id: &AgentId) -> Option<AgentRecord> {
-        let agents = self.agents.lock().expect("agents mutex poisoned");
+        let agents = self.agents.lock();
         let mut current = agents.get(id)?.clone();
         while let Some(parent) = current.parent.as_ref() {
             current = agents.get(parent)?.clone();
@@ -736,7 +679,7 @@ impl AgentSupervisor {
     /// use it as the authenticated actor. A missing right-hand agent returns
     /// `false`, which preserves visibility checks for unknown targets.
     pub fn shares_root_with(&self, left: &AgentId, right: &AgentId) -> Result<bool> {
-        let agents = self.agents.lock().expect("agents mutex poisoned");
+        let agents = self.agents.lock();
         let left_root = root_id_from_agents(&agents, left)?
             .ok_or_else(|| anyhow!("unknown agent {}", left.0))?;
         let Some(right_root) = root_id_from_agents(&agents, right)? else {
@@ -750,7 +693,7 @@ impl AgentSupervisor {
     /// The returned order is stable: root first, then depth-first descendants
     /// ordered by agent identifier at each sibling level.
     pub fn root_tree_records(&self, id: &AgentId) -> Result<Vec<AgentRecord>> {
-        let agents = self.agents.lock().expect("agents mutex poisoned");
+        let agents = self.agents.lock();
         let root_id =
             root_id_from_agents(&agents, id)?.ok_or_else(|| anyhow!("unknown agent {}", id.0))?;
         let root = agents
@@ -767,7 +710,6 @@ impl AgentSupervisor {
         let agent_id = snapshot.agent.id.clone();
         self.terminal_snapshots
             .lock()
-            .expect("terminal snapshot mutex poisoned")
             .insert(agent_id.clone(), snapshot);
         if let Some(record) = self.get(&agent_id) {
             self.record_audit(
@@ -782,19 +724,12 @@ impl AgentSupervisor {
 
     /// Returns the latest terminal snapshot for a closed agent.
     pub fn terminal_snapshot(&self, id: &AgentId) -> Option<ManagedAgentSnapshot> {
-        self.terminal_snapshots
-            .lock()
-            .expect("terminal snapshot mutex poisoned")
-            .get(id)
-            .cloned()
+        self.terminal_snapshots.lock().get(id).cloned()
     }
 
     /// Removes one persisted terminal snapshot after the runtime is reopened.
     pub fn clear_terminal_snapshot(&self, id: &AgentId) {
-        self.terminal_snapshots
-            .lock()
-            .expect("terminal snapshot mutex poisoned")
-            .remove(id);
+        self.terminal_snapshots.lock().remove(id);
     }
 
     /// Removes one agent record together with any cached mailbox or terminal state.
@@ -802,23 +737,10 @@ impl AgentSupervisor {
     /// This is intended for rollback paths that must discard an agent before it
     /// ever becomes part of durable topology.
     pub fn remove_agent(&self, id: &AgentId) -> Option<AgentRecord> {
-        self.mailboxes
-            .lock()
-            .expect("mailboxes mutex poisoned")
-            .remove(id);
-        self.mailbox_dead_letters
-            .lock()
-            .expect("mailbox dead letter mutex poisoned")
-            .remove(id);
-        self.terminal_snapshots
-            .lock()
-            .expect("terminal snapshot mutex poisoned")
-            .remove(id);
-        let removed = self
-            .agents
-            .lock()
-            .expect("agents mutex poisoned")
-            .remove(id);
+        self.mailboxes.lock().remove(id);
+        self.mailbox_dead_letters.lock().remove(id);
+        self.terminal_snapshots.lock().remove(id);
+        let removed = self.agents.lock().remove(id);
         if let Some(record) = removed.as_ref() {
             self.record_audit("removed", record, None, Some(record.status.clone()), None);
         }
@@ -840,7 +762,6 @@ impl AgentSupervisor {
     pub fn audit_log(&self, agent_id: Option<&AgentId>) -> Vec<AgentSupervisorAuditEntry> {
         self.audit_log
             .lock()
-            .expect("audit log mutex poisoned")
             .iter()
             .filter(|entry| agent_id.is_none_or(|agent_id| &entry.agent_id == agent_id))
             .cloned()
@@ -855,10 +776,7 @@ impl AgentSupervisor {
         status: Option<AgentStatus>,
         reason: Option<String>,
     ) {
-        let mut next_audit_id = self
-            .next_audit_id
-            .lock()
-            .expect("next audit id mutex poisoned");
+        let mut next_audit_id = self.next_audit_id.lock();
         *next_audit_id += 1;
         let entry = AgentSupervisorAuditEntry {
             audit_id: *next_audit_id,
@@ -871,26 +789,19 @@ impl AgentSupervisor {
             status,
             reason,
         };
-        let mut audit_log = self.audit_log.lock().expect("audit log mutex poisoned");
+        let mut audit_log = self.audit_log.lock();
         audit_log.push(entry.clone());
         let overflow = audit_log.len().saturating_sub(AGENT_SUPERVISOR_AUDIT_LIMIT);
         if overflow > 0 {
             audit_log.drain(..overflow);
         }
         drop(audit_log);
-        let sink = self
-            .audit_sink
-            .lock()
-            .expect("audit sink mutex poisoned")
-            .clone();
+        let sink = self.audit_sink.lock().clone();
         if let Some(sink) = sink
             && let Err(error) = sink.append_supervisor_audit(&entry)
         {
             self.audit_sink_error_count.fetch_add(1, Ordering::Relaxed);
-            *self
-                .audit_sink_last_error
-                .lock()
-                .expect("audit sink last error mutex poisoned") = Some(error.to_string());
+            *self.audit_sink_last_error.lock() = Some(error.to_string());
             warn!(
                 audit_id = entry.audit_id,
                 agent_id = %entry.agent_id.0,
@@ -904,32 +815,13 @@ impl AgentSupervisor {
     /// Returns a serializable snapshot of the supervisor state.
     pub fn snapshot(&self) -> AgentSupervisorSnapshot {
         AgentSupervisorSnapshot {
-            next_id: *self.next_id.lock().expect("next_id mutex poisoned"),
-            next_audit_id: *self
-                .next_audit_id
-                .lock()
-                .expect("next audit id mutex poisoned"),
-            agents: self.agents.lock().expect("agents mutex poisoned").clone(),
-            terminal_snapshots: self
-                .terminal_snapshots
-                .lock()
-                .expect("terminal snapshot mutex poisoned")
-                .clone(),
-            mailboxes: self
-                .mailboxes
-                .lock()
-                .expect("mailboxes mutex poisoned")
-                .clone(),
-            mailbox_dead_letters: self
-                .mailbox_dead_letters
-                .lock()
-                .expect("mailbox dead letter mutex poisoned")
-                .clone(),
-            audit_log: self
-                .audit_log
-                .lock()
-                .expect("audit log mutex poisoned")
-                .clone(),
+            next_id: *self.next_id.lock(),
+            next_audit_id: *self.next_audit_id.lock(),
+            agents: self.agents.lock().clone(),
+            terminal_snapshots: self.terminal_snapshots.lock().clone(),
+            mailboxes: self.mailboxes.lock().clone(),
+            mailbox_dead_letters: self.mailbox_dead_letters.lock().clone(),
+            audit_log: self.audit_log.lock().clone(),
         }
     }
 }

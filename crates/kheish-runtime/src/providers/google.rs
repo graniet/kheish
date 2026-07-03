@@ -1837,9 +1837,10 @@ fn provider_error(message: impl Into<String>) -> ProviderError {
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex;
     use std::collections::BTreeMap;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
 
     use anyhow::Result;
     use async_trait::async_trait;
@@ -1943,10 +1944,7 @@ mod tests {
         }
 
         fn debug_artifacts(&self) -> Vec<DebugArtifact> {
-            self.artifacts
-                .lock()
-                .expect("artifacts mutex poisoned")
-                .clone()
+            self.artifacts.lock().clone()
         }
     }
 
@@ -1958,10 +1956,7 @@ mod tests {
         fn record(&self, _event: TraceEvent) {}
 
         fn record_debug_artifact(&self, artifact: DebugArtifact) {
-            self.artifacts
-                .lock()
-                .expect("artifacts mutex poisoned")
-                .push(artifact);
+            self.artifacts.lock().push(artifact);
         }
 
         fn increment_counter(&self, _name: &str, _delta: u64) {}
@@ -2415,8 +2410,7 @@ mod tests {
         provider
             .stream(request, ModelEventSink::new(sender))
             .await?;
-        let payload: Value =
-            serde_json::from_str(&captured.lock().expect("request capture mutex poisoned"))?;
+        let payload: Value = serde_json::from_str(&captured.lock())?;
         assert_eq!(
             payload["systemInstruction"]["parts"][0]["text"],
             json!("Be precise.")
@@ -2681,8 +2675,7 @@ mod tests {
             .stream(request, ModelEventSink::new(sender))
             .await?;
 
-        let payload: Value =
-            serde_json::from_str(&captured.lock().expect("request capture mutex poisoned"))?;
+        let payload: Value = serde_json::from_str(&captured.lock())?;
         assert_eq!(
             payload["generationConfig"]["maxOutputTokens"],
             json!(kheish_types::model_max_output_tokens("gemini-3-pro-image-preview").default)
@@ -2935,8 +2928,7 @@ mod tests {
                 size: Some("1024x1024".to_string()),
             })
             .await?;
-        let payload: Value =
-            serde_json::from_str(&captured.lock().expect("request capture mutex poisoned"))?;
+        let payload: Value = serde_json::from_str(&captured.lock())?;
         assert_eq!(
             payload["generationConfig"]["responseModalities"],
             json!(["TEXT", "IMAGE"])
@@ -3292,8 +3284,7 @@ mod tests {
                 size: None,
             })
             .await?;
-        let payload: Value =
-            serde_json::from_str(&captured.lock().expect("request capture mutex poisoned"))?;
+        let payload: Value = serde_json::from_str(&captured.lock())?;
         assert_eq!(
             payload["contents"][0]["parts"][0]["inlineData"]["mimeType"],
             json!("image/png")
@@ -3350,8 +3341,7 @@ mod tests {
                 size: None,
             })
             .await?;
-        let payload: Value =
-            serde_json::from_str(&captured.lock().expect("request capture mutex poisoned"))?;
+        let payload: Value = serde_json::from_str(&captured.lock())?;
         assert_eq!(
             payload["contents"][0]["parts"][0]["inlineData"]["mimeType"],
             json!("image/png")

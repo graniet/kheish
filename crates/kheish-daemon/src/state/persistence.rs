@@ -1,9 +1,10 @@
 //! Persistence and topology support types shared by daemon state workflows.
 
 use super::*;
+use parking_lot::Mutex;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
@@ -26,9 +27,9 @@ const MAX_SESSION_RUN_IDEMPOTENCY_PENDING_AGE_MS: u64 = 15 * 60 * 1000;
 const MAX_SESSION_RUN_IDEMPOTENCY_RECEIPT_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const SUPERVISOR_AUDIT_LIMIT: usize = 2_048;
 
-fn supervisor_audit_lock_for(root: &Path) -> Arc<StdMutex<()>> {
-    static LOCKS: OnceLock<StdMutex<BTreeMap<PathBuf, Arc<StdMutex<()>>>>> = OnceLock::new();
-    let locks = LOCKS.get_or_init(|| StdMutex::new(BTreeMap::new()));
+fn supervisor_audit_lock_for(root: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()));
     let root_key = root.canonicalize().unwrap_or_else(|_| {
         if root.is_absolute() {
             root.to_path_buf()
@@ -40,12 +41,10 @@ fn supervisor_audit_lock_for(root: &Path) -> Arc<StdMutex<()>> {
         .components()
         .collect::<PathBuf>()
     });
-    let mut locks = locks
-        .lock()
-        .expect("supervisor audit lock registry mutex poisoned");
+    let mut locks = locks.lock();
     locks
         .entry(root_key)
-        .or_insert_with(|| Arc::new(StdMutex::new(())))
+        .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
 }
 
@@ -578,7 +577,7 @@ struct SupervisorAuditLedgerLoad {
 #[derive(Clone, Debug)]
 pub(crate) struct FileDaemonStore {
     root: PathBuf,
-    supervisor_audit_lock: Arc<StdMutex<()>>,
+    supervisor_audit_lock: Arc<Mutex<()>>,
 }
 
 impl FileDaemonStore {
@@ -637,10 +636,7 @@ impl FileDaemonStore {
     }
 
     pub(crate) fn load_supervisor(&self) -> Result<Option<AgentSupervisorSnapshot>> {
-        let _guard = self
-            .supervisor_audit_lock
-            .lock()
-            .expect("supervisor audit ledger mutex poisoned");
+        let _guard = self.supervisor_audit_lock.lock();
         let path = self.supervisor_path();
         if !path.exists() {
             return Ok(None);
@@ -661,10 +657,7 @@ impl FileDaemonStore {
     }
 
     pub(crate) fn save_supervisor(&self, snapshot: &AgentSupervisorSnapshot) -> Result<()> {
-        let _guard = self
-            .supervisor_audit_lock
-            .lock()
-            .expect("supervisor audit ledger mutex poisoned");
+        let _guard = self.supervisor_audit_lock.lock();
         write_json_pretty_atomically(&self.supervisor_path(), snapshot)?;
         self.compact_supervisor_audit_ledger_locked(snapshot.next_audit_id)
     }
@@ -676,10 +669,7 @@ impl FileDaemonStore {
                 entry.audit_id
             );
         }
-        let _guard = self
-            .supervisor_audit_lock
-            .lock()
-            .expect("supervisor audit ledger mutex poisoned");
+        let _guard = self.supervisor_audit_lock.lock();
         if self.supervisor_audit_ledger_tail_needs_repair_locked()? {
             let ledger = self.load_supervisor_audit_ledger_locked()?;
             self.rewrite_supervisor_audit_ledger_locked(&ledger.entries)?;

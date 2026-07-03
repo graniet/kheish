@@ -1,6 +1,6 @@
+use parking_lot::{Mutex, RwLock};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
 
 use anyhow::Result;
 use kheish_core::PermissionGate;
@@ -192,37 +192,23 @@ impl PermissionEngine {
 
     /// Returns the active permission mode.
     pub fn mode(&self) -> PermissionMode {
-        self.state
-            .read()
-            .expect("permission state rwlock poisoned")
-            .mode
-            .clone()
+        self.state.read().mode.clone()
     }
 
     /// Updates the active permission mode in place.
     pub fn set_mode(&self, mode: PermissionMode) {
-        self.state
-            .write()
-            .expect("permission state rwlock poisoned")
-            .mode = mode;
+        self.state.write().mode = mode;
     }
 
     /// Returns the optional session-scoped permission mode override.
     pub fn session_mode(&self, session_id: &str) -> Option<PermissionMode> {
-        self.session_modes
-            .read()
-            .expect("permission session mode rwlock poisoned")
-            .get(session_id)
-            .cloned()
+        self.session_modes.read().get(session_id).cloned()
     }
 
     /// Sets or clears the session-scoped permission mode override.
     pub fn set_session_mode(&self, session_id: impl Into<String>, mode: Option<PermissionMode>) {
         let session_id = session_id.into();
-        let mut session_modes = self
-            .session_modes
-            .write()
-            .expect("permission session mode rwlock poisoned");
+        let mut session_modes = self.session_modes.write();
         if let Some(mode) = mode {
             session_modes.insert(session_id, mode);
         } else {
@@ -232,17 +218,13 @@ impl PermissionEngine {
 
     /// Binds one async store used to persist session-scoped hook permission overrides.
     pub fn bind_session_rule_update_store(&self, store: Arc<dyn SessionPermissionUpdateStore>) {
-        *self
-            .session_rule_update_store
-            .write()
-            .expect("permission session rule update store rwlock poisoned") = Some(store);
+        *self.session_rule_update_store.write() = Some(store);
     }
 
     /// Returns the current session-scoped hook permission overrides for one session.
     pub fn session_rule_updates(&self, session_id: &str) -> Vec<HookPermissionUpdate> {
         self.session_rule_overrides
             .read()
-            .expect("permission session rule overrides rwlock poisoned")
             .get(session_id)
             .cloned()
             .unwrap_or_default()
@@ -258,10 +240,7 @@ impl PermissionEngine {
         updates: &[HookPermissionUpdate],
     ) {
         let session_id = session_id.into();
-        let mut session_overrides = self
-            .session_rule_overrides
-            .write()
-            .expect("permission session rule overrides rwlock poisoned");
+        let mut session_overrides = self.session_rule_overrides.write();
         if updates.is_empty() {
             session_overrides.remove(&session_id);
             return;
@@ -286,14 +265,8 @@ impl PermissionEngine {
             return;
         }
 
-        let mut state = self
-            .state
-            .write()
-            .expect("permission state rwlock poisoned");
-        let mut session_overrides = self
-            .session_rule_overrides
-            .write()
-            .expect("permission session rule overrides rwlock poisoned");
+        let mut state = self.state.write();
+        let mut session_overrides = self.session_rule_overrides.write();
         for update in updates {
             let rule = permission_rule_from_hook_update(update.clone());
 
@@ -368,7 +341,6 @@ impl PermissionEngine {
             }));
         self.audits
             .lock()
-            .expect("permission audit mutex poisoned")
             .entry(current_permission_session_id())
             .or_default()
             .push(audit.clone());
@@ -447,13 +419,12 @@ impl PermissionEngine {
         allocate_approval_id: bool,
         mode_override: Option<PermissionMode>,
     ) -> EvaluatedPermission {
-        let state = self.state.read().expect("permission state rwlock poisoned");
+        let state = self.state.read();
         let scoped_session_rules = current_execution_scope()
             .and_then(|scope| {
                 (!scope.session_id.is_empty()).then(|| {
                     self.session_rule_overrides
                         .read()
-                        .expect("permission session rule overrides rwlock poisoned")
                         .get(&scope.session_id)
                         .cloned()
                         .unwrap_or_default()
@@ -546,7 +517,7 @@ impl PermissionEngine {
 
     /// Drains and returns the accumulated audit records.
     pub fn drain_audits(&self) -> Vec<PermissionAuditRecord> {
-        let mut audits = self.audits.lock().expect("permission audit mutex poisoned");
+        let mut audits = self.audits.lock();
         audits
             .values_mut()
             .flat_map(std::mem::take)
@@ -555,7 +526,7 @@ impl PermissionEngine {
 
     /// Drains and returns accumulated audit records for one session only.
     pub fn drain_audits_for_session(&self, session_id: &str) -> Vec<PermissionAuditRecord> {
-        let mut audits = self.audits.lock().expect("permission audit mutex poisoned");
+        let mut audits = self.audits.lock();
         audits.remove(session_id).unwrap_or_default()
     }
 
@@ -599,11 +570,7 @@ impl PermissionGate for PermissionEngine {
             );
         }
         let _persist_guard = self.hook_update_persist_lock.lock().await;
-        let store = self
-            .session_rule_update_store
-            .read()
-            .expect("permission session rule update store rwlock poisoned")
-            .clone();
+        let store = self.session_rule_update_store.read().clone();
         if updates
             .iter()
             .any(|update| matches!(update.scope, HookPermissionUpdateScope::Session))
@@ -626,7 +593,7 @@ impl PermissionGate for PermissionEngine {
     ) -> Result<()> {
         let (decision_label, approval_request_id) = decision_label_and_request(decision);
         let session_id = current_permission_session_id();
-        let mut audits = self.audits.lock().expect("permission audit mutex poisoned");
+        let mut audits = self.audits.lock();
         let entries = audits.entry(session_id).or_default();
         if let Some(existing) = entries
             .iter_mut()
@@ -929,7 +896,8 @@ fn is_plan_mode_allowed_tool(tool_name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use anyhow::Result;
@@ -963,7 +931,6 @@ mod tests {
             }
             self.persisted
                 .lock()
-                .expect("test store mutex poisoned")
                 .push((session_id.to_string(), updates.to_vec()));
             Ok(())
         }
@@ -2070,7 +2037,7 @@ mod tests {
         first.await??;
         second.await??;
 
-        let persisted = store.persisted.lock().expect("test store mutex poisoned");
+        let persisted = store.persisted.lock();
         let (_, latest) = persisted.last().expect("expected persisted snapshots");
         assert_eq!(latest.len(), 2);
         assert!(

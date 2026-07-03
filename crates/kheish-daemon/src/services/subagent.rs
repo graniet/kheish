@@ -1,6 +1,6 @@
+use parking_lot::Mutex as SyncMutex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::Mutex as StdMutex;
 
 use anyhow::{Result, anyhow};
 use kheish_session::write_json_pretty_atomically;
@@ -79,9 +79,9 @@ pub(crate) struct SpawnRequestReservation {
 /// Owns daemon-local subagent coordination state such as spawn reservations and mailbox run gates.
 pub(crate) struct SubagentService {
     mailbox_scheduler: Mutex<BTreeSet<String>>,
-    spawn_reservations: StdMutex<SpawnReservationState>,
+    spawn_reservations: SyncMutex<SpawnReservationState>,
     spawn_policy_ledger_path: Option<PathBuf>,
-    spawn_policy_ledger: StdMutex<SpawnPolicyLedger>,
+    spawn_policy_ledger: SyncMutex<SpawnPolicyLedger>,
 }
 
 impl SubagentService {
@@ -98,9 +98,9 @@ impl SubagentService {
         });
         Self {
             mailbox_scheduler: Mutex::new(BTreeSet::new()),
-            spawn_reservations: StdMutex::new(SpawnReservationState::default()),
+            spawn_reservations: SyncMutex::new(SpawnReservationState::default()),
             spawn_policy_ledger_path: Some(ledger_path),
-            spawn_policy_ledger: StdMutex::new(ledger),
+            spawn_policy_ledger: SyncMutex::new(ledger),
         }
     }
 
@@ -108,19 +108,15 @@ impl SubagentService {
     fn new_ephemeral() -> Self {
         Self {
             mailbox_scheduler: Mutex::new(BTreeSet::new()),
-            spawn_reservations: StdMutex::new(SpawnReservationState::default()),
+            spawn_reservations: SyncMutex::new(SpawnReservationState::default()),
             spawn_policy_ledger_path: None,
-            spawn_policy_ledger: StdMutex::new(SpawnPolicyLedger::default()),
+            spawn_policy_ledger: SyncMutex::new(SpawnPolicyLedger::default()),
         }
     }
 
     /// Clears tracked per-run spawn counts after the owning run settles.
     pub(crate) fn clear_run_spawn_count(&self, run_id: &str) {
-        self.spawn_reservations
-            .lock()
-            .expect("spawn reservation mutex poisoned")
-            .by_run
-            .remove(run_id);
+        self.spawn_reservations.lock().by_run.remove(run_id);
     }
 
     /// Attempts to reserve one child spawn under the configured daemon policy.
@@ -200,10 +196,7 @@ impl SubagentService {
         &self,
         request_key: &str,
     ) -> Result<SpawnRequestReservation> {
-        let mut reservations = self
-            .spawn_reservations
-            .lock()
-            .expect("spawn reservation mutex poisoned");
+        let mut reservations = self.spawn_reservations.lock();
         anyhow::ensure!(
             !reservations.by_request.contains(request_key),
             "spawn request {request_key} is already in progress"
@@ -218,7 +211,6 @@ impl SubagentService {
     pub(crate) fn release_spawn_request_reservation(&self, reservation: SpawnRequestReservation) {
         self.spawn_reservations
             .lock()
-            .expect("spawn reservation mutex poisoned")
             .by_request
             .remove(&reservation.request_key);
     }
@@ -316,10 +308,7 @@ impl SubagentService {
         F: Fn(&AgentId) -> bool,
         G: Fn(&str) -> usize,
     {
-        let mut reservations = self
-            .spawn_reservations
-            .lock()
-            .expect("spawn reservation mutex poisoned");
+        let mut reservations = self.spawn_reservations.lock();
         self.evaluate_subagent_spawn_policy(
             supervisor,
             parent,
@@ -362,10 +351,7 @@ impl SubagentService {
         let root = supervisor
             .root_of(parent)
             .ok_or_else(|| anyhow!("unknown agent {}", parent.0))?;
-        let mut reservations = self
-            .spawn_reservations
-            .lock()
-            .expect("spawn reservation mutex poisoned");
+        let mut reservations = self.spawn_reservations.lock();
 
         if let Some(request_key) = request_key {
             if request_key_already_reserved {
@@ -671,10 +657,7 @@ impl SubagentService {
         let now = now_ms();
         let charge_key = spawn_policy_charge_key(request_key, request_fingerprint);
         let fingerprint_hash = spawn_policy_fingerprint_hash(request_fingerprint);
-        let mut ledger = self
-            .spawn_policy_ledger
-            .lock()
-            .expect("spawn policy ledger mutex poisoned");
+        let mut ledger = self.spawn_policy_ledger.lock();
         prune_spawn_policy_ledger(&mut ledger, now, policy.max_quota_window_ms());
         if ledger.entries.iter().any(|entry| entry.key == charge_key) {
             if charge_quota {
@@ -888,10 +871,7 @@ impl SubagentService {
 
     /// Releases one previously acquired child spawn reservation.
     pub(crate) fn release_spawn_reservation(&self, reservation: SpawnReservation) {
-        let mut reservations = self
-            .spawn_reservations
-            .lock()
-            .expect("spawn reservation mutex poisoned");
+        let mut reservations = self.spawn_reservations.lock();
         if reservation.counted_towards_limits {
             if let Some(count) = reservations.by_parent.get_mut(&reservation.parent_id) {
                 if *count <= 1 {
@@ -941,17 +921,11 @@ impl SubagentService {
         policy: &SubagentPolicyConfig,
         now_ms: u64,
     ) -> SubagentPolicyStatusView {
-        let reservations = self
-            .spawn_reservations
-            .lock()
-            .expect("spawn reservation mutex poisoned");
+        let reservations = self.spawn_reservations.lock();
         let reservation_status = reservation_status_view(&reservations);
         drop(reservations);
 
-        let mut ledger = self
-            .spawn_policy_ledger
-            .lock()
-            .expect("spawn policy ledger mutex poisoned");
+        let mut ledger = self.spawn_policy_ledger.lock();
         prune_spawn_policy_ledger(&mut ledger, now_ms, policy.max_quota_window_ms());
         let limits = policy.base_limits();
         let active_entries = quota_window_entries(&ledger, now_ms, limits.spawn_rate_window_ms);
@@ -1007,10 +981,7 @@ impl SubagentService {
 
     fn record_spawn_policy_denial(&self, reason_code: Option<&str>) {
         let reason_code = reason_code.unwrap_or("unknown").to_string();
-        let mut ledger = self
-            .spawn_policy_ledger
-            .lock()
-            .expect("spawn policy ledger mutex poisoned");
+        let mut ledger = self.spawn_policy_ledger.lock();
         *ledger.denied_by_reason.entry(reason_code).or_insert(0) += 1;
         if let Err(error) = self.persist_spawn_policy_ledger(&ledger) {
             warn!(error = %error, "failed to persist subagent policy denial");

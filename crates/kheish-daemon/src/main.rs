@@ -4443,8 +4443,9 @@ impl AgentStatusArg {
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex;
     use std::collections::BTreeSet;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::OnceLock;
 
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
@@ -6085,9 +6086,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_secrets_command_round_trips_global_store() -> Result<()> {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempfile::tempdir()?;
         let printer = Printer {
             format: OutputFormat::Json,
@@ -6147,9 +6146,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_secrets_command_requires_master_key_for_mutation() {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempfile::tempdir().expect("tempdir");
         let printer = Printer {
             format: OutputFormat::Json,
@@ -6181,9 +6178,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_secrets_command_rejects_invalid_master_key_for_mutation() {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempfile::tempdir().expect("tempdir");
         let printer = Printer {
             format: OutputFormat::Json,
@@ -6222,9 +6217,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_secrets_command_rejects_non_generic_connector_slots() {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempfile::tempdir().expect("tempdir");
         let printer = Printer {
             format: OutputFormat::Json,
@@ -6875,9 +6868,7 @@ base_url = "http://127.0.0.1:1/v1/responses"
 
     #[tokio::test]
     async fn resolve_route_inventory_from_file_supports_multiple_route_drivers() -> Result<()> {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempfile::TempDir::new()?;
         let routes_path = temp.path().join("routes.toml");
         std::fs::write(
@@ -6943,9 +6934,7 @@ auth_ref = "xai.prod"
 
     #[tokio::test]
     async fn resolve_route_inventory_from_file_supports_auth_refs() -> Result<()> {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempfile::TempDir::new()?;
         let routes_path = temp.path().join("routes.toml");
         std::fs::write(
@@ -6994,9 +6983,7 @@ base_url = "http://127.0.0.1:1/v1/responses"
 
     #[tokio::test]
     async fn resolve_route_inventory_from_file_rejects_incompatible_auth_refs() -> Result<()> {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempfile::TempDir::new()?;
         let routes_path = temp.path().join("routes.toml");
         std::fs::write(
@@ -7164,9 +7151,7 @@ auth_ref = "openrouter.primary"
     #[tokio::test]
     async fn resolve_route_inventory_without_routes_file_honors_default_route_override()
     -> Result<()> {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempfile::TempDir::new()?;
         unsafe {
             std::env::set_var("OPENAI_API_KEY", "sk-fallback");
@@ -7220,9 +7205,7 @@ auth_ref = "openrouter.primary"
 
     #[tokio::test]
     async fn global_auth_store_reports_missing_master_key_for_encrypted_store() -> Result<()> {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempfile::TempDir::new()?;
         let args = test_serve_args(&temp);
         let manager = AuthManager::new(global_auth_store_path(&args.state_root))?;
@@ -7337,9 +7320,7 @@ auth_ref = "openrouter.primary"
 
     #[test]
     fn cli_parses_disable_scheduler_env() {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("process env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let previous = std::env::var_os("KHEISH_DISABLE_SCHEDULER");
         unsafe {
             std::env::set_var("KHEISH_DISABLE_SCHEDULER", "true");
@@ -7812,9 +7793,7 @@ auth_ref = "openrouter.primary"
 
     #[test]
     fn resolve_additional_image_backends_rejects_invalid_provider_env_value() {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("KHEISH_IMAGE_PROVIDER", "bogus");
@@ -7837,9 +7816,7 @@ auth_ref = "openrouter.primary"
 
     #[test]
     fn resolve_additional_transcription_backends_rejects_invalid_provider_env_value() {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("KHEISH_TRANSCRIPTION_PROVIDER", "bogus");
@@ -8042,9 +8019,7 @@ auth_ref = "openrouter.primary"
 
     #[tokio::test]
     async fn custom_openai_routes_support_explicit_codex_auth() {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempfile::tempdir().expect("tempdir");
         let codex_auth_path = temp.path().join("auth.json");
         std::fs::write(
@@ -8120,9 +8095,7 @@ auth_ref = "openrouter.primary"
 
     #[tokio::test]
     async fn openai_codex_routes_reject_media_capability_overrides() -> Result<()> {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempfile::tempdir()?;
         let codex_auth_path = temp.path().join("auth.json");
         std::fs::write(
@@ -8275,9 +8248,7 @@ audio_generation = true
 
     #[tokio::test]
     async fn custom_anthropic_routes_support_explicit_claude_code_auth() {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempfile::tempdir().expect("tempdir");
         let credentials_path = temp.path().join("claude-credentials.json");
         std::fs::write(
@@ -8347,9 +8318,7 @@ audio_generation = true
 
     #[tokio::test]
     async fn ensure_openai_codex_slot_preserves_existing_state() {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempfile::tempdir().expect("tempdir");
         let codex_auth_path = temp.path().join("auth.json");
         std::fs::write(
@@ -8413,9 +8382,7 @@ audio_generation = true
 
     #[tokio::test]
     async fn ensure_openai_codex_slot_does_not_require_source_file_when_slot_exists() {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var(
@@ -8463,9 +8430,7 @@ audio_generation = true
 
     #[tokio::test]
     async fn ensure_openai_codex_slot_imports_from_explicit_auth_file() {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempfile::tempdir().expect("tempdir");
         let codex_auth_path = temp.path().join("custom-openai-auth.json");
         std::fs::write(
@@ -8508,9 +8473,7 @@ audio_generation = true
 
     #[tokio::test]
     async fn ensure_openai_codex_slot_requires_master_key_for_bootstrap_import() {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempfile::tempdir().expect("tempdir");
         let codex_auth_path = temp.path().join("custom-openai-auth.json");
         std::fs::write(
@@ -8545,9 +8508,7 @@ audio_generation = true
 
     #[tokio::test]
     async fn resolve_openai_provider_uses_persisted_slot_when_explicit_auth_file_is_missing() {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempfile::tempdir().expect("tempdir");
         let state_root = temp.path().join("state");
         std::fs::create_dir_all(state_root.join("auth")).expect("auth dir");
@@ -8604,9 +8565,7 @@ audio_generation = true
 
     #[tokio::test]
     async fn ensure_anthropic_claude_code_slot_preserves_existing_state() {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempfile::tempdir().expect("tempdir");
         let credentials_path = temp.path().join(".credentials.json");
         std::fs::write(
@@ -8664,9 +8623,7 @@ audio_generation = true
 
     #[tokio::test]
     async fn ensure_anthropic_claude_code_slot_does_not_require_source_file_when_slot_exists() {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var(
@@ -8709,9 +8666,7 @@ audio_generation = true
 
     #[tokio::test]
     async fn ensure_anthropic_claude_code_slot_imports_from_explicit_credentials_file() {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempfile::tempdir().expect("tempdir");
         let credentials_path = temp.path().join("custom-claude-credentials.json");
         std::fs::write(
@@ -8755,9 +8710,7 @@ audio_generation = true
 
     #[tokio::test]
     async fn ensure_anthropic_claude_code_slot_requires_master_key_for_bootstrap_import() {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempfile::tempdir().expect("tempdir");
         let credentials_path = temp.path().join("custom-claude-credentials.json");
         std::fs::write(
@@ -8790,9 +8743,7 @@ audio_generation = true
     #[tokio::test]
     async fn resolve_anthropic_provider_uses_persisted_slot_when_explicit_credentials_file_is_missing()
      {
-        let _guard = auth_store_env_lock()
-            .lock()
-            .expect("auth store env mutex poisoned");
+        let _guard = auth_store_env_lock().lock();
         let temp = tempfile::tempdir().expect("tempdir");
         let state_root = temp.path().join("state");
         std::fs::create_dir_all(state_root.join("auth")).expect("auth dir");

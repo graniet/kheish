@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex, RwLock};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
+use parking_lot::{Mutex as SyncMutex, RwLock};
 use tokio::sync::Mutex;
 
 use crate::backends::{
@@ -68,7 +69,7 @@ impl RequestAuthProvider for ManagedRequestAuthProvider {
 pub struct AuthManager {
     store: FileAuthStore,
     records: RwLock<BTreeMap<String, AuthSlotRecord>>,
-    slot_locks: StdMutex<HashMap<String, Arc<Mutex<()>>>>,
+    slot_locks: SyncMutex<HashMap<String, Arc<Mutex<()>>>>,
     mutation_lock: Mutex<()>,
     generic: Arc<GenericAuthBackend>,
     mcp_oauth: Arc<McpOAuthAuthBackend>,
@@ -89,7 +90,7 @@ impl AuthManager {
         Ok(Arc::new(Self {
             store,
             records: RwLock::new(snapshot.slots),
-            slot_locks: StdMutex::new(HashMap::new()),
+            slot_locks: SyncMutex::new(HashMap::new()),
             mutation_lock: Mutex::new(()),
             generic: Arc::new(GenericAuthBackend::new()),
             mcp_oauth: Arc::new(McpOAuthAuthBackend::new()?),
@@ -177,7 +178,6 @@ impl AuthManager {
         let record = self
             .records
             .read()
-            .expect("auth manager records rwlock poisoned")
             .get(&slot_id.0)
             .cloned()
             .ok_or_else(|| anyhow!("auth slot `{slot_id}` not found"))?;
@@ -414,10 +414,7 @@ impl AuthManager {
             }
             return Err(error);
         }
-        *self
-            .records
-            .write()
-            .expect("auth manager records rwlock poisoned") = next;
+        *self.records.write() = next;
         self.refresh_debug_redaction_tokens();
         self.broker.unrevoke_slot(&record.slot_id)?;
         self.status(&record.slot_id)
@@ -435,10 +432,7 @@ impl AuthManager {
         }
         next.insert(record.slot_id.0.clone(), record.clone());
         self.persist_records(next.clone()).await?;
-        *self
-            .records
-            .write()
-            .expect("auth manager records rwlock poisoned") = next;
+        *self.records.write() = next;
         self.refresh_debug_redaction_tokens();
         self.broker.unrevoke_slot(&record.slot_id)?;
         self.status(&record.slot_id)
@@ -447,19 +441,11 @@ impl AuthManager {
     }
 
     pub async fn has_slot(&self, slot_id: &AuthSlotId) -> bool {
-        self.records
-            .read()
-            .expect("auth manager records rwlock poisoned")
-            .contains_key(&slot_id.0)
+        self.records.read().contains_key(&slot_id.0)
     }
 
     pub async fn status(&self, slot_id: &AuthSlotId) -> Result<Option<AuthSlotStatus>> {
-        let record = self
-            .records
-            .read()
-            .expect("auth manager records rwlock poisoned")
-            .get(&slot_id.0)
-            .cloned();
+        let record = self.records.read().get(&slot_id.0).cloned();
         record
             .map(|record| self.backend(record.provider)?.status(&record))
             .transpose()
@@ -468,12 +454,7 @@ impl AuthManager {
     /// Resolves one opaque secret value from the daemon-managed store.
     pub fn secret_value(&self, slot_id: &AuthSlotId) -> Result<Option<String>> {
         self.ensure_slot_not_revoked(slot_id)?;
-        let record = self
-            .records
-            .read()
-            .expect("auth manager records rwlock poisoned")
-            .get(&slot_id.0)
-            .cloned();
+        let record = self.records.read().get(&slot_id.0).cloned();
         match record {
             Some(record) if record.provider == AuthProvider::Generic => {
                 Ok(Some(GenericAuthBackend::secret_value(&record)?))
@@ -485,13 +466,7 @@ impl AuthManager {
 
     /// Lists the current status of every stored auth slot in stable slot-id order.
     pub async fn list_statuses(&self) -> Result<Vec<AuthSlotStatus>> {
-        let records = self
-            .records
-            .read()
-            .expect("auth manager records rwlock poisoned")
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+        let records = self.records.read().values().cloned().collect::<Vec<_>>();
         let mut statuses = records
             .into_iter()
             .map(|record| self.backend(record.provider)?.status(&record))
@@ -511,10 +486,7 @@ impl AuthManager {
         let removed = next.remove(&slot_id.0).is_some();
         if removed {
             self.persist_records(next.clone()).await?;
-            *self
-                .records
-                .write()
-                .expect("auth manager records rwlock poisoned") = next;
+            *self.records.write() = next;
             self.refresh_debug_redaction_tokens();
             self.revoke_slot_leases(slot_id)?;
         }
@@ -530,7 +502,6 @@ impl AuthManager {
         let initial = self
             .records
             .read()
-            .expect("auth manager records rwlock poisoned")
             .get(&slot_id.0)
             .cloned()
             .ok_or_else(|| anyhow!("auth slot `{slot_id}` not found"))?;
@@ -549,7 +520,6 @@ impl AuthManager {
         let mut record = self
             .records
             .read()
-            .expect("auth manager records rwlock poisoned")
             .get(&slot_id.0)
             .cloned()
             .ok_or_else(|| anyhow!("auth slot `{slot_id}` not found"))?;
@@ -564,10 +534,7 @@ impl AuthManager {
             let mut next = self.snapshot_records();
             next.insert(slot_id.0.clone(), record);
             self.persist_records(next.clone()).await?;
-            *self
-                .records
-                .write()
-                .expect("auth manager records rwlock poisoned") = next;
+            *self.records.write() = next;
             self.refresh_debug_redaction_tokens();
         }
         Ok(material)
@@ -598,10 +565,7 @@ impl AuthManager {
     }
 
     fn slot_lock(&self, slot_id: &AuthSlotId) -> Arc<Mutex<()>> {
-        let mut locks = self
-            .slot_locks
-            .lock()
-            .expect("auth manager slot lock mutex poisoned");
+        let mut locks = self.slot_locks.lock();
         locks
             .entry(slot_id.0.clone())
             .or_insert_with(|| Arc::new(Mutex::new(())))
@@ -609,17 +573,11 @@ impl AuthManager {
     }
 
     fn snapshot_records(&self) -> BTreeMap<String, AuthSlotRecord> {
-        self.records
-            .read()
-            .expect("auth manager records rwlock poisoned")
-            .clone()
+        self.records.read().clone()
     }
 
     fn refresh_debug_redaction_tokens(&self) {
-        let records = self
-            .records
-            .read()
-            .expect("auth manager records rwlock poisoned");
+        let records = self.records.read();
         replace_auth_store_debug_redaction_tokens_for_records(records.values());
     }
 

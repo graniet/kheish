@@ -1,10 +1,11 @@
 //! Built-in authentication for the daemon control-plane HTTP API.
 
+use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::Json;
 use axum::body::Body;
@@ -165,9 +166,7 @@ impl ControlPlaneAuthorizer {
                 self.read_only_token_digest,
             );
         };
-        let mut token_files = token_files
-            .lock()
-            .expect("control-plane token-file mutex poisoned");
+        let mut token_files = token_files.lock();
         if let Err(error) = token_files.reload_from_disk() {
             warn!(error = %error, "failed to reload control-plane auth token file");
         }
@@ -760,15 +759,11 @@ impl ControlPlaneAuthMonitor {
         remote_addr: Option<std::net::SocketAddr>,
     ) -> bool {
         let now_ms = crate::now_ms();
-        match self
-            .limiter
-            .lock()
-            .expect("control-plane auth rate limiter mutex poisoned")
-            .note_failure(
-                auth_rate_limit_bucket(failure.code(), remote_addr),
-                now_ms,
-                self.rate_limit,
-            ) {
+        match self.limiter.lock().note_failure(
+            auth_rate_limit_bucket(failure.code(), remote_addr),
+            now_ms,
+            self.rate_limit,
+        ) {
             AuthFailureAuditDecision::Allowed => {
                 self.append_audit_record(&ControlPlaneAuthAuditRecord {
                     timestamp_ms: now_ms,
@@ -808,15 +803,11 @@ impl ControlPlaneAuthMonitor {
         remote_addr: Option<std::net::SocketAddr>,
     ) {
         let now_ms = crate::now_ms();
-        let decision = self
-            .limiter
-            .lock()
-            .expect("control-plane auth rate limiter mutex poisoned")
-            .note_failure(
-                auth_rate_limit_bucket("cors_origin_rejected", remote_addr),
-                now_ms,
-                self.rate_limit,
-            );
+        let decision = self.limiter.lock().note_failure(
+            auth_rate_limit_bucket("cors_origin_rejected", remote_addr),
+            now_ms,
+            self.rate_limit,
+        );
         match decision {
             AuthFailureAuditDecision::Allowed => {
                 self.append_audit_record(&ControlPlaneAuthAuditRecord {
@@ -861,10 +852,7 @@ impl ControlPlaneAuthMonitor {
         &self,
         record: &ControlPlaneAuthAuditRecord<'_>,
     ) -> std::io::Result<()> {
-        let _guard = self
-            .audit_lock
-            .lock()
-            .expect("control-plane auth audit mutex poisoned");
+        let _guard = self.audit_lock.lock();
         if let Some(parent) = self.audit_path.parent() {
             fs::create_dir_all(parent)?;
         }

@@ -197,19 +197,32 @@ impl AnthropicProvider {
                 })
                 .collect()
         };
-        let thinking_budget = anthropic_reasoning_budget(request.generation.reasoning.as_ref())?;
+        let reasoning = request.generation.reasoning.as_ref();
+        let adaptive = anthropic_model_uses_adaptive_thinking(&effective_model);
+        // Current-generation models reject `budget_tokens` and sampling
+        // parameters with HTTP 400; thinking is adaptive-only there and depth
+        // is steered through `output_config.effort`.
+        let thinking_budget = if adaptive {
+            None
+        } else {
+            anthropic_reasoning_budget(reasoning)?
+        };
         let max_tokens = anthropic_max_tokens_for_reasoning(
             &effective_model,
             request.generation.max_output_tokens,
             default_max_output_tokens,
             thinking_budget,
-            request
-                .generation
-                .reasoning
-                .as_ref()
+            reasoning
                 .map(|reasoning| reasoning.interleaved)
                 .unwrap_or(false),
         )?;
+
+        let adaptive_thinking = if adaptive {
+            anthropic_adaptive_thinking_value(reasoning)
+        } else {
+            None
+        };
+        let thinking_requested = thinking_budget.is_some() || adaptive_thinking.is_some();
 
         let mut body = serde_json::Map::new();
         body.insert("model".to_string(), Value::String(effective_model));
@@ -223,6 +236,12 @@ impl AnthropicProvider {
                 }),
             );
         }
+        if let Some(thinking) = adaptive_thinking {
+            body.insert("thinking".to_string(), thinking);
+            if let Some(effort) = reasoning.and_then(anthropic_effort_for_adaptive) {
+                body.insert("output_config".to_string(), json!({ "effort": effort }));
+            }
+        }
         body.insert("stream".to_string(), Value::Bool(true));
         body.insert(
             "messages".to_string(),
@@ -234,7 +253,7 @@ impl AnthropicProvider {
         if !tools.is_empty() {
             body.insert("tools".to_string(), Value::Array(tools));
         }
-        if thinking_budget.is_some()
+        if thinking_requested
             && matches!(
                 request.generation.tool_choice,
                 ToolChoice::Required | ToolChoice::Specific { .. }
@@ -256,7 +275,7 @@ impl AnthropicProvider {
                 serde_json::to_value(tool_choice).expect("tool choice serializes"),
             );
         }
-        if let Some(temperature) = request.generation.temperature {
+        if !adaptive && let Some(temperature) = request.generation.temperature {
             body.insert(
                 "temperature".to_string(),
                 serde_json::Number::from_f64(temperature as f64)
@@ -1021,6 +1040,71 @@ fn provider_audit_error(error: anyhow::Error) -> ProviderError {
     }
 }
 
+/// Returns whether the model rejects `budget_tokens` and sampling parameters
+/// in favor of adaptive thinking (`thinking: {type: "adaptive"}` +
+/// `output_config.effort`). One line per model family; extend the list when a
+/// new generation ships.
+fn anthropic_model_uses_adaptive_thinking(model: &str) -> bool {
+    let canonical = model.trim().trim_matches('"').to_ascii_lowercase();
+    ["fable-5", "mythos-5", "opus-4-7", "opus-4-8", "sonnet-5"]
+        .iter()
+        .any(|family| canonical.contains(family))
+}
+
+/// Builds the `thinking` value for adaptive-only models. Returns `None` when
+/// the request does not ask for reasoning — the parameter is then omitted
+/// entirely, which is the only spelling every adaptive model accepts (an
+/// explicit `disabled` is rejected on some of them).
+fn anthropic_adaptive_thinking_value(reasoning: Option<&ReasoningConfig>) -> Option<Value> {
+    let reasoning = reasoning?;
+    let wants_thinking = reasoning
+        .effort
+        .map(|effort| effort != ReasoningEffort::None)
+        .unwrap_or(false)
+        || reasoning.budget_tokens.is_some()
+        || reasoning.interleaved;
+    if !wants_thinking {
+        return None;
+    }
+    let mut thinking = serde_json::Map::new();
+    thinking.insert("type".to_string(), Value::String("adaptive".to_string()));
+    if reasoning
+        .summary
+        .and_then(|summary| summary.as_provider_str())
+        .is_some()
+    {
+        // Adaptive thinking exposes readable reasoning through the display
+        // knob; the closest match for any requested summary style.
+        thinking.insert(
+            "display".to_string(),
+            Value::String("summarized".to_string()),
+        );
+    }
+    Some(Value::Object(thinking))
+}
+
+/// Maps the requested reasoning depth onto the adaptive `output_config.effort`
+/// scale. Legacy `budget_tokens` configs are folded onto the nearest tier so
+/// existing routes keep a comparable thinking depth after a model upgrade.
+fn anthropic_effort_for_adaptive(reasoning: &ReasoningConfig) -> Option<&'static str> {
+    if let Some(effort) = reasoning.effort {
+        return match effort {
+            ReasoningEffort::None => None,
+            ReasoningEffort::Minimal | ReasoningEffort::Low => Some("low"),
+            ReasoningEffort::Medium => Some("medium"),
+            ReasoningEffort::High => Some("high"),
+            ReasoningEffort::Xhigh => Some("xhigh"),
+        };
+    }
+    let budget = reasoning.budget_tokens?;
+    Some(match budget {
+        0..=2_048 => "low",
+        2_049..=4_096 => "medium",
+        4_097..=8_192 => "high",
+        _ => "xhigh",
+    })
+}
+
 fn anthropic_reasoning_budget(
     reasoning: Option<&ReasoningConfig>,
 ) -> Result<Option<u32>, ProviderError> {
@@ -1657,9 +1741,10 @@ fn retry_after_ms_with_now(headers: &HeaderMap, now: SystemTime) -> Option<u64> 
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex;
     use std::collections::BTreeMap;
     use std::fs;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::{Duration as StdDuration, SystemTime};
 
     use anyhow::Result;
@@ -1708,10 +1793,7 @@ mod tests {
         }
 
         fn debug_artifacts(&self) -> Vec<DebugArtifact> {
-            self.artifacts
-                .lock()
-                .expect("artifacts mutex poisoned")
-                .clone()
+            self.artifacts.lock().clone()
         }
     }
 
@@ -1723,10 +1805,7 @@ mod tests {
         fn record(&self, _event: TraceEvent) {}
 
         fn record_debug_artifact(&self, artifact: DebugArtifact) {
-            self.artifacts
-                .lock()
-                .expect("artifacts mutex poisoned")
-                .push(artifact);
+            self.artifacts.lock().push(artifact);
         }
 
         fn increment_counter(&self, _name: &str, _delta: u64) {}
@@ -1885,8 +1964,7 @@ mod tests {
             )
             .await?;
 
-        let payload: Value =
-            serde_json::from_str(&captured.lock().expect("payload mutex poisoned"))?;
+        let payload: Value = serde_json::from_str(&captured.lock())?;
         assert_eq!(payload["model"], "claude-test");
         assert_eq!(payload["max_tokens"], 256);
         assert_eq!(payload["tool_choice"]["type"], "tool");
@@ -1920,6 +1998,163 @@ mod tests {
                 |event| matches!(event, ModelStreamEvent::TextDelta { text } if text == "done")
             )
         );
+        Ok(())
+    }
+
+    fn minimal_request(generation: ModelGenerationConfig) -> ModelRuntimeRequest {
+        ModelRuntimeRequest {
+            attempt: 1,
+            kind: kheish_core::ModelRequestKind::MainLoop,
+            session_id: "session-thinking".to_string(),
+            thread_id: None,
+            turn: 1,
+            prompt: ProviderPrompt {
+                instructions: Vec::new(),
+                force_synthetic_user_prefix: false,
+                items: vec![ProviderInputItem::Message {
+                    id: "user-1".to_string(),
+                    role: kheish_types::Role::User,
+                    content: "Hello".to_string(),
+                    content_parts: Vec::new(),
+                    attachments: Vec::new(),
+                    provider_response_id: None,
+                    provider_context: None,
+                }],
+            },
+            available_tools: Vec::new(),
+            generation,
+        }
+    }
+
+    #[test]
+    fn anthropic_model_capability_table_matches_current_generations() {
+        for model in [
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-sonnet-5",
+            "anthropic.claude-opus-4-8",
+        ] {
+            assert!(
+                super::anthropic_model_uses_adaptive_thinking(model),
+                "{model} should use adaptive thinking"
+            );
+        }
+        for model in [
+            "claude-opus-4-6",
+            "claude-opus-4-5",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-5",
+            "claude-haiku-4-5",
+        ] {
+            assert!(
+                !super::anthropic_model_uses_adaptive_thinking(model),
+                "{model} should keep the legacy request shape"
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_model_uses_adaptive_thinking_and_omits_sampling_params() -> Result<()> {
+        let provider =
+            AnthropicProvider::new(AnthropicProviderConfig::new("claude-fable-5", "test-key"))?;
+        let body = provider.build_request_body(&minimal_request(ModelGenerationConfig {
+            reasoning: Some(ReasoningConfig {
+                effort: Some(ReasoningEffort::High),
+                ..ReasoningConfig::default()
+            }),
+            temperature: Some(0.7),
+            ..ModelGenerationConfig::default()
+        }))?;
+
+        assert_eq!(body["thinking"], json!({ "type": "adaptive" }));
+        assert_eq!(body["output_config"], json!({ "effort": "high" }));
+        assert!(
+            body.get("temperature").is_none(),
+            "temperature must be omitted on current models"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn adaptive_model_maps_legacy_budget_tokens_to_an_effort_tier() -> Result<()> {
+        let provider =
+            AnthropicProvider::new(AnthropicProviderConfig::new("claude-opus-4-8", "test-key"))?;
+        let body = provider.build_request_body(&minimal_request(ModelGenerationConfig {
+            reasoning: Some(ReasoningConfig {
+                budget_tokens: Some(4_096),
+                ..ReasoningConfig::default()
+            }),
+            ..ModelGenerationConfig::default()
+        }))?;
+
+        assert_eq!(body["thinking"], json!({ "type": "adaptive" }));
+        assert_eq!(body["output_config"], json!({ "effort": "medium" }));
+        assert!(body["thinking"].get("budget_tokens").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn adaptive_model_without_reasoning_omits_thinking_entirely() -> Result<()> {
+        let provider =
+            AnthropicProvider::new(AnthropicProviderConfig::new("claude-fable-5", "test-key"))?;
+        let body = provider.build_request_body(&minimal_request(ModelGenerationConfig {
+            temperature: Some(0.2),
+            ..ModelGenerationConfig::default()
+        }))?;
+
+        assert!(
+            body.get("thinking").is_none(),
+            "omitting thinking is the only spelling every adaptive model accepts"
+        );
+        assert!(body.get("output_config").is_none());
+        assert!(body.get("temperature").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn adaptive_model_maps_summary_to_summarized_display() -> Result<()> {
+        let provider =
+            AnthropicProvider::new(AnthropicProviderConfig::new("claude-sonnet-5", "test-key"))?;
+        let body = provider.build_request_body(&minimal_request(ModelGenerationConfig {
+            reasoning: Some(ReasoningConfig {
+                effort: Some(ReasoningEffort::Medium),
+                summary: Some(ReasoningSummary::Auto),
+                ..ReasoningConfig::default()
+            }),
+            ..ModelGenerationConfig::default()
+        }))?;
+
+        assert_eq!(
+            body["thinking"],
+            json!({ "type": "adaptive", "display": "summarized" })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_model_keeps_budget_tokens_and_temperature() -> Result<()> {
+        let provider =
+            AnthropicProvider::new(AnthropicProviderConfig::new("claude-opus-4-6", "test-key"))?;
+        let body = provider.build_request_body(&minimal_request(ModelGenerationConfig {
+            reasoning: Some(ReasoningConfig {
+                effort: Some(ReasoningEffort::High),
+                ..ReasoningConfig::default()
+            }),
+            temperature: Some(0.7),
+            ..ModelGenerationConfig::default()
+        }))?;
+
+        assert_eq!(
+            body["thinking"],
+            json!({ "type": "enabled", "budget_tokens": 8_192 })
+        );
+        assert!(body.get("output_config").is_none());
+        let temperature = body["temperature"]
+            .as_f64()
+            .expect("temperature should be present on legacy models");
+        assert!((temperature - 0.7).abs() < 1e-6);
         Ok(())
     }
 

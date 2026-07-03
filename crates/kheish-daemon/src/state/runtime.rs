@@ -78,11 +78,7 @@ where
             hooks: self.hooks.settings(),
             debug_level: self.debug.level(),
             debug_capture: self.run_service.debug_capture_policy_view(),
-            mcp: self
-                .mcp
-                .lock()
-                .expect("mcp runtime snapshot mutex poisoned")
-                .clone(),
+            mcp: self.mcp.lock().clone(),
             skills: crate::RuntimeSkillsView {
                 loaded_count: self.skills.len(),
                 roots: self
@@ -113,14 +109,8 @@ where
         };
         let snapshot = manager.runtime_snapshot().await;
         let surface = snapshot.runtime_surface();
-        *self
-            .mcp
-            .lock()
-            .expect("mcp runtime snapshot mutex poisoned") = snapshot;
-        *self
-            .mcp_surface
-            .write()
-            .expect("mcp runtime surface rwlock poisoned") = surface;
+        *self.mcp.lock() = snapshot;
+        *self.mcp_surface.write() = surface;
     }
 
     pub(crate) async fn call_mcp_tool(
@@ -156,7 +146,6 @@ where
         let known_discovered_tool = self
             .mcp
             .lock()
-            .expect("mcp runtime snapshot mutex poisoned")
             .servers
             .iter()
             .any(|server| server.tools.iter().any(|candidate| candidate == tool_name));

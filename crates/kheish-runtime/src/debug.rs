@@ -1,7 +1,8 @@
+use parking_lot::{Mutex, RwLock};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -78,7 +79,7 @@ impl DebugControl {
 
     /// Returns the current debug level.
     pub fn level(&self) -> DebugCaptureLevel {
-        *self.level.read().expect("debug level rwlock poisoned")
+        *self.level.read()
     }
 
     /// Returns the capture level pinned to one run, pinning it lazily on first use.
@@ -87,20 +88,13 @@ impl DebugControl {
             return self.level();
         };
 
-        if let Some(level) = self
-            .run_levels
-            .read()
-            .expect("debug run-level rwlock poisoned")
-            .get(run_id)
-            .copied()
-        {
+        if let Some(level) = self.run_levels.read().get(run_id).copied() {
             return level;
         }
 
         let level = self.level();
         self.run_levels
             .write()
-            .expect("debug run-level rwlock poisoned")
             .entry(run_id.to_string())
             .or_insert(level);
         level
@@ -114,22 +108,18 @@ impl DebugControl {
         }
         self.run_levels
             .write()
-            .expect("debug run-level rwlock poisoned")
             .entry(run_id.to_string())
             .or_insert(level);
     }
 
     /// Updates the current debug level.
     pub fn set_level(&self, level: DebugCaptureLevel) {
-        *self.level.write().expect("debug level rwlock poisoned") = level;
+        *self.level.write() = level;
     }
 
     /// Clears a run-level pin after the run has finished executing.
     pub fn clear_run_level(&self, run_id: &str) {
-        self.run_levels
-            .write()
-            .expect("debug run-level rwlock poisoned")
-            .remove(run_id);
+        self.run_levels.write().remove(run_id);
     }
 }
 
@@ -876,9 +866,7 @@ fn configured_redaction_tokens() -> Result<Vec<String>, String> {
 fn warn_redaction_token_file_error(path: PathBuf, error: std::io::Error) {
     static WARNED_PATHS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
     let warned_paths = WARNED_PATHS.get_or_init(|| Mutex::new(BTreeSet::new()));
-    let mut warned_paths = warned_paths
-        .lock()
-        .expect("debug redaction token warning mutex poisoned");
+    let mut warned_paths = warned_paths.lock();
     if warned_paths.insert(path.clone()) {
         warn!(
             path = %path.display(),
@@ -924,9 +912,10 @@ fn is_token_delimiter(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex;
     use reqwest::header::{HeaderMap, HeaderValue};
     use serde_json::json;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::OnceLock;
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1267,9 +1256,7 @@ mod tests {
 
     #[test]
     fn redaction_can_be_extended_with_operator_tokens() {
-        let _guard = env_lock()
-            .lock()
-            .expect("debug redaction env lock poisoned");
+        let _guard = env_lock().lock();
         unsafe {
             std::env::set_var(DEBUG_REDACT_TOKENS_ENV, "tenant-secret, another-secret");
             std::env::remove_var(DEBUG_REDACT_TOKENS_FILE_ENV);
@@ -1285,9 +1272,7 @@ mod tests {
 
     #[test]
     fn redaction_includes_auth_managed_tokens() {
-        let _guard = env_lock()
-            .lock()
-            .expect("debug redaction env lock poisoned");
+        let _guard = env_lock().lock();
         unsafe {
             std::env::remove_var(DEBUG_REDACT_TOKENS_ENV);
             std::env::remove_var(DEBUG_REDACT_TOKENS_FILE_ENV);
