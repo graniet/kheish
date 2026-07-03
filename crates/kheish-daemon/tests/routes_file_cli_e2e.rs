@@ -7399,18 +7399,22 @@ data: [DONE]\n\n",
 }
 
 fn openai_tool_call_response(name: &str, arguments: Value) -> String {
+    openai_tool_call_response_with_call_id(name, arguments, "call-1")
+}
+
+fn openai_tool_call_response_with_call_id(name: &str, arguments: Value, call_id: &str) -> String {
     let arguments = arguments.to_string();
     let encoded_arguments =
         serde_json::to_string(&arguments).expect("tool call arguments should encode");
     format!(
         "event: response.created\n\
-data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp-tool-1\"}}}}\n\n\
+data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp-{call_id}\"}}}}\n\n\
 event: response.output_item.added\n\
-data: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"id\":\"fc_item_1\",\"type\":\"function_call\",\"status\":\"in_progress\",\"call_id\":\"call-1\",\"name\":{},\"arguments\":\"\"}}}}\n\n\
+data: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"id\":\"fc_item_{call_id}\",\"type\":\"function_call\",\"status\":\"in_progress\",\"call_id\":\"{call_id}\",\"name\":{},\"arguments\":\"\"}}}}\n\n\
 event: response.function_call_arguments.delta\n\
-data: {{\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_item_1\",\"output_index\":0,\"delta\":{encoded_arguments}}}\n\n\
+data: {{\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_item_{call_id}\",\"output_index\":0,\"delta\":{encoded_arguments}}}\n\n\
 event: response.function_call_arguments.done\n\
-data: {{\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_item_1\",\"output_index\":0,\"arguments\":{encoded_arguments}}}\n\n\
+data: {{\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_item_{call_id}\",\"output_index\":0,\"arguments\":{encoded_arguments}}}\n\n\
 event: response.completed\n\
 data: {{\"type\":\"response.completed\",\"response\":{{\"usage\":{{\"input_tokens\":12,\"output_tokens\":8}}}}}}\n\n",
         serde_json::to_string(name).expect("tool name should encode"),
@@ -33799,5 +33803,392 @@ async fn sessions_vacuum_cli_compacts_journal_and_respects_daemon_lock() -> Resu
             .any(|task| task.id == format!("task-{}", snapshot_count - 1))
     );
     stop_daemon(&mut daemon)?;
+    Ok(())
+}
+
+/// Marker echoed through the task_update output so the scripted provider can
+/// tell which step of the create → complete → done loop a request is at.
+const LOAD_TASK_DONE_MARKER: &str = "LOAD_TASK_DONE_MARKER";
+
+/// Extracts the most recent task id mentioned in one provider request body.
+/// Within one load-test run the session holds exactly one task, so the last
+/// `task-` occurrence is the id the current run just created.
+fn extract_last_task_id(body: &str) -> Option<String> {
+    let start = body.rfind("task-")?;
+    let id: String = body[start..]
+        .chars()
+        .take_while(|value| value.is_ascii_alphanumeric() || *value == '-')
+        .collect();
+    (id.len() > "task-".len()).then_some(id)
+}
+
+#[derive(Clone)]
+struct TaskLoopMockState {
+    created: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Scripted provider for the load test: every run is one task_create, one
+/// task_update to completed, then a final text turn — decided purely from the
+/// request transcript, over real HTTP.
+async fn task_loop_mock_response(State(state): State<TaskLoopMockState>, body: String) -> Response {
+    let sse = if body.contains(LOAD_TASK_DONE_MARKER) {
+        openai_text_response("load run complete")
+    } else if body.contains("task_count") {
+        match extract_last_task_id(&body) {
+            Some(task_id) => openai_tool_call_response_with_call_id(
+                "task_update",
+                json!({
+                    "task_id": task_id,
+                    "status": "completed",
+                    "output": LOAD_TASK_DONE_MARKER,
+                }),
+                "call-load-update",
+            ),
+            None => openai_text_response("missing task id"),
+        }
+    } else {
+        let index = state
+            .created
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        openai_tool_call_response_with_call_id(
+            "task_create",
+            json!({ "title": format!("load job {index}") }),
+            "call-load-create",
+        )
+    };
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/event-stream")],
+        sse,
+    )
+        .into_response()
+}
+
+async fn spawn_task_loop_mock_server() -> Result<String> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let app = Router::new()
+        .route("/v1/responses", post(task_loop_mock_response))
+        .with_state(TaskLoopMockState {
+            created: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("task loop mock server should stay healthy");
+    });
+    Ok(format!("http://{address}"))
+}
+
+fn load_test_run_request(content: &str) -> SubmitInputRequest {
+    SubmitInputRequest {
+        source_plugin: None,
+        source_kind: None,
+        actor_id: None,
+        provider: None,
+        content: content.to_string(),
+        input_items: Vec::new(),
+        attachments: Vec::new(),
+        generation: Some(kheish_runtime::ModelGenerationConfig::default()),
+        completion_requirements: None,
+        metadata: None,
+        reply_address: None,
+        binding_keys: Vec::new(),
+        reply_targets: Vec::new(),
+        reply_plugin: None,
+    }
+}
+
+/// Runs one create → complete → done load run against a real daemon and
+/// returns its wall-clock duration.
+async fn drive_load_run(client: &Client, base_url: &str, session_id: &str) -> Result<Duration> {
+    let started = Instant::now();
+    let submit_started = Instant::now();
+    let run: RunView = client
+        .post(format!("{base_url}/v1/sessions/{session_id}/runs"))
+        .json(&load_test_run_request("create one job and finish it"))
+        .send()
+        .await?
+        .error_for_status()
+        .with_context(|| format!("run submission failed for {session_id}"))?
+        .json()
+        .await?;
+    // A debug-build daemon absorbing the full burst serializes control-state
+    // saves globally, so the submission bound stays deliberately generous;
+    // what must hold is that no request errors and every run settles.
+    anyhow::ensure!(
+        submit_started.elapsed() < Duration::from_secs(60),
+        "run submission for {session_id} took {:?}",
+        submit_started.elapsed()
+    );
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let view: RunView = client
+            .get(format!("{base_url}/v1/runs/{}", run.run_id))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        match view.status {
+            DaemonRunStatus::Completed => break,
+            DaemonRunStatus::Failed | DaemonRunStatus::Cancelled | DaemonRunStatus::Interrupted => {
+                bail!(
+                    "run {} for {session_id} settled as {:?}",
+                    run.run_id,
+                    view.status
+                );
+            }
+            _ => {}
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "run {} for {session_id} did not complete in time",
+            run.run_id
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let tasks: Vec<kheish_types::TaskRecord> = client
+        .get(format!("{base_url}/v1/sessions/{session_id}/tasks"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    anyhow::ensure!(
+        tasks.len() == 1 && tasks[0].status == kheish_types::TaskStatus::Completed,
+        "session {session_id} should hold exactly one completed task: {tasks:?}"
+    );
+    Ok(started.elapsed())
+}
+
+/// Real-binary load test: 50 concurrent clients drive 200 sessions of
+/// create → complete task runs plus one pre-bloated ~32 MiB session, with
+/// status and task-list readers hammering the API throughout. Asserts zero
+/// errors, the exact per-session and aggregate state after the burst, and
+/// generous latency bounds. Ignored by default; run explicitly with:
+/// `cargo test -p kheish-daemon --test routes_file_cli_e2e -- --ignored fifty_concurrent_clients`
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "load test; run explicitly with --ignored"]
+async fn fifty_concurrent_clients_hammer_tasks_and_runs_on_a_real_daemon() -> Result<()> {
+    const CLIENTS: usize = 50;
+    const SESSIONS_PER_CLIENT: usize = 4;
+    const BIG_SESSION_ID: &str = "load-big-session";
+    const BIG_SESSION_PADDING_RECORDS: usize = 16_000;
+
+    let bin = cli_bin()?;
+    let temp = TempDir::new()?;
+    let state_root = temp.path().join("state");
+    let workspace_root = temp.path().join("workspace");
+    fs::create_dir_all(&state_root)?;
+    fs::create_dir_all(&workspace_root)?;
+    let provider_base = spawn_task_loop_mock_server().await?;
+    let routes_path = temp.path().join("routes.toml");
+    fs::write(
+        &routes_path,
+        format!(
+            "version = 1\ndefault_route = \"loadmock\"\n\n[routes.loadmock]\ndriver = \"openai\"\ndefault_model = \"gpt-5.4\"\nmodel_support = \"any\"\napi_key = \"test-key\"\nbase_url = \"{provider_base}/v1/responses\"\n"
+        ),
+    )?;
+
+    // Boot once to create the big session through production paths, then
+    // bloat its journal offline the way pre-sidecar builds did.
+    let bind = reserve_bind_address()?;
+    let mut daemon = start_daemon_with_env_and_args(
+        &bin,
+        &temp,
+        &bind,
+        &state_root,
+        &workspace_root,
+        &routes_path,
+        Some("loadmock"),
+        &[],
+        std::iter::empty::<(&str, &str)>(),
+    )?;
+    let base_url = format!("http://{bind}");
+    wait_for_daemon_ready(&bin, &base_url, &daemon)?;
+    let client = Client::new();
+    client
+        .post(format!("{base_url}/v1/sessions"))
+        .json(&json!({ "session_id": BIG_SESSION_ID, "thread_id": null }))
+        .send()
+        .await?
+        .error_for_status()?;
+    stop_daemon(&mut daemon)?;
+    drop(daemon);
+
+    let sessions_root = state_root.join("sessions");
+    let big_journal = resolve_storage_path_for_read(&sessions_root, BIG_SESSION_ID, "jsonl");
+    let padding = "x".repeat(2_048);
+    let bulk = (0..BIG_SESSION_PADDING_RECORDS)
+        .map(|revision| SessionRecordEnvelope {
+            version: CURRENT_SESSION_ENVELOPE_VERSION,
+            session_id: BIG_SESSION_ID.to_string(),
+            record: PersistedSessionRecord::Metadata {
+                key: "load_bulk_padding".to_string(),
+                value: json!({ "revision": revision, "padding": padding }),
+            },
+        })
+        .collect::<Vec<_>>();
+    kheish_session::append_json_lines_sync(&big_journal, &bulk)?;
+    let big_journal_bytes_before = fs::metadata(&big_journal)?.len();
+    assert!(
+        big_journal_bytes_before > 32 * 1024 * 1024,
+        "big session journal should exceed 32 MiB, got {big_journal_bytes_before}"
+    );
+
+    // Reboot and run the burst.
+    let bind = reserve_bind_address()?;
+    let mut daemon = start_daemon_with_env_and_args(
+        &bin,
+        &temp,
+        &bind,
+        &state_root,
+        &workspace_root,
+        &routes_path,
+        Some("loadmock"),
+        &[],
+        std::iter::empty::<(&str, &str)>(),
+    )?;
+    let base_url = format!("http://{bind}");
+    wait_for_daemon_ready(&bin, &base_url, &daemon)?;
+
+    let burst_started = Instant::now();
+    let stop_readers = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut readers = Vec::new();
+    for _ in 0..4 {
+        let client = client.clone();
+        let base_url = base_url.clone();
+        let stop = stop_readers.clone();
+        readers.push(tokio::spawn(async move {
+            let mut reads = 0usize;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let status: DaemonStatusView = client
+                    .get(format!("{base_url}/v1/status"))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                anyhow::ensure!(status.ready, "daemon must stay ready under load");
+                client
+                    .get(format!("{base_url}/v1/sessions/{BIG_SESSION_ID}/tasks"))
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                reads += 1;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Ok::<usize, anyhow::Error>(reads)
+        }));
+    }
+
+    let mut clients = Vec::new();
+    for client_index in 0..CLIENTS {
+        let client = client.clone();
+        let base_url = base_url.clone();
+        clients.push(tokio::spawn(async move {
+            let mut durations = Vec::new();
+            // The first client also drives the pre-bloated session through
+            // the same run shape as everyone else.
+            if client_index == 0 {
+                durations.push(drive_load_run(&client, &base_url, BIG_SESSION_ID).await?);
+            }
+            for session_index in 0..SESSIONS_PER_CLIENT {
+                let session_id = format!("load-session-{client_index}-{session_index}");
+                client
+                    .post(format!("{base_url}/v1/sessions"))
+                    .json(&json!({ "session_id": session_id, "thread_id": null }))
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                durations.push(drive_load_run(&client, &base_url, &session_id).await?);
+            }
+            Ok::<Vec<Duration>, anyhow::Error>(durations)
+        }));
+    }
+
+    let mut run_durations = Vec::new();
+    for handle in clients {
+        run_durations.extend(handle.await??);
+    }
+    let burst_elapsed = burst_started.elapsed();
+    stop_readers.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut reader_reads = 0usize;
+    for reader in readers {
+        reader_reads += reader.await??;
+    }
+    assert!(reader_reads > 0, "readers must have observed the burst");
+
+    let expected_runs = CLIENTS * SESSIONS_PER_CLIENT + 1;
+    assert_eq!(run_durations.len(), expected_runs);
+    let slowest = run_durations.iter().max().copied().unwrap_or_default();
+    assert!(
+        slowest < Duration::from_secs(120),
+        "slowest run took {slowest:?}"
+    );
+    assert!(
+        burst_elapsed < Duration::from_secs(300),
+        "burst took {burst_elapsed:?}"
+    );
+
+    // Aggregate state after the burst: one completed task per session, all
+    // archived out of the hot state, and the big session visible in the
+    // storage footprint view.
+    let status: DaemonStatusView = client
+        .get(format!("{base_url}/v1/status"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        status.tasks.completed, expected_runs,
+        "every run must have completed exactly one task"
+    );
+    assert_eq!(status.tasks.total, expected_runs);
+    let session_storage = status
+        .storage
+        .session_storage
+        .as_ref()
+        .context("session storage footprint must be measured")?;
+    assert_eq!(
+        session_storage.largest_session_id.as_deref(),
+        Some(BIG_SESSION_ID)
+    );
+    assert!(session_storage.largest_session_bytes > 32 * 1024 * 1024);
+    assert_eq!(session_storage.oversized_session_count, 0);
+
+    stop_daemon(&mut daemon)?;
+    drop(daemon);
+
+    // Disk-level truth: bounded hot state, one archived task per session,
+    // and no metadata growth in the big journal (events only).
+    let store = FileSessionStore::new(&sessions_root);
+    let big_journal_bytes_after = fs::metadata(&big_journal)?.len();
+    assert!(
+        big_journal_bytes_after < big_journal_bytes_before + 5 * 1024 * 1024,
+        "the big journal must not grow by metadata: {big_journal_bytes_before} -> {big_journal_bytes_after}"
+    );
+    for session_id in [
+        BIG_SESSION_ID.to_string(),
+        "load-session-0-0".to_string(),
+        format!("load-session-{}-{}", CLIENTS - 1, SESSIONS_PER_CLIENT - 1),
+    ] {
+        let control_state: SessionControlState = serde_json::from_value(
+            store
+                .load_metadata_value(&session_id, SESSION_CONTROL_STATE_METADATA_KEY)
+                .await?
+                .with_context(|| format!("missing control state for {session_id}"))?,
+        )?;
+        assert!(
+            control_state.tasks.is_empty(),
+            "hot state of {session_id} must be empty: {:?}",
+            control_state.tasks
+        );
+        assert_eq!(control_state.archived_tasks.completed, 1);
+        let archived = store.load_task_archive(&session_id).await?;
+        assert_eq!(archived.len(), 1, "one archive entry for {session_id}");
+    }
     Ok(())
 }
