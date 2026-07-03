@@ -13,12 +13,12 @@ Legend: `[x]` done · `[~]` partially done · `[ ]` not started. Effort: XS/S/M/
 |---|------|----------|--------|--------|
 | **P0.1** | Fix 2 red tests on `main` | Baseline | XS | `[x]` applied + verified |
 | **P0.2** | Add CI (fmt + build + lib-test; clippy advisory) | Baseline | S | `[x]` done + validated |
-| **P1.1** | Anthropic request-shape 400 on current models | High (core path broken) | S–M | `[ ]` designed |
+| **P1.1** | Anthropic request-shape 400 on current models | High (core path broken) | S–M | `[x]` done + 6 unit tests (2026-07-03) |
 | **P1.2** | OutputHost empty-target fan-out → cross-transport leak | High | S–M | `[ ]` designed |
-| **P1.3** | Lock-poison cascade (79 sites) → abort | High (availability) | M | `[ ]` designed |
+| **P1.3** | Lock-poison cascade (79 sites) → abort | High (availability) | M | `[x]` done — full workspace swap to parking_lot (~700 sites, 2026-07-03) |
 | **P1.4** | Auth-store: no AAD + silently accepts plaintext | High (security) | M | `[ ]` designed |
 | **P1.5** | Audit-key co-located: honesty + relocate flag | High (security) | S then M | `[~]` S part done (warning + docs); relocate flag (M) pending |
-| **P2.1** | Mid-run durability **Phase 0** (incremental journal, torn-line, O(Δ)) | High (the thesis gap) | S–M | `[ ]` designed |
+| **P2.1** | Mid-run durability **Phase 0** (incremental journal, torn-line, O(Δ)) | High (the thesis gap) | S–M | `[x]` done + 8 tests (2026-07-03) |
 | **P2.2** | Google provider non-streaming → >90s timeout | Medium (correctness) | M | `[ ]` designed |
 | **P2.3** | Rate limiter ~2× burst → token bucket | Medium | S | `[x]` done + 7 unit tests |
 | **P2.4** | `observation.rs` zero unit tests (security-critical) | Medium | M | `[~]` rate-limiter portion seeded by P2.3 |
@@ -47,9 +47,23 @@ Not in this batch (S–M or larger, per the "S and XS only" scope): P1.1, P1.2, 
 
 **Discovered during verification — flaky test (new follow-up, ~S):** `daemon_exposes_runtime_reconfiguration_and_global_sse` (`tests.rs:40830`) is timing-flaky under parallel-suite load: it passed 3/3 in isolation and in an earlier full matrix, but failed once in a loaded full `--lib --bins` run with a 5s SSE-chunk timeout. Root cause: the test subscribes to `/v1/events/stream` *live* and then POSTs the change, so an event broadcast before the subscription registers is missed. It is unrelated to this batch's changes (none touch SSE/runtime/events). Fix: use the existing cursor mechanism — capture the event id before the mutation and open the stream with `Last-Event-ID` (the handler already supports `subscribe_after(cursor)` at `handlers.rs:4848`), then read until the expected event. This matters for **P0.2 CI reliability**: until fixed, the CI `build & test` job can intermittently redden on this one test (re-run passes).
 
+## Implementation log — 2026-07-03 (M batch)
+
+- **P1.1** — `anthropic.rs` now builds requests from a model-capability table (`anthropic_model_uses_adaptive_thinking`, one line per family): Fable 5 / Mythos 5 / Opus 4.7 / 4.8 / Sonnet 5 get `thinking:{type:"adaptive"}` + `output_config.effort` and omit `temperature`; legacy `budget_tokens` configs fold onto the nearest effort tier; a requested summary maps to `display:"summarized"`; ≤4.6 keeps the old shape. 6 unit tests incl. Bedrock-prefixed ids and the sonnet-5 vs sonnet-4-5 non-match.
+- **P1.3** — full workspace migration off poison-prone `std::sync::{Mutex, RwLock}` to `parking_lot` (~700 call sites across kheish-runtime/daemon/agent/auth/core/harness/mcp, zero occurrences left; `tokio::sync` untouched; `assets.rs` Condvar migrated). The trigger was live evidence: one stale test expectation poisoned the daemon suite's debug-env mutex and cascaded 21 collateral failures.
+- **P2.1 Phase 0** — all three parts landed:
+  - *Incremental journaling:* new `JournalSink` trait on the engine, flushed at three turn boundaries (input/turn-top, after assistant+ToolCallStarted before execution, after ToolCallFinished), one fsync per boundary via `FileSessionStore::append_records`; a sink failure fails the run cleanly. Runtime persist paths skip already-flushed entries via `journal_flushed_len`; `load_after` skips duplicate event offsets defensively.
+  - *Torn-trailing-line tolerance:* readers skip a JSON-syntax failure only on the final non-empty line (warn); mid-file corruption still errors. The appender heals a torn tail before writing (truncate to last newline) so a new record never glues onto a partial line, and rolls back short writes.
+  - *O(Δ) persist:* `append_batch_dedup` now dedups against a backwards tail read (`load_record_tail`) instead of re-parsing the whole transcript.
+- **SSE flaky test** — fixed with the designed cursor approach: subscribe with `Last-Event-ID` (epoch 0 first, then the first event's id), read-until-match; race eliminated structurally.
+- **Harness goldens** — the 2 red `kheish-harness` fixture tests were stale goldens: the working tree's engine changes (prompt-window generation on compaction) legitimately changed `canonical_state_digest`; regenerated goldens after verifying the diff was digest+prompt-window-only.
+- **Startup worktree GC** — new `gc_orphaned_daemon_worktrees_on_boot`: reclaims daemon-owned worktrees whose agent record is settled/closed (crash between settle and cleanup), falls back to directory removal when the git registration is already gone, then `git worktree prune`. Live sidechains keep their worktrees. Covered by a restart e2e test.
+- **kheish-auth redaction flake root-caused** (see below) — deliberate fix still pending.
+
 **More load-dependent flakes observed 2026-07-03 (pre-existing, each passes in isolation, one red per loaded full-workspace run):**
 - `kheish-auth redaction::tests::{auth_record_debug_redaction_tokens_include_only_secret_material, ephemeral_debug_redaction_tokens_are_bounded}` — both assert on the **process-global** redaction-token registry while serializing only against each other (`redaction_test_lock`, `redaction.rs:173`). Every other kheish-auth test that constructs an `AuthManager` mutates that same registry without the lock (`manager.rs:87` on load, `:623` on refresh; `broker.rs:489` registers ephemeral tokens), so a parallel test thread can replace the registry between the test's write and its read. Fix options (deliberate choice needed, ~S–M): share one test lock across every registry-touching test, or make the registry storage thread-local under `#[cfg(test)]` (careful: multi-thread tokio tests hop threads). Note: kheish-auth is **not** in the CI matrix today, so this cannot redden CI — but the matrix gap itself is worth closing.
 - `kheish-daemon tests::daemon_stop_task_kills_orphaned_pipe_holder_and_is_session_scoped` — process-spawn/kill timing under load; passes in isolation. Not yet root-caused.
+- `kheish-daemon tests::{daemon_http_runs_do_not_infer_over_explicit_invalid_edit_image_ids, daemon_http_runs_reject_non_image_edit_assets}` — failed together in 2 of 6 loaded full-suite runs on 2026-07-03, pass in isolation and in the other 4 full runs. Same edit_image family; suspected shared-fixture timing. Not yet root-caused.
 
 ---
 

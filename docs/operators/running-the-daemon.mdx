@@ -149,6 +149,8 @@ The most important startup parameters are:
 
 Leave `--http-cors-allow-origin` unset for the default local-development policy, which accepts loopback browser origins. Set it one or more times, or use comma-delimited `KHEISH_HTTP_CORS_ALLOW_ORIGINS`, when the browser UI should be limited to exact local origins such as `http://localhost:5173`.
 
+Agent runs carry a bounded main-loop turn ceiling by default (500 turns), so a misconfigured or looping run cannot burn tokens forever. Override it with the `KHEISH_AGENT_MAX_TURNS` environment variable; setting it to `0` removes the ceiling entirely, which is an explicit operator decision — the daemon logs a loud warning at startup and runs then stop only on completion, budget, or operator action.
+
 Use `--mcp-profile` to enable a built-in MCP catalog profile without writing a Codex-compatible MCP config file:
 
 ```bash

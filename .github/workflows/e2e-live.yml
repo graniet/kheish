@@ -1,0 +1,81 @@
+name: E2E live (Linear + GitHub)
+
+# Exercises the real Linear/GitHub feature-loop path that unit tests cannot:
+# stack import -> plan -> apply -> verify against live services, through the
+# pinned GitHub MCP server image. Runs weekly and on demand — never on PRs,
+# because it needs real credentials and mutates nothing only as long as the
+# flow stays in its read-only smoke configuration.
+#
+# Requirements (all optional — the workflow skips cleanly when absent):
+#   secrets.LINEAR_API_KEY                 read scope is enough for the smoke
+#   secrets.E2E_GITHUB_PERSONAL_ACCESS_TOKEN  PAT for the test org/repo
+#   vars.E2E_GITHUB_MCP_IMAGE                  digest-pinned image, e.g.
+#                                          ghcr.io/github/github-mcp-server@sha256:...
+#
+# The LLM-driven Flow portion (KHEISH_E2E_RUN_STACK_FLOW=1, spends OpenAI
+# tokens) stays off unless explicitly requested via the dispatch input.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_stack_flow:
+        description: "Also run the LLM-driven Flow smoke (needs OpenAI auth, spends tokens)"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "17 5 * * 1" # Mondays 05:17 UTC — off-peak, avoids the on-the-hour thundering herd
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  live-e2e:
+    name: feature-loop live e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # Secrets are not visible to job-level `if:`; probe them in a step and
+      # short-circuit politely instead of failing the scheduled run on forks
+      # or repos without the credentials configured.
+      - name: Check credentials
+        id: creds
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          GITHUB_PERSONAL_ACCESS_TOKEN: ${{ secrets.E2E_GITHUB_PERSONAL_ACCESS_TOKEN }}
+          GITHUB_MCP_IMAGE: ${{ vars.E2E_GITHUB_MCP_IMAGE }}
+        run: |
+          missing=()
+          [[ -n "$LINEAR_API_KEY" ]] || missing+=(LINEAR_API_KEY)
+          [[ -n "$GITHUB_PERSONAL_ACCESS_TOKEN" ]] || missing+=(E2E_GITHUB_PERSONAL_ACCESS_TOKEN)
+          [[ -n "$GITHUB_MCP_IMAGE" ]] || missing+=("E2E_GITHUB_MCP_IMAGE (repository variable)")
+          if (( ${#missing[@]} )); then
+            echo "::notice::Skipping live e2e — missing: ${missing[*]}"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.creds.outputs.available == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.creds.outputs.available == 'true'
+
+      - name: Build daemon
+        if: steps.creds.outputs.available == 'true'
+        run: cargo build -p kheish-daemon --locked
+
+      - name: Run live e2e
+        if: steps.creds.outputs.available == 'true'
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          GITHUB_PERSONAL_ACCESS_TOKEN: ${{ secrets.E2E_GITHUB_PERSONAL_ACCESS_TOKEN }}
+          GITHUB_MCP_IMAGE: ${{ vars.E2E_GITHUB_MCP_IMAGE }}
+          KHEISH_E2E_SKIP_BUILD: "1"
+          KHEISH_E2E_RUN_STACK_FLOW: ${{ inputs.run_stack_flow && '1' || '0' }}
+        run: ./scripts/e2e/linear_github_feature_loop_live.sh
+
+      # Deliberately no artifact upload: the evidence directory contains the
+      # admin token and auth-store master key for the throwaway daemon. The
+      # script already prints its assertions and the daemon log path to stdout.

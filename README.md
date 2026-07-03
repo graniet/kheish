@@ -94,11 +94,38 @@ Stop the daemon, restart `serve`, and the same `runs list` reflects journaled st
 
 > If you only want to confirm the control plane works without spending tokens, the no-provider path is `status` → `capabilities` → `sessions create demo` → `sessions get demo`. Submitting input requires a configured provider.
 
+## Stacks: the deployment is a file
+
+Creating sessions by hand is fine for exploring. For anything you intend to keep running, Kheish has a declarative layer: a **Kheishfile** describes the personas, sessions, scopes, secrets, MCP requirements, playbooks, and schedules that make up one agent deployment, and the daemon **reconciles** live state against it — the same plan / apply / verify contract you know from Terraform, pointed at agents instead of infrastructure.
+
+```bash
+# Write a starter Kheishfile.yaml in the current directory
+./target/debug/kheish-daemon stack init
+
+# See what would change, change it, then prove the live daemon matches
+./target/debug/kheish-daemon stack plan
+./target/debug/kheish-daemon stack apply
+./target/debug/kheish-daemon stack verify
+```
+
+A few properties worth knowing before you rely on it:
+
+- **Fail-closed on capability drift.** If the stack declares an MCP server or tool that the live daemon does not actually expose, `plan`, `apply`, and `verify` refuse rather than deploy an agent that would silently miss a tool.
+- **Secrets are referenced, never embedded.** A Kheishfile names the secret slots it needs; values arrive through the daemon's auth store or an explicitly allowed environment import. Managed secrets carry a salted fingerprint, so a value rotated behind the daemon's back shows up as drift at `plan`/`verify` time without the value ever being stored.
+- **Ownership is tracked.** `apply` records what the stack created in a local ledger; `import` adopts pre-existing resources; `down` tears down only what the ledger owns.
+- **Schedules make it autonomous.** A stack can attach cron schedules that start playbook-driven Flows — that is how a Kheishfile becomes a standing loop instead of a one-shot setup.
+
+The complete worked example is [`examples/stacks/linear-github-feature-loop`](examples/stacks/linear-github-feature-loop): a stack that scans Linear for eligible tickets on a morning schedule, implements one ticket at a time in an isolated git worktree, opens a draft GitHub PR, and follows up on review feedback every half hour — with an internal 10/10 review gate before a PR leaves draft. It doubles as the reference for what production-shaped stacks look like (scoped sessions, versioned playbooks, operator contact, machine-readable state footers).
+
+Reference documentation lives in [`docs/operators/kheish-stack.mdx`](docs/operators/kheish-stack.mdx) and the feature-loop guide in [`docs/operators/linear-github-feature-loop.mdx`](docs/operators/linear-github-feature-loop.mdx).
+
 ## Core Capabilities
 
 - Persistent sessions with journaled state, checkpoints, and restart recovery
+- Declarative stacks (Kheishfile) with plan / apply / verify reconciliation, drift detection, and an ownership ledger
 - Detached runs with approvals and structured user-question flows
-- Multi-agent orchestration with sidechains, tasks, schedules, and mailboxes
+- Model-initiated operator contact: agents can notify a human or suspend on a question, through session-scoped, default-off policy
+- Multi-agent orchestration with sidechains, tasks, schedules, and mailboxes; implementation subagents work in daemon-owned isolated git worktrees
 - Brokered runtime auth with per-session and per-agent subjects, revocable short-lived leases, and signed external-action audit
 - Daemon-owned observation sources, captured records, and materialization flows for screenshots, webcam snapshots, microphone segments, and other external capture producers
 - Extensible runtime with built-in tools, hooks, skills, MCP, daemon-managed ingress connectors, and generic output plugins
@@ -123,12 +150,15 @@ See [`docs/capture.md`](docs/capture.md) for supported source kinds and media ty
 ## Security
 
 Before exposing the daemon beyond localhost, enable control-plane authentication and review the active permission, hook, connector, and output-routing configuration for your deployment. Kheish includes built-in bearer auth for the control plane, brokered runtime auth for credential-backed execution, and signed append-only audit records for external actions.
-Sessions and sidechains can further narrow auth-backed resources through `CredentialScope`, so delegated work can keep route access without inheriting connector or MCP credentials by default.
+
+Sessions and sidechains can further narrow auth-backed resources through `CredentialScope`, so delegated work can keep route access without inheriting connector or MCP credentials by default. Autonomous runs carry a bounded turn ceiling by default; removing it (`KHEISH_AGENT_MAX_TURNS=0`) is an explicit operator decision, and the daemon says so loudly at startup.
+
+Two honest caveats worth reading before production use: the external-action audit chain is only tamper-evident if its signing key lives off-box (see the integrity caveat in [`docs/operators/security-and-auth.mdx`](docs/operators/security-and-auth.mdx)), and mid-run durability currently checkpoints at run boundaries and gates rather than after every tool call — the remediation plan in [`REMEDIATION.md`](REMEDIATION.md) tracks both.
 
 ## Contributing
 
-See [AGENTS.md](AGENTS.md) for the operator guide used when working in this repository.
+See [AGENTS.md](AGENTS.md) for the operator guide used when working in this repository. CI runs rustfmt, a full workspace build, and the per-crate test matrix under `-D warnings`; a weekly live end-to-end workflow exercises the real Linear/GitHub feature loop when credentials are configured.
 
 ## License
 
-See [LICENSE](LICENSE).
+Apache-2.0 — see [LICENSE](LICENSE).
