@@ -6,6 +6,7 @@
     "input_source_kind": "test",
     "input_event_offset": 0,
     "completion_follow_up_count": 0,
+    "permission_denied_retry_count": 0,
     "max_output_tokens_recovery_count": 0,
     "autocompact": {
       "consecutive_failures": 0,
@@ -31,6 +32,7 @@
       "turn": 1,
       "prompt": {
         "checkpoint_offset_used": null,
+        "prompt_window_generation": 0,
         "summary_digest": null,
         "summary_text": null,
         "system_sections": [],
@@ -75,6 +77,9 @@
       "turn": 2,
       "prompt": {
         "checkpoint_offset_used": 1,
+        "prompt_window_id": "prompt-window-1",
+        "prompt_window_generation": 1,
+        "prompt_window_started_after_offset": 6,
         "summary_digest": "92e8b05974bf0bc8a0f92b3908301d4cc6a8c6376f34bbb5154c357f77afa806",
         "summary_text": "Summary:\n1. Primary Request and Intent\n- The user wants the task completed.\n2. Current Work\n- Waiting to continue after the tool result.",
         "system_sections": [],
@@ -104,10 +109,13 @@
   "checkpoints": [
     {
       "compacted_until_offset": 1,
-      "journal_digest": "b1eaffb457a8d2ed2bacec6c3bfafaf77d4a12bb14e4d89c85a24c89a02a3bb1",
+      "journal_digest": "a35b76ffec63f82645bad6bf47d35c9d3cad70dc66c5863e42d98be9dc8d300c",
+      "prompt_window_id": "prompt-window-1",
+      "prompt_window_generation": 1,
+      "prompt_window_started_after_offset": 5,
       "summary_digest": "92e8b05974bf0bc8a0f92b3908301d4cc6a8c6376f34bbb5154c357f77afa806",
       "summary_text": "Summary:\n1. Primary Request and Intent\n- The user wants the task completed.\n2. Current Work\n- Waiting to continue after the tool result.",
-      "canonical_state_digest": "b0e411a2f7aa34bff1b080829f81fb97e98b39b1ce4cdb3730f3678a898636c3"
+      "canonical_state_digest": "098ebe9280479097c5d7da7f060ac3e49f87ca58e2e99cb6a09959940b325be5"
     }
   ],
   "final_state": {
@@ -153,6 +161,6 @@
       "a8d61f9ad0146db965848511b8e9521f40af5ee96af5023e2df9b87937512b62"
     ],
     "open_tool_call_ids": [],
-    "canonical_state_digest": "05d46b90c2baa4d77bffc4affbafc4146e08dc9564e16e0237090532ece7cb5b"
+    "canonical_state_digest": "29e2f21698250af940f47e10aabf34f553f7784fb764f6843005000f93584b54"
   }
 }

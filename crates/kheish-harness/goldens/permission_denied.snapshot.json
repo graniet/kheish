@@ -6,6 +6,7 @@
     "input_source_kind": "test",
     "input_event_offset": 0,
     "completion_follow_up_count": 0,
+    "permission_denied_retry_count": 0,
     "max_output_tokens_recovery_count": 0,
     "autocompact": {
       "consecutive_failures": 0,
@@ -30,6 +31,7 @@
       "turn": 1,
       "prompt": {
         "checkpoint_offset_used": null,
+        "prompt_window_generation": 0,
         "summary_digest": null,
         "summary_text": null,
         "system_sections": [],
@@ -77,6 +79,7 @@
       "turn": 2,
       "prompt": {
         "checkpoint_offset_used": null,
+        "prompt_window_generation": 0,
         "summary_digest": null,
         "summary_text": null,
         "system_sections": [],
@@ -153,6 +156,6 @@
       "b5e64cbc0bacccc123b7cfda914d827c9b4b5932d6c5ed1fb41ca702b2611ede"
     ],
     "open_tool_call_ids": [],
-    "canonical_state_digest": "63569efe6a4df6fe5f2f4bfe20bcd29b3d76047d2d5776ac42bd53da620d0343"
+    "canonical_state_digest": "74394defc5f902492606d83e194ef8bd0790e70b8c49f3952921def7396f391c"
   }
 }
