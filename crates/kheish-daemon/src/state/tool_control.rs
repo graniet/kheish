@@ -354,6 +354,28 @@ where
         DaemonState::save_session_control_state(self.0.as_ref(), session_id, state).await
     }
 
+    async fn archived_session_task_index(
+        &self,
+        session_id: &str,
+    ) -> Result<std::sync::Arc<crate::services::ArchivedTaskIndex>> {
+        self.0.archived_session_task_index(session_id).await
+    }
+
+    async fn load_archived_session_tasks(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<kheish_types::ArchivedTaskRecord>> {
+        self.0.load_archived_session_tasks(session_id).await
+    }
+
+    async fn delete_session_task(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<kheish_types::TaskRecord> {
+        self.0.delete_session_task(session_id, task_id).await
+    }
+
     async fn load_session_goal(
         &self,
         session_id: &str,

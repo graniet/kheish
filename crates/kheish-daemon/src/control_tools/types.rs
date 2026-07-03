@@ -8,9 +8,9 @@ use kheish_agent::{ChildRetentionPolicy, ManagedAgentSnapshot};
 use kheish_runtime::{PermissionMode, PromptMergeMode, ToolExecutionOutput};
 use kheish_skills::{SkillDefinition, SkillSummary};
 use kheish_types::{
-    AttachmentRef, CapabilityScope, CredentialScope, ModelGenerationConfig, SessionControlState,
-    SessionGoal, SessionOperatorConfig, TaskRecord, TaskStatus, ToolSurfaceFilter,
-    UserQuestionRequest,
+    ArchivedTaskRecord, AttachmentRef, CapabilityScope, CredentialScope, ModelGenerationConfig,
+    SessionControlState, SessionGoal, SessionOperatorConfig, TaskRecord, TaskStatus,
+    ToolSurfaceFilter, UserQuestionRequest,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -685,6 +685,22 @@ pub trait DaemonToolControl: Send + Sync {
         session_id: &str,
         state: SessionControlState,
     ) -> Result<SessionControlState>;
+
+    /// Returns the archived-task index (ids plus terminal tally) of one session.
+    async fn archived_session_task_index(
+        &self,
+        session_id: &str,
+    ) -> Result<Arc<crate::services::ArchivedTaskIndex>>;
+
+    /// Loads the archived task records of one session, in archival order.
+    async fn load_archived_session_tasks(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<ArchivedTaskRecord>>;
+
+    /// Deletes one live session task, leaving an archive tombstone so it
+    /// cannot resurrect through the control-state merge.
+    async fn delete_session_task(&self, session_id: &str, task_id: &str) -> Result<TaskRecord>;
 
     /// Loads the current long-running session goal, when present.
     async fn load_session_goal(&self, session_id: &str) -> Result<Option<SessionGoal>>;

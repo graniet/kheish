@@ -75,20 +75,25 @@ impl TaskService {
         }
     }
 
-    /// Returns one unique background shell task identifier for the current session task set.
+    /// Returns one unique background shell task identifier for the current
+    /// session, avoiding live and archived task ids alike.
     pub(crate) fn next_background_shell_task_id(
         session_id: &str,
         tasks: &[kheish_types::TaskRecord],
+        archived_task_ids: &std::collections::BTreeSet<String>,
         now: u64,
     ) -> String {
+        let is_free = |candidate: &str| {
+            tasks.iter().all(|task| task.id != candidate) && !archived_task_ids.contains(candidate)
+        };
         let base = format!("shell-task-{}-{now}", shell_task_session_prefix(session_id));
-        if tasks.iter().all(|task| task.id != base) {
+        if is_free(&base) {
             return base;
         }
         let mut suffix = 1u32;
         loop {
             let candidate = format!("{base}-{suffix}");
-            if tasks.iter().all(|task| task.id != candidate) {
+            if is_free(&candidate) {
                 return candidate;
             }
             suffix = suffix.saturating_add(1);
@@ -472,6 +477,15 @@ impl TaskService {
     }
 }
 
+/// Returns whether one terminal shell task still needs a boot-time shutdown
+/// retry and must therefore stay in the hot control state instead of being
+/// archived: the archive is immutable, so archiving it would drop the retry.
+pub(crate) fn background_shell_task_shutdown_unsettled(task: &TaskRecord) -> bool {
+    background_shell_metadata(task)
+        .map(|metadata| background_shell_terminal_task_needs_shutdown_retry(task, &metadata))
+        .unwrap_or(false)
+}
+
 fn background_shell_terminal_task_needs_shutdown_retry(
     task: &TaskRecord,
     metadata: &BackgroundShellTaskMetadata,
@@ -580,7 +594,7 @@ mod tests {
         ];
 
         assert_eq!(
-            TaskService::next_background_shell_task_id(session_id, &tasks, 42),
+            TaskService::next_background_shell_task_id(session_id, &tasks, &Default::default(), 42),
             format!("shell-task-{prefix}-42-2")
         );
     }
@@ -1015,8 +1029,18 @@ mod tests {
     fn next_background_shell_task_id_is_unique_across_sessions() {
         let tasks = Vec::new();
 
-        let left = TaskService::next_background_shell_task_id("session-1", &tasks, 42);
-        let right = TaskService::next_background_shell_task_id("session-2", &tasks, 42);
+        let left = TaskService::next_background_shell_task_id(
+            "session-1",
+            &tasks,
+            &Default::default(),
+            42,
+        );
+        let right = TaskService::next_background_shell_task_id(
+            "session-2",
+            &tasks,
+            &Default::default(),
+            42,
+        );
 
         assert_ne!(left, right);
     }

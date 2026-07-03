@@ -7,6 +7,7 @@ use super::*;
 fn merge_generic_session_control_state(
     current: &SessionControlState,
     incoming: SessionControlState,
+    archived_task_ids: &BTreeSet<String>,
 ) -> SessionControlState {
     SessionControlState {
         plan_mode: current.plan_mode,
@@ -15,13 +16,17 @@ fn merge_generic_session_control_state(
         pre_plan_mode: current.pre_plan_mode.clone(),
         plan_artifact: current.plan_artifact.clone(),
         todos: incoming.todos,
-        tasks: merge_session_tasks(&current.tasks, incoming.tasks),
+        tasks: merge_session_tasks(&current.tasks, incoming.tasks, archived_task_ids),
+        // The archive tally is daemon-owned; the archival step refreshes it
+        // after this merge.
+        archived_tasks: current.archived_tasks,
     }
 }
 
 fn merge_session_tasks(
     current: &[kheish_types::TaskRecord],
     incoming: Vec<kheish_types::TaskRecord>,
+    archived_task_ids: &BTreeSet<String>,
 ) -> Vec<kheish_types::TaskRecord> {
     let current_by_id = current
         .iter()
@@ -32,6 +37,12 @@ fn merge_session_tasks(
     let mut seen = BTreeSet::new();
     for incoming in incoming {
         let task_id = incoming.id.clone();
+        // An archived id must never re-enter the hot state: a run that still
+        // holds a pre-archival snapshot would otherwise resurrect the task
+        // through this disk-union merge (deleted tasks included).
+        if archived_task_ids.contains(&task_id) {
+            continue;
+        }
         let task = match current_by_id.get(&task_id) {
             Some(current) => merge_session_task(current, &incoming),
             None => incoming,
@@ -40,6 +51,9 @@ fn merge_session_tasks(
         merged.push(task);
     }
     for current in current {
+        if archived_task_ids.contains(&current.id) {
+            continue;
+        }
         if seen.insert(current.id.clone()) {
             merged.push(current.clone());
         }
@@ -70,6 +84,14 @@ fn task_is_terminal(status: &kheish_types::TaskStatus) -> bool {
             | kheish_types::TaskStatus::Failed
             | kheish_types::TaskStatus::Cancelled
     )
+}
+
+/// A terminal task is archived once nothing can still mutate it: a shell task
+/// whose process shutdown may be retried on a future boot stays hot until the
+/// retry settles.
+fn task_should_archive(task: &kheish_types::TaskRecord) -> bool {
+    task_is_terminal(&task.status)
+        && !crate::services::background_shell_task_shutdown_unsettled(task)
 }
 
 impl<M> DaemonState<M>
@@ -231,14 +253,10 @@ where
                 .session_service
                 .load_session_control_state(session_id)
                 .await?;
-            let state = merge_generic_session_control_state(&previous, state);
-            if state != previous {
-                self.session_service
-                    .save_session_control_state(session_id, &state)
-                    .await?;
-            }
-            self.session_service
-                .remember_task_summary(session_id, &state.tasks)
+            let archived = self.session_service.archived_task_index(session_id).await?;
+            let state = merge_generic_session_control_state(&previous, state, &archived.ids);
+            let state = self
+                .archive_and_persist_control_state_locked(session_id, state, &previous)
                 .await?;
             (previous, state)
         };
@@ -294,6 +312,124 @@ where
                 .await;
         }
         Ok(state)
+    }
+
+    /// Archives every settled terminal task and persists the bounded hot
+    /// state; callers must hold the session control lock. Returns the
+    /// pre-strip state so callers still observe the transition they made.
+    async fn archive_and_persist_control_state_locked(
+        &self,
+        session_id: &str,
+        mut state: SessionControlState,
+        previous: &SessionControlState,
+    ) -> Result<SessionControlState> {
+        let archived_at_ms = crate::now_ms();
+        let newly_archived = state
+            .tasks
+            .iter()
+            .filter(|task| task_should_archive(task))
+            .map(|task| kheish_types::ArchivedTaskRecord {
+                task: task.clone(),
+                archived_at_ms,
+                reason: kheish_types::TaskArchiveReason::Terminal,
+            })
+            .collect::<Vec<_>>();
+        state.archived_tasks = self
+            .session_service
+            .archive_session_tasks(session_id, &newly_archived)
+            .await?;
+        let mut persisted = state.clone();
+        persisted.tasks.retain(|task| !task_should_archive(task));
+        if &persisted != previous {
+            self.session_service
+                .save_session_control_state(session_id, &persisted)
+                .await?;
+        }
+        self.session_service
+            .remember_task_summary(session_id, &persisted)
+            .await?;
+        Ok(state)
+    }
+
+    /// Deletes one live task, leaving a tombstone in the archive so the
+    /// disk-union merge can never resurrect it.
+    pub(crate) async fn delete_session_task(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<kheish_types::TaskRecord> {
+        let _guard = self.session_service.session_control_lock().lock().await;
+        let previous = self
+            .session_service
+            .load_session_control_state(session_id)
+            .await?;
+        let mut state = previous.clone();
+        let Some(index) = state.tasks.iter().position(|task| task.id == task_id) else {
+            let archived = self.session_service.archived_task_index(session_id).await?;
+            if archived.ids.contains(task_id) {
+                anyhow::bail!("task {task_id} is archived and immutable");
+            }
+            anyhow::bail!("unknown task {task_id}");
+        };
+        if crate::shell_tasks::background_shell_metadata(&state.tasks[index]).is_some()
+            && !task_is_terminal(&state.tasks[index].status)
+        {
+            anyhow::bail!(
+                "daemon-managed shell task {task_id} is live; stop it before deleting it"
+            );
+        }
+        let deleted = state.tasks.remove(index);
+        state.archived_tasks = self
+            .session_service
+            .archive_session_tasks(
+                session_id,
+                &[kheish_types::ArchivedTaskRecord {
+                    task: deleted.clone(),
+                    archived_at_ms: crate::now_ms(),
+                    reason: kheish_types::TaskArchiveReason::Deleted,
+                }],
+            )
+            .await?;
+        self.archive_and_persist_control_state_locked(session_id, state, &previous)
+            .await?;
+        Ok(deleted)
+    }
+
+    /// Returns the archived-task index (ids plus terminal tally) of one session.
+    pub(crate) async fn archived_session_task_index(
+        &self,
+        session_id: &str,
+    ) -> Result<std::sync::Arc<crate::services::ArchivedTaskIndex>> {
+        self.session_service.archived_task_index(session_id).await
+    }
+
+    /// Loads the archived task records of one session, in archival order.
+    pub(crate) async fn load_archived_session_tasks(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<kheish_types::ArchivedTaskRecord>> {
+        self.session_service
+            .load_archived_session_tasks(session_id)
+            .await
+    }
+
+    /// Finds the archived snapshot of one terminal task, when present.
+    /// Deleted tombstones stay hidden.
+    pub(crate) async fn find_archived_session_task(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<Option<kheish_types::TaskRecord>> {
+        let archived = self.session_service.archived_task_index(session_id).await?;
+        if !archived.ids.contains(task_id) {
+            return Ok(None);
+        }
+        Ok(crate::services::latest_archived_terminal_task(
+            self.session_service
+                .load_archived_session_tasks(session_id)
+                .await?,
+            task_id,
+        ))
     }
 
     pub(crate) async fn apply_requested_session_permission_mode(
@@ -557,6 +693,7 @@ mod tests {
                 created_at_ms: 1,
                 updated_at_ms: 1,
             }],
+            archived_tasks: Default::default(),
         };
         let incoming = SessionControlState {
             todos: vec![kheish_types::TodoItem {
@@ -580,7 +717,7 @@ mod tests {
             ..SessionControlState::default()
         };
 
-        let merged = merge_generic_session_control_state(&current, incoming);
+        let merged = merge_generic_session_control_state(&current, incoming, &BTreeSet::new());
 
         assert!(merged.plan_mode);
         assert_eq!(merged.pre_plan_mode.as_deref(), Some("bypassPermissions"));
@@ -632,11 +769,51 @@ mod tests {
             ..SessionControlState::default()
         };
 
-        let merged = merge_generic_session_control_state(&current, incoming);
+        let merged = merge_generic_session_control_state(&current, incoming, &BTreeSet::new());
 
         assert_eq!(merged.tasks.len(), 1);
         assert_eq!(merged.tasks[0].status, kheish_types::TaskStatus::Completed);
         assert_eq!(merged.tasks[0].updated_at_ms, 10);
         assert_eq!(merged.tasks[0].output.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn generic_session_control_merge_never_resurrects_archived_tasks() {
+        let task = |id: &str| kheish_types::TaskRecord {
+            id: id.to_string(),
+            title: id.to_string(),
+            description: String::new(),
+            status: kheish_types::TaskStatus::InProgress,
+            owner_agent_id: None,
+            blocked_by: Vec::new(),
+            blocks: Vec::new(),
+            output: None,
+            metadata: json!(null),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        // A pre-archival run snapshot re-sends an archived task, and a stale
+        // on-disk state still carries a deleted one.
+        let current = SessionControlState {
+            tasks: vec![task("task-deleted"), task("task-live")],
+            ..SessionControlState::default()
+        };
+        let incoming = SessionControlState {
+            tasks: vec![task("task-archived"), task("task-live")],
+            ..SessionControlState::default()
+        };
+        let archived_ids =
+            BTreeSet::from(["task-archived".to_string(), "task-deleted".to_string()]);
+
+        let merged = merge_generic_session_control_state(&current, incoming, &archived_ids);
+
+        assert_eq!(
+            merged
+                .tasks
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["task-live"]
+        );
     }
 }

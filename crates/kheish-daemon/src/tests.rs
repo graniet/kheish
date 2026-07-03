@@ -31086,6 +31086,7 @@ async fn daemon_repairs_stale_plan_mode_snapshots_after_restart() -> Result<()> 
                     plan_artifact: None,
                     todos: Vec::new(),
                     tasks: Vec::new(),
+                    archived_tasks: Default::default(),
                 })?,
             },
         )
@@ -54441,6 +54442,195 @@ async fn daemon_task_created_hook_executes_command() -> Result<()> {
         .error_for_status()?;
     assert_eq!(std::fs::read_to_string(&audit_path)?, "task-created");
 
+    let _ = shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_archives_terminal_tasks_and_honors_delete_tombstones() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-state");
+    let session_id = "task-archive-session";
+    let seed_task = |id: &str, status: kheish_types::TaskStatus, output: Option<&str>| {
+        kheish_types::TaskRecord {
+            id: id.to_string(),
+            title: format!("Task {id}"),
+            description: String::new(),
+            status,
+            owner_agent_id: None,
+            blocked_by: Vec::new(),
+            blocks: Vec::new(),
+            output: output.map(str::to_string),
+            metadata: Value::Null,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        }
+    };
+
+    let (address, shutdown) = scripted_daemon(&state_root, Vec::new()).await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+    wait_for_daemon_ready(&client, &base).await?;
+    create_test_session(&client, &base, session_id).await?;
+    let _ = shutdown.send(());
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Seed the hot state an upgraded state root can carry: one live task plus
+    // terminal tasks that never went through archival.
+    FileSessionStore::new(state_root.join("sessions"))
+        .append(
+            session_id,
+            kheish_session::PersistedSessionRecord::Metadata {
+                key: SESSION_CONTROL_STATE_METADATA_KEY.to_string(),
+                value: serde_json::to_value(SessionControlState {
+                    tasks: vec![
+                        seed_task("task-live-1", kheish_types::TaskStatus::InProgress, None),
+                        seed_task(
+                            "task-done-1",
+                            kheish_types::TaskStatus::Completed,
+                            Some("done"),
+                        ),
+                        seed_task(
+                            "task-failed-1",
+                            kheish_types::TaskStatus::Failed,
+                            Some("broke"),
+                        ),
+                    ],
+                    ..SessionControlState::default()
+                })?,
+            },
+        )
+        .await?;
+
+    // Reboot and run one scripted turn that deletes the live task: the save
+    // triggered by the delete also sweeps the seeded terminal tasks into the
+    // archive.
+    let (address, shutdown) = scripted_daemon(
+        &state_root,
+        vec![
+            Ok(vec![
+                ModelStreamEvent::MessageId {
+                    value: "assistant-archive-1".to_string(),
+                },
+                ModelStreamEvent::ToolCall {
+                    call: kheish_types::ToolCallRecord {
+                        id: "task-delete-call-1".to_string(),
+                        name: "task_delete".to_string(),
+                        input: json!({ "task_id": "task-live-1" }),
+                        assistant_message_id: None,
+                        assistant_provider_response_id: None,
+                    },
+                },
+                ModelStreamEvent::Stop {
+                    reason: kheish_types::ModelFinishReason::ToolCalls,
+                },
+            ]),
+            Ok(scripted_events(
+                "assistant-archive-2",
+                "done",
+                kheish_types::ModelFinishReason::Completed,
+            )),
+        ],
+    )
+    .await?;
+    let base = format!("http://{address}");
+    wait_for_daemon_ready(&client, &base).await?;
+    client
+        .post(format!("{base}/v1/sessions/{session_id}/input"))
+        .json(&SubmitInputRequest {
+            source_plugin: None,
+            source_kind: None,
+            actor_id: None,
+            provider: None,
+            content: "delete the live task".to_string(),
+            input_items: Vec::new(),
+            attachments: Vec::new(),
+            generation: Some(ModelGenerationConfig::default()),
+            completion_requirements: None,
+            metadata: None,
+            reply_address: None,
+            binding_keys: Vec::new(),
+            reply_targets: Vec::new(),
+            reply_plugin: None,
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let assert_task_views = |base: String| {
+        let client = client.clone();
+        async move {
+            // Archived terminal tasks stay listed and readable; the deleted
+            // task stays hidden.
+            let tasks = client
+                .get(format!("{base}/v1/sessions/{session_id}/tasks"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<Vec<kheish_types::TaskRecord>>()
+                .await?;
+            let mut ids = tasks
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            anyhow::ensure!(
+                ids == vec!["task-done-1", "task-failed-1"],
+                "unexpected task list: {ids:?}"
+            );
+            let done = client
+                .get(format!("{base}/v1/sessions/{session_id}/tasks/task-done-1"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<kheish_types::TaskRecord>()
+                .await?;
+            anyhow::ensure!(done.status == kheish_types::TaskStatus::Completed);
+            anyhow::ensure!(
+                !client
+                    .get(format!("{base}/v1/sessions/{session_id}/tasks/task-live-1"))
+                    .send()
+                    .await?
+                    .status()
+                    .is_success(),
+                "a deleted task must stay hidden"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+    };
+    assert_task_views(base.clone()).await?;
+
+    let _ = shutdown.send(());
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // The hot state is bounded to live work; the archive holds the rest.
+    let store = FileSessionStore::new(state_root.join("sessions"));
+    let control_state: SessionControlState = serde_json::from_value(
+        store
+            .load_metadata_value(session_id, SESSION_CONTROL_STATE_METADATA_KEY)
+            .await?
+            .context("control state must be persisted")?,
+    )?;
+    assert!(
+        control_state.tasks.is_empty(),
+        "hot state should only carry live tasks: {:?}",
+        control_state.tasks
+    );
+    assert_eq!(control_state.archived_tasks.completed, 1);
+    assert_eq!(control_state.archived_tasks.failed, 1);
+    assert_eq!(control_state.archived_tasks.cancelled, 0);
+    let archived = store.load_task_archive(session_id).await?;
+    assert_eq!(archived.len(), 3, "two terminal entries plus one tombstone");
+    assert!(archived.iter().any(|entry| {
+        entry.task.id == "task-live-1"
+            && matches!(entry.reason, kheish_types::TaskArchiveReason::Deleted)
+    }));
+
+    // A reboot serves the same views: nothing resurrects, nothing disappears.
+    let (address, shutdown) = scripted_daemon(&state_root, Vec::new()).await?;
+    let base = format!("http://{address}");
+    wait_for_daemon_ready(&client, &base).await?;
+    assert_task_views(base).await?;
     let _ = shutdown.send(());
     Ok(())
 }

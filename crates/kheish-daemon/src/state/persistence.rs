@@ -178,6 +178,18 @@ impl SessionTaskStatusSummaryState {
         }
         summary
     }
+
+    /// Counts the live tasks plus the terminal tasks archived out of the hot
+    /// state, so operator summaries do not shrink when tasks are archived.
+    pub(crate) fn from_control_state(state: &kheish_types::SessionControlState) -> Self {
+        let mut summary = Self::from_tasks(&state.tasks);
+        let archived = &state.archived_tasks;
+        summary.total += archived.total() as usize;
+        summary.completed += archived.completed as usize;
+        summary.failed += archived.failed as usize;
+        summary.cancelled += archived.cancelled as usize;
+        summary
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

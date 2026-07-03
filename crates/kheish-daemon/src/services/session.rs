@@ -5,13 +5,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Result, anyhow, bail};
 use kheish_session::{FileSessionStore, PersistedSessionRecord, StoredSession};
 use kheish_types::{
-    CapabilityScope, CredentialScope, HOOK_RUNTIME_STATE_METADATA_KEY, HookRuntimeState,
-    LearningScope, ReplyHandle, SESSION_CAPABILITY_SCOPE_METADATA_KEY,
-    SESSION_CONTROL_STATE_METADATA_KEY, SESSION_CREDENTIAL_SCOPE_METADATA_KEY,
-    SESSION_EXECUTION_IDENTITY_METADATA_KEY, SESSION_OPERATOR_CONFIG_METADATA_KEY,
-    SESSION_PERSONA_BINDING_METADATA_KEY, SESSION_REPLY_TARGETS_METADATA_KEY,
-    SESSION_ROUTE_POLICY_METADATA_KEY, SessionControlState, SessionExecutionIdentity,
-    SessionOperatorConfig, SessionPersonaBinding, SessionRoutePolicy, TaskRecord,
+    ArchivedTaskCounts, ArchivedTaskRecord, CapabilityScope, CredentialScope,
+    HOOK_RUNTIME_STATE_METADATA_KEY, HookRuntimeState, LearningScope, ReplyHandle,
+    SESSION_CAPABILITY_SCOPE_METADATA_KEY, SESSION_CONTROL_STATE_METADATA_KEY,
+    SESSION_CREDENTIAL_SCOPE_METADATA_KEY, SESSION_EXECUTION_IDENTITY_METADATA_KEY,
+    SESSION_OPERATOR_CONFIG_METADATA_KEY, SESSION_PERSONA_BINDING_METADATA_KEY,
+    SESSION_REPLY_TARGETS_METADATA_KEY, SESSION_ROUTE_POLICY_METADATA_KEY, SessionControlState,
+    SessionExecutionIdentity, SessionOperatorConfig, SessionPersonaBinding, SessionRoutePolicy,
+    TaskArchiveReason, TaskRecord,
 };
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -39,6 +40,63 @@ pub(crate) struct SessionService {
     index: Mutex<SessionIndex>,
     session_control: Mutex<()>,
     next_session_id: AtomicU64,
+    archived_tasks: parking_lot::Mutex<std::collections::HashMap<String, Arc<ArchivedTaskIndex>>>,
+}
+
+/// Compact per-session view of the task archive: every archived id plus the
+/// terminal-status tally. Kept in memory so control-state saves stay O(live
+/// tasks) instead of re-reading the archive file; the daemon is the only
+/// writer of a locked state root, so the cache cannot go stale.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ArchivedTaskIndex {
+    /// Every archived task id, including deleted tombstones.
+    pub(crate) ids: BTreeSet<String>,
+    /// Tally of archived terminal tasks (deleted tombstones excluded).
+    pub(crate) counts: ArchivedTaskCounts,
+}
+
+impl ArchivedTaskIndex {
+    pub(crate) fn from_entries(entries: &[ArchivedTaskRecord]) -> Self {
+        let mut index = Self::default();
+        for entry in entries {
+            index.ids.insert(entry.task.id.clone());
+            if matches!(entry.reason, TaskArchiveReason::Terminal) {
+                index.counts.record(&entry.task.status);
+            }
+        }
+        index
+    }
+}
+
+/// Returns the archived snapshot of one terminal task from loaded archive
+/// entries; the latest entry per id wins, and a deleted tombstone hides it.
+pub(crate) fn latest_archived_terminal_task(
+    entries: Vec<ArchivedTaskRecord>,
+    task_id: &str,
+) -> Option<TaskRecord> {
+    entries
+        .into_iter()
+        .rev()
+        .find(|entry| entry.task.id == task_id)
+        .filter(|entry| matches!(entry.reason, TaskArchiveReason::Terminal))
+        .map(|entry| entry.task)
+}
+
+/// Returns every archived terminal task in archival order, skipping tasks
+/// hidden by a deleted tombstone.
+pub(crate) fn archived_terminal_tasks(entries: Vec<ArchivedTaskRecord>) -> Vec<TaskRecord> {
+    let deleted = entries
+        .iter()
+        .filter(|entry| matches!(entry.reason, TaskArchiveReason::Deleted))
+        .map(|entry| entry.task.id.clone())
+        .collect::<BTreeSet<_>>();
+    entries
+        .into_iter()
+        .filter(|entry| {
+            matches!(entry.reason, TaskArchiveReason::Terminal) && !deleted.contains(&entry.task.id)
+        })
+        .map(|entry| entry.task)
+        .collect()
 }
 
 /// Cheap session-derived counters for `/v1/status`.
@@ -77,6 +135,7 @@ impl SessionService {
             index: Mutex::new(index),
             session_control: Mutex::new(()),
             next_session_id,
+            archived_tasks: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -229,13 +288,14 @@ impl SessionService {
         }
     }
 
-    /// Persists one session's compact task summary in the daemon index.
+    /// Persists one session's compact task summary in the daemon index,
+    /// counting live and archived terminal tasks together.
     pub(crate) async fn remember_task_summary(
         &self,
         session_id: &str,
-        tasks: &[TaskRecord],
+        state: &SessionControlState,
     ) -> Result<()> {
-        let summary = SessionTaskStatusSummaryState::from_tasks(tasks);
+        let summary = SessionTaskStatusSummaryState::from_control_state(state);
         self.update_index(|index| {
             let previous = index
                 .task_summaries
@@ -288,7 +348,7 @@ impl SessionService {
             };
             repaired.insert(
                 session_id,
-                SessionTaskStatusSummaryState::from_tasks(&control_state.tasks),
+                SessionTaskStatusSummaryState::from_control_state(&control_state),
             );
         }
         self.update_index(|index| {
@@ -334,7 +394,71 @@ impl SessionService {
 
     /// Deletes the persisted session transcript file during rollback cleanup.
     pub(crate) fn delete_session_file(&self, session_id: &str) -> Result<()> {
+        self.archived_tasks.lock().remove(session_id);
         self.sessions.delete(session_id)
+    }
+
+    /// Returns the archived-task index of one session, loading it from the
+    /// archive file on first access.
+    pub(crate) async fn archived_task_index(
+        &self,
+        session_id: &str,
+    ) -> Result<Arc<ArchivedTaskIndex>> {
+        if let Some(cached) = self.archived_tasks.lock().get(session_id).cloned() {
+            return Ok(cached);
+        }
+        let loaded = Arc::new(ArchivedTaskIndex::from_entries(
+            &self.sessions.load_task_archive(session_id).await?,
+        ));
+        // A concurrent archiver may have inserted a fresher entry (it holds
+        // the session control lock and rewrites the entry after appending);
+        // keep whichever landed first — both derive from the same file.
+        Ok(self
+            .archived_tasks
+            .lock()
+            .entry(session_id.to_string())
+            .or_insert(loaded)
+            .clone())
+    }
+
+    /// Appends tasks to the per-session archive and returns the updated
+    /// terminal tally. Callers must hold the session control lock so the
+    /// append and the cache rewrite stay atomic with the hot-state save.
+    pub(crate) async fn archive_session_tasks(
+        &self,
+        session_id: &str,
+        entries: &[ArchivedTaskRecord],
+    ) -> Result<ArchivedTaskCounts> {
+        let current = self.archived_task_index(session_id).await?;
+        if entries.is_empty() {
+            return Ok(current.counts);
+        }
+        self.sessions
+            .append_task_archive(session_id, entries)
+            .await?;
+        let mut next = ArchivedTaskIndex {
+            ids: current.ids.clone(),
+            counts: current.counts,
+        };
+        for entry in entries {
+            next.ids.insert(entry.task.id.clone());
+            if matches!(entry.reason, TaskArchiveReason::Terminal) {
+                next.counts.record(&entry.task.status);
+            }
+        }
+        let counts = next.counts;
+        self.archived_tasks
+            .lock()
+            .insert(session_id.to_string(), Arc::new(next));
+        Ok(counts)
+    }
+
+    /// Loads the full archived task records of one session, in archival order.
+    pub(crate) async fn load_archived_session_tasks(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<ArchivedTaskRecord>> {
+        self.sessions.load_task_archive(session_id).await
     }
 
     /// Returns the tracked run-memory pointers for one session.
@@ -1664,11 +1788,14 @@ mod tests {
         service
             .remember_task_summary(
                 "session-1",
-                &[
-                    test_task("task-1", TaskStatus::InProgress),
-                    test_task("task-2", TaskStatus::Failed),
-                    test_task("task-3", TaskStatus::Blocked),
-                ],
+                &SessionControlState {
+                    tasks: vec![
+                        test_task("task-1", TaskStatus::InProgress),
+                        test_task("task-2", TaskStatus::Failed),
+                        test_task("task-3", TaskStatus::Blocked),
+                    ],
+                    ..SessionControlState::default()
+                },
             )
             .await?;
 

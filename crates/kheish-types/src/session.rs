@@ -119,6 +119,67 @@ pub struct TaskRecord {
     pub updated_at_ms: u64,
 }
 
+/// Why one task left the hot session control state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskArchiveReason {
+    /// The task reached a terminal status (completed, failed, or cancelled).
+    #[default]
+    Terminal,
+    /// The task was explicitly deleted; it stays hidden from task views.
+    Deleted,
+}
+
+/// One task archived out of the hot session control state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchivedTaskRecord {
+    /// The task snapshot at archival time.
+    pub task: TaskRecord,
+    /// Archival timestamp in milliseconds.
+    pub archived_at_ms: u64,
+    /// Why the task was archived.
+    #[serde(default)]
+    pub reason: TaskArchiveReason,
+}
+
+/// Compact tally of terminal tasks archived out of the hot control state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchivedTaskCounts {
+    /// Archived tasks that completed successfully.
+    #[serde(default)]
+    pub completed: u64,
+    /// Archived tasks that failed.
+    #[serde(default)]
+    pub failed: u64,
+    /// Archived tasks that were cancelled.
+    #[serde(default)]
+    pub cancelled: u64,
+}
+
+impl ArchivedTaskCounts {
+    /// Returns whether nothing has been archived yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.total() == 0
+    }
+
+    /// Returns the total number of archived terminal tasks.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.completed + self.failed + self.cancelled
+    }
+
+    /// Tallies one archived task status.
+    pub fn record(&mut self, status: &TaskStatus) {
+        match status {
+            TaskStatus::Completed => self.completed += 1,
+            TaskStatus::Failed => self.failed += 1,
+            TaskStatus::Cancelled => self.cancelled += 1,
+            TaskStatus::Pending | TaskStatus::InProgress | TaskStatus::Blocked => {}
+        }
+    }
+}
+
 /// Session-scoped control state surfaced to the agent loop.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionControlState {
@@ -143,6 +204,9 @@ pub struct SessionControlState {
     /// The current tracked tasks.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tasks: Vec<TaskRecord>,
+    /// Tally of terminal tasks archived out of this hot state.
+    #[serde(default, skip_serializing_if = "ArchivedTaskCounts::is_empty")]
+    pub archived_tasks: ArchivedTaskCounts,
 }
 
 /// Lifecycle state for one long-running session goal.

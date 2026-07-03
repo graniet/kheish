@@ -68,25 +68,31 @@ impl Tool for TaskCreateTool {
     async fn execute(&self, ctx: ToolContext, input: Value) -> Result<ToolExecutionOutput> {
         let session_id = execution_session_id(&ctx)?;
         let actor_agent_id = execution_agent_id(&ctx)?.to_string();
-        let mut state = self
-            .control
-            .resolve()?
-            .load_session_control_state(session_id)
-            .await?;
+        let control = self.control.resolve()?;
+        let mut state = control.load_session_control_state(session_id).await?;
+        let archived = control.archived_session_task_index(session_id).await?;
         let title = input
             .get("title")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("title is required"))?;
         let now = crate::now_ms();
         ensure_unique_active_task_title(&state.tasks, title, None)?;
-        ensure_known_dependencies(&state.tasks, &string_array(input.get("blocked_by")))?;
-        ensure_known_dependencies(&state.tasks, &string_array(input.get("blocks")))?;
+        ensure_known_dependencies(
+            &state.tasks,
+            &archived.ids,
+            &string_array(input.get("blocked_by")),
+        )?;
+        ensure_known_dependencies(
+            &state.tasks,
+            &archived.ids,
+            &string_array(input.get("blocks")),
+        )?;
         let metadata = task_metadata_with_created_by_run_id(
             input.get("metadata").cloned().unwrap_or(Value::Null),
             execution_run_id(&ctx),
         )?;
         let task = TaskRecord {
-            id: next_task_id(&state.tasks, now),
+            id: next_task_id(&state.tasks, &archived.ids, now),
             title: title.to_string(),
             description: input
                 .get("description")
@@ -169,16 +175,15 @@ impl Tool for TaskGetTool {
             .get("task_id")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("task_id is required"))?;
-        let state = self
-            .control
-            .resolve()?
-            .load_session_control_state(session_id)
-            .await?;
-        let task = state
-            .tasks
-            .into_iter()
-            .find(|task| task.id == task_id)
-            .ok_or_else(|| anyhow!("unknown task {task_id}"))?;
+        let control = self.control.resolve()?;
+        let state = control.load_session_control_state(session_id).await?;
+        let task = match state.tasks.into_iter().find(|task| task.id == task_id) {
+            Some(task) => task,
+            // Terminal tasks move to the archive; they stay readable here.
+            None => find_archived_task(control.as_ref(), session_id, task_id)
+                .await?
+                .ok_or_else(|| anyhow!("unknown task {task_id}"))?,
+        };
         Ok(ToolExecutionOutput::json(serde_json::to_value(task)?))
     }
 }
@@ -220,13 +225,16 @@ impl Tool for TaskListTool {
             .and_then(Value::as_str)
             .map(parse_task_status)
             .transpose()?;
-        let state = self
-            .control
-            .resolve()?
-            .load_session_control_state(session_id)
-            .await?;
-        let tasks: Vec<TaskRecord> = state
-            .tasks
+        let control = self.control.resolve()?;
+        let state = control.load_session_control_state(session_id).await?;
+        let mut tasks = state.tasks;
+        // Archived terminal tasks stay listed; a task list must not shrink
+        // because the daemon compacted its hot state.
+        if !state.archived_tasks.is_empty() {
+            tasks.extend(archived_terminal_tasks(control.as_ref(), session_id).await?);
+            tasks.sort_by_key(|task| task.created_at_ms);
+        }
+        let tasks: Vec<TaskRecord> = tasks
             .into_iter()
             .filter(|task| {
                 filter
@@ -557,7 +565,8 @@ async fn update_task(
 ) -> Result<TaskRecord> {
     let mut state = control.load_session_control_state(session_id).await?;
     let now = crate::now_ms();
-    ensure_task_mutation_valid(&state.tasks, task_id, &mutation)?;
+    let archived = control.archived_session_task_index(session_id).await?;
+    ensure_task_mutation_valid(&state.tasks, &archived.ids, task_id, &mutation)?;
     let task = state
         .tasks
         .iter_mut()
@@ -688,9 +697,17 @@ fn ensure_unique_active_task_title(
     Ok(())
 }
 
-fn ensure_known_dependencies(tasks: &[TaskRecord], dependencies: &[String]) -> Result<()> {
+/// A dependency is known when it is live or archived; an archived reference
+/// is treated as settled rather than dangling.
+fn ensure_known_dependencies(
+    tasks: &[TaskRecord],
+    archived_task_ids: &std::collections::BTreeSet<String>,
+    dependencies: &[String],
+) -> Result<()> {
     for dependency in dependencies {
-        if !tasks.iter().any(|task| task.id == *dependency) {
+        if !tasks.iter().any(|task| task.id == *dependency)
+            && !archived_task_ids.contains(dependency)
+        {
             bail!("unknown task dependency {dependency}");
         }
     }
@@ -699,13 +716,18 @@ fn ensure_known_dependencies(tasks: &[TaskRecord], dependencies: &[String]) -> R
 
 fn ensure_task_mutation_valid(
     tasks: &[TaskRecord],
+    archived_task_ids: &std::collections::BTreeSet<String>,
     task_id: &str,
     mutation: &TaskMutation,
 ) -> Result<()> {
-    let task = tasks
-        .iter()
-        .find(|task| task.id == task_id)
-        .ok_or_else(|| anyhow!("unknown task {task_id}"))?;
+    let Some(task) = tasks.iter().find(|task| task.id == task_id) else {
+        if archived_task_ids.contains(task_id) {
+            bail!(
+                "task {task_id} is archived and immutable; archived tasks stay readable via task_get"
+            );
+        }
+        bail!("unknown task {task_id}");
+    };
     if let Some(title) = mutation.title.as_deref() {
         ensure_unique_active_task_title(tasks, title, Some(task_id))?;
     }
@@ -727,7 +749,7 @@ fn ensure_task_mutation_valid(
     if let Some(removals) = mutation.remove_blocked_by.clone() {
         remove_values(&mut blocked_by, &removals);
     }
-    ensure_known_dependencies(tasks, &blocked_by)?;
+    ensure_known_dependencies(tasks, archived_task_ids, &blocked_by)?;
 
     let mut blocks = task.blocks.clone();
     if let Some(replacement) = mutation.blocks.clone() {
@@ -739,7 +761,7 @@ fn ensure_task_mutation_valid(
     if let Some(removals) = mutation.remove_blocks.clone() {
         remove_values(&mut blocks, &removals);
     }
-    ensure_known_dependencies(tasks, &blocks)?;
+    ensure_known_dependencies(tasks, archived_task_ids, &blocks)?;
 
     if matches!(
         mutation.status,
@@ -802,15 +824,22 @@ fn ensure_shell_task_mutation_allowed(task: &TaskRecord, mutation: &TaskMutation
     Ok(())
 }
 
-fn next_task_id(tasks: &[TaskRecord], now: u64) -> String {
+fn next_task_id(
+    tasks: &[TaskRecord],
+    archived_task_ids: &std::collections::BTreeSet<String>,
+    now: u64,
+) -> String {
+    let is_free = |candidate: &str| {
+        tasks.iter().all(|task| task.id != candidate) && !archived_task_ids.contains(candidate)
+    };
     let base = format!("task-{now}");
-    if tasks.iter().all(|task| task.id != base) {
+    if is_free(&base) {
         return base;
     }
     let mut suffix = 1u32;
     loop {
         let candidate = format!("{base}-{suffix}");
-        if tasks.iter().all(|task| task.id != candidate) {
+        if is_free(&candidate) {
             return candidate;
         }
         suffix = suffix.saturating_add(1);
@@ -822,25 +851,32 @@ async fn delete_task(
     session_id: &str,
     task_id: &str,
 ) -> Result<TaskRecord> {
-    let mut state = control.load_session_control_state(session_id).await?;
-    let index = state
-        .tasks
-        .iter()
-        .position(|task| task.id == task_id)
-        .ok_or_else(|| anyhow!("unknown task {task_id}"))?;
-    if background_shell_metadata(&state.tasks[index]).is_some()
-        && !matches!(
-            state.tasks[index].status,
-            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
-        )
-    {
-        bail!("daemon-managed shell task {task_id} is live; stop it before deleting it");
-    }
-    let deleted = state.tasks.remove(index);
-    control
-        .save_session_control_state(session_id, state)
-        .await?;
-    Ok(deleted)
+    // The daemon removes the task and records an archive tombstone under the
+    // session control lock, so the disk-union merge cannot resurrect it.
+    control.delete_session_task(session_id, task_id).await
+}
+
+/// Finds the archived snapshot of one terminal task; deleted tombstones stay
+/// hidden.
+async fn find_archived_task(
+    control: &dyn DaemonToolControl,
+    session_id: &str,
+    task_id: &str,
+) -> Result<Option<TaskRecord>> {
+    Ok(crate::services::latest_archived_terminal_task(
+        control.load_archived_session_tasks(session_id).await?,
+        task_id,
+    ))
+}
+
+/// Returns every archived terminal task, skipping deleted tombstones.
+async fn archived_terminal_tasks(
+    control: &dyn DaemonToolControl,
+    session_id: &str,
+) -> Result<Vec<TaskRecord>> {
+    Ok(crate::services::archived_terminal_tasks(
+        control.load_archived_session_tasks(session_id).await?,
+    ))
 }
 
 fn string_array(value: Option<&Value>) -> Vec<String> {

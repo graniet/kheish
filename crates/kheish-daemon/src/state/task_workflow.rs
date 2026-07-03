@@ -29,7 +29,13 @@ where
         }
         let mut state = self.load_session_control_state(session_id).await?;
         let now = now_ms();
-        let task_id = TaskService::next_background_shell_task_id(session_id, &state.tasks, now);
+        let archived = self.archived_session_task_index(session_id).await?;
+        let task_id = TaskService::next_background_shell_task_id(
+            session_id,
+            &state.tasks,
+            &archived.ids,
+            now,
+        );
         let output_path = self.store.shell_task_output_path(&task_id);
         self.store.ensure_parent_dir(&output_path)?;
         self.task_service.insert_managed_shell_task(
@@ -727,7 +733,7 @@ where
     ) -> Result<TaskOutputView> {
         self.task_service
             .task_output_view(
-                || async { self.load_session_control_state(session_id).await },
+                || self.load_session_control_state_resolving_task(session_id, task_id),
                 task_id,
                 wait,
                 timeout,
@@ -735,6 +741,24 @@ where
                 include_full_output,
             )
             .await
+    }
+
+    /// Loads the hot control state, resolving the given task from the archive
+    /// when it is no longer live. Settle-waits and output views keep working
+    /// after a terminal task leaves the hot state; the archive is only read
+    /// on a miss.
+    async fn load_session_control_state_resolving_task(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<SessionControlState> {
+        let mut state = self.load_session_control_state(session_id).await?;
+        if !state.tasks.iter().any(|task| task.id == task_id)
+            && let Some(task) = self.find_archived_session_task(session_id, task_id).await?
+        {
+            state.tasks.push(task);
+        }
+        Ok(state)
     }
 
     pub(crate) async fn stop_session_task(
@@ -752,7 +776,7 @@ where
             let task = self
                 .task_service
                 .wait_for_task_settle(
-                    || async { self.load_session_control_state(session_id).await },
+                    || self.load_session_control_state_resolving_task(session_id, task_id),
                     task_id,
                     Duration::from_secs(5),
                 )
@@ -798,12 +822,14 @@ where
         }
 
         let mut state = self.load_session_control_state(session_id).await?;
-        let task_before = state
-            .tasks
-            .iter()
-            .find(|task| task.id == task_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("unknown task {task_id}"))?;
+        let Some(task_before) = state.tasks.iter().find(|task| task.id == task_id).cloned() else {
+            // An archived task is already terminal; stopping it is a no-op
+            // that returns the frozen snapshot.
+            return self
+                .find_archived_session_task(session_id, task_id)
+                .await?
+                .ok_or_else(|| anyhow!("unknown task {task_id}"));
+        };
         let was_terminal = matches!(
             task_before.status,
             kheish_types::TaskStatus::Completed

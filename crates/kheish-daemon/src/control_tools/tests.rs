@@ -41,6 +41,7 @@ struct FakeControlState {
     skills: BTreeMap<String, SkillDefinition>,
     learning_skills: BTreeMap<String, crate::LearningSkillView>,
     session_control: BTreeMap<String, SessionControlState>,
+    archived_tasks: BTreeMap<String, Vec<kheish_types::ArchivedTaskRecord>>,
     session_goals: BTreeMap<String, SessionGoal>,
     session_operators: BTreeMap<String, SessionOperatorConfig>,
     session_permission_modes: BTreeMap<String, Option<PermissionMode>>,
@@ -690,6 +691,69 @@ impl DaemonToolControl for FakeControl {
             .session_control
             .insert(session_id.to_string(), state.clone());
         Ok(state)
+    }
+
+    async fn archived_session_task_index(
+        &self,
+        session_id: &str,
+    ) -> Result<Arc<crate::services::ArchivedTaskIndex>> {
+        let entries = self
+            .state
+            .lock()
+            .archived_tasks
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default();
+        Ok(Arc::new(crate::services::ArchivedTaskIndex::from_entries(
+            &entries,
+        )))
+    }
+
+    async fn load_archived_session_tasks(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<kheish_types::ArchivedTaskRecord>> {
+        Ok(self
+            .state
+            .lock()
+            .archived_tasks
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn delete_session_task(&self, session_id: &str, task_id: &str) -> Result<TaskRecord> {
+        let mut state = self.state.lock();
+        let control = state
+            .session_control
+            .entry(session_id.to_string())
+            .or_default();
+        let index = control
+            .tasks
+            .iter()
+            .position(|task| task.id == task_id)
+            .ok_or_else(|| anyhow!("unknown task {task_id}"))?;
+        if crate::shell_tasks::background_shell_metadata(&control.tasks[index]).is_some()
+            && !matches!(
+                control.tasks[index].status,
+                TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+            )
+        {
+            anyhow::bail!(
+                "daemon-managed shell task {task_id} is live; stop it before deleting it"
+            );
+        }
+        let deleted = control.tasks.remove(index);
+        state
+            .archived_tasks
+            .entry(session_id.to_string())
+            .or_default()
+            .push(kheish_types::ArchivedTaskRecord {
+                task: deleted.clone(),
+                archived_at_ms: 0,
+                reason: kheish_types::TaskArchiveReason::Deleted,
+            });
+        Ok(deleted)
     }
 
     async fn enter_session_plan_mode(&self, session_id: &str) -> Result<SessionControlState> {

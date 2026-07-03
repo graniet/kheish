@@ -56,9 +56,11 @@ pub(crate) use runtime_config::RuntimeConfigService;
 pub(crate) use schedule::{
     ScheduleDueCompletion, ScheduleDueDecision, ScheduleService, SchedulerSnapshot,
 };
-pub(crate) use session::SessionService;
+pub(crate) use session::{
+    ArchivedTaskIndex, SessionService, archived_terminal_tasks, latest_archived_terminal_task,
+};
 pub(crate) use subagent::{SpawnRequestReservation, SpawnReservation, SubagentService};
 pub(crate) use task::{
     BackgroundShellTaskFinalState, BackgroundShellTaskHandle, FinalizedBackgroundShellTask,
-    TaskService, apply_background_shell_shutdown_outcome,
+    TaskService, apply_background_shell_shutdown_outcome, background_shell_task_shutdown_unsettled,
 };

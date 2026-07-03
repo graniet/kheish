@@ -555,7 +555,7 @@ fn session_control_sections(session_control: &SessionControlState) -> Vec<System
     if !session_control.todos.is_empty() {
         sections.push(section("todos", todo_section(session_control)));
     }
-    if !session_control.tasks.is_empty() {
+    if !session_control.tasks.is_empty() || !session_control.archived_tasks.is_empty() {
         sections.push(section("tasks", task_section(session_control)));
     }
     if let Some(plan_artifact) = session_control.plan_artifact.as_ref() {
@@ -620,6 +620,18 @@ fn task_section(session_control: &SessionControlState) -> String {
             task.title
         )
     }));
+    // Terminal tasks are archived out of the hot state so the prompt stays
+    // bounded by the work in flight; one summary line keeps them discoverable.
+    let archived = &session_control.archived_tasks;
+    if !archived.is_empty() {
+        lines.push(format!(
+            "- {} terminal task(s) archived ({} completed, {} failed, {} cancelled) — use task_get or task_list for details.",
+            archived.total(),
+            archived.completed,
+            archived.failed,
+            archived.cancelled
+        ));
+    }
     lines.join("\n")
 }
 
@@ -1059,5 +1071,43 @@ mod tests {
         assert!(sections.iter().any(|section| section.name == "plan_mode"));
         assert!(sections.iter().any(|section| section.name == "todos"));
         assert!(sections.iter().any(|section| section.name == "tasks"));
+    }
+
+    #[test]
+    fn builder_summarizes_archived_tasks_instead_of_rendering_them() {
+        let builder = SystemPromptBuilder::new(
+            SystemPromptEnvironment::new("/workspace", "/bin/bash"),
+            SystemPromptSettings::default(),
+        );
+
+        // Only archived work: the section still appears, as one summary line.
+        let sections = builder.build_sections(
+            &sample_tools(),
+            None,
+            None,
+            &[],
+            &SessionControlState {
+                archived_tasks: kheish_types::ArchivedTaskCounts {
+                    completed: 12,
+                    failed: 2,
+                    cancelled: 1,
+                },
+                ..SessionControlState::default()
+            },
+            None,
+        );
+
+        let tasks = sections
+            .iter()
+            .find(|section| section.name == "tasks")
+            .expect("archived work must keep the tasks section");
+        assert!(
+            tasks
+                .content
+                .contains("15 terminal task(s) archived (12 completed, 2 failed, 1 cancelled)"),
+            "unexpected tasks section: {}",
+            tasks.content
+        );
+        assert!(tasks.content.contains("task_get or task_list"));
     }
 }

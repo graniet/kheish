@@ -18,6 +18,8 @@ Session state is persisted as append-only JSONL records. The journal stores:
 
 Session metadata is last-wins per key, so it lives outside the journal in per-key sidecar files (`sessions/__safe/<name>.meta/<key>.json`), each replaced atomically on write. Journals written by older builds carried metadata inline; those records are still read, and a sidecar value for the same key takes precedence.
 
+Terminal tasks (completed, failed, cancelled) also leave the hot control state: each one is appended once to a per-session archive (`sessions/__safe/<name>.tasks-archive.jsonl`), so the control-state snapshot and the system prompt stay bounded by the work in flight. Archived tasks remain visible through `tasks list`, `tasks get`, task output views, and Flow projections, but they are immutable; deleting a live task leaves a tombstone in the same archive so a stale run snapshot can never resurrect it.
+
 Session metadata also carries:
 
 - the optional bound persona snapshot for that session, including the bound capability baseline and resolved persona default inline skills

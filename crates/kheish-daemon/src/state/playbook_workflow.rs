@@ -1304,10 +1304,17 @@ impl FlowProjectionContext {
         M: kheish_core::ModelDriver + Send + Sync + 'static,
     {
         if !self.tasks_by_session.contains_key(session_id) {
-            self.tasks_by_session.insert(
-                session_id.to_string(),
-                state.load_session_control_state(session_id).await?.tasks,
-            );
+            let control_state = state.load_session_control_state(session_id).await?;
+            let mut tasks = control_state.tasks;
+            // Flow status derives Failed/Cancelled/Succeeded from terminal
+            // task statuses, so archived terminal tasks must stay in scope.
+            if !control_state.archived_tasks.is_empty() {
+                tasks.extend(crate::services::archived_terminal_tasks(
+                    state.load_archived_session_tasks(session_id).await?,
+                ));
+                tasks.sort_by_key(|task| task.created_at_ms);
+            }
+            self.tasks_by_session.insert(session_id.to_string(), tasks);
         }
         Ok(self
             .tasks_by_session

@@ -7,7 +7,7 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow};
 use kheish_core::{AgentEngine, LoopPolicy};
-use kheish_types::{ConversationKey, LogEntry, SessionCheckpoint};
+use kheish_types::{ArchivedTaskRecord, ConversationKey, LogEntry, SessionCheckpoint};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -471,6 +471,7 @@ impl FileSessionStore {
             safe_storage_path(&self.root, session_id, "jsonl"),
             legacy_storage_path(&self.root, session_id, "jsonl")
                 .unwrap_or_else(|| safe_storage_path(&self.root, session_id, "jsonl")),
+            self.task_archive_path(session_id),
         ] {
             match fs::remove_file(&path) {
                 Ok(()) => {}
@@ -530,6 +531,77 @@ impl FileSessionStore {
             }
         }
         Ok(session_ids)
+    }
+
+    /// Returns the path of the append-only per-session task archive.
+    fn task_archive_path(&self, session_id: &str) -> PathBuf {
+        safe_storage_path(&self.root, session_id, "tasks-archive.jsonl")
+    }
+
+    /// Appends archived task records to the per-session task archive with a
+    /// single durable write.
+    pub async fn append_task_archive(
+        &self,
+        session_id: &str,
+        entries: &[ArchivedTaskRecord],
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let path = self.task_archive_path(session_id);
+        self.ensure_parent_dir(&path)?;
+        append_json_lines_sync(&path, entries)
+            .with_context(|| format!("failed to append to {}", path.display()))
+    }
+
+    /// Loads every archived task record of one session, in archival order.
+    ///
+    /// Tolerates one torn trailing line (the only corruption an interrupted
+    /// append can produce), like the session journal.
+    pub async fn load_task_archive(&self, session_id: &str) -> Result<Vec<ArchivedTaskRecord>> {
+        let path = self.task_archive_path(session_id);
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(error)
+                if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) =>
+            {
+                return Ok(Vec::new());
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read task archive {}", path.display()));
+            }
+        };
+        let lines = raw
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim().is_empty())
+            .collect::<Vec<_>>();
+        let last_index = lines.last().map(|(index, _)| *index);
+        let mut entries = Vec::with_capacity(lines.len());
+        for (index, line) in lines {
+            match serde_json::from_str::<ArchivedTaskRecord>(line) {
+                Ok(entry) => entries.push(entry),
+                Err(error) if Some(index) == last_index => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        line = index + 1,
+                        error = %error,
+                        "skipping torn trailing line in task archive"
+                    );
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "corrupt task archive record at {}:{}",
+                            path.display(),
+                            index + 1
+                        )
+                    });
+                }
+            }
+        }
+        Ok(entries)
     }
 
     /// Loads only the records after the provided cursor.
@@ -1778,6 +1850,59 @@ mod tests {
         // An identical metadata value is reported as written only once.
         let third = store.append_batch_dedup(session_id, &[metadata]).await?;
         assert!(third.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_archive_appends_load_in_order_and_tolerate_a_torn_tail() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = FileSessionStore::new(root.path());
+        let session_id = "session-task-archive";
+        let entry = |id: &str, archived_at_ms: u64| kheish_types::ArchivedTaskRecord {
+            task: kheish_types::TaskRecord {
+                id: id.to_string(),
+                title: format!("Task {id}"),
+                description: String::new(),
+                status: kheish_types::TaskStatus::Completed,
+                owner_agent_id: None,
+                blocked_by: Vec::new(),
+                blocks: Vec::new(),
+                output: Some("done".to_string()),
+                metadata: json!(null),
+                created_at_ms: 1,
+                updated_at_ms: archived_at_ms,
+            },
+            archived_at_ms,
+            reason: kheish_types::TaskArchiveReason::Terminal,
+        };
+
+        assert!(store.load_task_archive(session_id).await?.is_empty());
+        store
+            .append_task_archive(session_id, &[entry("task-1", 10), entry("task-2", 11)])
+            .await?;
+        store
+            .append_task_archive(session_id, &[entry("task-3", 12)])
+            .await?;
+
+        let loaded = store.load_task_archive(session_id).await?;
+        assert_eq!(
+            loaded
+                .iter()
+                .map(|e| e.task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["task-1", "task-2", "task-3"]
+        );
+
+        // A torn trailing line is skipped; torn data before valid lines fails.
+        let path = crate::safe_storage_path(root.path(), session_id, "tasks-archive.jsonl");
+        let mut bytes = std::fs::read(&path)?;
+        bytes.extend_from_slice(br#"{"task":{"id":"torn"#);
+        std::fs::write(&path, &bytes)?;
+        assert_eq!(store.load_task_archive(session_id).await?.len(), 3);
+
+        store.delete(session_id)?;
+        assert!(!path.exists());
+        assert!(store.load_task_archive(session_id).await?.is_empty());
         Ok(())
     }
 

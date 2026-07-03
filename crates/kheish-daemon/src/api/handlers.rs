@@ -5775,8 +5775,19 @@ where
         .load_session_control_state(&session_id)
         .await
         .map_err(internal_error)?;
-    let tasks = session_state
-        .tasks
+    let mut all_tasks = session_state.tasks;
+    // Archived terminal tasks stay visible: the API list must not shrink
+    // because the daemon compacted its hot state.
+    if !session_state.archived_tasks.is_empty() {
+        all_tasks.extend(crate::services::archived_terminal_tasks(
+            state
+                .load_archived_session_tasks(&session_id)
+                .await
+                .map_err(internal_error)?,
+        ));
+        all_tasks.sort_by_key(|task| task.created_at_ms);
+    }
+    let tasks = all_tasks
         .into_iter()
         .filter(|task| {
             query
@@ -5908,11 +5919,19 @@ where
         .load_session_control_state(&session_id)
         .await
         .map_err(internal_error)?;
-    let task = session_state
+    let task = match session_state
         .tasks
         .into_iter()
         .find(|task| task.id == task_id)
-        .ok_or_else(|| internal_error(anyhow!("unknown task {task_id}")))?;
+    {
+        Some(task) => task,
+        // Terminal tasks move to the archive; they stay readable here.
+        None => state
+            .find_archived_session_task(&session_id, &task_id)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| internal_error(anyhow!("unknown task {task_id}")))?,
+    };
     Ok(Json(task))
 }
 
