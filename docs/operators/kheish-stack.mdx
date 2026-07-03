@@ -44,4 +44,26 @@ Do not pass a separate `--state-root` to stack commands. Start the daemon with t
 
 Schedules can declare exactly one payload: `request`, `observation_materialization`, or `flow_start`. `flow_start` stores a normal Flow start request in the schedule. Recurring Flow schedules derive a per-fire Flow id and idempotency key. One-shot Flow schedules derive both only when neither identifier is supplied; an explicit `flow_id` or `idempotency_key` is preserved without synthesizing the missing counterpart. In Stack manifests, `flow_start.playbook_ref.digest` can be omitted when the referenced Playbook version is declared in the same Stack; the reconciler resolves the immutable digest from that manifest.
 
+## Operator Contact
+
+Sessions can opt in to model-initiated operator contact without hardcoding a transport in the daemon. Configure normal `reply_targets` for delivery, then enable `operator` on the same session:
+
+```yaml
+spec:
+  sessions:
+    - session_id: feature-loop
+      reply_targets:
+        - type: telegram
+          connector: ops-bot
+          chat_id: 123456789
+      operator:
+        enabled: true
+        display_name: Project operator
+        communication_style: concise, human, and action-oriented
+        allow_notify: true
+        allow_questions: true
+```
+
+When `operator.enabled` is true, future runs get an `Operator Contact` system section. The model may call `notify_operator` for non-blocking updates or `ask_operator` for a blocking structured question. `operator.allow_notify: true` requires at least one deliverable session `reply_targets` entry, while `operator.allow_questions: true` can use the daemon question/resume API even without outbound delivery. The referenced output connector must already exist when the Stack does not manage that connector kind. Operator config and session `reply_targets` are topology settings: update them while the session is idle, not during an active run. The model never receives or chooses transport addresses; those remain daemon-controlled `reply_targets`. `display_name` and `communication_style` are prompt-visible, so keep them descriptive and do not put tokens, URLs, emails, chat ids, channel ids, or webhook details there. `ask_operator` uses the same durable question/resume path as normal user questions, so the original run context and session memory are preserved.
+
 See `examples/stacks/linear-triage-daily`, `examples/stacks/playbook-review`, and `examples/stacks/linear-github-feature-loop` for runnable stacks.

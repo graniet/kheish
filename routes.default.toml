@@ -36,3 +36,8 @@ auth_ref = "anthropic.prod"
 driver = "openai"
 default_model = "gpt-5.4"
 auth_ref = "openai.prod"
+
+[routes.open_ai]
+driver = "openai"
+default_model = "gpt-5.5"
+auth_ref = "openai.prod"

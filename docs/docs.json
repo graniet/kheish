@@ -59,6 +59,7 @@
         "group": "Runtime",
         "pages": [
           "runtime/providers-and-routing",
+          "runtime/context-windows",
           "runtime/openrouter",
           "runtime/tools",
           "runtime/permissions",
@@ -81,6 +82,7 @@
         "pages": [
           "operators/runtime-configuration",
           "operators/kheish-stack",
+          "operators/linear-github-feature-loop",
           "operators/kheish-stack-api-spec",
           "operators/production-runbooks",
           "operators/mcp-catalog",
