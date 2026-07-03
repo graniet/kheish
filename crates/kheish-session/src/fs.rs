@@ -20,7 +20,7 @@ fn ensure_parent_dir(path: &Path) -> Result<PathBuf> {
     Ok(parent.to_path_buf())
 }
 
-fn sync_parent_dir(path: &Path) -> Result<()> {
+pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
     let parent = ensure_parent_dir(path)?;
     File::open(&parent)
         .with_context(|| format!("failed to open directory {}", parent.display()))?
@@ -28,7 +28,7 @@ fn sync_parent_dir(path: &Path) -> Result<()> {
         .with_context(|| format!("failed to sync directory {}", parent.display()))
 }
 
-fn temp_path_for(path: &Path) -> Result<PathBuf> {
+pub(crate) fn temp_path_for(path: &Path) -> Result<PathBuf> {
     let file_name = path
         .file_name()
         .ok_or_else(|| anyhow!("path has no file name: {}", path.display()))?;

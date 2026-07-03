@@ -46,12 +46,14 @@ use kheish_daemon::{
     SubmitInputItemRequest, SubmitInputRequest, TaskOutputView, TelegramIngressMode,
 };
 use kheish_runtime::{DebugCaptureLevel, PermissionMode};
-use kheish_session::{FileSessionStore, PermissionAuditRecord, resolve_storage_path_for_read};
+use kheish_session::{
+    FileSessionStore, PermissionAuditRecord, PersistedSessionRecord, resolve_storage_path_for_read,
+};
 use kheish_skills::SkillScope;
 use kheish_types::{
     ApprovalResolution, ApprovalResolutionBehavior, HookDefinition, HookEventName,
-    HookExecutorConfig, HookSettings, LearningStatus, SessionEvent, SkillExecutionContext,
-    TaskRecord, TaskStatus,
+    HookExecutorConfig, HookSettings, LearningStatus, SESSION_CONTROL_STATE_METADATA_KEY,
+    SessionControlState, SessionEvent, SkillExecutionContext, TaskRecord, TaskStatus,
 };
 use reqwest::Client;
 use serde::de::DeserializeOwned;
@@ -33613,5 +33615,173 @@ async fn projects_cli_start_tasks_and_reload_against_a_real_daemon() -> Result<(
             .any(|member| member.member_id == mirrored_member_id)
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sessions_vacuum_cli_compacts_journal_and_respects_daemon_lock() -> Result<()> {
+    let bin = cli_bin()?;
+    let temp = TempDir::new()?;
+    let state_root = temp.path().join("state");
+    let workspace_root = temp.path().join("workspace");
+    fs::create_dir_all(&state_root)?;
+    fs::create_dir_all(&workspace_root)?;
+    let session_id = "vacuum-e2e";
+
+    // Boot the real daemon so the session and its journal are created by
+    // production code paths, end to end through the control plane.
+    let bind = reserve_bind_address()?;
+    let mut daemon = start_legacy_daemon_with_env_and_args(
+        &bin,
+        &temp,
+        &bind,
+        &state_root,
+        &workspace_root,
+        &[
+            OsString::from("--provider"),
+            OsString::from("openai"),
+            OsString::from("--api-key"),
+            OsString::from("sk-vacuum-e2e-no-network"),
+        ],
+        std::iter::empty::<(&str, &str)>(),
+    )?;
+    let base_url = format!("http://{bind}");
+    wait_for_daemon_ready(&bin, &base_url, &daemon)?;
+    let _session: SessionView = run_cli_json(&bin, &base_url, ["sessions", "create", session_id])?;
+
+    // While the daemon holds the state-root lock, vacuum must refuse.
+    let locked = run_cli_output(
+        &bin,
+        &base_url,
+        [
+            OsString::from("sessions"),
+            OsString::from("vacuum"),
+            OsString::from(session_id),
+            OsString::from("--state-root"),
+            state_root.as_os_str().to_os_string(),
+        ],
+    )?;
+    assert!(
+        !locked.status.success(),
+        "vacuum must refuse while the daemon runs"
+    );
+    let locked_stderr = String::from_utf8_lossy(&locked.stderr);
+    assert!(
+        locked_stderr.contains("already locked"),
+        "unexpected vacuum-under-lock stderr:\n{locked_stderr}"
+    );
+
+    stop_daemon(&mut daemon)?;
+    drop(daemon);
+
+    // Bloat the journal exactly the way production does: superseded
+    // control-state snapshots appended through the real store code.
+    let sessions_root = state_root.join("sessions");
+    let store = FileSessionStore::new(&sessions_root);
+    let snapshot_count = 60usize;
+    for revision in 0..snapshot_count {
+        let state = SessionControlState {
+            tasks: (0..=revision)
+                .map(|index| TaskRecord {
+                    id: format!("task-{index}"),
+                    title: format!("Task {index}"),
+                    description: "x".repeat(2_048),
+                    status: if index < revision {
+                        TaskStatus::Completed
+                    } else {
+                        TaskStatus::InProgress
+                    },
+                    owner_agent_id: None,
+                    blocked_by: Vec::new(),
+                    blocks: Vec::new(),
+                    output: None,
+                    metadata: Value::Null,
+                    created_at_ms: 1,
+                    updated_at_ms: 1 + revision as u64,
+                })
+                .collect(),
+            ..SessionControlState::default()
+        };
+        store
+            .append(
+                session_id,
+                PersistedSessionRecord::Metadata {
+                    key: SESSION_CONTROL_STATE_METADATA_KEY.to_string(),
+                    value: serde_json::to_value(&state)?,
+                },
+            )
+            .await?;
+    }
+    let journal_path = resolve_storage_path_for_read(&sessions_root, session_id, "jsonl");
+    let bytes_before = fs::metadata(&journal_path)?.len();
+    let state_before = store.load(session_id).await?;
+
+    // Vacuum for real through the CLI binary.
+    let vacuum = run_cli_output(
+        &bin,
+        &base_url,
+        [
+            OsString::from("sessions"),
+            OsString::from("vacuum"),
+            OsString::from(session_id),
+            OsString::from("--state-root"),
+            state_root.as_os_str().to_os_string(),
+        ],
+    )?;
+    assert!(
+        vacuum.status.success(),
+        "vacuum failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&vacuum.stdout),
+        String::from_utf8_lossy(&vacuum.stderr)
+    );
+    let report: Value = serde_json::from_slice(&vacuum.stdout)?;
+    let bytes_after = fs::metadata(&journal_path)?.len();
+    assert!(
+        bytes_after < bytes_before / 10,
+        "vacuum should reclaim the superseded snapshots ({bytes_before} -> {bytes_after})"
+    );
+    assert_eq!(report["bytes_before"].as_u64(), Some(bytes_before));
+    assert_eq!(report["bytes_after"].as_u64(), Some(bytes_after));
+    assert!(
+        report["metadata_records_dropped"].as_u64().unwrap_or(0) >= snapshot_count as u64 - 1,
+        "unexpected vacuum report: {report}"
+    );
+    assert!(journal_path.with_extension("jsonl.vacuum-bak").exists());
+    assert_eq!(
+        store.load(session_id).await?,
+        state_before,
+        "vacuum must not change the loaded session state"
+    );
+
+    // The real daemon boots on the vacuumed root and serves the same state.
+    let bind = reserve_bind_address()?;
+    let mut daemon = start_legacy_daemon_with_env_and_args(
+        &bin,
+        &temp,
+        &bind,
+        &state_root,
+        &workspace_root,
+        &[
+            OsString::from("--provider"),
+            OsString::from("openai"),
+            OsString::from("--api-key"),
+            OsString::from("sk-vacuum-e2e-no-network"),
+        ],
+        std::iter::empty::<(&str, &str)>(),
+    )?;
+    let base_url = format!("http://{bind}");
+    wait_for_daemon_ready(&bin, &base_url, &daemon)?;
+    let tasks: Vec<TaskRecord> = run_cli_json(&bin, &base_url, ["tasks", "list", session_id])?;
+    assert_eq!(
+        tasks.len(),
+        snapshot_count,
+        "the vacuumed session must keep its final task list"
+    );
+    assert!(
+        tasks
+            .iter()
+            .any(|task| task.id == format!("task-{}", snapshot_count - 1))
+    );
+    stop_daemon(&mut daemon)?;
     Ok(())
 }

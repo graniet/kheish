@@ -67,6 +67,18 @@ Channel state restores from its own daemon-owned store, not from any member sess
 
 When a public thread behaves unexpectedly after restart, inspect the restored channel view, stimulus queue, and thread-work projection first, then confirm whether one referenced `ChannelDelivery` run is still active or has already settled.
 
+## Oversized session journals
+
+A session whose runs mutate tasks constantly appends a full control-state snapshot per mutation; only the last snapshot per metadata key matters, so a long-running autonomous session can accumulate gigabytes of superseded snapshots and slow every run start. Compact it offline:
+
+```bash
+# Requires the daemon to be stopped: the command takes the state-root lock
+# and refuses politely while a daemon is serving that root.
+./target/debug/kheish-daemon sessions vacuum <session-id> --state-root <state-root>
+```
+
+The rewrite is verified against the original before an atomic swap, and the pre-vacuum journal is preserved next to it as `<name>.jsonl.vacuum-bak` (remove that backup before vacuuming the same session again). Events, checkpoints, audits, and outputs are all kept in order; only superseded metadata snapshots are dropped, so the loaded session state is byte-for-byte equivalent. The lock-based exclusivity is enforced on unix (same mechanism as `serve`).
+
 ## Debug capture
 
 Use debug capture when you need to inspect:

@@ -4,6 +4,7 @@ mod fs;
 mod path;
 mod store;
 mod transcript;
+mod vacuum;
 
 pub use fs::{
     append_json_line_sync, append_json_lines_sync, atomic_write, write_json_pretty_atomically,
@@ -21,3 +22,4 @@ pub use store::{
 pub use transcript::{
     NormalizedTranscriptMessage, ParsedToolCall, ParsedToolResult, TranscriptGraph, TranscriptNode,
 };
+pub use vacuum::{VacuumReport, vacuum_session, vacuum_session_file};

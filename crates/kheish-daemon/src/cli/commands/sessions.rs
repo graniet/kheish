@@ -19,6 +19,29 @@ pub(crate) async fn run_sessions_command(
     printer: &crate::cli::Printer,
     command: crate::SessionsCommand,
 ) -> Result<()> {
+    // Vacuum is an offline maintenance command: it operates on the state root
+    // directly under the daemon lock and never talks to the control plane.
+    if let crate::SessionsCommand::Vacuum {
+        session_id,
+        state_root,
+    } = &command
+    {
+        let _lock = crate::cli::state_lock::StateRootLock::acquire(state_root)?;
+        let report = tokio::task::block_in_place(|| {
+            kheish_session::vacuum_session(&state_root.join("sessions"), session_id)
+        })?;
+        return printer.print(&serde_json::json!({
+            "session_id": session_id,
+            "path": report.path,
+            "backup_path": report.backup_path,
+            "bytes_before": report.bytes_before,
+            "bytes_after": report.bytes_after,
+            "kept_by_type": report.kept_by_type,
+            "metadata_keys_kept": report.metadata_keys_kept,
+            "metadata_records_dropped": report.metadata_records_dropped,
+            "torn_tail_dropped": report.torn_tail_dropped,
+        }));
+    }
     match command {
         crate::SessionsCommand::List { pagination } => {
             let mut path = "/v1/sessions".to_string();
@@ -453,6 +476,9 @@ pub(crate) async fn run_sessions_command(
                 )
                 .await?;
             printer.print(&session)
+        }
+        crate::SessionsCommand::Vacuum { .. } => {
+            unreachable!("vacuum is handled before control-plane routing")
         }
     }
 }

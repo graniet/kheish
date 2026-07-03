@@ -3309,6 +3309,15 @@ enum SessionsCommand {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Compact one session journal offline, dropping superseded metadata
+    /// snapshots. Requires the daemon to be stopped (takes the state-root
+    /// lock); the original journal is preserved as `<name>.vacuum-bak`.
+    Vacuum {
+        session_id: String,
+        /// The daemon state root holding the session (same as `serve --state-root`).
+        #[arg(long, env = "KHEISH_STATE_ROOT", default_value = ".kheish-daemon")]
+        state_root: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]

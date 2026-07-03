@@ -10,6 +10,7 @@ pub(crate) mod output;
 pub(crate) mod routing;
 pub(crate) mod secrets;
 pub(crate) mod serve;
+pub(crate) mod state_lock;
 pub(crate) mod wait;
 
 pub(crate) use builders::{
