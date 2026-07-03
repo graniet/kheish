@@ -30,10 +30,16 @@ pub const SESSION_CREDENTIAL_SCOPE_METADATA_KEY: &str = "session_credential_scop
 pub const SESSION_EXECUTION_IDENTITY_METADATA_KEY: &str = "session_execution_identity";
 /// Stable metadata key used to persist explicit session reply-target defaults.
 pub const SESSION_REPLY_TARGETS_METADATA_KEY: &str = "session_reply_targets";
+/// Stable metadata key used to persist one model-facing operator contact policy.
+pub const SESSION_OPERATOR_CONFIG_METADATA_KEY: &str = "session_operator_config";
 /// Stable metadata key used to persist hook runtime state.
 pub const HOOK_RUNTIME_STATE_METADATA_KEY: &str = "hook_runtime_state";
-/// Default turn ceiling for long-running autonomous agents.
-pub const DEFAULT_AGENT_MAX_TURNS: usize = 200;
+/// Sentinel value for an unbounded autonomous-agent turn policy.
+pub const UNBOUNDED_AGENT_MAX_TURNS: usize = 0;
+/// Default turn ceiling for long-running autonomous agents. Unbounded loops
+/// (`UNBOUNDED_AGENT_MAX_TURNS`) stay available as an explicit operator opt-in
+/// so a misconfigured or looping run cannot burn tokens forever by default.
+pub const DEFAULT_AGENT_MAX_TURNS: usize = 500;
 
 /// Stores one durable plan artifact captured while exiting plan mode.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -321,6 +327,55 @@ impl SessionExecutionIdentity {
     }
 }
 
+/// Session-scoped policy that tells the model how it may contact a human operator.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionOperatorConfig {
+    /// Whether model-initiated operator contact is enabled for this session.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Optional human-readable label for the operator audience.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Optional style guidance, usually aligned with the bound persona.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub communication_style: Option<String>,
+    /// Whether the model may send non-blocking operator notifications.
+    #[serde(default = "default_true")]
+    pub allow_notify: bool,
+    /// Whether the model may suspend the run with a structured operator question.
+    #[serde(default = "default_true")]
+    pub allow_questions: bool,
+}
+
+impl Default for SessionOperatorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            display_name: None,
+            communication_style: None,
+            allow_notify: true,
+            allow_questions: true,
+        }
+    }
+}
+
+impl SessionOperatorConfig {
+    /// Returns true when at least one model-initiated operator path is enabled.
+    pub fn is_active(&self) -> bool {
+        self.enabled && (self.allow_notify || self.allow_questions)
+    }
+
+    /// Returns true when operator contact should be omitted from compact views.
+    pub fn is_inactive(&self) -> bool {
+        !self.is_active()
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
 /// Decodes persisted session control state from metadata.
 pub fn session_control_state_from_metadata(
     metadata: &Value,
@@ -605,6 +660,46 @@ pub fn metadata_with_session_reply_targets(
     Ok(Value::Object(object))
 }
 
+/// Decodes the model-facing operator policy from persisted session metadata.
+pub fn session_operator_config_from_metadata(
+    metadata: &Value,
+) -> serde_json::Result<SessionOperatorConfig> {
+    metadata
+        .get(SESSION_OPERATOR_CONFIG_METADATA_KEY)
+        .filter(|value| !value.is_null())
+        .cloned()
+        .map(serde_json::from_value)
+        .unwrap_or_else(|| Ok(SessionOperatorConfig::default()))
+}
+
+/// Returns metadata with the model-facing operator policy merged under the stable key.
+pub fn metadata_with_session_operator_config(
+    metadata: Value,
+    config: Option<&SessionOperatorConfig>,
+) -> serde_json::Result<Value> {
+    let mut object = match metadata {
+        Value::Object(map) => map,
+        Value::Null => serde_json::Map::new(),
+        other => {
+            let mut map = serde_json::Map::new();
+            map.insert("user_metadata".to_string(), other);
+            map
+        }
+    };
+    match config {
+        Some(config) if config.is_active() => {
+            object.insert(
+                SESSION_OPERATOR_CONFIG_METADATA_KEY.to_string(),
+                serde_json::to_value(config)?,
+            );
+        }
+        _ => {
+            object.remove(SESSION_OPERATOR_CONFIG_METADATA_KEY);
+        }
+    }
+    Ok(Value::Object(object))
+}
+
 /// Decodes persisted hook runtime state from metadata.
 pub fn hook_runtime_state_from_metadata(metadata: &Value) -> serde_json::Result<HookRuntimeState> {
     metadata
@@ -754,11 +849,39 @@ pub struct SessionCheckpoint {
     pub compacted_until_offset: u64,
     pub journal_digest: String,
     pub prompt_summary: SummaryBlock,
+    /// Stable identifier for the active model-visible prompt window.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prompt_window_id: String,
+    /// Monotonic generation incremented every time compaction replaces the prompt window.
+    #[serde(default)]
+    pub prompt_window_generation: u64,
+    /// Provider continuation identifiers from entries at or before this offset belong to the
+    /// previous provider-side context and must not be reused.
+    #[serde(default)]
+    pub prompt_window_started_after_offset: u64,
+    /// Human-readable reason that created this prompt window.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prompt_window_created_by: String,
     #[serde(default)]
     pub compact_metadata: CompactBoundaryMetadata,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restoration: Option<PostCompactRestoration>,
     pub canonical: CanonicalStateSnapshot,
+}
+
+impl SessionCheckpoint {
+    /// Returns the effective cutoff for provider continuation IDs.
+    ///
+    /// Older checkpoint files did not persist prompt-window metadata. For those
+    /// checkpoints we fail closed and disable provider continuation until a new
+    /// checkpoint is created by this version.
+    pub fn effective_prompt_window_started_after_offset(&self) -> u64 {
+        if self.prompt_window_generation == 0 && self.prompt_window_started_after_offset == 0 {
+            u64::MAX
+        } else {
+            self.prompt_window_started_after_offset
+        }
+    }
 }
 
 /// Declares one append-only session event.
@@ -837,6 +960,7 @@ pub struct RunTrace {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RunPolicySnapshot {
+    /// Maximum main-loop turn number. `0` means no hard turn ceiling.
     pub max_turns: usize,
     pub keep_last_messages: usize,
     pub snip_token_budget: usize,
@@ -917,6 +1041,12 @@ pub struct SystemPromptSectionSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptSnapshot {
     pub checkpoint_offset_used: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_window_id: Option<String>,
+    #[serde(default)]
+    pub prompt_window_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_window_started_after_offset: Option<u64>,
     pub summary_digest: Option<String>,
     pub summary_text: Option<String>,
     pub system_sections: Vec<SystemPromptSectionSnapshot>,
@@ -958,6 +1088,12 @@ pub struct TurnSnapshot {
 pub struct CheckpointSnapshot {
     pub compacted_until_offset: u64,
     pub journal_digest: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prompt_window_id: String,
+    #[serde(default)]
+    pub prompt_window_generation: u64,
+    #[serde(default)]
+    pub prompt_window_started_after_offset: u64,
     pub summary_digest: String,
     pub summary_text: String,
     pub canonical_state_digest: String,

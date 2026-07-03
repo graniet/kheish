@@ -22,14 +22,15 @@ use kheish_types::{
     InputEnvelope, InputPayload, LearnedContextBundle, ModelGenerationConfig, PendingToolBatch,
     PendingUserQuestion, PostCompactRestoration, RecoveredMemoryBundle, ReplyHandle,
     RetainedUserInput, RichOutput, Role, RunMetaSnapshot, RunStatus, SessionControlState,
-    SessionExecutionIdentity, SessionGoal, SessionPersonaBinding, SessionSkillsState,
-    SkillExecutionContext, SourceRef, SystemPromptSection, ToolDefinition, ToolSurfaceFilter,
-    UserQuestionResolution, WorkspaceSnapshot, hook_runtime_state_from_metadata,
+    SessionExecutionIdentity, SessionGoal, SessionOperatorConfig, SessionPersonaBinding,
+    SessionSkillsState, SkillExecutionContext, SourceRef, SystemPromptSection, ToolDefinition,
+    ToolSurfaceFilter, UserQuestionResolution, WorkspaceSnapshot, hook_runtime_state_from_metadata,
     learned_context_from_metadata, model_context_window, model_max_output_tokens,
     normalize_reply_targets, recovered_memory_from_metadata,
     session_capability_scope_from_metadata, session_control_state_from_metadata,
     session_credential_scope_from_metadata, session_execution_identity_from_metadata,
-    session_goal_from_metadata, session_persona_binding_from_metadata,
+    session_goal_from_metadata, session_operator_config_from_metadata,
+    session_persona_binding_from_metadata, session_reply_targets_from_metadata,
     session_skills_state_from_metadata, session_visible_skills_from_metadata,
 };
 
@@ -227,6 +228,8 @@ pub struct AgentRuntime<M> {
     session_persona: Option<SessionPersonaBinding>,
     session_control: SessionControlState,
     session_goal: Option<SessionGoal>,
+    session_operator: SessionOperatorConfig,
+    session_reply_targets: Vec<ReplyHandle>,
     session_capability_scope: CapabilityScope,
     session_credential_scope: CredentialScope,
     session_execution_identity: SessionExecutionIdentity,
@@ -399,6 +402,59 @@ fn rich_output_tools_section(tool_definitions: &[ToolDefinition]) -> Option<Syst
     })
 }
 
+fn operator_contact_section(
+    operator: &SessionOperatorConfig,
+    tool_definitions: &[ToolDefinition],
+) -> Option<SystemPromptSection> {
+    if !operator.is_active() {
+        return None;
+    }
+    let has_notify = tool_definitions
+        .iter()
+        .any(|tool| tool.name == "notify_operator");
+    let has_ask = tool_definitions
+        .iter()
+        .any(|tool| tool.name == "ask_operator");
+    let allow_notify = operator.allow_notify && has_notify;
+    let allow_questions = operator.allow_questions && has_ask;
+    if !allow_notify && !allow_questions {
+        return None;
+    }
+
+    let mut lines = vec![
+        "# Operator Contact".to_string(),
+        "A human operator contact is configured for this session. You may contact the operator whenever your judgment says it is useful for progress, safety, product judgment, or operational visibility.".to_string(),
+        "The daemon owns the external destinations. Do not ask for, invent, print, or override chat IDs, webhook URLs, tokens, or other delivery addresses.".to_string(),
+    ];
+    if let Some(display_name) = operator.display_name.as_deref() {
+        lines.push(format!("Operator audience: {display_name}."));
+    }
+    if let Some(style) = operator.communication_style.as_deref() {
+        lines.push(format!("Communication style: {style}."));
+    }
+    if allow_notify {
+        lines.push(
+            "Use `notify_operator` for non-blocking updates, blockers, or FYI messages when you can continue or safely pause without an immediate answer. Delivery is asynchronous; a successful tool result means the daemon queued the notification, not that the operator read it."
+                .to_string(),
+        );
+    }
+    if allow_questions {
+        lines.push(
+            "Use `ask_operator` only when a concrete operator decision or answer is required before you can continue. Ask concise structured questions with clear options, include the consequence of no answer, and keep enough context for the operator to answer without reading raw logs."
+                .to_string(),
+        );
+    }
+    lines.push(
+        "Never include secrets, credentials, raw tokens, or large unredacted logs in operator messages. Summarize evidence and provide safe references instead."
+            .to_string(),
+    );
+
+    Some(SystemPromptSection {
+        name: "operator_contact".to_string(),
+        content: lines.join("\n\n"),
+    })
+}
+
 fn session_workspace_section(
     default_root: &Path,
     workspace_root_override: Option<&PathBuf>,
@@ -424,6 +480,7 @@ fn build_system_sections<M>(
     completion_requirements: &[CompletionRequirement],
     session_control: &SessionControlState,
     session_goal: Option<&SessionGoal>,
+    session_operator: &SessionOperatorConfig,
     available_skills: &[SkillSummary],
     active_skills: &[ActiveSkillSnapshot],
     mcp_server_instructions: &[String],
@@ -439,6 +496,9 @@ fn build_system_sections<M>(
         session_goal,
     );
     if let Some(section) = rich_output_tools_section(&tool_definitions) {
+        sections.push(section);
+    }
+    if let Some(section) = operator_contact_section(session_operator, &tool_definitions) {
         sections.push(section);
     }
     if let Some(section) = available_skills_section(available_skills) {
@@ -474,6 +534,7 @@ fn build_runtime_system_sections<M>(
     completion_requirements: &[CompletionRequirement],
     session_control: &SessionControlState,
     session_goal: Option<&SessionGoal>,
+    session_operator: &SessionOperatorConfig,
     available_skills: &[SkillSummary],
     active_skills: &[ActiveSkillSnapshot],
     mcp_server_instructions: &[String],
@@ -491,6 +552,7 @@ fn build_runtime_system_sections<M>(
         completion_requirements,
         session_control,
         session_goal,
+        session_operator,
         available_skills,
         active_skills,
         mcp_server_instructions,
@@ -1044,6 +1106,7 @@ where
             &[],
             &SessionControlState::default(),
             None,
+            &SessionOperatorConfig::default(),
             &deps.skills.summaries(),
             &[],
             &deps
@@ -1069,6 +1132,8 @@ where
             workspace_root_override,
             session_persona: None,
             session_goal: None,
+            session_operator: SessionOperatorConfig::default(),
+            session_reply_targets: Vec::new(),
             session_control: SessionControlState::default(),
             session_capability_scope: CapabilityScope::default(),
             session_credential_scope: CredentialScope::default(),
@@ -1104,6 +1169,9 @@ where
         let stored_metadata = serde_json::to_value(&stored.metadata)?;
         let session_control = session_control_state_from_metadata(&stored_metadata)?;
         let session_goal = session_goal_from_metadata(&stored_metadata)?;
+        let session_operator = session_operator_config_from_metadata(&stored_metadata)?;
+        let session_reply_targets =
+            session_reply_targets_from_metadata(&stored_metadata)?.unwrap_or_default();
         let session_persona = session_persona_binding_from_metadata(&stored_metadata)?;
         let session_capability_scope = session_capability_scope_from_metadata(&stored_metadata)?;
         let session_credential_scope = session_credential_scope_from_metadata(&stored_metadata)?;
@@ -1151,6 +1219,7 @@ where
                 .unwrap_or_default(),
             &session_control,
             session_goal.as_ref(),
+            &session_operator,
             &filter_skill_summaries_by_scope(
                 deps.skills.summaries(),
                 &effective_scope,
@@ -1189,6 +1258,8 @@ where
             session_persona,
             session_control,
             session_goal,
+            session_operator,
+            session_reply_targets,
             session_capability_scope,
             session_credential_scope,
             session_execution_identity,
@@ -1293,6 +1364,8 @@ where
         self.session_persona = self.load_session_persona_binding().await?;
         self.session_control = self.load_session_control_state().await?;
         self.session_goal = self.load_session_goal().await?;
+        self.session_operator = self.load_session_operator_config().await?;
+        self.session_reply_targets = self.load_session_reply_targets().await?;
         self.session_capability_scope = self.load_session_capability_scope().await?;
         self.session_credential_scope = self.load_session_credential_scope().await?;
         self.session_execution_identity = self.load_session_execution_identity().await?;
@@ -1425,6 +1498,8 @@ where
         self.session_persona = self.load_session_persona_binding().await?;
         self.session_control = self.load_session_control_state().await?;
         self.session_goal = self.load_session_goal().await?;
+        self.session_operator = self.load_session_operator_config().await?;
+        self.session_reply_targets = self.load_session_reply_targets().await?;
         self.session_capability_scope = self.load_session_capability_scope().await?;
         self.session_credential_scope = self.load_session_credential_scope().await?;
         self.session_execution_identity = self.load_session_execution_identity().await?;
@@ -1608,6 +1683,8 @@ where
         self.session_persona = self.load_session_persona_binding().await?;
         self.session_control = self.load_session_control_state().await?;
         self.session_goal = self.load_session_goal().await?;
+        self.session_operator = self.load_session_operator_config().await?;
+        self.session_reply_targets = self.load_session_reply_targets().await?;
         self.session_capability_scope = self.load_session_capability_scope().await?;
         self.session_credential_scope = self.load_session_credential_scope().await?;
         self.session_execution_identity = self.load_session_execution_identity().await?;
@@ -1797,6 +1874,7 @@ where
             completion_requirements,
             &self.session_control,
             self.session_goal.as_ref(),
+            &self.session_operator,
             &self.current_available_skills(),
             &self.current_active_skills(),
             &self.current_mcp_server_instruction_sections(),
@@ -2287,7 +2365,30 @@ where
                 filter.denylist.push(tool_name.clone());
             }
         }
+        if !self.operator_notify_tool_available()
+            && !filter
+                .denylist
+                .iter()
+                .any(|entry| entry == "notify_operator")
+        {
+            filter.denylist.push("notify_operator".to_string());
+        }
+        if !self.operator_question_tool_available()
+            && !filter.denylist.iter().any(|entry| entry == "ask_operator")
+        {
+            filter.denylist.push("ask_operator".to_string());
+        }
         filter
+    }
+
+    fn operator_notify_tool_available(&self) -> bool {
+        self.session_operator.enabled
+            && self.session_operator.allow_notify
+            && !self.session_reply_targets.is_empty()
+    }
+
+    fn operator_question_tool_available(&self) -> bool {
+        self.session_operator.enabled && self.session_operator.allow_questions
     }
 
     fn server_has_executable_mcp_surface(
@@ -2395,6 +2496,28 @@ where
             .load(&self.engine.conversation().session_id)
             .await?;
         session_goal_from_metadata(&serde_json::to_value(&stored.metadata)?).map_err(Into::into)
+    }
+
+    async fn load_session_operator_config(&self) -> Result<SessionOperatorConfig> {
+        let stored = self
+            .deps
+            .sessions
+            .load(&self.engine.conversation().session_id)
+            .await?;
+        session_operator_config_from_metadata(&serde_json::to_value(&stored.metadata)?)
+            .map_err(Into::into)
+    }
+
+    async fn load_session_reply_targets(&self) -> Result<Vec<ReplyHandle>> {
+        let stored = self
+            .deps
+            .sessions
+            .load(&self.engine.conversation().session_id)
+            .await?;
+        Ok(
+            session_reply_targets_from_metadata(&serde_json::to_value(&stored.metadata)?)?
+                .unwrap_or_default(),
+        )
     }
 
     fn restoration_provider(&self) -> RuntimeRestorationProvider {
@@ -2908,9 +3031,9 @@ mod tests {
     use super::{
         AgentEngine, AgentRuntime, AgentRuntimeDependencies, AgentRuntimeRestore,
         McpInstructionBlock, McpRuntimeSurface, RuntimeRestorationProvider,
-        contextual_memory_budget_tokens, learned_context_section, pack_learned_context_bundle,
-        pack_recovered_memory_bundle_with_omitted, pack_recovered_memory_section,
-        recovered_memory_section,
+        contextual_memory_budget_tokens, learned_context_section, operator_contact_section,
+        pack_learned_context_bundle, pack_recovered_memory_bundle_with_omitted,
+        pack_recovered_memory_section, recovered_memory_section,
     };
     use crate::model::{
         ModelBudget, ModelRetryPolicy, ModelRuntime, ModelStreamEvent, ModelUsage, ProviderError,
@@ -2941,8 +3064,8 @@ mod tests {
         HookEventName, HookInvocation, InputContentPart, InputEnvelope, LearnedContextBundle,
         LearnedContextEntry, MessageRecord, ModelGenerationConfig, RecoveredMemoryBundle,
         ReplyHandle, Role, SESSION_PERSONA_BINDING_METADATA_KEY, SessionControlState, SessionEvent,
-        SessionPersonaBinding, ToolResultRecord, ToolSurfaceFilter, asset_storage_uri,
-        hook_runtime_state_from_metadata,
+        SessionOperatorConfig, SessionPersonaBinding, ToolDefinition, ToolResultRecord,
+        ToolSurfaceFilter, asset_storage_uri, hook_runtime_state_from_metadata,
     };
 
     struct ScriptedProvider(Mutex<VecDeque<Result<Vec<ModelStreamEvent>, ProviderError>>>);
@@ -2973,6 +3096,15 @@ mod tests {
     }
 
     struct EchoTool;
+
+    fn test_tool_definition(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: "test tool".to_string(),
+            input_schema: json!({"type": "object"}),
+            allows_parallel: false,
+        }
+    }
 
     struct LocalPersistenceAssertingOutputPlugin {
         sessions: Arc<FileSessionStore>,
@@ -3172,6 +3304,95 @@ mod tests {
             .expect("stop hook block should preserve HookBlockedError");
         assert_eq!(blocked.event(), &HookEventName::Stop);
         assert_eq!(blocked.detail(), "stop policy block");
+    }
+
+    #[test]
+    fn operator_contact_section_is_conditional_and_transport_opaque() {
+        let operator = SessionOperatorConfig {
+            enabled: true,
+            display_name: Some("Project operator".to_string()),
+            communication_style: Some("human and concise".to_string()),
+            allow_notify: true,
+            allow_questions: true,
+        };
+        let section = operator_contact_section(
+            &operator,
+            &[
+                test_tool_definition("notify_operator"),
+                test_tool_definition("ask_operator"),
+            ],
+        )
+        .expect("active operator section");
+
+        assert_eq!(section.name, "operator_contact");
+        assert!(section.content.contains("notify_operator"));
+        assert!(section.content.contains("ask_operator"));
+        assert!(section.content.contains("Project operator"));
+        assert!(section.content.contains("human and concise"));
+        assert!(
+            section
+                .content
+                .contains("daemon owns the external destinations")
+        );
+        assert!(!section.content.contains("chat_id"));
+    }
+
+    #[test]
+    fn operator_contact_section_hides_unavailable_tools() {
+        let operator = SessionOperatorConfig {
+            enabled: true,
+            allow_notify: true,
+            allow_questions: true,
+            ..Default::default()
+        };
+
+        assert!(operator_contact_section(&operator, &[]).is_none());
+
+        let section = operator_contact_section(&operator, &[test_tool_definition("ask_operator")])
+            .expect("question-only operator section");
+        assert!(!section.content.contains("notify_operator"));
+        assert!(section.content.contains("ask_operator"));
+    }
+
+    #[test]
+    fn effective_tool_surface_hides_operator_tools_until_session_policy_allows_them() {
+        let session_root = unique_session_root("kheish-runtime-operator-surface");
+        let (_sessions, mut runtime) = runtime_with_hook_dispatcher(
+            &session_root,
+            "operator-surface-session",
+            Arc::new(NoopHookDispatcher),
+        );
+        runtime.tool_surface = ToolSurfaceFilter {
+            allowlist: vec!["notify_operator".to_string(), "ask_operator".to_string()],
+            denylist: Vec::new(),
+        };
+
+        let disabled = runtime.effective_tool_surface();
+        assert!(!disabled.allows("notify_operator"));
+        assert!(!disabled.allows("ask_operator"));
+
+        runtime.session_operator = SessionOperatorConfig {
+            enabled: true,
+            allow_notify: false,
+            allow_questions: true,
+            ..Default::default()
+        };
+        let question_only = runtime.effective_tool_surface();
+        assert!(!question_only.allows("notify_operator"));
+        assert!(question_only.allows("ask_operator"));
+
+        runtime.session_operator.allow_notify = true;
+        let no_targets = runtime.effective_tool_surface();
+        assert!(!no_targets.allows("notify_operator"));
+        assert!(no_targets.allows("ask_operator"));
+
+        runtime.session_reply_targets = vec![ReplyHandle {
+            plugin: "daemon".to_string(),
+            address: "operator-surface-session".to_string(),
+        }];
+        let notify_ready = runtime.effective_tool_surface();
+        assert!(notify_ready.allows("notify_operator"));
+        assert!(notify_ready.allows("ask_operator"));
     }
 
     #[tokio::test]

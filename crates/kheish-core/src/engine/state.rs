@@ -14,6 +14,7 @@ const DEFAULT_MICROCOMPACT_STALE_AFTER_MS: u64 = 15 * 60 * 1000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoopPolicy {
+    /// Maximum main-loop turn number. `0` means no hard turn ceiling.
     pub max_turns: usize,
     pub keep_last_messages: usize,
     pub snip_token_budget: usize,

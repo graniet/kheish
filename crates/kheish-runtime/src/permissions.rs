@@ -907,6 +907,7 @@ fn is_plan_mode_allowed_tool(tool_name: &str) -> bool {
             | "read_mcp_resource"
             | "list_skills"
             | "read_channel_thread"
+            | "ask_operator"
             | "ask_user_question"
             | "request_parent_clarification"
             | "spawn_agent"
@@ -1751,6 +1752,7 @@ mod tests {
 
     #[test]
     fn plan_mode_allows_structured_user_questions() {
+        assert!(super::is_plan_mode_allowed_tool("ask_operator"));
         assert!(super::is_plan_mode_allowed_tool("ask_user_question"));
         assert!(super::is_plan_mode_allowed_tool("read_channel_thread"));
         assert!(super::is_plan_mode_allowed_tool(

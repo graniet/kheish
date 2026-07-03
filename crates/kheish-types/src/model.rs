@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt::{Display, Formatter};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -9,6 +10,143 @@ pub const COMPLETION_REQUIREMENTS_METADATA_KEY: &str = "completion_requirements"
 pub const CAPPED_DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8_000;
 /// Claude Code-style escalated output token ceiling used for recovery.
 pub const ESCALATED_MAX_OUTPUT_TOKENS: u32 = 64_000;
+
+/// Coarse provider failure category used by the core engine.
+///
+/// Providers keep their native error payloads, but the engine must not depend on
+/// brittle provider-specific strings to decide whether a request exhausted the
+/// active context window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderErrorKind {
+    ContextWindowExceeded,
+    RateLimited,
+    Auth,
+    InvalidRequest,
+    ServerOverloaded,
+    Transport,
+    #[default]
+    Unknown,
+}
+
+/// Provider error type shared across the runtime/core boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelProviderError {
+    pub kind: ProviderErrorKind,
+    pub message: String,
+    pub retryable: bool,
+    pub retry_after_ms: Option<u64>,
+}
+
+impl ModelProviderError {
+    pub fn new(
+        kind: ProviderErrorKind,
+        message: impl Into<String>,
+        retryable: bool,
+        retry_after_ms: Option<u64>,
+    ) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            retryable,
+            retry_after_ms,
+        }
+    }
+
+    pub fn from_message(
+        message: impl Into<String>,
+        retryable: bool,
+        retry_after_ms: Option<u64>,
+    ) -> Self {
+        let message = message.into();
+        Self::new(
+            classify_provider_error_message(&message),
+            message,
+            retryable,
+            retry_after_ms,
+        )
+    }
+}
+
+impl Display for ModelProviderError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ModelProviderError {}
+
+/// Classifies provider messages into stable engine-level error kinds.
+pub fn classify_provider_error_message(message: &str) -> ProviderErrorKind {
+    let message = message.to_ascii_lowercase();
+    let is_media_413 = message.contains("status 413") || message.contains("http error 413");
+    let is_media_payload = message.contains("attachment")
+        || message.contains("image")
+        || message.contains("pdf")
+        || message.contains("media");
+    if message.contains("context_length_exceeded")
+        || message.contains("context_window_exceeded")
+        || message.contains("model_context_window_exceeded")
+        || message.contains("context window exceeded")
+        || message.contains("maximum context length")
+        || message.contains("context length")
+        || message.contains("context limit")
+        || message.contains("prompt too long")
+        || message.contains("prompt is too long")
+        || message.contains("too many tokens")
+        || message.contains("token count exceeds")
+        || message.contains("exceeds the model context")
+        || (is_media_413 && !is_media_payload)
+    {
+        return ProviderErrorKind::ContextWindowExceeded;
+    }
+    if message.contains("rate limit")
+        || message.contains("rate_limit")
+        || message.contains("too many requests")
+        || message.contains("status 429")
+        || message.contains("http error 429")
+    {
+        return ProviderErrorKind::RateLimited;
+    }
+    if message.contains("invalid api key")
+        || message.contains("authentication")
+        || message.contains("unauthorized")
+        || message.contains("forbidden")
+        || message.contains("status 401")
+        || message.contains("status 403")
+        || message.contains("http error 401")
+        || message.contains("http error 403")
+    {
+        return ProviderErrorKind::Auth;
+    }
+    if message.contains("overloaded")
+        || message.contains("temporarily unavailable")
+        || message.contains("status 503")
+        || message.contains("status 529")
+        || message.contains("http error 503")
+        || message.contains("http error 529")
+    {
+        return ProviderErrorKind::ServerOverloaded;
+    }
+    if message.contains("timeout")
+        || message.contains("timed out")
+        || message.contains("inactive")
+        || message.contains("transport")
+        || message.contains("connection")
+        || message.contains("network")
+    {
+        return ProviderErrorKind::Transport;
+    }
+    if message.contains("invalid_request_error")
+        || message.contains("invalid request")
+        || message.contains("bad request")
+        || message.contains("status 400")
+        || message.contains("http error 400")
+    {
+        return ProviderErrorKind::InvalidRequest;
+    }
+    ProviderErrorKind::Unknown
+}
 
 /// Default and upper-limit output token settings for one model family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

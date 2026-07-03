@@ -11,14 +11,15 @@ use kheish_types::{
     CompactBoundaryMetadata, CompactionBoundary, CompactionStrategy, CompactionTrigger,
     CompletionRequirement, ConversationKey, FinalStateSnapshot, HookDecision, HookDispatchOutcome,
     HookEventName, HookInvocation, HookPermissionBehavior, InputEnvelope, InputPayload, LogEntry,
-    MessageRecord, ModelFinishReason, ModelGenerationConfig, PendingToolBatch, PendingToolDecision,
-    PendingUserQuestion, PermissionDecision, PostCompactRestoration, PreservedSegment,
-    PromptMessageSnapshot, PromptProjection, PromptSnapshot, PromptTrace, ProviderInputItem,
-    ProviderPrompt, Role, RunMetaSnapshot, RunPolicySnapshot, RunSnapshot, RunStatus, RunTrace,
-    SessionCheckpoint, SessionEvent, SummaryBlock, SystemPromptSection,
-    SystemPromptSectionSnapshot, ToolCallRecord, ToolCallSnapshot, ToolChoice, ToolDefinition,
-    ToolExecutionTrace, ToolResultRecord, ToolResultSnapshot, TurnSnapshot, TurnTrace,
-    UserQuestionRequest, UserQuestionResolution,
+    MessageRecord, ModelFinishReason, ModelGenerationConfig, ModelProviderError, PendingToolBatch,
+    PendingToolDecision, PendingUserQuestion, PermissionDecision, PostCompactRestoration,
+    PreservedSegment, PromptMessageSnapshot, PromptProjection, PromptSnapshot, PromptTrace,
+    ProviderErrorKind, ProviderInputItem, ProviderPrompt, Role, RunMetaSnapshot, RunPolicySnapshot,
+    RunSnapshot, RunStatus, RunTrace, SessionCheckpoint, SessionEvent, SummaryBlock,
+    SystemPromptSection, SystemPromptSectionSnapshot, ToolCallRecord, ToolCallSnapshot, ToolChoice,
+    ToolDefinition, ToolExecutionTrace, ToolResultRecord, ToolResultSnapshot, TurnSnapshot,
+    TurnTrace, UserQuestionRequest, UserQuestionResolution, model_context_window,
+    model_max_output_tokens,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -41,6 +42,8 @@ mod state;
 
 const MAX_COMPACTION_PTL_RETRIES: usize = 3;
 const MAX_OUTPUT_TOKENS_RECOVERY_LIMIT: u8 = 3;
+const PROMPT_VISIBLE_TOOL_OUTPUT_TOKEN_LIMIT: usize = 10_000;
+const PROMPT_VISIBLE_TOOL_OUTPUT_PREVIEW_CHARS: usize = 32_000;
 
 pub struct AgentEngine {
     conversation: ConversationKey,
@@ -215,13 +218,22 @@ impl AgentEngine {
     fn build_prompt_workspace(&self) -> PromptWorkspace {
         let checkpoint = self.checkpoints.last();
         let compacted_until_offset = checkpoint.map(|value| value.compacted_until_offset);
+        let provider_window_started_after_offset =
+            self.provider_window_started_after_offset(checkpoint);
         let summary = checkpoint.map(|value| value.prompt_summary.clone());
         let mut messages = Vec::new();
         let mut message_offsets = Vec::new();
         let mut input_content_parts =
             std::collections::BTreeMap::<String, Vec<kheish_types::InputContentPart>>::new();
-        let mut open_tool_calls = checkpoint
-            .map(|value| value.canonical.open_tool_calls.clone())
+        let mut open_tool_calls: std::collections::BTreeMap<String, ToolCallRecord> = checkpoint
+            .map(|value| {
+                value
+                    .canonical
+                    .open_tool_calls
+                    .iter()
+                    .map(|(id, call)| (id.clone(), Self::without_provider_resume_tool_call(call)))
+                    .collect()
+            })
             .unwrap_or_default();
         let mut items = Vec::new();
         let mut item_offsets = Vec::new();
@@ -233,6 +245,7 @@ impl AgentEngine {
         let mut active_assistant_message_id: Option<String> = None;
         if let Some(checkpoint) = checkpoint {
             for call in checkpoint.canonical.open_tool_calls.values() {
+                let call = Self::without_provider_resume_tool_call(call);
                 items.push(ProviderInputItem::ToolCall {
                     assistant_message_id: call.assistant_message_id.clone(),
                     call: call.clone(),
@@ -263,6 +276,14 @@ impl AgentEngine {
                 | SessionEvent::UserQuestionRequested { .. }
                 | SessionEvent::UserQuestionResolved { .. } => {}
                 SessionEvent::MessageAppended { message } => {
+                    let mut message = Self::prompt_visible_message(message);
+                    if !Self::provider_resume_allowed_at_offset(
+                        provider_window_started_after_offset,
+                        entry.offset,
+                    ) {
+                        message.provider_response_id = None;
+                        message.provider_context = None;
+                    }
                     messages.push(message.clone());
                     message_offsets.push(Some(entry.offset));
                     if message.role == Role::Tool {
@@ -288,6 +309,13 @@ impl AgentEngine {
                     item_offsets.push(Some(entry.offset));
                 }
                 SessionEvent::ToolCallStarted { call } => {
+                    let mut call = call.clone();
+                    if !Self::provider_resume_allowed_at_offset(
+                        provider_window_started_after_offset,
+                        entry.offset,
+                    ) {
+                        call.assistant_provider_response_id = None;
+                    }
                     open_tool_calls.insert(call.id.clone(), call.clone());
                     let assistant_message_id = call
                         .assistant_message_id
@@ -300,10 +328,9 @@ impl AgentEngine {
                     item_offsets.push(Some(entry.offset));
                 }
                 SessionEvent::ToolCallFinished { result } => {
+                    let result = Self::prompt_visible_tool_result(result);
                     open_tool_calls.remove(&result.call_id);
-                    items.push(ProviderInputItem::ToolResult {
-                        result: result.clone(),
-                    });
+                    items.push(ProviderInputItem::ToolResult { result });
                     item_offsets.push(Some(entry.offset));
                 }
             }
@@ -612,7 +639,15 @@ impl AgentEngine {
             turn_counter: run_meta.autocompact.turn_counter,
         };
 
-        for turn in start_turn..=self.policy.max_turns {
+        let turns: Box<dyn Iterator<Item = usize> + Send> = if self.policy.max_turns == 0 {
+            Box::new(std::iter::successors(Some(start_turn), |turn| {
+                turn.checked_add(1)
+            }))
+        } else {
+            Box::new(start_turn..=self.policy.max_turns)
+        };
+
+        for turn in turns {
             self.autocompact_tracking.turn_counter =
                 self.autocompact_tracking.turn_counter.saturating_add(1);
             run_meta.autocompact = self.snapshot_autocompact_tracking();
@@ -620,7 +655,13 @@ impl AgentEngine {
             let mut workspace = self.build_prompt_workspace();
             let pipeline_start_offset = self.next_offset;
             if let Some(checkpoint) = self
-                .compact_pipeline(&mut workspace, turn, model, restoration)
+                .compact_pipeline(
+                    &mut workspace,
+                    turn,
+                    &pending_generation,
+                    model,
+                    restoration,
+                )
                 .await?
             {
                 trace.checkpoints.push(CheckpointTrace {
@@ -664,7 +705,9 @@ impl AgentEngine {
                     Err(error) if Self::is_prompt_too_long_error(&error) => {
                         if !aggressively_snipped {
                             let snip_start_offset = self.next_offset;
-                            if let Some(rebuilt) = self.aggressive_snip_workspace(turn) {
+                            if let Some(rebuilt) =
+                                self.aggressive_snip_workspace(turn, &request.generation)
+                            {
                                 trace.compaction_boundaries.extend(
                                     self.collect_compaction_boundaries_since(snip_start_offset),
                                 );
@@ -958,6 +1001,9 @@ impl AgentEngine {
             }
         }
 
+        if self.policy.max_turns == 0 {
+            bail!("agent loop exhausted the usize turn counter");
+        }
         bail!("agent loop exceeded max_turns={}", self.policy.max_turns);
     }
 
@@ -1128,7 +1174,9 @@ impl AgentEngine {
             };
             if let Some(request) = Self::extract_pending_user_question(&result)? {
                 if pending_question.is_some() || decisions.len() != 1 {
-                    bail!("ask_user_question must be the only tool call in its turn");
+                    bail!(
+                        "ask_user_question or ask_operator must be the only tool call in its turn"
+                    );
                 }
                 self.record_event(SessionEvent::UserQuestionRequested {
                     request: request.clone(),
@@ -1626,6 +1674,12 @@ impl AgentEngine {
         let checkpoint = self.checkpoints.last();
         Ok(PromptSnapshot {
             checkpoint_offset_used: checkpoint.map(|checkpoint| checkpoint.compacted_until_offset),
+            prompt_window_id: checkpoint.map(|checkpoint| checkpoint.prompt_window_id.clone()),
+            prompt_window_generation: checkpoint
+                .map(|checkpoint| checkpoint.prompt_window_generation)
+                .unwrap_or_default(),
+            prompt_window_started_after_offset: self
+                .provider_window_started_after_offset(checkpoint),
             summary_digest: prompt.summary.as_ref().map(Self::digest_of).transpose()?,
             summary_text: prompt
                 .summary
@@ -1720,7 +1774,12 @@ impl AgentEngine {
     fn extract_pending_user_question(
         result: &ToolResultRecord,
     ) -> Result<Option<UserQuestionRequest>> {
-        if result.is_error || result.tool_name.as_deref() != Some("ask_user_question") {
+        if result.is_error
+            || !matches!(
+                result.tool_name.as_deref(),
+                Some("ask_user_question" | "ask_operator")
+            )
+        {
             return Ok(None);
         }
         let Some(marker) = result.output.get("_kheish_pending_user_question") else {
@@ -1735,10 +1794,15 @@ impl AgentEngine {
         resolution: &UserQuestionResolution,
     ) -> Result<ToolResultRecord> {
         let mut output = render_user_question_resolution(&pending.request, resolution)?;
-        output["message"] = json!(if resolution.declined {
-            "User declined to answer your clarification request."
+        let audience = if pending.call.name == "ask_operator" {
+            "Operator"
         } else {
-            "User answered your clarification request."
+            "User"
+        };
+        output["message"] = json!(if resolution.declined {
+            format!("{audience} declined to answer your clarification request.")
+        } else {
+            format!("{audience} answered your clarification request.")
         });
 
         Ok(ToolResultRecord {
@@ -1830,10 +1894,11 @@ impl AgentEngine {
     }
 
     fn append_tool_result_message(&mut self, result: &ToolResultRecord) -> Result<u64> {
+        let prompt_visible = Self::prompt_visible_tool_result(result);
         let tool_message = MessageRecord::new(
             format!("tool-message-{}", result.call_id),
             Role::Tool,
-            serde_json::to_string(&result.output)?,
+            serde_json::to_string(&prompt_visible.output)?,
         );
         Ok(self.append_message(tool_message))
     }
@@ -2008,6 +2073,163 @@ impl AgentEngine {
         self.record_event(SessionEvent::CompactionBoundary { boundary });
     }
 
+    fn provider_window_started_after_offset(
+        &self,
+        checkpoint: Option<&SessionCheckpoint>,
+    ) -> Option<u64> {
+        let checkpoint_offset = checkpoint.map(|checkpoint| {
+            let effective = checkpoint.effective_prompt_window_started_after_offset();
+            if effective == u64::MAX {
+                self.first_compaction_boundary_after(checkpoint.compacted_until_offset)
+                    .unwrap_or(u64::MAX)
+            } else {
+                effective
+            }
+        });
+        let boundary_offset = self.latest_compaction_boundary_offset();
+        checkpoint_offset.into_iter().chain(boundary_offset).max()
+    }
+
+    fn first_compaction_boundary_after(&self, offset: u64) -> Option<u64> {
+        self.journal.iter().find_map(|entry| {
+            (entry.offset > offset
+                && matches!(entry.event, SessionEvent::CompactionBoundary { .. }))
+            .then_some(entry.offset)
+        })
+    }
+
+    fn latest_compaction_boundary_offset(&self) -> Option<u64> {
+        self.journal.iter().rev().find_map(|entry| {
+            matches!(entry.event, SessionEvent::CompactionBoundary { .. }).then_some(entry.offset)
+        })
+    }
+
+    fn provider_resume_allowed_at_offset(
+        provider_window_started_after_offset: Option<u64>,
+        offset: u64,
+    ) -> bool {
+        provider_window_started_after_offset
+            .map(|started_after| offset > started_after)
+            .unwrap_or(true)
+    }
+
+    fn without_provider_resume_tool_call(call: &ToolCallRecord) -> ToolCallRecord {
+        let mut call = call.clone();
+        call.assistant_provider_response_id = None;
+        call
+    }
+
+    fn disable_provider_resume_in_workspace(workspace: &mut PromptWorkspace) {
+        for message in &mut workspace.prompt.messages {
+            message.provider_response_id = None;
+            message.provider_context = None;
+        }
+        for call in &mut workspace.prompt.open_tool_calls {
+            call.assistant_provider_response_id = None;
+        }
+        for item in &mut workspace.provider_prompt.items {
+            match item {
+                ProviderInputItem::Message {
+                    provider_response_id,
+                    provider_context,
+                    ..
+                } => {
+                    *provider_response_id = None;
+                    *provider_context = None;
+                }
+                ProviderInputItem::ToolCall { call, .. } => {
+                    call.assistant_provider_response_id = None;
+                }
+                ProviderInputItem::Summary { .. }
+                | ProviderInputItem::Restoration { .. }
+                | ProviderInputItem::ToolResult { .. } => {}
+            }
+        }
+    }
+
+    fn prompt_visible_message(message: &MessageRecord) -> MessageRecord {
+        if message.role != Role::Tool {
+            return message.clone();
+        }
+        if rough_token_estimate_value(&Value::String(message.content.clone()))
+            <= PROMPT_VISIBLE_TOOL_OUTPUT_TOKEN_LIMIT
+        {
+            return message.clone();
+        }
+
+        let output = serde_json::from_str::<Value>(&message.content)
+            .unwrap_or_else(|_| Value::String(message.content.clone()));
+        let capped = Self::bounded_prompt_tool_output(
+            message.id.as_str(),
+            None,
+            format!("session://messages/{}", message.id),
+            &output,
+        );
+        let mut message = message.clone();
+        message.content = serde_json::to_string(&capped)
+            .unwrap_or_else(|_| "\"[Tool output truncated for prompt safety]\"".to_string());
+        message
+    }
+
+    fn prompt_visible_tool_result(result: &ToolResultRecord) -> ToolResultRecord {
+        let mut result = result.clone();
+        result.output = Self::bounded_prompt_tool_output(
+            result.call_id.as_str(),
+            result.tool_name.as_deref(),
+            format!("session://tool-results/{}", result.call_id),
+            &result.output,
+        );
+        result
+    }
+
+    fn bounded_prompt_tool_output(
+        source_id: &str,
+        tool_name: Option<&str>,
+        raw_ref: String,
+        output: &Value,
+    ) -> Value {
+        let estimated_tokens = rough_token_estimate_value(output);
+        if estimated_tokens <= PROMPT_VISIBLE_TOOL_OUTPUT_TOKEN_LIMIT {
+            return output.clone();
+        }
+
+        let raw = serde_json::to_string(output).unwrap_or_else(|_| output.to_string());
+        let preview = Self::truncate_prompt_preview(&raw, PROMPT_VISIBLE_TOOL_OUTPUT_PREVIEW_CHARS);
+        json!({
+            "_kheish_prompt_visible_tool_output": {
+                "truncated": true,
+                "source_id": source_id,
+                "tool_name": tool_name,
+                "raw_ref": raw_ref,
+                "sha256": digest_text(&raw),
+                "bytes": raw.len(),
+                "estimated_tokens": estimated_tokens,
+                "token_limit": PROMPT_VISIBLE_TOOL_OUTPUT_TOKEN_LIMIT,
+                "preview": preview,
+                "message": "Tool output was truncated for prompt safety. The raw output is retained in the session audit."
+            }
+        })
+    }
+
+    fn truncate_prompt_preview(value: &str, max_chars: usize) -> String {
+        let mut truncated = false;
+        let mut end = value.len();
+        let mut count = 0usize;
+        for (index, _) in value.char_indices() {
+            if count == max_chars {
+                end = index;
+                truncated = true;
+                break;
+            }
+            count += 1;
+        }
+        if !truncated {
+            value.to_string()
+        } else {
+            value[..end].to_string()
+        }
+    }
+
     fn collect_compaction_boundaries_since(&self, offset: u64) -> Vec<CompactionBoundary> {
         self.journal
             .iter()
@@ -2043,6 +2265,24 @@ impl AgentEngine {
             &prompt.open_tool_calls,
             prompt.restoration.as_ref(),
         )
+    }
+
+    fn effective_autocompact_threshold_tokens(&self, generation: &ModelGenerationConfig) -> usize {
+        let Some(model) = generation.model.as_deref() else {
+            return self.policy.autocompact_threshold_tokens;
+        };
+        let Some(context_window) = model_context_window(model) else {
+            return self.policy.autocompact_threshold_tokens;
+        };
+        let reserved_output_tokens = generation
+            .max_output_tokens
+            .map(|value| value as usize)
+            .unwrap_or_else(|| model_max_output_tokens(model).default as usize);
+        context_window
+            .saturating_sub(reserved_output_tokens)
+            .saturating_sub(self.policy.autocompact_buffer_tokens)
+            .max(1)
+            .min(self.policy.autocompact_threshold_tokens)
     }
 
     fn apply_snip_to_workspace(&self, workspace: &mut PromptWorkspace, new_head_offset: u64) {
@@ -2092,6 +2332,7 @@ impl AgentEngine {
         workspace.item_offsets = filtered_offsets;
         workspace.prompt.open_tool_calls =
             Self::recompute_open_tool_calls(&workspace.provider_prompt.items);
+        Self::disable_provider_resume_in_workspace(workspace);
     }
 
     fn recompute_open_tool_calls(items: &[ProviderInputItem]) -> Vec<ToolCallRecord> {
@@ -2185,6 +2426,7 @@ impl AgentEngine {
                 message.content = CLEARED_TOOL_RESULT_MESSAGE.to_string();
             }
         }
+        Self::disable_provider_resume_in_workspace(workspace);
         Some(CompactionBoundary::Microcompact {
             turn,
             cleared_tool_ids: result.cleared_tool_ids,
@@ -2197,6 +2439,7 @@ impl AgentEngine {
         workspace: &mut PromptWorkspace,
         upcoming_turn: usize,
         pre_tokens: usize,
+        threshold_tokens: usize,
     ) -> Result<bool> {
         if self.checkpoints.is_empty() {
             return Ok(false);
@@ -2243,7 +2486,7 @@ impl AgentEngine {
         let mut candidate = workspace.clone();
         self.apply_snip_to_workspace(&mut candidate, new_head_offset);
         let post_tokens = Self::prompt_token_count(&candidate.prompt);
-        if post_tokens >= pre_tokens || post_tokens > self.policy.autocompact_threshold_tokens {
+        if post_tokens >= pre_tokens || post_tokens > threshold_tokens {
             return Ok(false);
         }
 
@@ -2262,6 +2505,7 @@ impl AgentEngine {
         &mut self,
         workspace: &mut PromptWorkspace,
         upcoming_turn: usize,
+        generation: &ModelGenerationConfig,
         model: &M,
         restoration: Option<&dyn PostCompactRestorationProvider>,
     ) -> Result<Option<CheckpointSnapshot>>
@@ -2293,7 +2537,8 @@ impl AgentEngine {
         }
 
         let post_light_tokens = Self::prompt_token_count(&workspace.prompt);
-        if post_light_tokens <= self.policy.autocompact_threshold_tokens {
+        let threshold_tokens = self.effective_autocompact_threshold_tokens(generation);
+        if post_light_tokens <= threshold_tokens {
             return Ok(None);
         }
 
@@ -2304,7 +2549,7 @@ impl AgentEngine {
                 json!({
                     "turn": upcoming_turn,
                     "token_count": post_light_tokens,
-                    "threshold_tokens": self.policy.autocompact_threshold_tokens,
+                    "threshold_tokens": threshold_tokens,
                 }),
             )
             .await?;
@@ -2317,7 +2562,12 @@ impl AgentEngine {
             return Ok(None);
         }
 
-        if self.try_session_memory_compact(workspace, upcoming_turn, post_light_tokens)? {
+        if self.try_session_memory_compact(
+            workspace,
+            upcoming_turn,
+            post_light_tokens,
+            threshold_tokens,
+        )? {
             self.autocompact_tracking.record_success(upcoming_turn);
             let post_compact = self
                 .dispatch_hook(
@@ -2350,7 +2600,7 @@ impl AgentEngine {
                 post_light_tokens,
                 model,
                 restoration,
-                false,
+                true,
                 CompactionTrigger::Auto,
             )
             .await
@@ -2455,10 +2705,20 @@ impl AgentEngine {
             .await?;
         let canonical = self.replay_until_offset(cutoff);
         let preserved_segment = self.preserved_segment_after(cutoff);
+        let prompt_window_generation = self
+            .checkpoints
+            .last()
+            .map(|checkpoint| checkpoint.prompt_window_generation.max(1).saturating_add(1))
+            .unwrap_or(1);
+        let prompt_window_started_after_offset = self.next_offset.saturating_sub(1);
         let mut checkpoint = SessionCheckpoint {
             compacted_until_offset: cutoff,
             journal_digest: self.digest_until_offset(cutoff)?,
             prompt_summary: summary,
+            prompt_window_id: format!("prompt-window-{prompt_window_generation}"),
+            prompt_window_generation,
+            prompt_window_started_after_offset,
+            prompt_window_created_by: format!("{trigger:?}"),
             compact_metadata: CompactBoundaryMetadata {
                 trigger,
                 pre_tokens: token_count,
@@ -2519,6 +2779,9 @@ impl AgentEngine {
         let trace = CheckpointSnapshot {
             compacted_until_offset: checkpoint.compacted_until_offset,
             journal_digest: checkpoint.journal_digest.clone(),
+            prompt_window_id: checkpoint.prompt_window_id.clone(),
+            prompt_window_generation: checkpoint.prompt_window_generation,
+            prompt_window_started_after_offset: checkpoint.prompt_window_started_after_offset,
             summary_digest: Self::digest_of(&checkpoint.prompt_summary)?,
             summary_text: checkpoint.prompt_summary.content.clone(),
             canonical_state_digest: Self::digest_canonical_state(&checkpoint.canonical)?,
@@ -2656,6 +2919,9 @@ impl AgentEngine {
                 | SessionEvent::UserQuestionRequested { .. }
                 | SessionEvent::UserQuestionResolved { .. } => {}
                 SessionEvent::MessageAppended { message } => {
+                    let mut message = Self::prompt_visible_message(message);
+                    message.provider_response_id = None;
+                    message.provider_context = None;
                     messages.push(message.clone());
                     if message.role == Role::Tool {
                         continue;
@@ -2679,6 +2945,7 @@ impl AgentEngine {
                     });
                 }
                 SessionEvent::ToolCallStarted { call } => {
+                    let call = Self::without_provider_resume_tool_call(call);
                     items.push(ProviderInputItem::ToolCall {
                         assistant_message_id: call
                             .assistant_message_id
@@ -2688,9 +2955,8 @@ impl AgentEngine {
                     });
                 }
                 SessionEvent::ToolCallFinished { result } => {
-                    items.push(ProviderInputItem::ToolResult {
-                        result: result.clone(),
-                    });
+                    let result = Self::prompt_visible_tool_result(result);
+                    items.push(ProviderInputItem::ToolResult { result });
                 }
             }
         }
@@ -2761,8 +3027,12 @@ impl AgentEngine {
 
     fn is_prompt_too_long_error(error: &anyhow::Error) -> bool {
         error.chain().any(|cause| {
+            if let Some(provider_error) = cause.downcast_ref::<ModelProviderError>() {
+                return provider_error.kind == ProviderErrorKind::ContextWindowExceeded;
+            }
             let message = cause.to_string().to_ascii_lowercase();
-            message.contains("prompt too long")
+            message.contains("context_length_exceeded")
+                || message.contains("prompt too long")
                 || message.contains("prompt is too long")
                 || message.contains("maximum context length")
                 || message.contains("context length")
@@ -2832,12 +3102,12 @@ impl AgentEngine {
         Some(generation)
     }
 
-    fn aggressive_snip_workspace(&mut self, upcoming_turn: usize) -> Option<PromptWorkspace> {
-        let target_budget = self
-            .policy
-            .autocompact_threshold_tokens
-            .saturating_sub(self.policy.autocompact_buffer_tokens)
-            .max(1);
+    fn aggressive_snip_workspace(
+        &mut self,
+        upcoming_turn: usize,
+        generation: &ModelGenerationConfig,
+    ) -> Option<PromptWorkspace> {
+        let target_budget = self.effective_autocompact_threshold_tokens(generation);
         let mut workspace = self.build_prompt_workspace();
         let result = snip_if_needed(
             &workspace.prompt.messages,
@@ -3614,6 +3884,96 @@ mod tests {
                 .messages
                 .iter()
                 .any(|message| message.role == Role::Tool)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn zero_max_turns_allows_an_unbounded_agent_loop() -> Result<()> {
+        let conversation = ConversationKey {
+            session_id: "session-unbounded".to_string(),
+            thread_id: None,
+        };
+        let mut engine = AgentEngine::new(
+            conversation,
+            LoopPolicy {
+                max_turns: 0,
+                keep_last_messages: 3,
+                ..LoopPolicy::default()
+            },
+        );
+
+        let model = ScriptedModel::new(vec![
+            ModelTurn {
+                assistant_message: MessageRecord::new(
+                    "assistant-tool-1",
+                    Role::Assistant,
+                    "Je dois inspecter une premiere chose.",
+                ),
+                tool_calls: vec![ToolCallRecord {
+                    id: "call-tool-1".to_string(),
+                    name: "lookup_context".to_string(),
+                    input: json!({"query": "one"}),
+                    assistant_message_id: None,
+                    assistant_provider_response_id: None,
+                }],
+                finish_reason: ModelFinishReason::ToolCalls,
+                usage: None,
+            },
+            ModelTurn {
+                assistant_message: MessageRecord::new(
+                    "assistant-tool-2",
+                    Role::Assistant,
+                    "Je continue avec une deuxieme inspection.",
+                ),
+                tool_calls: vec![ToolCallRecord {
+                    id: "call-tool-2".to_string(),
+                    name: "lookup_context".to_string(),
+                    input: json!({"query": "two"}),
+                    assistant_message_id: None,
+                    assistant_provider_response_id: None,
+                }],
+                finish_reason: ModelFinishReason::ToolCalls,
+                usage: None,
+            },
+            ModelTurn {
+                assistant_message: MessageRecord::new(
+                    "assistant-tool-3",
+                    Role::Assistant,
+                    "Je termine la verification.",
+                ),
+                tool_calls: vec![ToolCallRecord {
+                    id: "call-tool-3".to_string(),
+                    name: "lookup_context".to_string(),
+                    input: json!({"query": "three"}),
+                    assistant_message_id: None,
+                    assistant_provider_response_id: None,
+                }],
+                finish_reason: ModelFinishReason::ToolCalls,
+                usage: None,
+            },
+            ModelTurn {
+                assistant_message: MessageRecord::new(
+                    "assistant-final-unbounded",
+                    Role::Assistant,
+                    "J'ai fini.",
+                ),
+                tool_calls: Vec::new(),
+                finish_reason: ModelFinishReason::Completed,
+                usage: None,
+            },
+        ]);
+
+        let input = InputEnvelope::text("memory", "test", "session-unbounded", "user-1", "start");
+        let outcome = engine.run_input(input, &model, &EchoToolExecutor).await?;
+
+        assert_eq!(outcome.turns, 4);
+        assert!(matches!(outcome.status, RunStatus::Completed));
+        assert_eq!(outcome.trace.turns.len(), 4);
+        assert_eq!(
+            outcome.snapshot.run_meta.policy.max_turns, 0,
+            "zero is the public sentinel for an unbounded turn policy"
         );
 
         Ok(())
@@ -4535,7 +4895,13 @@ mod tests {
         let model = ScriptedModel::new(Vec::new());
 
         let checkpoint = engine
-            .compact_pipeline(&mut workspace, 2, &model, None)
+            .compact_pipeline(
+                &mut workspace,
+                2,
+                &ModelGenerationConfig::default(),
+                &model,
+                None,
+            )
             .await?;
 
         assert!(checkpoint.is_none());
@@ -4617,7 +4983,13 @@ mod tests {
         let no_model = ScriptedModel::new(Vec::new());
 
         let checkpoint = engine
-            .compact_pipeline(&mut workspace, 2, &no_model, None)
+            .compact_pipeline(
+                &mut workspace,
+                2,
+                &ModelGenerationConfig::default(),
+                &no_model,
+                None,
+            )
             .await?;
 
         assert!(
@@ -4816,6 +5188,10 @@ mod tests {
                 title: "compacted_history".to_string(),
                 content: "alpha".to_string(),
             },
+            prompt_window_id: "prompt-window-1".to_string(),
+            prompt_window_generation: 1,
+            prompt_window_started_after_offset: 0,
+            prompt_window_created_by: "test".to_string(),
             compact_metadata: CompactBoundaryMetadata::default(),
             restoration: None,
             canonical: valid_canonical,
@@ -4827,6 +5203,10 @@ mod tests {
                 title: "compacted_history".to_string(),
                 content: "broken".to_string(),
             },
+            prompt_window_id: "prompt-window-2".to_string(),
+            prompt_window_generation: 2,
+            prompt_window_started_after_offset: 1,
+            prompt_window_created_by: "test".to_string(),
             compact_metadata: CompactBoundaryMetadata::default(),
             restoration: None,
             canonical: CanonicalStateSnapshot::default(),
@@ -4973,6 +5353,270 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compaction_invalidates_provider_continuation_until_new_window_response() -> Result<()>
+    {
+        let conversation = ConversationKey {
+            session_id: "session-provider-window".to_string(),
+            thread_id: None,
+        };
+        let mut engine = AgentEngine::new(
+            conversation,
+            LoopPolicy {
+                keep_last_messages: 3,
+                autocompact_threshold_tokens: 1,
+                ..LoopPolicy::default()
+            },
+        );
+        engine.append_message(MessageRecord::new("user-1", Role::User, "old user"));
+        engine.append_message(
+            MessageRecord::new("assistant-1", Role::Assistant, "old assistant")
+                .with_provider_response_id("resp_older")
+                .with_provider_context(json!({"anthropic": {"content_blocks": ["old"]}})),
+        );
+        engine.append_message(MessageRecord::new("user-2", Role::User, "tail user"));
+        engine.append_message(
+            MessageRecord::new("assistant-2", Role::Assistant, "tail assistant")
+                .with_provider_response_id("resp_old")
+                .with_provider_context(json!({"anthropic": {"content_blocks": ["tail"]}})),
+        );
+        engine.append_message(MessageRecord::new("user-3", Role::User, "latest user"));
+
+        let model = ScriptedModel::new(vec![ModelTurn {
+            assistant_message: MessageRecord::new(
+                "compaction-window",
+                Role::Assistant,
+                "<summary>Window summary.</summary>",
+            ),
+            tool_calls: Vec::new(),
+            finish_reason: ModelFinishReason::Completed,
+            usage: None,
+        }]);
+        engine
+            .compact_if_needed(1, &model)
+            .await?
+            .expect("compaction should create a checkpoint");
+
+        let provider_prompt = engine.current_provider_prompt();
+        let tail_assistant = provider_prompt
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ProviderInputItem::Message {
+                    id,
+                    provider_response_id,
+                    provider_context,
+                    ..
+                } if id == "assistant-2" => Some((provider_response_id, provider_context)),
+                _ => None,
+            })
+            .expect("tail assistant should remain visible after compaction");
+        assert!(tail_assistant.0.is_none());
+        assert!(tail_assistant.1.is_none());
+
+        engine.append_message(
+            MessageRecord::new("assistant-new", Role::Assistant, "new-window assistant")
+                .with_provider_response_id("resp_new")
+                .with_provider_context(json!({"anthropic": {"content_blocks": ["new"]}})),
+        );
+        let provider_prompt = engine.current_provider_prompt();
+        let new_assistant = provider_prompt
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ProviderInputItem::Message {
+                    id,
+                    provider_response_id,
+                    provider_context,
+                    ..
+                } if id == "assistant-new" => Some((provider_response_id, provider_context)),
+                _ => None,
+            })
+            .expect("new-window assistant should be visible");
+        assert_eq!(new_assistant.0.as_deref(), Some("resp_new"));
+        assert!(new_assistant.1.is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn snip_projection_disables_provider_resume_for_all_providers() {
+        let conversation = ConversationKey {
+            session_id: "session-snip-provider-window".to_string(),
+            thread_id: None,
+        };
+        let mut engine = AgentEngine::new(
+            conversation,
+            LoopPolicy {
+                snip_token_budget: 10,
+                snip_keep_minimum: 1,
+                autocompact_threshold_tokens: 20,
+                autocompact_buffer_tokens: 5,
+                ..LoopPolicy::default()
+            },
+        );
+        engine.append_message(MessageRecord::new("user-1", Role::User, &"A".repeat(400)));
+        engine.append_message(
+            MessageRecord::new("assistant-1", Role::Assistant, "tail assistant")
+                .with_provider_response_id("resp_old")
+                .with_provider_context(json!({"anthropic": {"content_blocks": ["old"]}})),
+        );
+
+        let workspace = engine
+            .aggressive_snip_workspace(1, &ModelGenerationConfig::default())
+            .expect("snip should rebuild a smaller prompt");
+        assert!(
+            workspace
+                .provider_prompt
+                .items
+                .iter()
+                .all(|item| match item {
+                    ProviderInputItem::Message {
+                        provider_response_id,
+                        provider_context,
+                        ..
+                    } => provider_response_id.is_none() && provider_context.is_none(),
+                    ProviderInputItem::ToolCall { call, .. } => {
+                        call.assistant_provider_response_id.is_none()
+                    }
+                    _ => true,
+                })
+        );
+
+        let rebuilt = engine.build_prompt_workspace();
+        assert!(
+            rebuilt.provider_prompt.items.iter().all(|item| match item {
+                ProviderInputItem::Message {
+                    provider_response_id,
+                    provider_context,
+                    ..
+                } => provider_response_id.is_none() && provider_context.is_none(),
+                ProviderInputItem::ToolCall { call, .. } => {
+                    call.assistant_provider_response_id.is_none()
+                }
+                _ => true,
+            }),
+            "provider resume must remain disabled after rebuilding from the journal"
+        );
+    }
+
+    #[test]
+    fn prompt_visible_tool_outputs_are_bounded_without_mutating_audit() -> Result<()> {
+        let conversation = ConversationKey {
+            session_id: "session-tool-output-cap".to_string(),
+            thread_id: None,
+        };
+        let mut engine = AgentEngine::new(conversation, LoopPolicy::default());
+        engine.start_tool_call(ToolCallRecord {
+            id: "call-large".to_string(),
+            name: "custom_mcp_large_output".to_string(),
+            input: json!({"query": "large"}),
+            assistant_message_id: Some("assistant-large".to_string()),
+            assistant_provider_response_id: Some("resp_large".to_string()),
+        });
+        let raw_output = "x".repeat(60_000);
+        let result = ToolResultRecord {
+            call_id: "call-large".to_string(),
+            output: json!({"payload": raw_output}),
+            is_error: false,
+            tool_name: Some("custom_mcp_large_output".to_string()),
+            offset: None,
+            timestamp_ms: None,
+            context_updates: Vec::new(),
+            hook_contexts: Vec::new(),
+        };
+        engine.finish_tool_call(result.clone());
+        engine.append_tool_result_message(&result)?;
+
+        let audit = engine.replay_from_journal();
+        assert_eq!(audit.completed_tool_results[0].output, result.output);
+
+        let provider_prompt = engine.current_provider_prompt();
+        let capped = provider_prompt
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ProviderInputItem::ToolResult { result } if result.call_id == "call-large" => {
+                    Some(&result.output)
+                }
+                _ => None,
+            })
+            .expect("tool result should be visible");
+        let metadata = capped
+            .get("_kheish_prompt_visible_tool_output")
+            .expect("large output should be capped");
+        assert_eq!(metadata["truncated"], true);
+        assert_eq!(metadata["tool_name"], "custom_mcp_large_output");
+        assert!(metadata["preview"].as_str().unwrap_or_default().len() < 60_000);
+
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_prompt_projection_caps_outputs_and_strips_provider_resume() -> Result<()> {
+        let conversation = ConversationKey {
+            session_id: "session-compaction-prompt-cap".to_string(),
+            thread_id: None,
+        };
+        let mut engine = AgentEngine::new(conversation, LoopPolicy::default());
+        engine.append_message(
+            MessageRecord::new("assistant-large", Role::Assistant, "using tool")
+                .with_provider_response_id("resp_old")
+                .with_provider_context(json!({"anthropic": {"content_blocks": ["old"]}})),
+        );
+        engine.start_tool_call(ToolCallRecord {
+            id: "call-large".to_string(),
+            name: "custom_mcp_large_output".to_string(),
+            input: json!({}),
+            assistant_message_id: Some("assistant-large".to_string()),
+            assistant_provider_response_id: Some("resp_old".to_string()),
+        });
+        let raw_output = "x".repeat(60_000);
+        let result = ToolResultRecord {
+            call_id: "call-large".to_string(),
+            output: json!({"payload": raw_output}),
+            is_error: false,
+            tool_name: Some("custom_mcp_large_output".to_string()),
+            offset: None,
+            timestamp_ms: None,
+            context_updates: Vec::new(),
+            hook_contexts: Vec::new(),
+        };
+        engine.finish_tool_call(result.clone());
+        engine.append_tool_result_message(&result)?;
+
+        let groups = vec![engine.journal().to_vec()];
+        let (projection, provider_prompt) = engine.compaction_prompt_projection(None, &groups, 1);
+
+        assert!(projection.messages.iter().all(|message| {
+            message.provider_response_id.is_none() && message.provider_context.is_none()
+        }));
+        assert!(provider_prompt.items.iter().all(|item| match item {
+            ProviderInputItem::Message {
+                provider_response_id,
+                provider_context,
+                ..
+            } => provider_response_id.is_none() && provider_context.is_none(),
+            ProviderInputItem::ToolCall { call, .. } => {
+                call.assistant_provider_response_id.is_none()
+            }
+            _ => true,
+        }));
+        let capped = provider_prompt
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ProviderInputItem::ToolResult { result } if result.call_id == "call-large" => {
+                    Some(&result.output)
+                }
+                _ => None,
+            })
+            .expect("tool result should be visible to compaction");
+        assert!(capped.get("_kheish_prompt_visible_tool_output").is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn compaction_retries_after_prompt_too_long_by_truncating_oldest_groups() -> Result<()> {
         let conversation = ConversationKey {
             session_id: "session-5".to_string(),
@@ -5094,6 +5738,31 @@ mod tests {
     }
 
     #[test]
+    fn autocompact_threshold_respects_resolved_model_context_window() {
+        let engine = AgentEngine::new(
+            ConversationKey {
+                session_id: "session-threshold".to_string(),
+                thread_id: None,
+            },
+            LoopPolicy {
+                autocompact_threshold_tokens: 167_000,
+                autocompact_buffer_tokens: 13_000,
+                ..LoopPolicy::default()
+            },
+        );
+        let generation = ModelGenerationConfig {
+            model: Some("gpt-4o".to_string()),
+            max_output_tokens: Some(8_000),
+            ..ModelGenerationConfig::default()
+        };
+
+        assert_eq!(
+            engine.effective_autocompact_threshold_tokens(&generation),
+            107_000
+        );
+    }
+
+    #[test]
     fn accept_input_does_not_persist_recovered_memory_metadata() -> Result<()> {
         let mut engine = AgentEngine::new(
             ConversationKey {
@@ -5185,5 +5854,19 @@ mod tests {
     fn prompt_too_long_gap_parser_extracts_token_difference() {
         let error = anyhow!("API Error: Prompt is too long: 137500 tokens > 135000 maximum");
         assert_eq!(AgentEngine::prompt_too_long_token_gap(&error), Some(2500));
+    }
+
+    #[test]
+    fn typed_context_window_error_triggers_reactive_compaction_path() {
+        let typed = anyhow!(ModelProviderError::new(
+            ProviderErrorKind::ContextWindowExceeded,
+            "OpenAI stream error: type=invalid_request_error, code=context_length_exceeded",
+            false,
+            None,
+        ));
+        assert!(AgentEngine::is_prompt_too_long_error(&typed));
+
+        let fallback = anyhow!("provider error code=context_length_exceeded");
+        assert!(AgentEngine::is_prompt_too_long_error(&fallback));
     }
 }

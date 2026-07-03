@@ -4,7 +4,10 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use kheish_core::{ModelDriver, ModelRequest, ModelRequestKind, ModelTurn};
-use kheish_types::{MessageRecord, ProviderPrompt, Role, ToolCallRecord, ToolDefinition};
+use kheish_types::{
+    MessageRecord, ModelProviderError, ProviderErrorKind, ProviderPrompt, Role, ToolCallRecord,
+    ToolDefinition,
+};
 pub use kheish_types::{
     ModelFinishReason, ModelGenerationConfig, ModelUsage, ReasoningConfig, ReasoningEffort,
     ReasoningSummary, ResponseFormat, StructuredFieldSchema, StructuredValueKind, ToolChoice,
@@ -89,6 +92,22 @@ impl Display for ProviderError {
 }
 
 impl std::error::Error for ProviderError {}
+
+impl ProviderError {
+    /// Returns the shared engine-level error kind for this provider failure.
+    pub fn kind(&self) -> ProviderErrorKind {
+        kheish_types::classify_provider_error_message(&self.message)
+    }
+
+    fn into_model_provider_error(self) -> ModelProviderError {
+        ModelProviderError::new(
+            self.kind(),
+            self.message,
+            self.retryable,
+            self.retry_after_ms,
+        )
+    }
+}
 
 /// A single model stream event emitted by a provider.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -247,7 +266,7 @@ where
     async fn next_turn(&self, request: ModelRequest) -> Result<ModelTurn> {
         let cancellation = current_cancellation_token();
         let mut current_generation = request.generation.clone();
-        let mut last_retryable_error = None::<String>;
+        let mut last_retryable_error = None::<ProviderError>;
         for attempt in 1..=self.retry.max_attempts {
             let mut attempt_request = request.clone();
             attempt_request.generation = current_generation.clone();
@@ -424,7 +443,7 @@ where
                     });
                 }
                 Err(error) if error.retryable && attempt < self.retry.max_attempts => {
-                    last_retryable_error = Some(error.message.clone());
+                    last_retryable_error = Some(error.clone());
                     if let Some(adjusted_max_output_tokens) =
                         parse_max_tokens_context_overflow_adjustment(&error.message)
                     {
@@ -483,13 +502,18 @@ where
                         &error.message,
                         false,
                     );
-                    return Err(anyhow!(error));
+                    return Err(anyhow!(error.into_model_provider_error()));
                 }
             }
         }
 
         if let Some(reason) = last_retryable_error {
-            bail!("model runtime exhausted retries: {reason}");
+            return Err(anyhow!(ModelProviderError::new(
+                reason.kind(),
+                format!("model runtime exhausted retries: {}", reason.message),
+                reason.retryable,
+                reason.retry_after_ms,
+            )));
         }
         bail!("model runtime exhausted retries")
     }
@@ -771,8 +795,8 @@ mod tests {
     use kheish_core::{ModelDriver, ModelRequest, ModelRequestKind};
     use kheish_types::ToolCallRecord;
     use kheish_types::{
-        ConversationKey, ModelFinishReason, ModelGenerationConfig, PromptProjection,
-        ProviderPrompt, ResponseFormat,
+        ConversationKey, ModelFinishReason, ModelGenerationConfig, ModelProviderError,
+        PromptProjection, ProviderErrorKind, ProviderPrompt, ResponseFormat,
     };
     use serde_json::json;
     use tokio::time::{Duration, sleep};
@@ -931,6 +955,64 @@ mod tests {
                 .traces()
                 .iter()
                 .any(|event| matches!(event.kind, TraceEventKind::ModelRetryScheduled { .. }))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_error_kind_classifies_context_window_across_provider_messages() {
+        let cases = [
+            "OpenAI stream error: type=invalid_request_error, code=context_length_exceeded",
+            "Anthropic request failed with status 400: prompt is too long",
+            "Google request error with status 400: token count exceeds the model context length",
+            "OpenRouter request error with status 413",
+        ];
+        for message in cases {
+            let error = ProviderError {
+                message: message.to_string(),
+                retryable: false,
+                retry_after_ms: None,
+            };
+            assert_eq!(error.kind(), ProviderErrorKind::ContextWindowExceeded);
+        }
+    }
+
+    #[tokio::test]
+    async fn model_runtime_preserves_typed_error_when_retries_exhaust() -> Result<()> {
+        let observer = InMemoryObserver::shared();
+        let runtime = ModelRuntime::new(
+            ScriptedProvider::new(vec![
+                Err(ProviderError {
+                    message: "OpenAI stream error: code=context_length_exceeded".to_string(),
+                    retryable: true,
+                    retry_after_ms: None,
+                }),
+                Err(ProviderError {
+                    message: "OpenAI stream error: code=context_length_exceeded".to_string(),
+                    retryable: true,
+                    retry_after_ms: None,
+                }),
+            ]),
+            ModelRetryPolicy {
+                max_attempts: 2,
+                base_backoff_ms: 0,
+                stream_timeout_ms: 10_000,
+                inactivity_timeout_ms: 10_000,
+            },
+            ModelBudget::default(),
+            observer,
+        );
+
+        let error = runtime
+            .next_turn(default_request("session-retry-kind", ResponseFormat::Text))
+            .await
+            .expect_err("exhausted retries should fail");
+        let provider_error = error
+            .downcast_ref::<ModelProviderError>()
+            .expect("runtime should preserve typed provider error");
+        assert_eq!(
+            provider_error.kind,
+            ProviderErrorKind::ContextWindowExceeded
         );
         Ok(())
     }
