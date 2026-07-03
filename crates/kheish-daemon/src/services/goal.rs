@@ -124,6 +124,35 @@ impl GoalService {
         Ok(saved)
     }
 
+    pub(crate) async fn create_or_replace_inactive_session_goal(
+        &self,
+        session_id: &str,
+        objective: String,
+        token_budget: Option<u64>,
+        status: SessionGoalStatus,
+        created_by_run_id: Option<String>,
+    ) -> Result<SessionGoal> {
+        let saved = {
+            let lock = self.session_lock(session_id).await;
+            let _guard = lock.lock().await;
+            if let Some(existing) = self.load_session_goal(session_id).await? {
+                if existing.should_continue() {
+                    bail!("session already has an active goal");
+                }
+            }
+            self.replace_session_goal_locked(
+                session_id,
+                objective,
+                token_budget,
+                status,
+                created_by_run_id,
+            )
+            .await?
+        };
+        self.publish_session_goal(session_id, Some(saved.clone()));
+        Ok(saved)
+    }
+
     pub(crate) async fn set_session_goal(
         &self,
         session_id: &str,
@@ -550,6 +579,68 @@ mod tests {
 
         service.clear_session_goal("session-1").await?;
         assert!(service.load_session_goal("session-1").await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn goal_service_replaces_inactive_goal_but_preserves_active_goal() -> Result<()> {
+        let temp = tempdir()?;
+        let service = service(temp.path());
+        let active = service
+            .create_session_goal(
+                "session-1",
+                "Active work".to_string(),
+                None,
+                SessionGoalStatus::Active,
+                None,
+            )
+            .await?;
+
+        let error = service
+            .create_or_replace_inactive_session_goal(
+                "session-1",
+                "Unexpected replacement".to_string(),
+                None,
+                SessionGoalStatus::Active,
+                None,
+            )
+            .await
+            .expect_err("active goal must not be replaced");
+        assert_eq!(error.to_string(), "session already has an active goal");
+        assert_eq!(
+            service.load_session_goal("session-1").await?.as_ref(),
+            Some(&active)
+        );
+
+        service
+            .update_session_goal(
+                "session-1",
+                SessionGoalPatch {
+                    status: Some(SessionGoalStatus::Paused),
+                    expected_goal_id: Some(active.goal_id.clone()),
+                    expected_definition_version: Some(active.definition_version),
+                    ..SessionGoalPatch::default()
+                },
+            )
+            .await?;
+
+        let replacement = service
+            .create_or_replace_inactive_session_goal(
+                "session-1",
+                "Next active work".to_string(),
+                Some(500),
+                SessionGoalStatus::Active,
+                Some("run-next".to_string()),
+            )
+            .await?;
+
+        assert_ne!(replacement.goal_id, active.goal_id);
+        assert_eq!(replacement.objective, "Next active work");
+        assert_eq!(replacement.status, SessionGoalStatus::Active);
+        assert_eq!(replacement.token_budget, Some(500));
+        assert_eq!(replacement.created_by_run_id.as_deref(), Some("run-next"));
+        assert_eq!(replacement.version, 1);
+        assert_eq!(replacement.definition_version, 1);
         Ok(())
     }
 

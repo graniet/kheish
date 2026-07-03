@@ -6,6 +6,8 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use clap::ValueEnum;
+use tracing::warn;
+
 use kheish_auth::{
     AnthropicAuthBackend, AuthManager, AuthMode, AuthProvider, AuthSlotId,
     DEFAULT_ANTHROPIC_OAUTH_TOKEN_URL, DEFAULT_CLAUDE_CODE_CLIENT_ID,
@@ -232,6 +234,49 @@ mod tests {
         assert_eq!(status.active_route_lease_ids.len(), 1);
         Ok(())
     }
+
+    // The full control-plane auth resolution matrix — non-loopback refusals (mode none and auto),
+    // bearer/admin token handling, duplicate-token rejection, and Auto+loopback fallback — is
+    // covered by the `control_plane_auth_*` tests in `main.rs`. This adds the one branch they miss:
+    // `--http-auth-mode none` on a loopback bind, which is also the second site that now emits the
+    // "control-plane auth DISABLED" operator warning.
+    #[test]
+    fn control_plane_auth_disabled_on_loopback_with_mode_none() {
+        use clap::Parser;
+        let cli = crate::Cli::parse_from([
+            "kheish-daemon",
+            "serve",
+            "--bind",
+            "127.0.0.1:4000",
+            "--http-auth-mode",
+            "none",
+        ]);
+        let args = match cli.command {
+            Some(crate::Command::Serve(args)) => args,
+            _ => panic!("expected the serve subcommand"),
+        };
+        let config = super::resolve_control_plane_auth_config(&args)
+            .expect("mode none on a loopback bind should be allowed");
+        assert!(
+            !config.is_enabled(),
+            "mode none on loopback must disable control-plane auth"
+        );
+    }
+}
+
+/// Builds a disabled control-plane auth config and emits an operator warning.
+///
+/// Auth is only ever disabled on a loopback bind — non-loopback binds without an admin token are
+/// refused before reaching here — but an unauthenticated control plane still grants full admin
+/// access to every process that can reach the bind, so surface it loudly rather than silently.
+fn disabled_control_plane_auth_with_warning(bind: std::net::SocketAddr) -> ControlPlaneAuthConfig {
+    warn!(
+        %bind,
+        "daemon control-plane authentication is DISABLED; every client able to reach this bind has \
+         full admin access. This is only intended for trusted loopback use. Set --http-admin-token \
+         (optionally with --http-readonly-token) to require bearer authentication."
+    );
+    ControlPlaneAuthConfig::disabled()
 }
 
 /// Resolves the HTTP control-plane auth policy for one daemon instance.
@@ -260,7 +305,7 @@ pub(crate) fn resolve_control_plane_auth_config(
                     args.bind
                 );
             }
-            Ok(ControlPlaneAuthConfig::disabled())
+            Ok(disabled_control_plane_auth_with_warning(args.bind))
         }
         HttpAuthModeArg::Bearer => {
             let admin_token = admin_token.ok_or_else(|| {
@@ -285,7 +330,7 @@ pub(crate) fn resolve_control_plane_auth_config(
             None if read_only_token.is_some() => {
                 bail!("--http-readonly-token requires --http-admin-token or --http-auth-mode none")
             }
-            None if bind_is_loopback => Ok(ControlPlaneAuthConfig::disabled()),
+            None if bind_is_loopback => Ok(disabled_control_plane_auth_with_warning(args.bind)),
             None => bail!(
                 "refusing to expose daemon control-plane on non-loopback bind {} without HTTP auth; configure --http-admin-token",
                 args.bind

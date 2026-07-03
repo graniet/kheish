@@ -417,6 +417,7 @@ where
         let capability_scope = self.load_session_capability_scope(session_id).await?;
         let credential_scope = self.load_session_credential_scope(session_id).await?;
         let persona_binding = self.load_session_persona_binding(session_id).await?;
+        let operator = self.load_session_operator_config(session_id).await?;
         let reply_targets = self.session_reply_targets(session_id).await;
         let effective_capability_scope =
             effective_session_capability_scope(persona_binding.as_ref(), &capability_scope);
@@ -433,6 +434,7 @@ where
             credential_scope,
             effective_credential_scope,
             persona,
+            operator,
             reply_targets,
             outputs: self.delivery_service.session_outputs(session_id).await?,
         })
@@ -480,6 +482,7 @@ where
             let goal = self.load_session_goal(&session_id).await?;
             let capability_scope = self.load_session_capability_scope(&session_id).await?;
             let credential_scope = self.load_session_credential_scope(&session_id).await?;
+            let operator = self.load_session_operator_config(&session_id).await?;
             let reply_targets = self.session_reply_targets(&session_id).await;
             let effective_capability_scope =
                 effective_session_capability_scope(persona_binding.as_ref(), &capability_scope);
@@ -497,6 +500,7 @@ where
                 credential_scope,
                 effective_credential_scope,
                 persona,
+                operator,
                 reply_targets,
             });
         }
@@ -577,7 +581,7 @@ where
         session_id: &str,
         run_id: Option<&str>,
         tool_call_id: Option<&str>,
-        mut request: GenerateImageToolRequest,
+        request: GenerateImageToolRequest,
     ) -> Result<GenerateImageToolResponse> {
         let service = self
             .image_generation
@@ -592,9 +596,11 @@ where
         } else {
             None
         };
-        if request.route.provider.is_none() {
-            request.route.provider = preferred_route_id.clone();
-        }
+        // `preferred_route_id` (the run's text provider) is passed to `generate_with_context` as a
+        // *soft* preference: tried first when a matching image backend exists, else default/any.
+        // Copying it into `request.route.provider` would make it a *hard* override and wrongly fail
+        // generation on runs whose text provider has no matching image backend. An explicit provider
+        // supplied by the model in the tool call stays in `request.route.provider` as a hard override.
         let credential_scope = self.load_session_credential_scope(session_id).await?;
         service
             .generate_with_context(
@@ -621,7 +627,6 @@ where
             .audio_generation
             .as_ref()
             .ok_or_else(|| anyhow!("no audio-generation backend is configured"))?;
-        let mut request = request;
         let preferred_route_id = if let Some(run_id) = run_id {
             self.run_service
                 .run_record(run_id)
@@ -631,9 +636,11 @@ where
         } else {
             None
         };
-        if request.route.provider.is_none() {
-            request.route.provider = preferred_route_id.clone();
-        }
+        // `preferred_route_id` (the run's text provider) is passed to `generate_with_context` as a
+        // *soft* preference: tried first when a matching audio backend exists, else default/any.
+        // Copying it into `request.route.provider` would make it a *hard* override and wrongly fail
+        // generation on runs whose text provider has no matching audio backend. An explicit provider
+        // supplied by the model in the tool call stays in `request.route.provider` as a hard override.
         let credential_scope = self.load_session_credential_scope(session_id).await?;
         service
             .generate_with_context(
@@ -672,9 +679,13 @@ where
         } else {
             None
         };
-        if request.route.provider.is_none() {
-            request.route.provider = preferred_route_id.clone();
-        }
+        // `preferred_route_id` is the run's text provider. It is a *soft* preference: pass it to
+        // `edit_with_context` so the service tries it first when a matching image-edit backend
+        // exists, then falls back to the default/any configured route. Copying it into
+        // `request.route.provider` would turn it into a *hard* override and wrongly fail edits on
+        // runs whose text provider has no matching image-edit backend (e.g. an Anthropic run
+        // editing through the default OpenAI image route). Only an explicit provider supplied by
+        // the model in the tool call should be treated as a hard route override.
         let credential_scope = self.load_session_credential_scope(session_id).await?;
         service
             .edit_with_context(

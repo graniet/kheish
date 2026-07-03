@@ -802,6 +802,8 @@ pub enum DaemonOutputSourceKind {
     EmitOutput,
     /// The output was emitted directly by daemon control-plane code.
     DaemonEmitOutput,
+    /// The output is a model-requested notification to the configured operator.
+    OperatorNotification,
 }
 
 impl DaemonOutputSourceKind {
@@ -811,6 +813,7 @@ impl DaemonOutputSourceKind {
             "assistant_text" => Some(Self::AssistantText),
             "emit_output" => Some(Self::EmitOutput),
             "daemon_emit_output" => Some(Self::DaemonEmitOutput),
+            "operator_notification" => Some(Self::OperatorNotification),
             _ => None,
         }
     }

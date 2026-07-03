@@ -23,24 +23,36 @@ where
         ))
     }
 
-    pub(crate) async fn create_session_goal(
+    pub(crate) async fn create_session_goal_from_tool(
         &self,
         session_id: &str,
         objective: String,
         token_budget: Option<u64>,
         created_by_run_id: Option<String>,
+        replace_if_inactive: bool,
     ) -> Result<SessionGoalResponse> {
         self.ensure_goal_session_exists(session_id).await?;
-        let goal = self
-            .goal_service
-            .create_session_goal(
-                session_id,
-                objective,
-                token_budget,
-                SessionGoalStatus::Active,
-                created_by_run_id,
-            )
-            .await?;
+        let goal = if replace_if_inactive {
+            self.goal_service
+                .create_or_replace_inactive_session_goal(
+                    session_id,
+                    objective,
+                    token_budget,
+                    SessionGoalStatus::Active,
+                    created_by_run_id,
+                )
+                .await?
+        } else {
+            self.goal_service
+                .create_session_goal(
+                    session_id,
+                    objective,
+                    token_budget,
+                    SessionGoalStatus::Active,
+                    created_by_run_id,
+                )
+                .await?
+        };
         Ok(SessionGoalResponse::new(Some(goal)))
     }
 
@@ -162,6 +174,34 @@ where
                     expected_goal_id: Some(expected_goal_id),
                     expected_definition_version: Some(expected_definition_version),
                     completed_by_run_id: Some(run_id.to_string()),
+                    ..SessionGoalPatch::default()
+                },
+            )
+            .await?;
+        Ok(SessionGoalResponse::new(Some(goal)))
+    }
+
+    pub(crate) async fn pause_session_goal_from_run(
+        &self,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<SessionGoalResponse> {
+        self.ensure_goal_session_exists(session_id).await?;
+        let run = self.run_service.get_run(run_id).await?;
+        let goal = self
+            .load_session_goal(session_id)
+            .await?
+            .ok_or_else(|| anyhow!("session has no goal"))?;
+        let (expected_goal_id, expected_definition_version) =
+            goal_completion_expectation_from_run(&goal, run.input_metadata.as_ref(), run_id)?;
+        let goal = self
+            .goal_service
+            .update_session_goal(
+                session_id,
+                SessionGoalPatch {
+                    status: Some(SessionGoalStatus::Paused),
+                    expected_goal_id: Some(expected_goal_id),
+                    expected_definition_version: Some(expected_definition_version),
                     ..SessionGoalPatch::default()
                 },
             )

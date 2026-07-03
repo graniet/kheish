@@ -6032,6 +6032,7 @@ async fn daemon_playbook_flow_api_starts_idempotently_and_survives_restart() -> 
         .as_ref()
         .context("flow run should preserve input metadata")?;
     assert_eq!(metadata["caller"], "test");
+    assert_eq!(metadata["operator"], "integration-test");
     assert_eq!(metadata[KHEISH_FLOW_METADATA_KEY]["flow_id"], "flow-api-1");
     assert_eq!(
         metadata[KHEISH_FLOW_METADATA_KEY]["playbook_id"],
@@ -6231,6 +6232,7 @@ async fn daemon_schedule_starts_flow_and_settles_with_scheduled_root_run() -> Re
         .context("scheduled Flow run should preserve input metadata")?;
     assert_eq!(metadata["schedule_id"], schedule.schedule_id);
     assert_eq!(metadata["scheduled_for_ms"], fire_at_ms);
+    assert_eq!(metadata["operator"], "scheduler");
     assert_eq!(
         metadata[KHEISH_FLOW_METADATA_KEY]["flow_id"],
         expected_flow_id
@@ -33676,6 +33678,739 @@ async fn daemon_user_questions_suspend_resume_and_block_parallel_inputs() -> Res
 }
 
 #[tokio::test]
+async fn daemon_operator_notify_requires_durable_session_reply_targets() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-operator-reply-target-state");
+    let (address, shutdown) = scripted_daemon(&state_root, Vec::new()).await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+
+    client
+        .post(format!("{base}/v1/sessions"))
+        .json(&CreateSessionRequest {
+            session_id: Some("operator-notify-session".to_string()),
+            thread_id: None,
+            persona_id: None,
+            credential_scope: None,
+            capability_scope: None,
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let notify_without_target = client
+        .post(format!(
+            "{base}/v1/sessions/operator-notify-session/operator"
+        ))
+        .json(&SetSessionOperatorConfigRequest {
+            operator: kheish_types::SessionOperatorConfig {
+                enabled: true,
+                allow_notify: true,
+                allow_questions: false,
+                ..Default::default()
+            },
+        })
+        .send()
+        .await?;
+    assert_eq!(notify_without_target.status(), StatusCode::BAD_REQUEST);
+
+    client
+        .post(format!(
+            "{base}/v1/sessions/operator-notify-session/reply-targets"
+        ))
+        .json(&SetSessionReplyTargetsRequest {
+            reply_targets: vec![SessionReplyTargetRequest::Http {
+                url: "https://example.com/kheish/operator".to_string(),
+                headers: BTreeMap::new(),
+            }],
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+
+    client
+        .post(format!(
+            "{base}/v1/sessions/operator-notify-session/operator"
+        ))
+        .json(&SetSessionOperatorConfigRequest {
+            operator: kheish_types::SessionOperatorConfig {
+                enabled: true,
+                allow_notify: true,
+                allow_questions: false,
+                ..Default::default()
+            },
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let clear_while_enabled = client
+        .delete(format!(
+            "{base}/v1/sessions/operator-notify-session/reply-targets"
+        ))
+        .send()
+        .await?;
+    assert_eq!(clear_while_enabled.status(), StatusCode::BAD_REQUEST);
+
+    client
+        .delete(format!(
+            "{base}/v1/sessions/operator-notify-session/operator"
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+    client
+        .delete(format!(
+            "{base}/v1/sessions/operator-notify-session/reply-targets"
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let _ = shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_operator_notify_is_disabled_when_reply_targets_become_undeliverable() -> Result<()>
+{
+    ensure_auth_store_master_key();
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-operator-target-repair-state");
+    let (address, shutdown) = scripted_daemon(&state_root, Vec::new()).await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+
+    client
+        .put(format!(
+            "{base}/v1/runtime/connectors/telegram/operator-scope"
+        ))
+        .json(&json!({
+            "allow_unauthenticated_ingress": true,
+            "bot_token": {"value": "test-token"},
+            "allowed_chat_ids": [123456789i64]
+        }))
+        .send()
+        .await?
+        .error_for_status()?;
+    client
+        .post(format!("{base}/v1/sessions"))
+        .json(&CreateSessionRequest {
+            session_id: Some("operator-scope-session".to_string()),
+            thread_id: None,
+            persona_id: None,
+            credential_scope: None,
+            capability_scope: None,
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+    client
+        .post(format!(
+            "{base}/v1/sessions/operator-scope-session/reply-targets"
+        ))
+        .json(&SetSessionReplyTargetsRequest {
+            reply_targets: vec![SessionReplyTargetRequest::Telegram {
+                connector: "operator-scope".to_string(),
+                chat_id: 123456789,
+                message_thread_id: None,
+                reply_to_message_id: None,
+            }],
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+    client
+        .post(format!(
+            "{base}/v1/sessions/operator-scope-session/operator"
+        ))
+        .json(&SetSessionOperatorConfigRequest {
+            operator: kheish_types::SessionOperatorConfig {
+                enabled: true,
+                allow_notify: true,
+                allow_questions: false,
+                ..Default::default()
+            },
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let repaired_by_scope = client
+        .post(format!(
+            "{base}/v1/sessions/operator-scope-session/credential-scope"
+        ))
+        .json(&SetSessionCredentialScopeRequest {
+            credential_scope: Some(kheish_types::CredentialScope {
+                connector_deny: vec!["operator-scope".to_string()],
+                ..Default::default()
+            }),
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionView>()
+        .await?;
+    assert!(repaired_by_scope.reply_targets.is_empty());
+    assert!(!repaired_by_scope.operator.enabled);
+    assert!(!repaired_by_scope.operator.is_active());
+
+    client
+        .put(format!(
+            "{base}/v1/runtime/connectors/telegram/operator-connector"
+        ))
+        .json(&json!({
+            "allow_unauthenticated_ingress": true,
+            "bot_token": {"value": "test-token"},
+            "allowed_chat_ids": [987654321i64]
+        }))
+        .send()
+        .await?
+        .error_for_status()?;
+    client
+        .post(format!("{base}/v1/sessions"))
+        .json(&CreateSessionRequest {
+            session_id: Some("operator-connector-session".to_string()),
+            thread_id: None,
+            persona_id: None,
+            credential_scope: None,
+            capability_scope: None,
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+    client
+        .post(format!(
+            "{base}/v1/sessions/operator-connector-session/reply-targets"
+        ))
+        .json(&SetSessionReplyTargetsRequest {
+            reply_targets: vec![SessionReplyTargetRequest::Telegram {
+                connector: "operator-connector".to_string(),
+                chat_id: 987654321,
+                message_thread_id: None,
+                reply_to_message_id: None,
+            }],
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+    client
+        .post(format!(
+            "{base}/v1/sessions/operator-connector-session/operator"
+        ))
+        .json(&SetSessionOperatorConfigRequest {
+            operator: kheish_types::SessionOperatorConfig {
+                enabled: true,
+                allow_notify: true,
+                allow_questions: false,
+                ..Default::default()
+            },
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+
+    client
+        .put(format!(
+            "{base}/v1/runtime/connectors/telegram/operator-connector"
+        ))
+        .json(&json!({
+            "allow_unauthenticated_ingress": true,
+            "bot_token": {"value": "test-token"},
+            "allowed_chat_ids": [111111111i64]
+        }))
+        .send()
+        .await?
+        .error_for_status()?;
+    let repaired_by_connector = client
+        .get(format!("{base}/v1/sessions/operator-connector-session"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionView>()
+        .await?;
+    assert!(repaired_by_connector.reply_targets.is_empty());
+    assert!(!repaired_by_connector.operator.enabled);
+    assert!(!repaired_by_connector.operator.is_active());
+
+    let _ = shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_operator_contact_topology_mutations_require_idle_sessions() -> Result<()> {
+    ensure_auth_store_master_key();
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-operator-idle-state");
+    let (address, shutdown) = slow_daemon(&state_root).await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+
+    client
+        .put(format!(
+            "{base}/v1/runtime/connectors/telegram/operator-idle"
+        ))
+        .json(&json!({
+            "allow_unauthenticated_ingress": true,
+            "bot_token": {"value": "test-token"},
+            "allowed_chat_ids": [123456789i64]
+        }))
+        .send()
+        .await?
+        .error_for_status()?;
+    client
+        .post(format!("{base}/v1/sessions"))
+        .json(&CreateSessionRequest {
+            session_id: Some("operator-busy-session".to_string()),
+            thread_id: None,
+            persona_id: None,
+            credential_scope: None,
+            capability_scope: None,
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+    client
+        .post(format!(
+            "{base}/v1/sessions/operator-busy-session/reply-targets"
+        ))
+        .json(&SetSessionReplyTargetsRequest {
+            reply_targets: vec![SessionReplyTargetRequest::Telegram {
+                connector: "operator-idle".to_string(),
+                chat_id: 123456789,
+                message_thread_id: None,
+                reply_to_message_id: None,
+            }],
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let run = client
+        .post(format!("{base}/v1/sessions/operator-busy-session/runs"))
+        .json(&SubmitInputRequest {
+            source_plugin: None,
+            source_kind: None,
+            actor_id: None,
+            provider: None,
+            content: "stay busy".to_string(),
+            input_items: Vec::new(),
+            attachments: Vec::new(),
+            generation: Some(ModelGenerationConfig::default()),
+            completion_requirements: None,
+            metadata: None,
+            reply_address: None,
+            binding_keys: Vec::new(),
+            reply_targets: Vec::new(),
+            reply_plugin: None,
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<RunView>()
+        .await?;
+    wait_for_run_status(&client, &base, &run.run_id, &[DaemonRunStatus::Running]).await?;
+
+    let rejected_operator = client
+        .post(format!("{base}/v1/sessions/operator-busy-session/operator"))
+        .json(&SetSessionOperatorConfigRequest {
+            operator: kheish_types::SessionOperatorConfig {
+                enabled: true,
+                allow_notify: false,
+                allow_questions: true,
+                ..Default::default()
+            },
+        })
+        .send()
+        .await?;
+    assert_eq!(rejected_operator.status(), StatusCode::CONFLICT);
+
+    let rejected_reply_targets = client
+        .post(format!(
+            "{base}/v1/sessions/operator-busy-session/reply-targets"
+        ))
+        .json(&SetSessionReplyTargetsRequest {
+            reply_targets: vec![SessionReplyTargetRequest::Telegram {
+                connector: "operator-idle".to_string(),
+                chat_id: 123456789,
+                message_thread_id: None,
+                reply_to_message_id: None,
+            }],
+        })
+        .send()
+        .await?;
+    assert_eq!(rejected_reply_targets.status(), StatusCode::CONFLICT);
+
+    let rejected_connector = client
+        .put(format!(
+            "{base}/v1/runtime/connectors/telegram/operator-idle"
+        ))
+        .json(&json!({
+            "allow_unauthenticated_ingress": true,
+            "bot_token": {"value": "test-token"},
+            "allowed_chat_ids": [987654321i64]
+        }))
+        .send()
+        .await?;
+    assert_eq!(rejected_connector.status(), StatusCode::CONFLICT);
+
+    let _ = shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_connector_sticky_reply_targets_do_not_rewrite_non_idle_operator_session()
+-> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-operator-sticky-target-state");
+    let (address, shutdown) = slow_daemon(&state_root).await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+
+    client
+        .post(format!("{base}/v1/sessions"))
+        .json(&CreateSessionRequest {
+            session_id: Some("operator-sticky-session".to_string()),
+            thread_id: None,
+            persona_id: None,
+            credential_scope: None,
+            capability_scope: None,
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+    client
+        .post(format!(
+            "{base}/v1/sessions/operator-sticky-session/reply-targets"
+        ))
+        .json(&SetSessionReplyTargetsRequest {
+            reply_targets: vec![SessionReplyTargetRequest::Http {
+                url: "https://example.com/operator".to_string(),
+                headers: BTreeMap::new(),
+            }],
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+    client
+        .post(format!(
+            "{base}/v1/sessions/operator-sticky-session/operator"
+        ))
+        .json(&SetSessionOperatorConfigRequest {
+            operator: kheish_types::SessionOperatorConfig {
+                enabled: true,
+                allow_notify: true,
+                allow_questions: false,
+                ..Default::default()
+            },
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let run = client
+        .post(format!("{base}/v1/sessions/operator-sticky-session/runs"))
+        .json(&SubmitInputRequest {
+            source_plugin: None,
+            source_kind: None,
+            actor_id: None,
+            provider: None,
+            content: "stay busy".to_string(),
+            input_items: Vec::new(),
+            attachments: Vec::new(),
+            generation: Some(ModelGenerationConfig::default()),
+            completion_requirements: None,
+            metadata: None,
+            reply_address: None,
+            binding_keys: Vec::new(),
+            reply_targets: Vec::new(),
+            reply_plugin: None,
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<RunView>()
+        .await?;
+    wait_for_run_status(&client, &base, &run.run_id, &[DaemonRunStatus::Running]).await?;
+
+    client
+        .post(format!("{base}/v1/sessions/operator-sticky-session/runs"))
+        .json(&SubmitInputRequest {
+            source_plugin: Some("external".to_string()),
+            source_kind: Some("webhook".to_string()),
+            actor_id: Some("connector-user".to_string()),
+            provider: None,
+            content: "connector follow-up".to_string(),
+            input_items: Vec::new(),
+            attachments: Vec::new(),
+            generation: Some(ModelGenerationConfig::default()),
+            completion_requirements: None,
+            metadata: None,
+            reply_address: None,
+            binding_keys: Vec::new(),
+            reply_targets: vec![kheish_types::ReplyHandle {
+                plugin: "http".to_string(),
+                address: r#"{"url":"https://example.com/connector"}"#.to_string(),
+            }],
+            reply_plugin: None,
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let session = client
+        .get(format!("{base}/v1/sessions/operator-sticky-session"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionView>()
+        .await?;
+    assert_eq!(session.reply_targets.len(), 1);
+    assert!(session.reply_targets[0].address.contains("/operator"));
+
+    let _ = shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_connector_delete_rejects_non_idle_reply_target_dependents() -> Result<()> {
+    ensure_auth_store_master_key();
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-operator-delete-connector-state");
+    let (address, shutdown) = slow_daemon(&state_root).await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+
+    client
+        .put(format!(
+            "{base}/v1/runtime/connectors/telegram/operator-delete"
+        ))
+        .json(&json!({
+            "allow_unauthenticated_ingress": true,
+            "bot_token": {"value": "test-token"},
+            "allowed_chat_ids": [123456789i64]
+        }))
+        .send()
+        .await?
+        .error_for_status()?;
+    client
+        .post(format!("{base}/v1/sessions"))
+        .json(&CreateSessionRequest {
+            session_id: Some("operator-delete-session".to_string()),
+            thread_id: None,
+            persona_id: None,
+            credential_scope: None,
+            capability_scope: None,
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+    client
+        .post(format!(
+            "{base}/v1/sessions/operator-delete-session/reply-targets"
+        ))
+        .json(&SetSessionReplyTargetsRequest {
+            reply_targets: vec![SessionReplyTargetRequest::Telegram {
+                connector: "operator-delete".to_string(),
+                chat_id: 123456789,
+                message_thread_id: None,
+                reply_to_message_id: None,
+            }],
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let run = client
+        .post(format!("{base}/v1/sessions/operator-delete-session/runs"))
+        .json(&SubmitInputRequest {
+            source_plugin: None,
+            source_kind: None,
+            actor_id: None,
+            provider: None,
+            content: "stay busy".to_string(),
+            input_items: Vec::new(),
+            attachments: Vec::new(),
+            generation: Some(ModelGenerationConfig::default()),
+            completion_requirements: None,
+            metadata: None,
+            reply_address: None,
+            binding_keys: Vec::new(),
+            reply_targets: Vec::new(),
+            reply_plugin: None,
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<RunView>()
+        .await?;
+    wait_for_run_status(&client, &base, &run.run_id, &[DaemonRunStatus::Running]).await?;
+
+    let rejected = client
+        .delete(format!(
+            "{base}/v1/runtime/connectors/telegram/operator-delete"
+        ))
+        .send()
+        .await?;
+    assert_eq!(rejected.status(), StatusCode::CONFLICT);
+
+    let _ = shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_operator_questions_reuse_user_question_resume_flow() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-operator-question-state");
+    let (address, shutdown) = scripted_daemon(
+        &state_root,
+        vec![
+            Ok(vec![
+                ModelStreamEvent::MessageId {
+                    value: "assistant-operator-question-1".to_string(),
+                },
+                ModelStreamEvent::TextDelta {
+                    text: "Need operator input.".to_string(),
+                },
+                ModelStreamEvent::ToolCall {
+                    call: kheish_types::ToolCallRecord {
+                        id: "operator-question-call-1".to_string(),
+                        name: "ask_operator".to_string(),
+                        input: json!({
+                            "questions": [{
+                                "id": "decision",
+                                "header": "Decision",
+                                "question": "Which path should I take?",
+                                "options": [
+                                    {"id": "safe", "label": "Safe path"},
+                                    {"id": "fast", "label": "Fast path"}
+                                ]
+                            }]
+                        }),
+                        assistant_message_id: None,
+                        assistant_provider_response_id: None,
+                    },
+                },
+                ModelStreamEvent::Stop {
+                    reason: kheish_types::ModelFinishReason::ToolCalls,
+                },
+            ]),
+            Ok(scripted_events(
+                "assistant-operator-question-2",
+                "DECISION:safe",
+                kheish_types::ModelFinishReason::Completed,
+            )),
+        ],
+    )
+    .await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+
+    client
+        .post(format!("{base}/v1/sessions"))
+        .json(&CreateSessionRequest {
+            session_id: Some("operator-question-session".to_string()),
+            thread_id: None,
+            persona_id: None,
+            credential_scope: None,
+            capability_scope: None,
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+
+    client
+        .post(format!(
+            "{base}/v1/sessions/operator-question-session/operator"
+        ))
+        .json(&SetSessionOperatorConfigRequest {
+            operator: kheish_types::SessionOperatorConfig {
+                enabled: true,
+                display_name: Some("Project operator".to_string()),
+                communication_style: Some("concise".to_string()),
+                allow_notify: false,
+                allow_questions: true,
+            },
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let run = client
+        .post(format!("{base}/v1/sessions/operator-question-session/runs"))
+        .json(&SubmitInputRequest {
+            source_plugin: None,
+            source_kind: None,
+            actor_id: None,
+            provider: None,
+            content: "Ask the operator one structured question, then continue.".to_string(),
+            input_items: Vec::new(),
+            attachments: Vec::new(),
+            generation: Some(ModelGenerationConfig::default()),
+            completion_requirements: None,
+            metadata: None,
+            reply_address: None,
+            binding_keys: Vec::new(),
+            reply_targets: Vec::new(),
+            reply_plugin: None,
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<RunView>()
+        .await?;
+
+    let waiting = wait_for_pending_question_run(&client, &base, &run.run_id).await?;
+    assert_eq!(
+        waiting.pending_question_ids,
+        vec!["question-request-operator-question-call-1".to_string()]
+    );
+
+    let questions = client
+        .get(format!(
+            "{base}/v1/sessions/operator-question-session/questions"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<PendingQuestionView>>()
+        .await?;
+    assert_eq!(questions.len(), 1);
+    assert_eq!(questions[0].request.questions[0].id, "decision");
+
+    client
+        .post(format!("{base}/v1/runs/{}/questions", run.run_id))
+        .json(&ResolveUserQuestionRequest {
+            idempotency_key: None,
+            resolution: kheish_types::UserQuestionResolution {
+                request_id: questions[0].request.id.clone(),
+                answers: vec![kheish_types::UserQuestionAnswer {
+                    question_id: "decision".to_string(),
+                    selected_option_ids: vec!["safe".to_string()],
+                    freeform_answer: None,
+                }],
+                declined: false,
+                justification: Some("operator selected safe path".to_string()),
+            },
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let completed =
+        wait_for_run_status(&client, &base, &run.run_id, &[DaemonRunStatus::Completed]).await?;
+    assert_eq!(completed.outputs.len(), 1);
+    assert!(
+        completed.outputs[0].content.contains("DECISION:safe"),
+        "unexpected output: {}",
+        serde_json::to_string_pretty(&completed)?
+    );
+
+    let _ = shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
 async fn daemon_status_snapshot_matches_detail_endpoints_for_mixed_live_runs() -> Result<()> {
     let temp = tempdir()?;
     let state_root = temp.path().join("daemon-state");
@@ -51773,6 +52508,184 @@ async fn daemon_http_runs_can_infer_single_attached_jpeg_for_edit_image() -> Res
         &sample_jpeg_bytes()?,
     )
     .await
+}
+
+#[tokio::test]
+async fn daemon_http_generate_image_falls_back_when_run_provider_lacks_image_backend() -> Result<()>
+{
+    // Regression for the route-override bug (the same defect fixed in edit_image): a run whose text
+    // provider has no matching image backend must fall back to the default image route, not hard
+    // fail. Here the run's text provider resolves to "scripted" (no image backend) and the only
+    // configured backend is the default "openai" route. Before the fix, generate_image copied the
+    // run's text provider into the route override and bailed with "no image-generation backend is
+    // configured for route scripted"; the tool result was an error. After the fix the soft
+    // preference is ignored when it has no backend and generation succeeds via the default route.
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-generate-fallback");
+    let events = DaemonEventBus::new(256);
+    let debug = DebugControl::new(DebugCaptureLevel::Off);
+    let observer: Arc<dyn RuntimeObserver> = DaemonObserver::shared(
+        events.clone(),
+        debug.clone(),
+        FileDebugStore::new(&state_root),
+    );
+    let model = Arc::new(ModelRuntime::new(
+        ScriptedProvider(Mutex::new(
+            vec![
+                Ok(vec![
+                    ModelStreamEvent::MessageId {
+                        value: "assistant-generate-fallback-1".to_string(),
+                    },
+                    ModelStreamEvent::ToolCall {
+                        call: kheish_types::ToolCallRecord {
+                            id: "call-generate-fallback-1".to_string(),
+                            name: "generate_image".to_string(),
+                            input: json!({
+                                "prompt": "Render a fallback image.",
+                                "count": 1,
+                            }),
+                            assistant_message_id: None,
+                            assistant_provider_response_id: None,
+                        },
+                    },
+                    ModelStreamEvent::Stop {
+                        reason: kheish_types::ModelFinishReason::ToolCalls,
+                    },
+                ]),
+                Ok(scripted_events(
+                    "assistant-generate-fallback-2",
+                    "GENERATE_FALLBACK_OK",
+                    kheish_types::ModelFinishReason::Completed,
+                )),
+            ]
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+        )),
+        ModelRetryPolicy::default(),
+        ModelBudget::default(),
+        observer.clone(),
+    ));
+    let permissions = Arc::new(PermissionEngine::new(
+        vec![],
+        vec![],
+        vec![],
+        observer.clone(),
+    ));
+    permissions.set_mode(PermissionMode::BypassPermissions);
+    let (address, shutdown) = start_test_daemon_with_image_service(
+        &state_root,
+        model,
+        permissions,
+        Some(Arc::new(ScriptedModelControl::new("gpt-5.4"))),
+        events,
+        debug,
+        observer,
+        move |assets| {
+            let mut backends = BTreeMap::new();
+            // Only the default "openai" route has a backend; the run's text provider ("scripted")
+            // deliberately has none, forcing the fallback path under test.
+            backends.insert(
+                "openai".to_string(),
+                Arc::new(StaticRouteImageBackend {
+                    provider: "openai",
+                    model: "default-image-model",
+                    supports_edit: true,
+                }) as Arc<dyn crate::image_generation::ImageGenerationBackend>,
+            );
+            Ok(Arc::new(
+                crate::image_generation::ImageGenerationService::new(
+                    backends,
+                    "openai".to_string(),
+                    assets,
+                )?,
+            ))
+        },
+        true,
+        true,
+        |_| {},
+    )
+    .await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+
+    client
+        .post(format!("{base}/v1/sessions"))
+        .json(&CreateSessionRequest {
+            session_id: Some("generate-fallback-demo".to_string()),
+            thread_id: None,
+            persona_id: None,
+            credential_scope: None,
+            capability_scope: None,
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let run = client
+        .post(format!("{base}/v1/sessions/generate-fallback-demo/runs"))
+        .json(&SubmitInputRequest {
+            source_plugin: None,
+            source_kind: None,
+            actor_id: None,
+            provider: None,
+            content: "Generate a fallback image.".to_string(),
+            input_items: Vec::new(),
+            attachments: Vec::new(),
+            generation: Some(ModelGenerationConfig::default()),
+            completion_requirements: None,
+            metadata: None,
+            reply_address: None,
+            binding_keys: Vec::new(),
+            reply_targets: Vec::new(),
+            reply_plugin: None,
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<RunView>()
+        .await?;
+    let completed =
+        wait_for_run_status(&client, &base, &run.run_id, &[DaemonRunStatus::Completed]).await?;
+    assert_eq!(completed.status, DaemonRunStatus::Completed);
+
+    let events = client
+        .get(format!("{base}/v1/sessions/generate-fallback-demo/events"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionEventLogView>()
+        .await?;
+    let generate_result = events
+        .session
+        .journal
+        .iter()
+        .find_map(|entry| match &entry.event {
+            SessionEvent::ToolCallFinished { result }
+                if result.tool_name.as_deref() == Some("generate_image") =>
+            {
+                Some(result)
+            }
+            _ => None,
+        })
+        .ok_or_else(|| anyhow!("missing generate_image tool result"))?;
+    // Core regression assertion: generation did NOT hard-fail on the mismatched run provider.
+    assert!(
+        !generate_result.is_error,
+        "generate_image should fall back to the default route, got error output: {:?}",
+        generate_result.output
+    );
+    // And it resolved to the only configured (default) route, proving fallback rather than a hard
+    // override to the run's text provider.
+    assert_eq!(generate_result.output["route_id"], json!("openai"));
+    assert_eq!(generate_result.output["provider"], json!("openai"));
+    assert_eq!(
+        generate_result.output["model"],
+        json!("default-image-model")
+    );
+
+    let _ = shutdown.send(());
+    Ok(())
 }
 
 #[tokio::test]

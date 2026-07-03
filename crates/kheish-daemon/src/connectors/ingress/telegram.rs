@@ -309,7 +309,7 @@ async fn fetch_updates(
     let header_retry_after_ms = telegram_retry_after_header_ms(&headers);
     let body = match serde_json::from_str::<TelegramUpdatesResponse>(&raw) {
         Ok(body) => body,
-        Err(error)
+        Err(_)
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS
                 && header_retry_after_ms.is_some() =>
         {

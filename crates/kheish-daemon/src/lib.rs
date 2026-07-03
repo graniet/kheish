@@ -22,6 +22,7 @@ mod model_routing;
 mod observation_ingress;
 mod observation_transcripts;
 mod observations;
+mod operator_contact;
 mod personas;
 mod playbooks;
 mod problems;
@@ -81,12 +82,13 @@ pub use api::{
     RuntimeSettingsView, RuntimeSkillsView, ScheduleListQuery, ScheduleMutationResponse,
     SessionEventLogView, SessionGoalResponse, SessionListQuery, SessionMemoryContextQuery,
     SessionMemoryContextView, SessionMemorySearchQuery, SessionMemorySearchResultKind,
-    SessionMemorySearchResultView, SessionMemorySearchView, SessionPermissionAuditListView,
-    SessionPersonaSummaryView, SessionReplyTargetRequest, SessionReplyTargetsView, SessionView,
-    SessionViewSummary, SetAgentNicknameRequest, SetChannelReactionRequest, SetDebugLevelRequest,
-    SetHooksRequest, SetLearningPolicyRequest, SetModelRequest, SetPermissionModeRequest,
-    SetRunMemoryPolicyRequest, SetSessionCapabilityScopeRequest, SetSessionCredentialScopeRequest,
-    SetSessionGoalRequest, SetSessionPersonaRequest, SetSessionReplyTargetsRequest,
+    SessionMemorySearchResultView, SessionMemorySearchView, SessionOperatorConfigView,
+    SessionPermissionAuditListView, SessionPersonaSummaryView, SessionReplyTargetRequest,
+    SessionReplyTargetsView, SessionView, SessionViewSummary, SetAgentNicknameRequest,
+    SetChannelReactionRequest, SetDebugLevelRequest, SetHooksRequest, SetLearningPolicyRequest,
+    SetModelRequest, SetPermissionModeRequest, SetRunMemoryPolicyRequest,
+    SetSessionCapabilityScopeRequest, SetSessionCredentialScopeRequest, SetSessionGoalRequest,
+    SetSessionOperatorConfigRequest, SetSessionPersonaRequest, SetSessionReplyTargetsRequest,
     SetSessionRoutePolicyRequest, SetSystemPromptRequest, SetToolRuntimeLimitsRequest,
     SidechainSubtaskRequest, SkillListQuery, SkillRuntimeView, SkillSummaryView, SkillView,
     SlackConnectorView, SpawnSidechainRequest, StackApplyRequest, StackDownRequest,

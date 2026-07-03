@@ -41,19 +41,21 @@ spec:
         - mcp__github__list_pull_requests
         - mcp__github__pull_request_read
         - mcp__github__add_reply_to_pull_request_comment
+        - mcp__github__add_issue_comment
         - mcp__linear__get_issue
         - mcp__linear__list_comments
         - mcp__linear__list_issues
         - mcp__linear__list_issue_statuses
         - mcp__linear__list_projects
+        - mcp__linear__list_teams
         - mcp__linear__save_comment
         - mcp__linear__save_issue
   personas:
-    - persona_id: feature-pr-operator-v012
+    - persona_id: feature-pr-operator-v013
       display_name: Feature PR Operator
       soul_file: persona.md
       capability_scope:
-        skill_deny: ["*"]
+        skill_allow: ["notify_operator", "ask_operator"]
         mcp_server_allow: ["github", "linear"]
         mcp_tool_allow:
           - mcp__github__get_me
@@ -69,18 +71,20 @@ spec:
           - mcp__github__list_pull_requests
           - mcp__github__pull_request_read
           - mcp__github__add_reply_to_pull_request_comment
+          - mcp__github__add_issue_comment
           - mcp__linear__get_issue
           - mcp__linear__list_comments
           - mcp__linear__list_issues
           - mcp__linear__list_issue_statuses
           - mcp__linear__list_projects
+          - mcp__linear__list_teams
           - mcp__linear__save_comment
           - mcp__linear__save_issue
   sessions:
-    - session_id: feature-pr-loop-v012
-      persona_id: feature-pr-operator-v012
+    - session_id: feature-pr-loop-v015
+      persona_id: feature-pr-operator-v013
       capability_scope:
-        skill_deny: ["*"]
+        skill_allow: ["notify_operator", "ask_operator"]
         mcp_server_allow: ["github", "linear"]
         mcp_tool_allow:
           - mcp__github__get_me
@@ -96,17 +100,19 @@ spec:
           - mcp__github__list_pull_requests
           - mcp__github__pull_request_read
           - mcp__github__add_reply_to_pull_request_comment
+          - mcp__github__add_issue_comment
           - mcp__linear__get_issue
           - mcp__linear__list_comments
           - mcp__linear__list_issues
           - mcp__linear__list_issue_statuses
           - mcp__linear__list_projects
+          - mcp__linear__list_teams
           - mcp__linear__save_comment
           - mcp__linear__save_issue
       credential_scope:
         route_allow: ["openai"]
-        connector_deny: ["*"]
-        connector_credential_deny: ["*"]
+        connector_allow: ["feature-loop-operator-telegram"]
+        connector_credential_allow: ["feature-loop-operator-telegram:bot_token"]
         mcp_server_allow: ["github", "linear"]
       route_policy:
         provider: openai
@@ -115,6 +121,16 @@ spec:
           max_output_tokens: 6000
           reasoning:
             effort: medium
+      reply_targets:
+        - type: telegram
+          connector: feature-loop-operator-telegram
+          chat_id: 123456789
+      operator:
+        enabled: true
+        display_name: Project operator
+        communication_style: concise and human
+        allow_notify: true
+        allow_questions: true
   playbooks:
     - manifest_file: playbook.yaml
       publish:
@@ -124,8 +140,8 @@ spec:
             id: stack-example-reviewed
             description: Example reviewed before publication.
   schedules:
-    - name: linear-intake-0800-v016
-      target_session_id: feature-pr-loop-v012
+    - name: linear-intake-0800-v024
+      target_session_id: feature-pr-loop-v015
       cadence:
         type: cron
         expression: "0 0 8 * * *"
@@ -136,7 +152,7 @@ spec:
       flow_start:
         playbook_ref:
           playbook_id: linear-github-feature-pr-loop
-          version: "0.1.6"
+          version: "0.1.14"
         request:
           provider: openai
           content_file: intake.md
@@ -147,14 +163,18 @@ spec:
               effort: medium
         metadata:
           workflow: linear-intake
-          project: Evapayrent
-          repository: graniet/evapayrent
+          project: ExampleProject
+          linear_team_key: ENG
+          repository: example-org/example-app
           max_tickets: 1
-    - name: github-review-followup-hourly-v016
-      target_session_id: feature-pr-loop-v012
+          goal_token_budget: 600000
+          max_goal_attempts: 6
+          max_no_progress: 2
+    - name: github-review-followup-30m-v026
+      target_session_id: feature-pr-loop-v015
       cadence:
         type: cron
-        expression: "0 0 * * * *"
+        expression: "0 15,45 * * * *"
         timezone: Europe/Paris
       overlap_policy: skip
       misfire_policy:
@@ -162,7 +182,7 @@ spec:
       flow_start:
         playbook_ref:
           playbook_id: linear-github-feature-pr-loop
-          version: "0.1.6"
+          version: "0.1.14"
         request:
           provider: openai
           content_file: review-followup.md
@@ -173,22 +193,26 @@ spec:
               effort: medium
         metadata:
           workflow: github-review-followup
-          project: Evapayrent
-          repository: graniet/evapayrent
+          project: ExampleProject
+          linear_team_key: ENG
+          repository: example-org/example-app
+          goal_token_budget: 600000
+          max_goal_attempts: 6
+          max_no_progress: 2
   verification:
     - name: persona
       type: persona_exists
-      persona_id: feature-pr-operator-v012
+      persona_id: feature-pr-operator-v013
     - name: session
       type: session_exists
-      session_id: feature-pr-loop-v012
+      session_id: feature-pr-loop-v015
     - name: intake-schedule
       type: schedule_exists
-      schedule_name: linear-intake-0800-v016
+      schedule_name: linear-intake-0800-v024
     - name: followup-schedule
       type: schedule_exists
-      schedule_name: github-review-followup-hourly-v016
+      schedule_name: github-review-followup-30m-v026
     - name: playbook
       type: playbook_version_exists
       playbook_id: linear-github-feature-pr-loop
-      version: "0.1.6"
+      version: "0.1.14"

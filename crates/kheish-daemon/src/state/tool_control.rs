@@ -101,6 +101,24 @@ where
             .await
     }
 
+    async fn load_session_operator_config(
+        &self,
+        session_id: &str,
+    ) -> Result<kheish_types::SessionOperatorConfig> {
+        self.0.load_session_operator_config(session_id).await
+    }
+
+    async fn notify_operator(
+        &self,
+        session_id: &str,
+        run_id: Option<&str>,
+        request: control_tools::OperatorNotificationRequest,
+    ) -> Result<control_tools::OperatorNotificationToolResponse> {
+        self.0
+            .emit_operator_notification(session_id, run_id, request)
+            .await
+    }
+
     async fn wait_agent(
         &self,
         caller_agent_id: &str,
@@ -349,13 +367,15 @@ where
         run_id: Option<&str>,
         objective: String,
         token_budget: Option<u64>,
+        replace_if_inactive: bool,
     ) -> Result<kheish_types::SessionGoal> {
         self.0
-            .create_session_goal(
+            .create_session_goal_from_tool(
                 session_id,
                 objective,
                 token_budget,
                 run_id.map(str::to_string),
+                replace_if_inactive,
             )
             .await
             .and_then(|response| {
@@ -377,6 +397,21 @@ where
                 response
                     .goal
                     .ok_or_else(|| anyhow::anyhow!("goal was not completed"))
+            })
+    }
+
+    async fn pause_session_goal(
+        &self,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<kheish_types::SessionGoal> {
+        self.0
+            .pause_session_goal_from_run(session_id, run_id)
+            .await
+            .and_then(|response| {
+                response
+                    .goal
+                    .ok_or_else(|| anyhow::anyhow!("goal was not paused"))
             })
     }
 

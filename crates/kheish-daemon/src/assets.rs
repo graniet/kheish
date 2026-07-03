@@ -393,43 +393,42 @@ impl FileAssetStore {
         let stored_bytes = prepare_stored_payload(&media_type, bytes)?;
         let sha256 = hex::encode(Sha256::digest(&stored_bytes));
         let digest_key = digest_key(&media_type, &sha256);
-        loop {
-            match self.reserve_import(&digest_key) {
-                ImportReservation::Existing(existing) => {
-                    return self.append_asset_provenance_if_needed(existing, provenance.clone());
-                }
-                ImportReservation::Wait(pending) => {
-                    let mut state = pending
-                        .state
-                        .lock()
-                        .expect("asset import reservation mutex poisoned");
-                    while !state.settled {
-                        state = pending
-                            .ready
-                            .wait(state)
-                            .expect("asset import reservation wait poisoned");
-                    }
-                    if let Some(record) = state.record.clone() {
-                        return self.append_asset_provenance_if_needed(record, provenance.clone());
-                    }
-                    if let Some(message) = state.error.clone() {
-                        bail!("{message}");
-                    }
-                    bail!("asset import reservation settled without a result");
-                }
-                ImportReservation::Owner { id, pending } => {
-                    return self.finish_reserved_import(
-                        file_name,
-                        media_type,
-                        stored_bytes,
-                        sha256,
-                        digest_key,
-                        id,
-                        pending,
-                        provenance,
-                    );
-                }
+        // `reserve_import` resolves to exactly one terminal outcome per call (the content-addressed
+        // entry already exists, another caller is importing the same digest, or we became the
+        // owner); none of the arms requests a retry, so this is a straight-line `match`, not a loop.
+        match self.reserve_import(&digest_key) {
+            ImportReservation::Existing(existing) => {
+                self.append_asset_provenance_if_needed(existing, provenance)
             }
+            ImportReservation::Wait(pending) => {
+                let mut state = pending
+                    .state
+                    .lock()
+                    .expect("asset import reservation mutex poisoned");
+                while !state.settled {
+                    state = pending
+                        .ready
+                        .wait(state)
+                        .expect("asset import reservation wait poisoned");
+                }
+                if let Some(record) = state.record.clone() {
+                    return self.append_asset_provenance_if_needed(record, provenance);
+                }
+                if let Some(message) = state.error.clone() {
+                    bail!("{message}");
+                }
+                bail!("asset import reservation settled without a result");
+            }
+            ImportReservation::Owner { id, pending } => self.finish_reserved_import(
+                file_name,
+                media_type,
+                stored_bytes,
+                sha256,
+                digest_key,
+                id,
+                pending,
+                provenance,
+            ),
         }
     }
 

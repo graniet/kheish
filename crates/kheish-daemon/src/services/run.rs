@@ -297,6 +297,22 @@ impl RunService {
         self.session_runs.lock().await.get(session_id).cloned()
     }
 
+    pub(crate) async fn has_pending_topology_submission(&self, session_id: &str) -> bool {
+        if self
+            .pending_idle_submissions
+            .lock()
+            .await
+            .contains_key(session_id)
+        {
+            return true;
+        }
+        self.pending_goal_continuations
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|run_ids| !run_ids.is_empty())
+    }
+
     /// Runs one mutation while holding the session queue idle, preventing a run
     /// from becoming active between an idle precondition and the mutation.
     pub(crate) async fn with_session_idle_guard<F, Fut, T>(
@@ -5085,6 +5101,7 @@ mod tests {
                 .reserve_idle_submission_slot("session-1", "run-input-1")
                 .await?
         );
+        assert!(service.has_pending_topology_submission("session-1").await);
         assert!(
             !service
                 .reserve_goal_continuation_slot("session-1", "run-goal-3")
@@ -5102,11 +5119,13 @@ mod tests {
             .release_idle_submission_slot("session-1", "run-input-1")
             .await;
         assert!(!should_promote);
+        assert!(!service.has_pending_topology_submission("session-1").await);
         assert!(
             service
                 .reserve_goal_continuation_slot("session-1", "run-goal-4")
                 .await?
         );
+        assert!(service.has_pending_topology_submission("session-1").await);
         Ok(())
     }
 

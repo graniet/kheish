@@ -60,17 +60,17 @@ use super::types::{
     RuntimeRollbackRequest, RuntimeSettingsView, ScheduleListQuery, ScheduleMutationResponse,
     SessionEventLogView, SessionGoalResponse, SessionListQuery, SessionMemoryContextQuery,
     SessionMemoryContextView, SessionMemorySearchQuery, SessionMemorySearchView,
-    SessionReplyTargetRequest, SessionReplyTargetsView, SessionView, SetAgentNicknameRequest,
-    SetChannelReactionRequest, SetDebugLevelRequest, SetHooksRequest, SetLearningPolicyRequest,
-    SetModelRequest, SetPermissionModeRequest, SetRunMemoryPolicyRequest,
+    SessionOperatorConfigView, SessionReplyTargetRequest, SessionReplyTargetsView, SessionView,
+    SetAgentNicknameRequest, SetChannelReactionRequest, SetDebugLevelRequest, SetHooksRequest,
+    SetLearningPolicyRequest, SetModelRequest, SetPermissionModeRequest, SetRunMemoryPolicyRequest,
     SetSessionCapabilityScopeRequest, SetSessionCredentialScopeRequest, SetSessionGoalRequest,
-    SetSessionPersonaRequest, SetSessionReplyTargetsRequest, SetSessionRoutePolicyRequest,
-    SetSystemPromptRequest, SetToolRuntimeLimitsRequest, SkillListQuery, SkillSummaryView,
-    SkillView, SpawnSidechainRequest, StackApplyRequest, StackDownRequest, StackImportRequest,
-    StackManifestRequest, StackPlanRequest, StartProjectTaskRequest, StopTaskRequest,
-    SubmitInputRequest, SubmitRunRequest, SupersedeLearningRequest, TaskListQuery, TaskOutputQuery,
-    UpdateBoardRequest, UpdateChannelRequest, UpdatePersonaRequest, UpdateProjectRequest,
-    UpdateProjectTaskRequest,
+    SetSessionOperatorConfigRequest, SetSessionPersonaRequest, SetSessionReplyTargetsRequest,
+    SetSessionRoutePolicyRequest, SetSystemPromptRequest, SetToolRuntimeLimitsRequest,
+    SkillListQuery, SkillSummaryView, SkillView, SpawnSidechainRequest, StackApplyRequest,
+    StackDownRequest, StackImportRequest, StackManifestRequest, StackPlanRequest,
+    StartProjectTaskRequest, StopTaskRequest, SubmitInputRequest, SubmitRunRequest,
+    SupersedeLearningRequest, TaskListQuery, TaskOutputQuery, UpdateBoardRequest,
+    UpdateChannelRequest, UpdatePersonaRequest, UpdateProjectRequest, UpdateProjectTaskRequest,
 };
 use crate::assets::MAX_ASSET_BYTES;
 use crate::problems::DaemonProblem;
@@ -769,6 +769,13 @@ where
             post(set_session_route_policy::<M>)
                 .put(replace_session_route_policy::<M>)
                 .delete(clear_session_route_policy::<M>),
+        )
+        .route(
+            "/v1/sessions/{session_id}/operator",
+            get(get_session_operator_config::<M>)
+                .post(set_session_operator_config::<M>)
+                .put(replace_session_operator_config::<M>)
+                .delete(clear_session_operator_config::<M>),
         )
         .route(
             "/v1/sessions/{session_id}/capability-scope",
@@ -1900,6 +1907,10 @@ const CONTROL_PLANE_OPENAPI_ROUTES: &[OpenApiRouteSpec] = &[
     OpenApiRouteSpec {
         path: "/v1/sessions/{session_id}/route-policy",
         methods: &["POST", "PUT", "DELETE"],
+    },
+    OpenApiRouteSpec {
+        path: "/v1/sessions/{session_id}/operator",
+        methods: &["GET", "POST", "PUT", "DELETE"],
     },
     OpenApiRouteSpec {
         path: "/v1/sessions/{session_id}/capability-scope",
@@ -5573,6 +5584,68 @@ where
         .map_err(internal_error)
 }
 
+async fn get_session_operator_config<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Result<Json<SessionOperatorConfigView>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    state
+        .agent_id_for_session(&session_id)
+        .await
+        .map_err(internal_error)?;
+    state
+        .load_session_operator_config(&session_id)
+        .await
+        .map(|operator| Json(SessionOperatorConfigView { operator }))
+        .map_err(internal_error)
+}
+
+async fn set_session_operator_config<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    AxumPath(session_id): AxumPath<String>,
+    Json(request): Json<SetSessionOperatorConfigRequest>,
+) -> Result<Json<SessionView>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    state
+        .set_session_operator_config(&session_id, Some(request.operator))
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn replace_session_operator_config<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    AxumPath(session_id): AxumPath<String>,
+    Json(request): Json<SetSessionOperatorConfigRequest>,
+) -> Result<Json<SessionView>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    state
+        .set_session_operator_config(&session_id, Some(request.operator))
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn clear_session_operator_config<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Result<Json<SessionView>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    state
+        .set_session_operator_config(&session_id, None)
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
 async fn get_session_reply_targets<M>(
     State(state): State<Arc<DaemonState<M>>>,
     AxumPath(session_id): AxumPath<String>,
@@ -7897,6 +7970,13 @@ fn internal_error(error: anyhow::Error) -> ApiError {
         || message.contains("flow requires narrower session capability_scope")
         || message.contains("flow requires narrower session credential_scope")
         || message.contains("credential_scope does not allow route")
+        || message.contains("session operator config must allow")
+        || message.contains("session operator config with notify_operator enabled requires")
+        || message.contains("cannot clear session reply targets while notify_operator is enabled")
+        || message.contains("session operator display_name appears to contain secret material")
+        || message
+            .contains("session operator communication_style appears to contain secret material")
+        || message.contains("must not contain delivery addresses or token references")
         || message.contains("metadata key `") && message.contains("` is daemon-owned")
         || message.contains("metadata must be an object when daemon metadata is attached")
         || message.contains("report_path must be workspace-relative")
@@ -7991,9 +8071,8 @@ fn internal_error(error: anyhow::Error) -> ApiError {
         || message.contains("session ")
             && message.contains("is already bound to a different credential scope")
         || message == "session has non-terminal work or live descendants"
-        || message.contains("persona changes are only allowed while the session is idle")
-        || message.contains("capability-scope changes are only allowed while the session is idle")
-        || message.contains("credential-scope changes are only allowed while the session is idle")
+        || message.contains("changes are only allowed while the session is idle")
+        || message.contains("connector changes are only allowed after those sessions are idle")
         || message.contains("learning candidate ") && message.contains("was already published")
         || message.contains("learning candidate ") && message.contains("was rejected")
         || message.contains("learning ") && message.contains("was already superseded")
@@ -8115,6 +8194,7 @@ fn typed_problem_code(message: &str, status: StatusCode) -> Option<(&'static str
         }
         if message.contains("session has non-terminal work or live descendants")
             || message.contains("changes are only allowed while the session is idle")
+            || message.contains("connector changes are only allowed after those sessions are idle")
         {
             return Some(("sessions", "session_not_idle"));
         }
@@ -8578,6 +8658,22 @@ startup_timeout_sec = 1
         assert_eq!(readiness.status, StatusCode::BAD_REQUEST);
         assert_eq!(readiness.domain, Some("routes"));
         assert_eq!(readiness.code, "route_not_ready");
+    }
+
+    #[test]
+    fn internal_error_classifies_session_operator_validation_errors() {
+        for message in [
+            "session operator config must allow notify_operator or ask_operator when enabled",
+            "session operator config with notify_operator enabled requires at least one session reply target",
+            "cannot clear session reply targets while notify_operator is enabled for this session",
+            "session operator display_name appears to contain secret material",
+            "session operator communication_style appears to contain secret material",
+            "session operator display_name must not contain delivery addresses or token references",
+        ] {
+            let error = internal_error(anyhow!(message));
+            assert_eq!(error.status, StatusCode::BAD_REQUEST, "{message}");
+            assert_eq!(error.code, "bad_request", "{message}");
+        }
     }
 
     #[test]

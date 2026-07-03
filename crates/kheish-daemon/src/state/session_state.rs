@@ -134,6 +134,15 @@ where
             .await
     }
 
+    pub(crate) async fn load_session_operator_config(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionOperatorConfig> {
+        self.session_service
+            .load_session_operator_config(session_id)
+            .await
+    }
+
     pub(crate) async fn load_session_capability_scope(
         &self,
         session_id: &str,
@@ -168,6 +177,16 @@ where
     ) -> Result<SessionRoutePolicy> {
         self.session_service
             .save_session_route_policy(session_id, &state)
+            .await
+    }
+
+    pub(super) async fn save_session_operator_config(
+        &self,
+        session_id: &str,
+        config: SessionOperatorConfig,
+    ) -> Result<SessionOperatorConfig> {
+        self.session_service
+            .save_session_operator_config(session_id, &config)
             .await
     }
 

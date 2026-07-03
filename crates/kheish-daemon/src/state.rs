@@ -73,9 +73,9 @@ use kheish_skills::SharedSkillRegistry;
 use kheish_types::{
     ActorRef, AttachmentRef, CompletionRequirement, ConversationKey, HookEventName, HookInvocation,
     HookRuntimeState, HookSettings, InputEnvelope, InputPayload, RecoveredMemoryBundle,
-    ReplyHandle, RichOutput, SessionControlState, SessionRoutePolicy, SourceRef, ToolCallRecord,
-    UserQuestionRequest, UserQuestionResolution, metadata_with_recovered_memory,
-    normalize_reply_targets,
+    ReplyHandle, RichOutput, SessionControlState, SessionOperatorConfig, SessionRoutePolicy,
+    SourceRef, ToolCallRecord, UserQuestionRequest, UserQuestionResolution,
+    metadata_with_recovered_memory, normalize_reply_targets,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -87,8 +87,8 @@ use crate::channels::{
     ChannelMessageView, ChannelStimulusView, ChannelThreadWorkStateView, ChannelTurnLeaseView,
     ChannelView, FileChannelStore,
 };
-use crate::connectors::ConnectorRegistry;
 use crate::connectors::ExternalConnectorRuntimeService;
+use crate::connectors::{ConnectorKind, ConnectorRegistry};
 use crate::control_tools::{
     self, DaemonToolControl, EditImageToolRequest, EditImageToolResponse, GenerateAudioToolRequest,
     GenerateAudioToolResponse, GenerateImageToolRequest, GenerateImageToolResponse,
@@ -627,21 +627,51 @@ where
         &self,
         config: crate::TelegramConnectorConfig,
     ) -> Result<crate::TelegramConnectorConfig> {
-        self.connector_service.put_telegram_connector(config).await
+        let name = config.name.clone();
+        self.reject_non_idle_reply_target_dependents(ConnectorKind::Telegram, &name)
+            .await?;
+        let applied = self
+            .connector_service
+            .put_telegram_connector(config)
+            .await?;
+        self.clear_invalid_session_reply_targets_referencing_connector(
+            ConnectorKind::Telegram,
+            &name,
+        )
+        .await?;
+        Ok(applied)
     }
 
     pub(crate) async fn put_external_connector(
         &self,
         config: crate::ExternalConnectorConfig,
     ) -> Result<crate::ExternalConnectorConfig> {
-        self.connector_service.put_external_connector(config).await
+        let name = config.name.clone();
+        self.reject_non_idle_reply_target_dependents(ConnectorKind::External, &name)
+            .await?;
+        let applied = self
+            .connector_service
+            .put_external_connector(config)
+            .await?;
+        self.clear_invalid_session_reply_targets_referencing_connector(
+            ConnectorKind::External,
+            &name,
+        )
+        .await?;
+        Ok(applied)
     }
 
     pub(crate) async fn put_slack_connector(
         &self,
         config: crate::SlackConnectorConfig,
     ) -> Result<crate::SlackConnectorConfig> {
-        self.connector_service.put_slack_connector(config).await
+        let name = config.name.clone();
+        self.reject_non_idle_reply_target_dependents(ConnectorKind::Slack, &name)
+            .await?;
+        let applied = self.connector_service.put_slack_connector(config).await?;
+        self.clear_invalid_session_reply_targets_referencing_connector(ConnectorKind::Slack, &name)
+            .await?;
+        Ok(applied)
     }
 
     pub(crate) async fn put_http_connector(
@@ -663,6 +693,10 @@ where
     pub(crate) async fn delete_connector(&self, kind: &str, name: &str) -> Result<bool> {
         self.reject_connector_schedule_dependencies(kind, name)
             .await?;
+        if let Ok(kind) = ConnectorKind::parse(kind) {
+            self.reject_non_idle_reply_target_dependents(kind, name)
+                .await?;
+        }
         let deleted = self.connector_service.delete_connector(kind, name).await?;
         if deleted {
             let session_ids = self.session_service.cached_reply_target_session_ids().await;
@@ -908,7 +942,10 @@ where
     }
 
     pub(crate) async fn reload_connectors(&self) -> Result<()> {
-        self.connector_service.reload_resolved().await
+        self.connector_service.reload_resolved().await?;
+        let session_ids = self.session_service.cached_reply_target_session_ids().await;
+        self.clear_invalid_session_reply_targets_for_sessions(session_ids)
+            .await
     }
 
     pub(crate) async fn delete_auth_slot(&self, slot_id: &str) -> Result<bool> {

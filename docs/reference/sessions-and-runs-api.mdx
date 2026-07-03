@@ -34,6 +34,10 @@ Sessions:
 - `POST /v1/sessions/{session_id}/reply-targets`
 - `PUT /v1/sessions/{session_id}/reply-targets`
 - `DELETE /v1/sessions/{session_id}/reply-targets`
+- `GET /v1/sessions/{session_id}/operator`
+- `POST /v1/sessions/{session_id}/operator`
+- `PUT /v1/sessions/{session_id}/operator`
+- `DELETE /v1/sessions/{session_id}/operator`
 - `POST /v1/sessions/{session_id}/route-policy`
 - `PUT /v1/sessions/{session_id}/route-policy`
 - `DELETE /v1/sessions/{session_id}/route-policy`
@@ -380,6 +384,24 @@ Supported request variants:
 ```
 
 The returned `reply_targets` array is normalized `ReplyHandle` data, not the original structured request shape.
+
+### Operator contact
+
+`POST` and `PUT /v1/sessions/{session_id}/operator` persist the model-facing operator policy for future runs:
+
+```json
+{
+  "enabled": true,
+  "display_name": "Project operator",
+  "communication_style": "concise, human, and action-oriented",
+  "allow_notify": true,
+  "allow_questions": true
+}
+```
+
+When enabled, the runtime prompt tells the model it may contact the operator at its own discretion. `notify_operator` queues non-blocking messages through the session `reply_targets`; enabling `allow_notify` requires at least one deliverable session reply target. `ask_operator` creates a normal pending structured question and preserves the original run/session context for resume, so question-only operator contact can run without an outbound transport. Operator config and session reply targets are topology settings and can only be changed while the session is idle. `display_name` and `communication_style` are prompt-visible and must not contain tokens, URLs, emails, chat ids, channel ids, or webhook details.
+
+`DELETE /v1/sessions/{session_id}/operator` disables model-initiated operator contact. Transport destinations are never accepted on this endpoint; use session `reply_targets` for Telegram, Slack, HTTP, or other delivery plugins.
 
 ### Persona binding
 

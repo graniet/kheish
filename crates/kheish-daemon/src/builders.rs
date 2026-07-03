@@ -501,6 +501,37 @@ fn validate_route_capability_overrides(
     Ok(())
 }
 
+/// Environment variable overriding the main-loop turn ceiling for agent runs.
+/// `0` opts into an unbounded loop; runs then stop only on completion, budget,
+/// or operator action.
+pub const AGENT_MAX_TURNS_ENV: &str = "KHEISH_AGENT_MAX_TURNS";
+
+fn resolve_agent_loop_policy() -> LoopPolicy {
+    agent_loop_policy_from(std::env::var(AGENT_MAX_TURNS_ENV).ok().as_deref())
+}
+
+fn agent_loop_policy_from(raw: Option<&str>) -> LoopPolicy {
+    let mut policy = LoopPolicy::default();
+    let Some(raw) = raw else {
+        return policy;
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(kheish_types::UNBOUNDED_AGENT_MAX_TURNS) => {
+            tracing::warn!(
+                "{AGENT_MAX_TURNS_ENV}=0 removes the agent turn ceiling; \
+                 runs stop only on completion, budget, or operator action"
+            );
+            policy.max_turns = kheish_types::UNBOUNDED_AGENT_MAX_TURNS;
+        }
+        Ok(value) => policy.max_turns = value,
+        Err(_) => tracing::warn!(
+            "ignoring invalid {AGENT_MAX_TURNS_ENV}={raw:?}; keeping the default of {} turns",
+            policy.max_turns
+        ),
+    }
+    policy
+}
+
 /// Builds a production-ready daemon service around the provided primary and fallback routes.
 pub async fn build_provider_daemon<R>(
     config: DaemonConfig,
@@ -739,7 +770,7 @@ where
     let supervisor =
         restore_supervisor(&FileDaemonStore::new(&config.state_root), observer.clone())?;
     let orchestrator = AgentOrchestrator::new(
-        LoopPolicy::default(),
+        resolve_agent_loop_policy(),
         AgentRuntimeDependencies {
             model,
             tools,
@@ -865,13 +896,41 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        allow_all_session_permission_rule, build_audio_generation_service,
+        agent_loop_policy_from, allow_all_session_permission_rule, build_audio_generation_service,
         default_session_permission_rules, has_audio_generation_backend,
         mcp_resolved_secrets_from_auth_store,
     };
     use crate::assets::FileAssetStore;
     use crate::control_tools::{DaemonToolControlHandle, register_daemon_control_tools};
     use crate::model_routing::{ConfiguredModelRoute, ModelRouteConfig, RouteCapabilities};
+
+    #[test]
+    fn agent_loop_policy_defaults_to_a_bounded_turn_ceiling() {
+        let policy = agent_loop_policy_from(None);
+        assert_eq!(policy.max_turns, kheish_types::DEFAULT_AGENT_MAX_TURNS);
+        assert_ne!(policy.max_turns, kheish_types::UNBOUNDED_AGENT_MAX_TURNS);
+    }
+
+    #[test]
+    fn agent_loop_policy_env_override_supports_bounded_and_unbounded_values() {
+        assert_eq!(agent_loop_policy_from(Some("42")).max_turns, 42);
+        assert_eq!(
+            agent_loop_policy_from(Some(" 0 ")).max_turns,
+            kheish_types::UNBOUNDED_AGENT_MAX_TURNS
+        );
+    }
+
+    #[test]
+    fn agent_loop_policy_ignores_invalid_env_values() {
+        assert_eq!(
+            agent_loop_policy_from(Some("unlimited")).max_turns,
+            kheish_types::DEFAULT_AGENT_MAX_TURNS
+        );
+        assert_eq!(
+            agent_loop_policy_from(Some("-1")).max_turns,
+            kheish_types::DEFAULT_AGENT_MAX_TURNS
+        );
+    }
 
     #[test]
     fn wildcard_permission_rule_stays_last_after_extension_rules() {
@@ -956,6 +1015,7 @@ mod tests {
             tool_names,
             vec![
                 "apply_patch",
+                "ask_operator",
                 "ask_user_question",
                 "bash",
                 "create_channel_stimulus",
@@ -976,6 +1036,7 @@ mod tests {
                 "list_files",
                 "list_skills",
                 "message_agent",
+                "notify_operator",
                 "read_channel_thread",
                 "read_file",
                 "request_parent_clarification",
@@ -1248,7 +1309,8 @@ mod tests {
     fn plan_mode_default_tool_allowlist_contains(tool_name: &str) -> bool {
         matches!(
             tool_name,
-            "ask_user_question"
+            "ask_operator"
+                | "ask_user_question"
                 | "enter_plan_mode"
                 | "exit_plan_mode"
                 | "get_agent"

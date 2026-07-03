@@ -39,10 +39,45 @@ pub(crate) struct ObservationService {
     next_observation_id: AtomicU64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct ObservationIngressRateLimitState {
-    window_started_at_ms: u64,
-    accepted: u64,
+    /// Available tokens in the bucket (fractional; refills continuously with elapsed time).
+    tokens: f64,
+    /// Wall-clock timestamp (ms) of the last refill, used to compute elapsed time.
+    last_refill_ms: u64,
+}
+
+impl ObservationIngressRateLimitState {
+    /// Refills the bucket for the time elapsed since the last call, then tries to spend one token.
+    ///
+    /// This is a token bucket: capacity is `burst`, refilled at `burst` tokens per `window_ms`. It
+    /// bounds the sustained rate to `burst`/`window_ms` and caps any instantaneous burst at `burst`
+    /// — unlike the previous fixed-window counter, which admitted up to ~2x `burst` across a window
+    /// boundary. `window_ms`/`burst` are clamped to >= 1 defensively; source validation
+    /// (`CreateObservationSourceRequest::validate`) already guarantees both are non-zero.
+    fn admit(
+        &mut self,
+        now_ms: u64,
+        window_ms: u64,
+        burst: u64,
+    ) -> ObservationIngressRateLimitDecision {
+        let window_ms = window_ms.max(1);
+        let capacity = burst.max(1) as f64;
+        let elapsed_ms = now_ms.saturating_sub(self.last_refill_ms);
+        let refill = elapsed_ms as f64 * capacity / window_ms as f64;
+        self.tokens = (self.tokens + refill).min(capacity);
+        self.last_refill_ms = now_ms;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            ObservationIngressRateLimitDecision::Accepted
+        } else {
+            let deficit = 1.0 - self.tokens;
+            let retry_after_ms = (deficit * window_ms as f64 / capacity).ceil() as u64;
+            ObservationIngressRateLimitDecision::Limited {
+                retry_after_ms: retry_after_ms.max(1),
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1004,25 +1039,13 @@ impl ObservationService {
         let mut limits = self.ingress_rate_limits.lock().await;
         let state = limits.entry(source_id.to_string()).or_insert_with(|| {
             ObservationIngressRateLimitState {
-                window_started_at_ms: now_ms,
-                accepted: 0,
+                // A previously unseen source starts with a full bucket, preserving the prior
+                // behavior where a fresh source could immediately spend its whole burst.
+                tokens: burst.max(1) as f64,
+                last_refill_ms: now_ms,
             }
         });
-        if now_ms.saturating_sub(state.window_started_at_ms) >= window_ms {
-            state.window_started_at_ms = now_ms;
-            state.accepted = 0;
-        }
-        if state.accepted >= burst {
-            let retry_after_ms = state
-                .window_started_at_ms
-                .saturating_add(window_ms)
-                .saturating_sub(now_ms);
-            return Ok(ObservationIngressRateLimitDecision::Limited {
-                retry_after_ms: retry_after_ms.max(1),
-            });
-        }
-        state.accepted = state.accepted.saturating_add(1);
-        Ok(ObservationIngressRateLimitDecision::Accepted)
+        Ok(state.admit(now_ms, window_ms, burst))
     }
 
     /// Appends one sanitized audit record. Audit persistence failures are logged but non-fatal.
@@ -1893,4 +1916,155 @@ fn audit_reason_looks_secret_like(reason: &str) -> bool {
     ]
     .iter()
     .any(|marker| lowered.contains(marker))
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::{ObservationIngressRateLimitDecision, ObservationIngressRateLimitState};
+
+    fn fresh(burst: u64, now_ms: u64) -> ObservationIngressRateLimitState {
+        ObservationIngressRateLimitState {
+            tokens: burst.max(1) as f64,
+            last_refill_ms: now_ms,
+        }
+    }
+
+    fn drain(
+        state: &mut ObservationIngressRateLimitState,
+        now_ms: u64,
+        window_ms: u64,
+        burst: u64,
+    ) {
+        for _ in 0..burst {
+            assert_eq!(
+                state.admit(now_ms, window_ms, burst),
+                ObservationIngressRateLimitDecision::Accepted,
+            );
+        }
+    }
+
+    #[test]
+    fn admits_full_burst_then_limits() {
+        let (window_ms, burst) = (60_000, 3);
+        let mut state = fresh(burst, 0);
+        drain(&mut state, 0, window_ms, burst);
+        assert!(matches!(
+            state.admit(0, window_ms, burst),
+            ObservationIngressRateLimitDecision::Limited { .. }
+        ));
+    }
+
+    #[test]
+    fn refills_one_token_after_one_proportional_period() {
+        // burst=6 over 60_000ms => one token every 10_000ms.
+        let (window_ms, burst) = (60_000, 6);
+        let mut state = fresh(burst, 0);
+        drain(&mut state, 0, window_ms, burst);
+        // Exactly one refill period later, exactly one more token is available, then limited.
+        assert_eq!(
+            state.admit(10_000, window_ms, burst),
+            ObservationIngressRateLimitDecision::Accepted
+        );
+        assert!(matches!(
+            state.admit(10_000, window_ms, burst),
+            ObservationIngressRateLimitDecision::Limited { .. }
+        ));
+    }
+
+    #[test]
+    fn no_instantaneous_double_burst_across_window_boundary() {
+        // Regression for the previous fixed-window counter, which reset at the window edge and could
+        // admit ~2x `burst` within a tiny interval straddling the boundary. With a token bucket the
+        // capacity caps any single-instant burst at `burst`: draining at the end of one window and
+        // retrying right after the boundary must not yield a second full burst.
+        let (window_ms, burst) = (60_000, 4);
+        let mut state = fresh(burst, 0);
+        let edge = window_ms - 1;
+        let mut admitted_at_edge = 0u64;
+        while let ObservationIngressRateLimitDecision::Accepted =
+            state.admit(edge, window_ms, burst)
+        {
+            admitted_at_edge += 1;
+            assert!(
+                admitted_at_edge <= burst,
+                "instantaneous burst exceeded capacity at the window edge"
+            );
+        }
+        // 1ms past the boundary only a negligible fraction of a token has refilled.
+        let mut admitted_after_boundary = 0u64;
+        while let ObservationIngressRateLimitDecision::Accepted =
+            state.admit(window_ms, window_ms, burst)
+        {
+            admitted_after_boundary += 1;
+            assert!(
+                admitted_after_boundary < burst,
+                "a second full burst was admitted right after the window boundary (fixed-window 2x bug)"
+            );
+        }
+    }
+
+    #[test]
+    fn full_window_idle_restores_exactly_one_burst() {
+        let (window_ms, burst) = (60_000, 4);
+        let mut state = fresh(burst, 0);
+        drain(&mut state, 0, window_ms, burst);
+        // After a full idle window the bucket is full again — a fresh burst, but not more.
+        drain(&mut state, window_ms, window_ms, burst);
+        assert!(matches!(
+            state.admit(window_ms, window_ms, burst),
+            ObservationIngressRateLimitDecision::Limited { .. }
+        ));
+    }
+
+    #[test]
+    fn limited_retry_after_is_positive_and_bounded_by_window() {
+        let (window_ms, burst) = (60_000, 1);
+        let mut state = fresh(burst, 0);
+        assert_eq!(
+            state.admit(0, window_ms, burst),
+            ObservationIngressRateLimitDecision::Accepted
+        );
+        match state.admit(0, window_ms, burst) {
+            ObservationIngressRateLimitDecision::Limited { retry_after_ms } => {
+                assert!(retry_after_ms > 0);
+                assert!(
+                    retry_after_ms <= window_ms,
+                    "retry_after {retry_after_ms} should not exceed a full window {window_ms}"
+                );
+            }
+            other => panic!("expected limited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clock_skew_backwards_does_not_overflow_or_refill() {
+        let (window_ms, burst) = (60_000, 2);
+        let mut state = fresh(burst, 10_000);
+        drain(&mut state, 10_000, window_ms, burst);
+        // A timestamp earlier than the last refill must not refill (saturating elapsed) or panic.
+        assert!(matches!(
+            state.admit(0, window_ms, burst),
+            ObservationIngressRateLimitDecision::Limited { .. }
+        ));
+    }
+
+    #[test]
+    fn zero_config_is_clamped_not_dividing_by_zero() {
+        // Defensive: validation guarantees non-zero, but a malformed/legacy record must clamp to
+        // 1/1 rather than produce NaN/inf or panic.
+        let mut state = ObservationIngressRateLimitState {
+            tokens: 1.0,
+            last_refill_ms: 0,
+        };
+        assert_eq!(
+            state.admit(0, 0, 0),
+            ObservationIngressRateLimitDecision::Accepted
+        );
+        match state.admit(0, 0, 0) {
+            ObservationIngressRateLimitDecision::Limited { retry_after_ms } => {
+                assert!(retry_after_ms > 0);
+            }
+            other => panic!("expected limited, got {other:?}"),
+        }
+    }
 }

@@ -343,6 +343,15 @@ where
                         .await?,
                 )
             }
+            ["v1", "sessions", session_id, "operator"] => {
+                let request =
+                    serde_json::from_value::<crate::SetSessionOperatorConfigRequest>(body)?;
+                encode_response(
+                    self.state
+                        .set_session_operator_config(session_id, Some(request.operator))
+                        .await?,
+                )
+            }
             ["v1", "sessions", session_id, "reply-targets"] => {
                 let request = serde_json::from_value::<crate::SetSessionReplyTargetsRequest>(body)?;
                 let reply_targets = request
@@ -1200,6 +1209,7 @@ fn validate_stack(context: &StackContext) -> Result<StackValidation> {
         document.spec.requires.mcp.tools.iter().map(String::as_str),
         &mut validation,
     );
+    validate_session_operator_configs(document, &mut validation);
     validate_mcp_requirement_details(&document.spec.requires.mcp, &mut validation);
     validate_unique(
         "spec.playbooks[] playbook_id/version",
@@ -1239,6 +1249,38 @@ fn validate_stack(context: &StackContext) -> Result<StackValidation> {
     }
     validation.valid = validation.errors.is_empty();
     Ok(validation)
+}
+
+fn validate_session_operator_configs(document: &StackDocument, validation: &mut StackValidation) {
+    for session in &document.spec.sessions {
+        let Some(operator) = session.operator.as_ref() else {
+            continue;
+        };
+        if let Err(error) =
+            crate::operator_contact::normalize_session_operator_config(operator.clone())
+        {
+            validation.errors.push(format!(
+                "spec.sessions[{}].operator is invalid: {error}",
+                session.session_id
+            ));
+            continue;
+        }
+        if !operator.enabled {
+            continue;
+        }
+        if !operator.allow_notify && !operator.allow_questions {
+            validation.errors.push(format!(
+                "spec.sessions[{}].operator must allow notify_operator or ask_operator when enabled",
+                session.session_id
+            ));
+        }
+        if operator.allow_notify && session.reply_targets.as_ref().is_none_or(Vec::is_empty) {
+            validation.errors.push(format!(
+                "spec.sessions[{}].operator.allow_notify requires at least one reply_targets entry",
+                session.session_id
+            ));
+        }
+    }
 }
 
 fn validate_resource_count(document: &StackDocument, validation: &mut StackValidation) {
@@ -2437,7 +2479,7 @@ where
             "session",
             session.session_id.clone(),
             operation,
-            "session persona, scopes, route policy, and reply targets are reconciled through daemon APIs",
+            "session persona, scopes, route policy, operator config, and reply targets are reconciled through daemon APIs",
         ));
     }
     Ok(())
@@ -3232,14 +3274,14 @@ where
                 },
             )
             .await?;
-        client
-            .post_json::<_, crate::SessionView>(
-                &format!("/v1/sessions/{encoded}/reply-targets"),
-                &crate::SetSessionReplyTargetsRequest {
-                    reply_targets: session.reply_targets.clone().unwrap_or_default(),
-                },
-            )
-            .await?;
+        let desired_operator = session.operator.clone().unwrap_or_default();
+        if desired_operator.enabled && desired_operator.allow_notify {
+            apply_session_reply_targets(client, &encoded, session).await?;
+            apply_session_operator(client, &encoded, desired_operator).await?;
+        } else {
+            apply_session_operator(client, &encoded, desired_operator).await?;
+            apply_session_reply_targets(client, &encoded, session).await?;
+        }
         ledger.record_resource(&context.ownership_id(), &key, session.digest.clone());
         ledger.save(ledger_path).await?;
         report.applied.push(StackAction::new(
@@ -3251,6 +3293,40 @@ where
         ));
     }
     Ok(())
+}
+
+async fn apply_session_operator<C>(
+    client: &C,
+    encoded_session_id: &str,
+    operator: kheish_types::SessionOperatorConfig,
+) -> Result<crate::SessionView>
+where
+    C: StackControlPlane + Sync,
+{
+    client
+        .post_json::<_, crate::SessionView>(
+            &format!("/v1/sessions/{encoded_session_id}/operator"),
+            &crate::SetSessionOperatorConfigRequest { operator },
+        )
+        .await
+}
+
+async fn apply_session_reply_targets<C>(
+    client: &C,
+    encoded_session_id: &str,
+    session: &ResolvedSession,
+) -> Result<crate::SessionView>
+where
+    C: StackControlPlane + Sync,
+{
+    client
+        .post_json::<_, crate::SessionView>(
+            &format!("/v1/sessions/{encoded_session_id}/reply-targets"),
+            &crate::SetSessionReplyTargetsRequest {
+                reply_targets: session.reply_targets.clone().unwrap_or_default(),
+            },
+        )
+        .await
 }
 
 async fn apply_schedules<C>(
@@ -3834,6 +3910,7 @@ fn session_matches(live: &crate::SessionView, desired: &ResolvedSession) -> bool
         && live.capability_scope == desired.capability_scope.clone().unwrap_or_default()
         && live.credential_scope == desired.credential_scope.clone().unwrap_or_default()
         && live.route_policy == desired.route_policy.clone().unwrap_or_default()
+        && live.operator == desired.operator.clone().unwrap_or_default()
         && live.reply_targets == desired_reply_targets
 }
 
@@ -4652,6 +4729,8 @@ struct StackSessionSpec {
     #[serde(default)]
     route_policy: Option<kheish_types::SessionRoutePolicy>,
     #[serde(default)]
+    operator: Option<kheish_types::SessionOperatorConfig>,
+    #[serde(default)]
     reply_targets: Option<Vec<crate::SessionReplyTargetRequest>>,
 }
 
@@ -4942,6 +5021,11 @@ impl ResolvedStack {
                         .clone()
                         .map(|scope| scope.normalized()),
                     route_policy: session.route_policy.clone(),
+                    operator: session
+                        .operator
+                        .clone()
+                        .map(crate::operator_contact::normalize_session_operator_config)
+                        .transpose()?,
                     reply_targets: session.reply_targets.clone(),
                     digest: String::new(),
                 };
@@ -5263,6 +5347,7 @@ struct ResolvedSession {
     capability_scope: Option<kheish_types::CapabilityScope>,
     credential_scope: Option<kheish_types::CredentialScope>,
     route_policy: Option<kheish_types::SessionRoutePolicy>,
+    operator: Option<kheish_types::SessionOperatorConfig>,
     reply_targets: Option<Vec<crate::SessionReplyTargetRequest>>,
     digest: String,
 }
@@ -5276,6 +5361,7 @@ impl ResolvedSession {
             "capability_scope": self.capability_scope,
             "credential_scope": self.credential_scope,
             "route_policy": self.route_policy,
+            "operator": self.operator,
             "reply_targets": self.reply_targets,
         })
     }
@@ -6153,6 +6239,7 @@ mod tests {
                 credential_scope: request.credential_scope.clone().unwrap_or_default(),
                 effective_credential_scope: request.credential_scope.unwrap_or_default(),
                 persona,
+                operator: Default::default(),
                 reply_targets: Vec::new(),
                 outputs: Vec::new(),
             })
@@ -6472,6 +6559,17 @@ mod tests {
                         .get_mut(*session_id)
                         .ok_or_else(|| anyhow!("session {session_id} not found"))?;
                     session.route_policy = request.route_policy.unwrap_or_default();
+                    encode_response(session.clone())
+                }
+                ["v1", "sessions", session_id, "operator"] => {
+                    let request = serde_json::from_value::<crate::SetSessionOperatorConfigRequest>(
+                        serde_json::to_value(body)?,
+                    )?;
+                    let mut sessions = self.state.sessions.lock().expect("sessions lock");
+                    let session = sessions
+                        .get_mut(*session_id)
+                        .ok_or_else(|| anyhow!("session {session_id} not found"))?;
+                    session.operator = request.operator;
                     encode_response(session.clone())
                 }
                 ["v1", "sessions", session_id, "reply-targets"] => {
@@ -7731,6 +7829,144 @@ spec:
     }
 
     #[tokio::test]
+    async fn sessions_accept_generic_operator_contact_policy() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: operator-contact
+spec:
+  sessions:
+    - session_id: feature-loop
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_deny: ["*"]
+        mcp_tool_deny: ["*"]
+      credential_scope:
+        route_deny: ["*"]
+        connector_deny: ["*"]
+        connector_credential_deny: ["*"]
+        mcp_server_deny: ["*"]
+      reply_targets:
+        - type: http
+          url: https://example.com/kheish/operator
+      operator:
+        enabled: true
+        display_name: Project operator
+        communication_style: concise and human
+        allow_notify: true
+        allow_questions: true
+"#;
+        let resolved = ResolvedStack::from_context(&context(raw)).await.unwrap();
+        let session = resolved.sessions.first().expect("session");
+        let operator = session.operator.as_ref().expect("operator policy");
+        assert!(operator.enabled);
+        assert_eq!(operator.display_name.as_deref(), Some("Project operator"));
+        assert_eq!(
+            session.desired_value()["operator"]["communication_style"],
+            json!("concise and human")
+        );
+        assert_eq!(session.reply_targets.as_ref().map(Vec::len), Some(1));
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_operator_questions_without_reply_targets() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: operator-questions
+spec:
+  sessions:
+    - session_id: feature-loop
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_deny: ["*"]
+        mcp_tool_deny: ["*"]
+      credential_scope:
+        route_deny: ["*"]
+        connector_deny: ["*"]
+        connector_credential_deny: ["*"]
+        mcp_server_deny: ["*"]
+      operator:
+        enabled: true
+        allow_notify: false
+        allow_questions: true
+"#;
+        let validation = validate_stack_context(&context(raw)).await.unwrap();
+
+        assert!(validation.valid, "{:?}", validation.errors);
+    }
+
+    #[tokio::test]
+    async fn sessions_canonicalize_inactive_operator_contact_policy() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: inactive-operator
+spec:
+  sessions:
+    - session_id: feature-loop
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_deny: ["*"]
+        mcp_tool_deny: ["*"]
+      credential_scope:
+        route_deny: ["*"]
+        connector_deny: ["*"]
+        connector_credential_deny: ["*"]
+        mcp_server_deny: ["*"]
+      operator:
+        enabled: false
+        display_name: Project operator
+        communication_style: concise
+        allow_notify: false
+        allow_questions: false
+"#;
+        let resolved = ResolvedStack::from_context(&context(raw)).await.unwrap();
+        let session = resolved.sessions.first().expect("session");
+
+        assert_eq!(
+            session.operator.as_ref(),
+            Some(&kheish_types::SessionOperatorConfig::default())
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_operator_notifications_without_reply_targets() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: operator-notify
+spec:
+  sessions:
+    - session_id: feature-loop
+      capability_scope:
+        skill_deny: ["*"]
+        mcp_server_deny: ["*"]
+        mcp_tool_deny: ["*"]
+      credential_scope:
+        route_deny: ["*"]
+        connector_deny: ["*"]
+        connector_credential_deny: ["*"]
+        mcp_server_deny: ["*"]
+      operator:
+        enabled: true
+        allow_notify: true
+        allow_questions: true
+"#;
+        let validation = validate_stack_context(&context(raw)).await.unwrap();
+
+        assert!(!validation.valid);
+        assert!(errors_contain(
+            &validation,
+            "spec.sessions[feature-loop].operator.allow_notify requires at least one reply_targets entry"
+        ));
+    }
+
+    #[tokio::test]
     async fn validate_rejects_flow_start_scalar_request_metadata() {
         let raw = r#"
 apiVersion: kheish.ai/v1alpha1
@@ -8615,11 +8851,13 @@ spec:
             "mcp__github__list_pull_requests",
             "mcp__github__pull_request_read",
             "mcp__github__add_reply_to_pull_request_comment",
+            "mcp__github__add_issue_comment",
             "mcp__linear__get_issue",
             "mcp__linear__list_comments",
             "mcp__linear__list_issues",
             "mcp__linear__list_issue_statuses",
             "mcp__linear__list_projects",
+            "mcp__linear__list_teams",
             "mcp__linear__save_comment",
             "mcp__linear__save_issue",
         ]
@@ -8627,6 +8865,7 @@ spec:
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
         let runtime_tools = vec![
+            "mcp__github__add_issue_comment",
             "mcp__github__add_reply_to_pull_request_comment",
             "mcp__github__create_branch",
             "mcp__github__create_or_update_file",
@@ -8792,7 +9031,7 @@ spec:
     fn assert_feature_loop_persona_session_contract(resolved: &ResolvedStack, tools: &[String]) {
         assert_eq!(resolved.personas.len(), 1);
         let persona = &resolved.personas[0];
-        assert_eq!(persona.persona_id, "feature-pr-operator-v012");
+        assert_eq!(persona.persona_id, "feature-pr-operator-v013");
         assert_eq!(persona.display_name, "Feature PR Operator");
         assert_eq!(
             persona.soul.trim_end(),
@@ -8810,13 +9049,30 @@ spec:
 
         assert_eq!(resolved.sessions.len(), 1);
         let session = &resolved.sessions[0];
-        assert_eq!(session.session_id, "feature-pr-loop-v012");
+        assert_eq!(session.session_id, "feature-pr-loop-v015");
         assert_eq!(session.thread_id, None);
         assert_eq!(
             session.persona_id.as_deref(),
-            Some("feature-pr-operator-v012")
+            Some("feature-pr-operator-v013")
         );
-        assert_eq!(session.reply_targets, None);
+        assert_eq!(
+            session.reply_targets,
+            Some(vec![crate::SessionReplyTargetRequest::Telegram {
+                connector: "feature-loop-operator-telegram".to_string(),
+                chat_id: 123456789,
+                message_thread_id: None,
+                reply_to_message_id: None,
+            }])
+        );
+        let operator = session.operator.as_ref().expect("session operator config");
+        assert!(operator.enabled);
+        assert_eq!(operator.display_name.as_deref(), Some("Project operator"));
+        assert_eq!(
+            operator.communication_style.as_deref(),
+            Some("concise and human")
+        );
+        assert!(operator.allow_notify);
+        assert!(operator.allow_questions);
         assert_scope_allows_exact_mcp(
             session
                 .capability_scope
@@ -8830,10 +9086,16 @@ spec:
             .expect("session credential scope");
         assert_eq!(credentials.route_allow, vec!["openai".to_string()]);
         assert!(credentials.route_deny.is_empty());
-        assert!(credentials.connector_allow.is_empty());
-        assert_eq!(credentials.connector_deny, vec!["*".to_string()]);
-        assert!(credentials.connector_credential_allow.is_empty());
-        assert_eq!(credentials.connector_credential_deny, vec!["*".to_string()]);
+        assert_eq!(
+            credentials.connector_allow,
+            vec!["feature-loop-operator-telegram".to_string()]
+        );
+        assert!(credentials.connector_deny.is_empty());
+        assert_eq!(
+            credentials.connector_credential_allow,
+            vec!["feature-loop-operator-telegram:bot_token".to_string()]
+        );
+        assert!(credentials.connector_credential_deny.is_empty());
         assert_eq!(
             credentials
                 .mcp_server_allow
@@ -8860,7 +9122,7 @@ spec:
             playbook.manifest.playbook_id,
             "linear-github-feature-pr-loop"
         );
-        assert_eq!(playbook.manifest.version, "0.1.6");
+        assert_eq!(playbook.manifest.version, "0.1.14");
         assert_eq!(playbook.manifest.title, "Linear to GitHub Feature PR Loop");
         assert_eq!(
             playbook.manifest.objective,
@@ -8901,7 +9163,7 @@ spec:
             .collect::<BTreeMap<_, _>>();
         assert_eq!(
             inputs.keys().copied().collect::<BTreeSet<_>>(),
-            BTreeSet::from(["project", "repository"])
+            BTreeSet::from(["linear_team_key", "project", "repository"])
         );
         assert_playbook_input(
             inputs.get("project").copied(),
@@ -8911,6 +9173,11 @@ spec:
         assert_playbook_input(
             inputs.get("repository").copied(),
             "GitHub repository scope.",
+            false,
+        );
+        assert_playbook_input(
+            inputs.get("linear_team_key").copied(),
+            "Optional Linear team key to use when the deployment scope is a team rather than a Linear Project.",
             false,
         );
         let roles = playbook
@@ -8948,10 +9215,19 @@ spec:
         );
         assert_playbook_phase(
             phases.get("discover").copied(),
-            "Identify eligible Linear issues or GitHub review comments.",
+            "Identify eligible Linear issues or complete GitHub feedback envelopes.",
             &[
+                "An active session goal is checked before scanning for new work.",
+                "Existing active goals are continued instead of selecting a different ticket or PR.",
+                "A newly selected ticket or PR gets a session goal before GitHub or Linear mutation.",
                 "Exactly one ticket or PR is selected for the run.",
+                "Fresh Linear intake scans unmarked open issues in the configured project or team before concluding there is no work.",
+                "When `linear_team_key` is present or the configured project resolves as a team, issues are listed from the resolved Linear team.",
+                "Linear intake does not maintain unrelated existing workflow PRs; GitHub follow-up owns those.",
+                "Daemon state files and prior run logs are not scanned to discover current flow metadata.",
+                "Workflow footers are used for recovery and deduplication, not as the only selector for new Linear work.",
                 "Existing PRs are detected before new PR creation.",
+                "GitHub feedback is inventoried across review summaries, inline threads, replies, and top-level PR comments before action.",
                 "Previously blocked Linear issues without PRs can be recovered by a later run.",
                 "Unsafe or ambiguous items are reported instead of auto-mutated.",
             ],
@@ -8978,6 +9254,7 @@ spec:
             "Obtain an internal xhigh review score after a durable draft PR exists.",
             &[
                 "Review evidence includes diff scope, tests, and remaining risk.",
+                "Follow-up reviews treat a GitHub review as an envelope instead of acting on one inline fragment.",
                 "Follow-up runs recheck stale blocked test evidence before preserving a tests blocker.",
                 "Scores below 10/10 keep the PR draft and trigger another fix iteration or a blocked report.",
                 "Reviewer timeout or context-limit failure preserves the latest completed score and does not spawn unbounded review work.",
@@ -8991,6 +9268,7 @@ spec:
                 "A coherent ticket-scoped patch is published as a draft PR before the final 10/10 gate.",
                 "The PR references the Linear ticket.",
                 "The PR and Linear ticket record PR URL, tests, review score, and blockers.",
+                "The PR and Linear ticket record handled GitHub feedback watermarks when feedback is processed.",
                 "Machine-readable footers never contain placeholder PR URLs after a PR exists.",
             ],
         );
@@ -8998,10 +9276,14 @@ spec:
             playbook.manifest.acceptance_criteria,
             vec![
                 "Each root run processes at most one ticket or PR.".to_string(),
+                "Safe ticket-scoped work leaves the session goal active until the daemon continuation completes it.".to_string(),
+                "Goals are completed only after current tests, a 10/10 internal review, updated GitHub/Linear footers, and terminal subagents.".to_string(),
+                "Goals are paused only for durable human or external blockers.".to_string(),
                 "No duplicate PR is created for an issue with an active workflow PR.".to_string(),
                 "Every automatic code mutation has test evidence or an explicit test blocker, plus xhigh review evidence when available.".to_string(),
                 "Missing host runtimes are not enough to mark tests blocked until repository-provided Docker Compose or other project-native test commands have been tried or ruled out.".to_string(),
                 "Follow-up runs do not preserve a stale `Tests:` blocker without rechecking current project-native test entrypoints.".to_string(),
+                "Follow-up runs do not act on a single inline review fragment before checking sibling review comments, review metadata, and top-level PR comments.".to_string(),
                 "Draft PR creation is allowed before a 10/10 review score; leaving draft status is not.".to_string(),
                 "Subagents report blockers to the coordinator instead of asking user-facing clarification questions.".to_string(),
                 "The workflow stops rather than guessing when human product judgment is required."
@@ -9013,6 +9295,8 @@ spec:
             vec![
                 "The root scheduled run id is available from the Flow projection.".to_string(),
                 "Reviewer subagent evidence is recorded in the run output or linked PR/Linear comments.".to_string(),
+                "GitHub feedback inventory evidence is recorded before feedback-driven mutation."
+                    .to_string(),
             ]
         );
         assert!(!playbook.manifest.tools.enforce);
@@ -9031,14 +9315,14 @@ spec:
             plan,
             "playbooks",
             "playbook",
-            "linear-github-feature-pr-loop/0.1.6",
+            "linear-github-feature-pr-loop/0.1.14",
             "create",
         );
         assert_action(
             plan,
             "playbooks",
             "playbook_release",
-            "linear-github-feature-pr-loop/0.1.6",
+            "linear-github-feature-pr-loop/0.1.14",
             "update",
         );
     }
@@ -9050,14 +9334,11 @@ spec:
                 .iter()
                 .map(|schedule| schedule.name.as_str())
                 .collect::<BTreeSet<_>>(),
-            BTreeSet::from([
-                "github-review-followup-hourly-v016",
-                "linear-intake-0800-v016"
-            ])
+            BTreeSet::from(["github-review-followup-30m-v026", "linear-intake-0800-v024"])
         );
         let playbook = resolved.playbooks.first().expect("feature loop playbook");
         assert_feature_loop_schedule(
-            schedule_by_name(resolved, "linear-intake-0800-v016"),
+            schedule_by_name(resolved, "linear-intake-0800-v024"),
             playbook,
             "0 0 8 * * *",
             "linear-intake",
@@ -9065,9 +9346,9 @@ spec:
             Some(1),
         );
         assert_feature_loop_schedule(
-            schedule_by_name(resolved, "github-review-followup-hourly-v016"),
+            schedule_by_name(resolved, "github-review-followup-30m-v026"),
             playbook,
-            "0 0 * * * *",
+            "0 15,45 * * * *",
             "github-review-followup",
             EXPECTED_FEATURE_LOOP_REVIEW_PROMPT,
             None,
@@ -9076,20 +9357,20 @@ spec:
             plan,
             "schedules",
             "schedule",
-            "linear-intake-0800-v016",
+            "linear-intake-0800-v024",
             "create",
         );
         assert_action(
             plan,
             "schedules",
             "schedule",
-            "github-review-followup-hourly-v016",
+            "github-review-followup-30m-v026",
             "create",
         );
     }
 
     fn assert_feature_loop_prompt_policy_contract(resolved: &ResolvedStack) {
-        let intake = schedule_by_name(resolved, "linear-intake-0800-v016")
+        let intake = schedule_by_name(resolved, "linear-intake-0800-v024")
             .request
             .flow_start
             .as_ref()
@@ -9112,8 +9393,14 @@ spec:
         assert!(intake.contains(
             "host missing tools such as `php`, `composer`, `node`, or language-specific package managers are not by themselves a test blocker"
         ));
+        assert!(intake.contains("call `get_goal` before scanning Linear or GitHub work items"));
+        assert!(intake.contains("leave the goal `Active` whenever the selected item still has a safe, ticket-scoped next action"));
+        assert!(intake.contains("GoalId: <goal-id-or-none>"));
+        assert!(intake.contains("NoProgressCount: <integer>"));
+        assert!(intake.contains("LastFeedbackSeenAt: <iso8601-or-none>"));
+        assert!(intake.contains("HandledFeedbackIDs: <comma-separated-ids-or-none>"));
 
-        let followup = schedule_by_name(resolved, "github-review-followup-hourly-v016")
+        let followup = schedule_by_name(resolved, "github-review-followup-30m-v026")
             .request
             .flow_start
             .as_ref()
@@ -9142,6 +9429,38 @@ spec:
         assert!(followup.contains(
             "Do not carry forward stale test blockers without rechecking the current repository and local project-native test entrypoints."
         ));
+        assert!(followup.contains("call `get_goal` before scanning Linear or GitHub work items"));
+        assert!(followup.contains("leave the goal `Active` whenever the selected item still has a safe, ticket-scoped next action"));
+        assert!(
+            followup.contains(
+                "build a compact GitHub feedback inventory for each matching workflow PR"
+            )
+        );
+        assert!(
+            followup.contains("`get`, `get_reviews`, `get_review_comments`, and `get_comments`")
+        );
+        assert!(followup.contains(
+            "If any required feedback method is unavailable or errors, record the tool failure and do not mutate the PR"
+        ));
+        assert!(followup.contains("Follow pagination or cursor fields when present"));
+        assert!(followup.contains("record the truncation before deciding"));
+        assert!(followup.contains(
+            "review summaries, unresolved review threads with replies, and top-level PR comments"
+        ));
+        assert!(followup.contains("Never reduce a multi-line comment to only its last line"));
+        assert!(followup.contains(
+            "treat a GitHub review as one envelope: review summary/body when available, inline review comments, and replies"
+        ));
+        assert!(followup.contains(
+            "update the PR body with the latest tests, review score, blockers, `LastFeedbackSeenAt`, and `HandledFeedbackIDs`"
+        ));
+        assert!(
+            followup.contains("update the linked Linear ticket with the same footer watermarks")
+        );
+        assert!(followup.contains("GoalId: <goal-id-or-none>"));
+        assert!(followup.contains("NoProgressCount: <integer>"));
+        assert!(followup.contains("LastFeedbackSeenAt: <iso8601-or-none>"));
+        assert!(followup.contains("HandledFeedbackIDs: <comma-separated-ids-or-none>"));
     }
 
     fn assert_feature_loop_verification_contract(resolved: &ResolvedStack, plan: &StackPlan) {
@@ -9162,20 +9481,20 @@ spec:
             .iter()
             .map(|probe| (probe.name.as_str(), &probe.kind))
             .collect::<BTreeMap<_, _>>();
-        assert_probe_persona(probes.get("persona").copied(), "feature-pr-operator-v012");
-        assert_probe_session(probes.get("session").copied(), "feature-pr-loop-v012");
+        assert_probe_persona(probes.get("persona").copied(), "feature-pr-operator-v013");
+        assert_probe_session(probes.get("session").copied(), "feature-pr-loop-v015");
         assert_probe_schedule(
             probes.get("intake-schedule").copied(),
-            "linear-intake-0800-v016",
+            "linear-intake-0800-v024",
         );
         assert_probe_schedule(
             probes.get("followup-schedule").copied(),
-            "github-review-followup-hourly-v016",
+            "github-review-followup-30m-v026",
         );
         assert_probe_playbook(
             probes.get("playbook").copied(),
             "linear-github-feature-pr-loop",
-            "0.1.6",
+            "0.1.14",
         );
     }
 
@@ -9201,37 +9520,37 @@ spec:
         expected.push(action_key(
             "personas",
             "persona",
-            "feature-pr-operator-v012",
+            "feature-pr-operator-v013",
             "create",
         ));
         expected.push(action_key(
             "sessions",
             "session",
-            "feature-pr-loop-v012",
+            "feature-pr-loop-v015",
             "create",
         ));
         expected.push(action_key(
             "playbooks",
             "playbook",
-            "linear-github-feature-pr-loop/0.1.6",
+            "linear-github-feature-pr-loop/0.1.14",
             "create",
         ));
         expected.push(action_key(
             "playbooks",
             "playbook_release",
-            "linear-github-feature-pr-loop/0.1.6",
+            "linear-github-feature-pr-loop/0.1.14",
             "update",
         ));
         expected.push(action_key(
             "schedules",
             "schedule",
-            "linear-intake-0800-v016",
+            "linear-intake-0800-v024",
             "create",
         ));
         expected.push(action_key(
             "schedules",
             "schedule",
-            "github-review-followup-hourly-v016",
+            "github-review-followup-30m-v026",
             "create",
         ));
         for probe in feature_loop_probe_set() {
@@ -9257,19 +9576,19 @@ spec:
                 "mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN",
                 "create",
             ),
-            action_key("personas", "persona", "feature-pr-operator-v012", "create"),
-            action_key("sessions", "session", "feature-pr-loop-v012", "create"),
+            action_key("personas", "persona", "feature-pr-operator-v013", "create"),
+            action_key("sessions", "session", "feature-pr-loop-v015", "create"),
             action_key(
                 "playbooks",
                 "playbook",
-                "linear-github-feature-pr-loop/0.1.6",
+                "linear-github-feature-pr-loop/0.1.14",
                 "apply",
             ),
-            action_key("schedules", "schedule", "linear-intake-0800-v016", "create"),
+            action_key("schedules", "schedule", "linear-intake-0800-v024", "create"),
             action_key(
                 "schedules",
                 "schedule",
-                "github-review-followup-hourly-v016",
+                "github-review-followup-30m-v026",
                 "create",
             ),
         ];
@@ -9286,7 +9605,7 @@ spec:
         max_tickets: Option<i64>,
     ) {
         assert_eq!(schedule.request.name, schedule.name);
-        assert_eq!(schedule.request.target_session_id, "feature-pr-loop-v012");
+        assert_eq!(schedule.request.target_session_id, "feature-pr-loop-v015");
         assert_eq!(schedule.request.target_agent_id, None);
         assert_eq!(schedule.request.max_executions, None);
         assert_eq!(
@@ -9323,7 +9642,7 @@ spec:
         );
         assert_eq!(flow_start.playbook_ref.version, playbook.manifest.version);
         assert_eq!(flow_start.playbook_ref.digest, playbook.digest);
-        assert_eq!(flow_start.session_id, "feature-pr-loop-v012");
+        assert_eq!(flow_start.session_id, "feature-pr-loop-v015");
         assert_eq!(flow_start.request.provider.as_deref(), Some("openai"));
         assert_eq!(flow_start.request.source_plugin, None);
         assert_eq!(flow_start.request.source_kind, None);
@@ -9360,20 +9679,51 @@ spec:
         );
         assert_eq!(
             flow_start.metadata.get("project").and_then(Value::as_str),
-            Some("Evapayrent")
+            Some("ExampleProject")
+        );
+        assert_eq!(
+            flow_start
+                .metadata
+                .get("linear_team_key")
+                .and_then(Value::as_str),
+            Some("ENG")
         );
         assert_eq!(
             flow_start
                 .metadata
                 .get("repository")
                 .and_then(Value::as_str),
-            Some("graniet/evapayrent")
+            Some("example-org/example-app")
+        );
+        assert_eq!(
+            flow_start
+                .metadata
+                .get("goal_token_budget")
+                .and_then(Value::as_i64),
+            Some(600000)
+        );
+        assert_eq!(
+            flow_start
+                .metadata
+                .get("max_goal_attempts")
+                .and_then(Value::as_i64),
+            Some(6)
+        );
+        assert_eq!(
+            flow_start
+                .metadata
+                .get("max_no_progress")
+                .and_then(Value::as_i64),
+            Some(2)
         );
     }
 
     fn assert_scope_allows_exact_mcp(scope: &kheish_types::CapabilityScope, tools: &[String]) {
-        assert_eq!(scope.skill_deny, vec!["*".to_string()]);
-        assert!(scope.skill_allow.is_empty());
+        assert!(scope.skill_deny.is_empty());
+        assert_eq!(
+            scope.skill_allow.iter().cloned().collect::<BTreeSet<_>>(),
+            string_set(["notify_operator", "ask_operator"])
+        );
         assert!(scope.mcp_server_deny.is_empty());
         assert!(scope.mcp_tool_deny.is_empty());
         assert_eq!(

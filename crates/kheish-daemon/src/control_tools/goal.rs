@@ -8,8 +8,8 @@ use serde_json::{Value, json};
 
 use super::DaemonToolControlHandle;
 use super::helpers::{
-    build_number_field, build_string_field, execution_run_id, execution_session_id,
-    optional_u64_field,
+    build_boolean_field, build_number_field, build_string_field, execution_run_id,
+    execution_session_id, optional_u64_field,
 };
 
 fn goal_json(goal: Option<SessionGoal>) -> Value {
@@ -71,13 +71,18 @@ impl Tool for CreateGoalTool {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "create_goal".to_string(),
-            description: "Create one long-running goal for this session. Fails if the session already has a goal.".to_string(),
+            description: "Create one long-running goal for this session. Fails if the session already has an active goal.".to_string(),
             schema: ToolSchema {
                 fields: vec![
                     build_string_field("objective", "Concrete objective to pursue.", true),
                     build_number_field(
                         "token_budget",
                         "Optional positive token budget for this goal.",
+                        false,
+                    ),
+                    build_boolean_field(
+                        "replace_if_inactive",
+                        "Replace an existing paused, budget-limited, or complete goal. Active goals are never replaced.",
                         false,
                     ),
                 ],
@@ -98,11 +103,22 @@ impl Tool for CreateGoalTool {
             .ok_or_else(|| anyhow!("objective is required"))?
             .to_string();
         let token_budget = optional_u64_field(&input, "token_budget");
+        let replace_if_inactive = match input.get("replace_if_inactive") {
+            Some(Value::Bool(value)) => *value,
+            Some(Value::Null) | None => false,
+            Some(_) => bail!("replace_if_inactive must be a boolean"),
+        };
         let run_id = execution_run_id(&ctx);
         let goal = self
             .control
             .resolve()?
-            .create_session_goal(session_id, run_id, objective, token_budget)
+            .create_session_goal(
+                session_id,
+                run_id,
+                objective,
+                token_budget,
+                replace_if_inactive,
+            )
             .await?;
         Ok(ToolExecutionOutput::json(goal_json(Some(goal))))
     }
@@ -124,11 +140,11 @@ impl Tool for UpdateGoalTool {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "update_goal".to_string(),
-            description: "Mark the current session goal complete. The model may only use this when the goal is actually achieved.".to_string(),
+            description: "Mark the current session goal complete or pause it when progress requires human action. The model may only complete a goal when it is actually achieved.".to_string(),
             schema: ToolSchema {
                 fields: vec![build_string_field(
                     "status",
-                    "Only 'complete' is accepted.",
+                    "Accepted values: 'complete' or 'paused'.",
                     true,
                 )],
             },
@@ -145,16 +161,14 @@ impl Tool for UpdateGoalTool {
             .and_then(Value::as_str)
             .map(str::trim)
             .unwrap_or_default();
-        if status != "complete" {
-            bail!("update_goal only accepts status 'complete'");
-        }
         let run_id =
             execution_run_id(&ctx).ok_or_else(|| anyhow!("tool execution missing run_id"))?;
-        let goal = self
-            .control
-            .resolve()?
-            .complete_session_goal(session_id, run_id)
-            .await?;
+        let control = self.control.resolve()?;
+        let goal = match status {
+            "complete" => control.complete_session_goal(session_id, run_id).await?,
+            "paused" => control.pause_session_goal(session_id, run_id).await?,
+            _ => bail!("update_goal only accepts status 'complete' or 'paused'"),
+        };
         Ok(ToolExecutionOutput::json(goal_json(Some(goal))))
     }
 }

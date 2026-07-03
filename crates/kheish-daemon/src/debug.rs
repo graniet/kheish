@@ -50,9 +50,12 @@ const MIN_DEBUG_ARTIFACT_BYTES: u64 = 512;
 #[cfg(test)]
 pub(crate) fn debug_capture_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    // A test that panics while holding the guard must not cascade into
+    // PoisonError aborts across the rest of the suite; the lock only
+    // serializes env-var mutation, so recovering the guard is safe.
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("debug capture env lock poisoned")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// One stored debug artifact descriptor.

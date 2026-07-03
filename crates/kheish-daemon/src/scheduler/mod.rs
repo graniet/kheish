@@ -13,7 +13,7 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use crate::observations::summarize_observation_materialization_request;
-use crate::playbooks::ensure_control_identifier;
+use crate::playbooks::{KHEISH_FLOW_METADATA_KEY, ensure_control_identifier};
 use crate::{
     ObservationMaterializationRequest, RunRequestSummary, StartFlowRequest, SubmitInputRequest,
     summarize_input_request,
@@ -294,6 +294,7 @@ pub(crate) fn validate_schedule_create_request(request: &ScheduleCreateRequest) 
                 .is_none_or(|metadata| metadata.is_null() || metadata.is_object()),
             "flow_start.request.metadata must be an object"
         );
+        validate_flow_start_metadata_for_run(flow_start)?;
         if !matches!(request.cadence, ScheduleCadence::Once { .. }) {
             anyhow::ensure!(
                 flow_start.flow_id.as_deref().is_none_or(str::is_empty),
@@ -306,6 +307,35 @@ pub(crate) fn validate_schedule_create_request(request: &ScheduleCreateRequest) 
                     .is_none_or(str::is_empty),
                 "flow_start.idempotency_key is only supported for one-shot schedules; recurring scheduled Flows derive a unique idempotency_key per fire"
             );
+        }
+    }
+    Ok(())
+}
+
+fn validate_flow_start_metadata_for_run(flow_start: &StartFlowRequest) -> Result<()> {
+    let flow_metadata = match &flow_start.metadata {
+        Value::Null => return Ok(()),
+        Value::Object(object) if object.is_empty() => return Ok(()),
+        Value::Object(object) => object,
+        _ => anyhow::bail!("flow_start.metadata must be an object"),
+    };
+    for key in flow_metadata.keys() {
+        if key == KHEISH_FLOW_METADATA_KEY || key == "daemon" {
+            anyhow::bail!("flow_start.metadata key `{key}` is daemon-owned");
+        }
+    }
+    if let Some(request_metadata) = flow_start
+        .request
+        .metadata
+        .as_ref()
+        .and_then(Value::as_object)
+    {
+        for key in flow_metadata.keys() {
+            if request_metadata.contains_key(key) {
+                anyhow::bail!(
+                    "flow_start.metadata key `{key}` conflicts with flow_start.request.metadata"
+                );
+            }
         }
     }
     Ok(())
@@ -807,6 +837,46 @@ mod tests {
             error
                 .to_string()
                 .contains("flow_start.request.metadata must be an object"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn flow_start_schedule_rejects_invalid_flow_metadata_before_dispatch() {
+        let mut request = sample_flow_schedule(ScheduleCadence::Once { fire_at_ms: 10_000 });
+        request.flow_start.as_mut().expect("flow_start").metadata =
+            Value::String("not-object".to_string());
+        let error =
+            validate_schedule_create_request(&request).expect_err("scalar flow metadata fails");
+        assert!(
+            error
+                .to_string()
+                .contains("flow_start.metadata must be an object"),
+            "{error}"
+        );
+
+        let mut request = sample_flow_schedule(ScheduleCadence::Once { fire_at_ms: 10_000 });
+        request.flow_start.as_mut().expect("flow_start").metadata =
+            serde_json::json!({ KHEISH_FLOW_METADATA_KEY: true });
+        let error =
+            validate_schedule_create_request(&request).expect_err("daemon flow metadata fails");
+        assert!(
+            error
+                .to_string()
+                .contains("flow_start.metadata key `kheish_flow` is daemon-owned"),
+            "{error}"
+        );
+
+        let mut request = sample_flow_schedule(ScheduleCadence::Once { fire_at_ms: 10_000 });
+        let flow_start = request.flow_start.as_mut().expect("flow_start");
+        flow_start.metadata = serde_json::json!({"project": "demo"});
+        flow_start.request.metadata = Some(serde_json::json!({"project": "other"}));
+        let error =
+            validate_schedule_create_request(&request).expect_err("colliding metadata fails");
+        assert!(
+            error
+                .to_string()
+                .contains("flow_start.metadata key `project` conflicts"),
             "{error}"
         );
     }

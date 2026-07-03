@@ -5995,6 +5995,121 @@ async fn spawn_openai_compaction_guard_mock_server(
     Ok(format!("http://{address}"))
 }
 
+#[derive(Clone)]
+struct OpenAiReactiveCompactionState {
+    captured_requests: Arc<Mutex<Vec<String>>>,
+    main_request_count: Arc<Mutex<usize>>,
+}
+
+async fn record_openai_reactive_compaction_request(
+    State(state): State<OpenAiReactiveCompactionState>,
+    body: String,
+) -> Response {
+    state
+        .captured_requests
+        .lock()
+        .expect("request capture mutex poisoned")
+        .push(body.clone());
+
+    if body.contains("Your task is to create a detailed summary") {
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            openai_text_sse_response(
+                "resp_compaction_summary",
+                "<summary>Reactive summary.</summary>",
+                10,
+            ),
+        )
+            .into_response();
+    }
+
+    let mut count = state
+        .main_request_count
+        .lock()
+        .expect("main request count mutex poisoned");
+    *count = count.saturating_add(1);
+    let current = *count;
+    drop(count);
+
+    if current == 5 {
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            concat!(
+                "event: response.failed\n",
+                "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"too much context\",\"type\":\"invalid_request_error\",\"code\":\"context_length_exceeded\"}}}\n\n"
+            ),
+        )
+            .into_response();
+    }
+
+    if current > 5 && body.contains("\"previous_response_id\"") {
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "application/json")],
+            json!({
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "previous_response_not_found",
+                    "message": "stale previous_response_id after compaction"
+                }
+            })
+            .to_string(),
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/event-stream")],
+        openai_text_sse_response(&format!("resp_seed_{current}"), "ok", 10),
+    )
+        .into_response()
+}
+
+fn openai_text_sse_response(response_id: &str, text: &str, input_tokens: usize) -> String {
+    format!(
+        concat!(
+            "event: response.created\n",
+            "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"{}\"}}}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"id\":\"msg-{}\",\"type\":\"message\",\"status\":\"in_progress\",\"role\":\"assistant\",\"content\":[]}}}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {{\"type\":\"response.output_text.delta\",\"item_id\":\"msg-{}\",\"output_index\":0,\"content_index\":0,\"delta\":{}}}\n\n",
+            "event: response.completed\n",
+            "data: {{\"type\":\"response.completed\",\"response\":{{\"usage\":{{\"input_tokens\":{},\"output_tokens\":4}}}}}}\n\n",
+        ),
+        response_id,
+        response_id,
+        response_id,
+        serde_json::to_string(text).expect("text should serialize"),
+        input_tokens,
+    )
+}
+
+async fn spawn_openai_reactive_compaction_mock_server(
+    captured_requests: Arc<Mutex<Vec<String>>>,
+) -> Result<String> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let app = Router::new()
+        .route(
+            "/v1/responses",
+            post(record_openai_reactive_compaction_request),
+        )
+        .with_state(OpenAiReactiveCompactionState {
+            captured_requests,
+            main_request_count: Arc::new(Mutex::new(0)),
+        });
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("mock provider server should stay healthy");
+    });
+    Ok(format!("http://{address}"))
+}
+
 async fn spawn_raw_mock_server(
     response_body: &str,
     content_type: &str,
@@ -27064,6 +27179,96 @@ async fn openai_compaction_requests_stay_hermetic_against_a_real_daemon() -> Res
         compaction_body.get("model").and_then(Value::as_str),
         Some("gpt-5.4"),
         "compaction must inherit the run-scoped OpenAI model instead of the daemon default"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn openai_context_window_failure_rebuilds_without_stale_response_resume() -> Result<()> {
+    let bin = cli_bin()?;
+    let captured_requests = Arc::new(Mutex::new(Vec::new()));
+    let provider_base_url =
+        spawn_openai_reactive_compaction_mock_server(captured_requests.clone()).await?;
+
+    let temp = TempDir::new()?;
+    let state_root = temp.path().join("state");
+    let workspace_root = temp.path().join("workspace");
+    fs::create_dir_all(&state_root)?;
+    fs::create_dir_all(&workspace_root)?;
+    let routes_path = temp.path().join("routes.toml");
+    fs::write(
+        &routes_path,
+        format!(
+            "version = 1\ndefault_route = \"openai\"\n\n[routes.openai]\ndriver = \"openai\"\ndefault_model = \"gpt-5.4\"\napi_key = \"test-key\"\nbase_url = \"{provider_base_url}/v1/responses\"\n"
+        ),
+    )?;
+
+    let (base_url, _daemon) = start_daemon_ready_with_env(
+        &bin,
+        &temp,
+        &state_root,
+        &workspace_root,
+        &routes_path,
+        Some("openai"),
+        std::iter::empty::<(&str, &str)>(),
+    )?;
+
+    let _: SessionView = run_cli_json(
+        &bin,
+        &base_url,
+        ["sessions", "create", "reactive-compact-demo"],
+    )?;
+
+    for index in 0..5 {
+        let run: RunView = run_cli_json(
+            &bin,
+            &base_url,
+            [
+                "sessions",
+                "input",
+                "reactive-compact-demo",
+                &format!("turn {index}"),
+            ],
+        )?;
+        let completed: RunView = run_cli_json(
+            &bin,
+            &base_url,
+            vec![
+                OsString::from("runs"),
+                OsString::from("wait"),
+                OsString::from(run.run_id),
+            ],
+        )?;
+        assert_eq!(completed.status, DaemonRunStatus::Completed);
+    }
+
+    let requests = captured_requests
+        .lock()
+        .expect("request capture mutex poisoned")
+        .clone();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("\"previous_response_id\"")),
+        "pre-compaction OpenAI turns should still use provider resume"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("Your task is to create a detailed summary")),
+        "context window failure should trigger a compaction request"
+    );
+    let retry_after_compaction = requests
+        .iter()
+        .find(|request| {
+            request.contains("Reactive summary")
+                && !request.contains("Your task is to create a detailed summary")
+        })
+        .ok_or_else(|| anyhow!("missing main-loop retry after reactive compaction"))?;
+    assert!(
+        !retry_after_compaction.contains("\"previous_response_id\""),
+        "main-loop retry after compaction must not reuse stale OpenAI response IDs"
     );
 
     Ok(())

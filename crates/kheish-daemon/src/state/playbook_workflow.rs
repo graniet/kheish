@@ -93,6 +93,11 @@ where
         if !metadata_can_accept_daemon_key(&request.request.metadata) {
             anyhow::bail!("metadata must be an object when daemon metadata is attached");
         }
+        merge_flow_start_metadata_into_run_metadata(
+            &mut request.request.metadata,
+            &request.metadata,
+        )?;
+        append_flow_input_metadata_context(&mut request.request, &request.metadata)?;
         self.agent_id_for_session(&request.session_id).await?;
         self.apply_flow_runtime_defaults(&mut request).await?;
         self.ensure_submit_input_request_has_payload(&request.request)?;
@@ -1106,6 +1111,139 @@ fn metadata_can_accept_daemon_key(metadata: &Option<serde_json::Value>) -> bool 
     )
 }
 
+fn merge_flow_start_metadata_into_run_metadata(
+    run_metadata: &mut Option<serde_json::Value>,
+    flow_metadata: &serde_json::Value,
+) -> Result<()> {
+    let flow_metadata = match flow_metadata {
+        serde_json::Value::Null => return Ok(()),
+        serde_json::Value::Object(object) if object.is_empty() => return Ok(()),
+        serde_json::Value::Object(object) => object,
+        _ => anyhow::bail!("flow metadata must be an object"),
+    };
+    let mut run_object = match run_metadata.take() {
+        None | Some(serde_json::Value::Null) => serde_json::Map::new(),
+        Some(serde_json::Value::Object(object)) => object,
+        Some(other) => {
+            *run_metadata = Some(other);
+            anyhow::bail!("metadata must be an object when flow metadata is attached");
+        }
+    };
+    for (key, value) in flow_metadata {
+        if key == KHEISH_FLOW_METADATA_KEY || key == "daemon" {
+            anyhow::bail!("flow metadata key `{key}` is daemon-owned");
+        }
+        if run_object.contains_key(key) {
+            anyhow::bail!("flow metadata key `{key}` conflicts with run metadata");
+        }
+        run_object.insert(key.clone(), value.clone());
+    }
+    *run_metadata = Some(serde_json::Value::Object(run_object));
+    Ok(())
+}
+
+const FLOW_INPUT_METADATA_CONTEXT_CHAR_LIMIT: usize = 8 * 1024;
+const FLOW_INPUT_METADATA_STRING_VALUE_LIMIT: usize = 2 * 1024;
+
+fn append_flow_input_metadata_context(
+    request: &mut SubmitInputRequest,
+    flow_metadata: &serde_json::Value,
+) -> Result<()> {
+    let Some(rendered) = render_flow_input_metadata_context(flow_metadata)? else {
+        return Ok(());
+    };
+    let block = format!("Flow input metadata:\n```json\n{rendered}\n```");
+    if request.input_items.is_empty() {
+        if !request.content.trim().is_empty() {
+            request.content.push_str("\n\n");
+        }
+        request.content.push_str(&block);
+    } else {
+        request
+            .input_items
+            .push(SubmitInputItemRequest::Text { text: block });
+    }
+    Ok(())
+}
+
+fn render_flow_input_metadata_context(flow_metadata: &serde_json::Value) -> Result<Option<String>> {
+    match flow_metadata {
+        serde_json::Value::Null => return Ok(None),
+        serde_json::Value::Object(object) if object.is_empty() => return Ok(None),
+        serde_json::Value::Object(_) => {}
+        _ => anyhow::bail!("flow metadata must be an object"),
+    }
+    let sanitized = sanitize_prompt_metadata(flow_metadata);
+    let mut rendered = serde_json::to_string_pretty(&sanitized)?;
+    if rendered.len() <= FLOW_INPUT_METADATA_CONTEXT_CHAR_LIMIT {
+        return Ok(Some(rendered));
+    }
+    rendered = serde_json::to_string(&sanitized)?;
+    if rendered.len() <= FLOW_INPUT_METADATA_CONTEXT_CHAR_LIMIT {
+        return Ok(Some(rendered));
+    }
+    let keys = sanitized
+        .as_object()
+        .map(|object| object.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    Ok(Some(serde_json::to_string_pretty(&json!({
+        "_notice": "Flow input metadata exceeded the prompt rendering limit and was summarized.",
+        "top_level_keys": keys,
+    }))?))
+}
+
+fn sanitize_prompt_metadata(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(object) => serde_json::Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| {
+                    let value = if prompt_metadata_key_is_sensitive(key) {
+                        serde_json::Value::String("[redacted]".to_string())
+                    } else {
+                        sanitize_prompt_metadata(value)
+                    };
+                    (key.clone(), value)
+                })
+                .collect(),
+        ),
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(sanitize_prompt_metadata).collect())
+        }
+        serde_json::Value::String(value)
+            if value.chars().count() > FLOW_INPUT_METADATA_STRING_VALUE_LIMIT =>
+        {
+            let truncated = value
+                .chars()
+                .take(FLOW_INPUT_METADATA_STRING_VALUE_LIMIT)
+                .collect::<String>();
+            serde_json::Value::String(format!("{truncated}...[truncated]"))
+        }
+        other => other.clone(),
+    }
+}
+
+fn prompt_metadata_key_is_sensitive(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase();
+    [
+        "api_key",
+        "apikey",
+        "access_token",
+        "auth_token",
+        "bearer_token",
+        "bot_token",
+        "client_secret",
+        "credential",
+        "password",
+        "private_key",
+        "secret",
+        "token",
+        "webhook_secret",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
 #[derive(Debug, Default)]
 struct FlowScopeProjection {
     primitive_refs: FlowPrimitiveRefs,
@@ -1773,6 +1911,95 @@ mod tests {
             deliveries: Vec::new(),
             error: None,
         }
+    }
+
+    fn test_submit_input_request(content: &str) -> SubmitInputRequest {
+        SubmitInputRequest {
+            provider: None,
+            source_plugin: None,
+            source_kind: None,
+            actor_id: None,
+            content: content.to_string(),
+            input_items: Vec::new(),
+            attachments: Vec::new(),
+            generation: None,
+            completion_requirements: None,
+            metadata: None,
+            binding_keys: Vec::new(),
+            reply_targets: Vec::new(),
+            reply_plugin: None,
+            reply_address: None,
+        }
+    }
+
+    #[test]
+    fn flow_input_metadata_context_appends_to_text_content() -> Result<()> {
+        let mut request = test_submit_input_request("Run the Flow.");
+
+        append_flow_input_metadata_context(
+            &mut request,
+            &json!({
+                "project": "ExampleProject",
+                "repository": "example-org/example-app",
+                "linear_team_key": "ENG"
+            }),
+        )?;
+
+        assert!(request.content.contains("Run the Flow."));
+        assert!(request.content.contains("Flow input metadata:"));
+        assert!(request.content.contains(r#""project": "ExampleProject""#));
+        assert!(
+            request
+                .content
+                .contains(r#""repository": "example-org/example-app""#)
+        );
+        assert!(request.content.contains(r#""linear_team_key": "ENG""#));
+        assert!(request.input_items.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn flow_input_metadata_context_redacts_sensitive_values() -> Result<()> {
+        let mut request = test_submit_input_request("Run the Flow.");
+
+        append_flow_input_metadata_context(
+            &mut request,
+            &json!({
+                "project": "demo",
+                "bot_token": "telegram-secret",
+                "nested": {
+                    "api_key": "provider-secret"
+                }
+            }),
+        )?;
+
+        assert!(request.content.contains(r#""project": "demo""#));
+        assert!(request.content.contains(r#""bot_token": "[redacted]""#));
+        assert!(request.content.contains(r#""api_key": "[redacted]""#));
+        assert!(!request.content.contains("telegram-secret"));
+        assert!(!request.content.contains("provider-secret"));
+        Ok(())
+    }
+
+    #[test]
+    fn flow_input_metadata_context_appends_to_rich_input_items() -> Result<()> {
+        let mut request = test_submit_input_request("");
+        request.input_items.push(SubmitInputItemRequest::Text {
+            text: "Run the Flow.".to_string(),
+        });
+
+        append_flow_input_metadata_context(&mut request, &json!({"workflow": "linear-intake"}))?;
+
+        assert_eq!(request.input_items.len(), 2);
+        assert_eq!(request.content, "");
+        match &request.input_items[1] {
+            SubmitInputItemRequest::Text { text } => {
+                assert!(text.contains("Flow input metadata:"));
+                assert!(text.contains(r#""workflow": "linear-intake""#));
+            }
+            other => panic!("expected text metadata context, got {other:?}"),
+        }
+        Ok(())
     }
 
     #[test]

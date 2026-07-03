@@ -485,9 +485,7 @@ async fn telegram_ok_response(
     let header_retry_after_ms = telegram_retry_after_header_ms(&headers);
     let body = match serde_json::from_str::<TelegramApiResponse>(&raw) {
         Ok(body) => body,
-        Err(error)
-            if status == StatusCode::TOO_MANY_REQUESTS && header_retry_after_ms.is_some() =>
-        {
+        Err(_) if status == StatusCode::TOO_MANY_REQUESTS && header_retry_after_ms.is_some() => {
             let retry_after_ms = header_retry_after_ms.unwrap_or(1_000);
             return Err(retry_after_delivery_error(
                 retry_after_ms,

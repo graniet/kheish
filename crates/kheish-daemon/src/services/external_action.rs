@@ -22,6 +22,7 @@ use kheish_session::{
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tracing::warn;
 
 const EXTERNAL_ACTION_AUDIT_SIGNING_KEY_ENV: &str = "KHEISH_EXTERNAL_ACTION_AUDIT_SIGNING_KEY";
 const EXTERNAL_ACTION_AUDIT_SIGNING_KEY_FILE_ENV: &str =
@@ -622,6 +623,19 @@ fn load_or_create_signer(state_root: &Path) -> Result<AuditSigner> {
         return Ok(signer);
     }
     let key_path = state_root.join(GENERATED_AUDIT_KEY_FILE_NAME);
+    // No external signing key was configured, so the Ed25519 key that makes the audit log
+    // tamper-evident lives inside the state root next to the records it signs. Anyone who can write
+    // to the state directory can therefore forge and re-sign the log. Warn loudly: the tamper-
+    // evidence guarantee only holds if the key is kept outside the state root.
+    warn!(
+        key_path = %key_path.display(),
+        "no external audit signing key is configured, so external-action audit signing falls back \
+         to a key under the daemon state root; a tamper-evident audit log kept next to its own \
+         signing key can be forged by anyone able to write to the state directory. For a real \
+         integrity guarantee, provide a signing key outside the state root via {} or {}.",
+        EXTERNAL_ACTION_AUDIT_SIGNING_KEY_ENV,
+        EXTERNAL_ACTION_AUDIT_SIGNING_KEY_FILE_ENV
+    );
     if key_path.exists() {
         let bytes = fs::read(&key_path)
             .with_context(|| format!("failed to read {}", key_path.display()))?;

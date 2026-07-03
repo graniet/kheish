@@ -20,6 +20,13 @@ where
         if has_background_work {
             return Ok(false);
         }
+        if self
+            .run_service
+            .has_pending_topology_submission(session_id)
+            .await
+        {
+            return Ok(false);
+        }
         let agent_id = self.agent_id_for_session(session_id).await?;
         if self.supervisor.mailbox_len(&agent_id) > 0 {
             return Ok(false);

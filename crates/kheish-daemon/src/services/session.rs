@@ -8,15 +8,17 @@ use kheish_types::{
     CapabilityScope, CredentialScope, HOOK_RUNTIME_STATE_METADATA_KEY, HookRuntimeState,
     LearningScope, ReplyHandle, SESSION_CAPABILITY_SCOPE_METADATA_KEY,
     SESSION_CONTROL_STATE_METADATA_KEY, SESSION_CREDENTIAL_SCOPE_METADATA_KEY,
-    SESSION_EXECUTION_IDENTITY_METADATA_KEY, SESSION_PERSONA_BINDING_METADATA_KEY,
-    SESSION_REPLY_TARGETS_METADATA_KEY, SESSION_ROUTE_POLICY_METADATA_KEY, SessionControlState,
-    SessionExecutionIdentity, SessionPersonaBinding, SessionRoutePolicy, TaskRecord,
+    SESSION_EXECUTION_IDENTITY_METADATA_KEY, SESSION_OPERATOR_CONFIG_METADATA_KEY,
+    SESSION_PERSONA_BINDING_METADATA_KEY, SESSION_REPLY_TARGETS_METADATA_KEY,
+    SESSION_ROUTE_POLICY_METADATA_KEY, SessionControlState, SessionExecutionIdentity,
+    SessionOperatorConfig, SessionPersonaBinding, SessionRoutePolicy, TaskRecord,
 };
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::DaemonTaskStatusSummaryView;
+use crate::connectors::{ConnectorKind, reply_target_references_connector};
 use crate::memory::{
     RunMemoryIndex, RunMemoryIndexEntry, RunMemoryIndexUpdate, RunMemoryMaintenanceStatusView,
     RunMemoryMetricsSnapshot, RunMemoryPolicyConfig, RunMemoryRecord, RunMemoryStatusView,
@@ -511,6 +513,45 @@ impl SessionService {
         Ok(state.clone())
     }
 
+    /// Loads the model-facing operator contact policy for one session.
+    pub(crate) async fn load_session_operator_config(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionOperatorConfig> {
+        let stored = self.sessions.load(session_id).await?;
+        stored
+            .metadata
+            .get(SESSION_OPERATOR_CONFIG_METADATA_KEY)
+            .filter(|value| !value.is_null())
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map(|state| state.unwrap_or_default())
+            .map_err(Into::into)
+    }
+
+    /// Persists the model-facing operator contact policy for one session.
+    pub(crate) async fn save_session_operator_config(
+        &self,
+        session_id: &str,
+        config: &SessionOperatorConfig,
+    ) -> Result<SessionOperatorConfig> {
+        self.sessions
+            .append(
+                session_id,
+                PersistedSessionRecord::Metadata {
+                    key: SESSION_OPERATOR_CONFIG_METADATA_KEY.to_string(),
+                    value: if config.is_active() {
+                        serde_json::to_value(config)?
+                    } else {
+                        Value::Null
+                    },
+                },
+            )
+            .await?;
+        Ok(config.clone())
+    }
+
     /// Loads the stored session capability scope override for one session.
     pub(crate) async fn load_session_capability_scope(
         &self,
@@ -701,6 +742,26 @@ impl SessionService {
             .reply_targets
             .keys()
             .cloned()
+            .collect()
+    }
+
+    /// Returns session identifiers whose cached reply-target defaults reference one connector.
+    pub(crate) async fn cached_reply_target_session_ids_referencing_connector(
+        &self,
+        kind: ConnectorKind,
+        name: &str,
+    ) -> Vec<String> {
+        self.index
+            .lock()
+            .await
+            .reply_targets
+            .iter()
+            .filter(|(_, targets)| {
+                targets
+                    .iter()
+                    .any(|target| reply_target_references_connector(target, kind, name))
+            })
+            .map(|(session_id, _)| session_id.clone())
             .collect()
     }
 

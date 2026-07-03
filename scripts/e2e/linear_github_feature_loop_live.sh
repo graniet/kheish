@@ -577,36 +577,43 @@ cli mcp tools call mcp__github__list_pull_requests \
 python3 - \
   "$GITHUB_REPOSITORY_FULL_NAME" \
   "$EVIDENCE/mcp-github-list-pull-requests.json" \
-  "$EVIDENCE/mcp-github-pull-request-read-input.json" <<'PY'
+  "$EVIDENCE" <<'PY'
 import json
 import pathlib
 import sys
 
 owner, repo = sys.argv[1].split("/", 1)
 list_result = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+evidence = pathlib.Path(sys.argv[3])
 content = list_result.get("output", {}).get("output", {}).get("content", [])
 pulls = []
 if content:
     pulls = json.loads(content[0].get("text", "[]"))
 if not pulls:
     raise SystemExit("GitHub list_pull_requests returned no PRs; pull_request_read cannot be exercised")
-pathlib.Path(sys.argv[3]).write_text(
-    json.dumps(
-        {
-            "owner": owner,
-            "repo": repo,
-            "pullNumber": pulls[0]["number"],
-            "method": "get",
-        },
-        separators=(",", ":"),
+for method in ("get", "get_reviews", "get_review_comments", "get_comments"):
+    payload = {
+        "owner": owner,
+        "repo": repo,
+        "pullNumber": pulls[0]["number"],
+        "method": method,
+    }
+    (evidence / f"mcp-github-pull-request-read-{method}-input.json").write_text(
+        json.dumps(payload, separators=(",", ":")) + "\n",
+        encoding="utf-8",
     )
-    + "\n",
+(evidence / "mcp-github-pull-request-read-input.json").write_text(
+    (evidence / "mcp-github-pull-request-read-get-input.json").read_text(encoding="utf-8"),
     encoding="utf-8",
 )
 PY
-cli mcp tools call mcp__github__pull_request_read \
-  --input-file "$EVIDENCE/mcp-github-pull-request-read-input.json" \
-  >"$EVIDENCE/mcp-github-pull-request-read.json"
+for method in get get_reviews get_review_comments get_comments; do
+  cli mcp tools call mcp__github__pull_request_read \
+    --input-file "$EVIDENCE/mcp-github-pull-request-read-${method}-input.json" \
+    >"$EVIDENCE/mcp-github-pull-request-read-${method}.json"
+done
+cp "$EVIDENCE/mcp-github-pull-request-read-get.json" \
+  "$EVIDENCE/mcp-github-pull-request-read.json"
 
 cli mcp tools call mcp__linear__list_issues \
   --input-json '{"limit":1}' \
@@ -669,10 +676,10 @@ cli stack diff \
 cli schedules list \
   >"$EVIDENCE/schedules-after-apply.json"
 
-cli runs list --session-id feature-pr-loop-v012 \
+cli runs list --session-id feature-pr-loop-v015 \
   >"$EVIDENCE/runs-after-apply.json"
 
-cli tasks list feature-pr-loop-v012 \
+cli tasks list feature-pr-loop-v015 \
   >"$EVIDENCE/tasks-after-apply.json"
 
 if [[ "$RUN_STACK_FLOW" == "1" ]]; then
@@ -710,12 +717,12 @@ request = {
         [
             "E2E smoke for the Kheishfile-installed Linear/GitHub feature loop.",
             "Use the persona, session capability scope, declared MCP surface, and playbook installed by the Kheishfile.",
-            f"Repository scope: {repo}. Linear scope: Evapayrent.",
+            f"Repository scope: {repo}. Linear scope: ExampleProject.",
             "This smoke validates that the Kheishfile-installed playbook and session can call one read-only MCP tool through the Flow API.",
             "Call exactly one tool: mcp__github__get_me with empty input. Do not call bash or any other local tool.",
             "Do not create, update, close, comment on, branch, push, or delete anything in GitHub or Linear during this smoke run.",
             "Do not spawn subagents for this smoke because it is not an implementation task.",
-            "Finish with a concise report that includes these exact strings: linear-github-feature-pr-loop, 0.1.6, feature-pr-loop-v012, openai, gpt-5.5, mcp__github__get_me.",
+            "Finish with a concise report that includes these exact strings: linear-github-feature-pr-loop, 0.1.14, feature-pr-loop-v015, openai, gpt-5.5, mcp__github__get_me.",
         ]
     ),
     "generation": {
@@ -740,9 +747,9 @@ PY
     --flow-id "$STACK_FLOW_ID" \
     --idempotency-key "$STACK_FLOW_ID" \
     --playbook-id linear-github-feature-pr-loop \
-    --version "0.1.6" \
+    --version "0.1.14" \
     --digest "$PLAYBOOK_DIGEST" \
-    --session-id feature-pr-loop-v012 \
+    --session-id feature-pr-loop-v015 \
     --request-file "$EVIDENCE/stack-flow-request.json" \
     --metadata-json '{"workflow":"stack-direct-flow-smoke","source":"kheishfile-e2e"}' \
     >"$EVIDENCE/stack-flow-start.json"
@@ -769,7 +776,7 @@ PY
     : >"$decisions_file"
     for ((poll_index = 1; poll_index <= max_polls; poll_index++)); do
       "$BIN" --base-url "$BASE_URL" --token-file "$ADMIN_TOKEN_FILE" --output json \
-        approvals list --session-id feature-pr-loop-v012 \
+        approvals list --session-id feature-pr-loop-v015 \
         >"$poll_file" 2>/dev/null || true
 
       python3 - "$poll_file" "$decisions_file" <<'PY' |
@@ -820,14 +827,14 @@ PY
         error_file="$EVIDENCE/stack-flow-approval-$request_id.err"
         if [[ "$action" == "allow" ]]; then
           if "$BIN" --base-url "$BASE_URL" --token-file "$ADMIN_TOKEN_FILE" --output json \
-            approvals allow feature-pr-loop-v012 "$request_id" \
+            approvals allow feature-pr-loop-v015 "$request_id" \
             --justification "approved read-only Kheishfile E2E smoke tool: $tool_name" \
             >"$output_file" 2>"$error_file"; then
             printf '%s\n' "$decision" >>"$decisions_file"
           fi
         else
           if "$BIN" --base-url "$BASE_URL" --token-file "$ADMIN_TOKEN_FILE" --output json \
-            approvals deny feature-pr-loop-v012 "$request_id" \
+            approvals deny feature-pr-loop-v015 "$request_id" \
             --reason "not part of read-only Kheishfile E2E smoke: $tool_name" \
             --justification "Kheishfile E2E smoke only permits read-only GitHub/Linear MCP probes" \
             >"$output_file" 2>"$error_file"; then
@@ -876,7 +883,7 @@ PY
     >"$EVIDENCE/stack-flow-run-events.json" || true
   cli runs external-actions "$STACK_FLOW_RUN_ID" \
     >"$EVIDENCE/stack-flow-external-actions.json" || true
-  cli approvals list --session-id feature-pr-loop-v012 \
+  cli approvals list --session-id feature-pr-loop-v015 \
     >"$EVIDENCE/stack-flow-approvals.json" || true
 fi
 
@@ -939,7 +946,15 @@ validate = json.loads((evidence / "validate.json").read_text(encoding="utf-8"))
 validate_live = json.loads((evidence / "validate-live.json").read_text(encoding="utf-8"))
 github_get_me = json.loads((evidence / "mcp-github-get-me.json").read_text(encoding="utf-8"))
 github_list_pull_requests = json.loads((evidence / "mcp-github-list-pull-requests.json").read_text(encoding="utf-8"))
-github_pull_request_read = json.loads((evidence / "mcp-github-pull-request-read.json").read_text(encoding="utf-8"))
+github_pull_request_read_methods = {
+    method: json.loads(
+        (evidence / f"mcp-github-pull-request-read-{method}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    for method in ("get", "get_reviews", "get_review_comments", "get_comments")
+}
+github_pull_request_read = github_pull_request_read_methods["get"]
 linear_list_issues = json.loads((evidence / "mcp-linear-list-issues.json").read_text(encoding="utf-8"))
 linear_get_issue = json.loads((evidence / "mcp-linear-get-issue.json").read_text(encoding="utf-8"))
 plan_original = json.loads((evidence / "plan-original.json").read_text(encoding="utf-8"))
@@ -1034,8 +1049,8 @@ def has_all(text, snippets):
 
 linear_secret_block = list_item_block(original_text, "- ref: mcp.linear.LINEAR_API_KEY")
 github_secret_block = list_item_block(original_text, "- ref: mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN")
-intake_schedule_block = list_item_block(original_text, "- name: linear-intake-0800-v016")
-followup_schedule_block = list_item_block(original_text, "- name: github-review-followup-hourly-v016")
+intake_schedule_block = list_item_block(original_text, "- name: linear-intake-0800-v024")
+followup_schedule_block = list_item_block(original_text, "- name: github-review-followup-30m-v026")
 original_manifest_expected = {
     "linear_secret_source": has_all(
         linear_secret_block,
@@ -1048,42 +1063,44 @@ original_manifest_expected = {
     "intake_schedule_definition": has_all(
         intake_schedule_block,
         [
-            "target_session_id: feature-pr-loop-v012",
+            "target_session_id: feature-pr-loop-v015",
             'expression: "0 0 8 * * *"',
             "timezone: Europe/Paris",
             "overlap_policy: skip",
             "type: coalesce_once",
             "playbook_id: linear-github-feature-pr-loop",
-            'version: "0.1.6"',
+            'version: "0.1.14"',
             "provider: openai",
             "content_file: intake.md",
             "model: gpt-5.5",
             "max_output_tokens: 6000",
             "effort: medium",
             "workflow: linear-intake",
-            "project: Evapayrent",
-            "repository: graniet/evapayrent",
+            "project: ExampleProject",
+            "linear_team_key: ENG",
+            "repository: example-org/example-app",
             "max_tickets: 1",
         ],
     ),
     "followup_schedule_definition": has_all(
         followup_schedule_block,
         [
-            "target_session_id: feature-pr-loop-v012",
-            'expression: "0 0 * * * *"',
+            "target_session_id: feature-pr-loop-v015",
+            'expression: "0 15,45 * * * *"',
             "timezone: Europe/Paris",
             "overlap_policy: skip",
             "type: coalesce_once",
             "playbook_id: linear-github-feature-pr-loop",
-            'version: "0.1.6"',
+            'version: "0.1.14"',
             "provider: openai",
             "content_file: review-followup.md",
             "model: gpt-5.5",
             "max_output_tokens: 6000",
             "effort: medium",
             "workflow: github-review-followup",
-            "project: Evapayrent",
-            "repository: graniet/evapayrent",
+            "project: ExampleProject",
+            "linear_team_key: ENG",
+            "repository: example-org/example-app",
         ],
     ),
     "playbook_publish_active": bool(
@@ -1096,7 +1113,7 @@ original_manifest_expected = {
         playbook_text,
         [
             "playbook_id: linear-github-feature-pr-loop",
-            'version: "0.1.6"',
+            'version: "0.1.14"',
             "model: gpt-5.5",
             "workflow: linear-github-feature-loop",
         ],
@@ -1105,11 +1122,11 @@ original_manifest_expected = {
 
 
 expected_apply = {
-    ("personas", "persona", "feature-pr-operator-v012", "create"),
-    ("sessions", "session", "feature-pr-loop-v012", "create"),
-    ("playbooks", "playbook", "linear-github-feature-pr-loop/0.1.6", "apply"),
-    ("schedules", "schedule", "linear-intake-0800-v016", "create"),
-    ("schedules", "schedule", "github-review-followup-hourly-v016", "create"),
+    ("personas", "persona", "feature-pr-operator-v013", "create"),
+    ("sessions", "session", "feature-pr-loop-v015", "create"),
+    ("playbooks", "playbook", "linear-github-feature-pr-loop/0.1.14", "apply"),
+    ("schedules", "schedule", "linear-intake-0800-v024", "create"),
+    ("schedules", "schedule", "github-review-followup-30m-v026", "create"),
 }
 expected_managed_imports = {
     ("import", "secret", "stack.e2e.MANAGED_SECRET", "adopt"),
@@ -1133,6 +1150,7 @@ expected_requirement_actions = {
     ("requirements", "mcp_tool", "mcp__github__list_pull_requests", "noop"),
     ("requirements", "mcp_tool", "mcp__github__pull_request_read", "noop"),
     ("requirements", "mcp_tool", "mcp__github__add_reply_to_pull_request_comment", "noop"),
+    ("requirements", "mcp_tool", "mcp__github__add_issue_comment", "noop"),
     ("requirements", "mcp_tool", "mcp__linear__get_issue", "noop"),
     ("requirements", "mcp_tool", "mcp__linear__list_comments", "noop"),
     ("requirements", "mcp_tool", "mcp__linear__list_issues", "noop"),
@@ -1142,16 +1160,16 @@ expected_requirement_actions = {
     ("requirements", "mcp_tool", "mcp__linear__save_issue", "noop"),
 }
 expected_schedule_actions = {
-    ("schedules", "schedule", "linear-intake-0800-v016", "create"),
-    ("schedules", "schedule", "github-review-followup-hourly-v016", "create"),
+    ("schedules", "schedule", "linear-intake-0800-v024", "create"),
+    ("schedules", "schedule", "github-review-followup-30m-v026", "create"),
 }
 expected_secret_actions = {
     ("secrets", "secret", "mcp.linear.LINEAR_API_KEY", "verify"),
     ("secrets", "secret", "mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN", "verify"),
 }
 expected_playbook_actions = {
-    ("playbooks", "playbook", "linear-github-feature-pr-loop/0.1.6", "create"),
-    ("playbooks", "playbook_release", "linear-github-feature-pr-loop/0.1.6", "update"),
+    ("playbooks", "playbook", "linear-github-feature-pr-loop/0.1.14", "create"),
+    ("playbooks", "playbook_release", "linear-github-feature-pr-loop/0.1.14", "update"),
 }
 expected_runtime_mcp_servers = {
     ("github", "codex_config", True, ("mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN",)),
@@ -1173,6 +1191,7 @@ expected_verify_checks = {
     ("requirement", "mcp_tool/mcp__github__list_pull_requests"),
     ("requirement", "mcp_tool/mcp__github__pull_request_read"),
     ("requirement", "mcp_tool/mcp__github__add_reply_to_pull_request_comment"),
+    ("requirement", "mcp_tool/mcp__github__add_issue_comment"),
     ("requirement", "mcp_tool/mcp__linear__get_issue"),
     ("requirement", "mcp_tool/mcp__linear__list_comments"),
     ("requirement", "mcp_tool/mcp__linear__list_issues"),
@@ -1182,11 +1201,11 @@ expected_verify_checks = {
     ("requirement", "mcp_tool/mcp__linear__save_issue"),
     ("secret", "mcp.linear.LINEAR_API_KEY"),
     ("secret", "mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN"),
-    ("persona", "feature-pr-operator-v012"),
-    ("session", "feature-pr-loop-v012"),
-    ("playbook", "linear-github-feature-pr-loop/0.1.6"),
-    ("schedule", "linear-intake-0800-v016"),
-    ("schedule", "github-review-followup-hourly-v016"),
+    ("persona", "feature-pr-operator-v013"),
+    ("session", "feature-pr-loop-v015"),
+    ("playbook", "linear-github-feature-pr-loop/0.1.14"),
+    ("schedule", "linear-intake-0800-v024"),
+    ("schedule", "github-review-followup-30m-v026"),
     ("probe", "persona"),
     ("probe", "session"),
     ("probe", "intake-schedule"),
@@ -1266,7 +1285,7 @@ managed_plan_secret_actions = [
     and action.get("resource_type") == "secret"
 ]
 schedules_by_name = {schedule.get("name"): schedule for schedule in schedules}
-expected_schedule_names = {"linear-intake-0800-v016", "github-review-followup-hourly-v016"}
+expected_schedule_names = {"linear-intake-0800-v024", "github-review-followup-30m-v026"}
 required_schedule_quiescence_fields = {
     "status",
     "execution_count",
@@ -1426,10 +1445,18 @@ mcp_tool_call_exercised = all(
     [
         github_get_me.get("tool_name") == "mcp__github__get_me",
         github_list_pull_requests.get("tool_name") == "mcp__github__list_pull_requests",
-        github_pull_request_read.get("tool_name") == "mcp__github__pull_request_read",
+        all(
+            result.get("tool_name") == "mcp__github__pull_request_read"
+            for result in github_pull_request_read_methods.values()
+        ),
         linear_list_issues.get("tool_name") == "mcp__linear__list_issues",
         linear_get_issue.get("tool_name") == "mcp__linear__get_issue",
     ]
+)
+github_pull_request_read_feedback_methods_ok = all(
+    result.get("tool_name") == "mcp__github__pull_request_read"
+    and result.get("output", {}).get("output", {}).get("is_error") is False
+    for result in github_pull_request_read_methods.values()
 )
 stack_flow_checks = {
     "enabled": run_stack_flow,
@@ -1446,11 +1473,11 @@ stack_flow_checks = {
     "run_id_recorded": bool(stack_flow_run_id),
     "flow_start_uses_stack_playbook": (
         stack_flow_start_ref.get("playbook_id") == "linear-github-feature-pr-loop"
-        and stack_flow_start_ref.get("version") == "0.1.6"
+        and stack_flow_start_ref.get("version") == "0.1.14"
     ),
     "flow_start_uses_stack_session": (
         isinstance(stack_flow_start, dict)
-        and stack_flow_start.get("session_id") == "feature-pr-loop-v012"
+        and stack_flow_start.get("session_id") == "feature-pr-loop-v015"
     ),
     "flow_digest_matches_published_playbook": (
         bool(stack_flow_selected_playbook.get("digest"))
@@ -1481,8 +1508,8 @@ stack_flow_checks = {
         snippet in stack_flow_output_text
         for snippet in [
             "linear-github-feature-pr-loop",
-            "0.1.6",
-            "feature-pr-loop-v012",
+            "0.1.14",
+            "feature-pr-loop-v015",
             "openai",
             "gpt-5.5",
             "mcp__github__get_me",
@@ -1545,12 +1572,12 @@ check = {
     "plan_copy_has_no_value_env": "value_env:" not in plan_text,
     "plan_copy_keeps_schedule_drift": all(
         name in plan_text
-        for name in ["linear-intake-0800-v016", "github-review-followup-hourly-v016"]
+        for name in ["linear-intake-0800-v024", "github-review-followup-30m-v026"]
     ),
     "live_copy_has_no_value_env": "value_env:" not in live_text,
     "live_copy_keeps_schedules": (
-        "linear-intake-0800-v016" in live_text
-        and "github-review-followup-hourly-v016" in live_text
+        "linear-intake-0800-v024" in live_text
+        and "github-review-followup-30m-v026" in live_text
         and "intake-schedule" in live_text
         and "followup-schedule" in live_text
     ),
@@ -1589,6 +1616,14 @@ check = {
     "github_list_pull_requests_is_error": github_list_pull_requests.get("output", {}).get("output", {}).get("is_error"),
     "github_pull_request_read_called": github_pull_request_read.get("tool_name") == "mcp__github__pull_request_read",
     "github_pull_request_read_is_error": github_pull_request_read.get("output", {}).get("output", {}).get("is_error"),
+    "github_pull_request_read_feedback_methods": {
+        method: {
+            "called": result.get("tool_name") == "mcp__github__pull_request_read",
+            "is_error": result.get("output", {}).get("output", {}).get("is_error"),
+        }
+        for method, result in sorted(github_pull_request_read_methods.items())
+    },
+    "github_pull_request_read_feedback_methods_ok": github_pull_request_read_feedback_methods_ok,
     "linear_list_issues_called": linear_list_issues.get("tool_name") == "mcp__linear__list_issues",
     "linear_list_issues_is_error": linear_list_issues.get("output", {}).get("output", {}).get("is_error"),
     "linear_get_issue_called": linear_get_issue.get("tool_name") == "mcp__linear__get_issue",
@@ -1662,6 +1697,7 @@ failed = (
     or check["github_list_pull_requests_is_error"] is not False
     or not check["github_pull_request_read_called"]
     or check["github_pull_request_read_is_error"] is not False
+    or not check["github_pull_request_read_feedback_methods_ok"]
     or not check["linear_list_issues_called"]
     or check["linear_list_issues_is_error"] is not False
     or not check["linear_get_issue_called"]

@@ -417,6 +417,7 @@ fn read_path_allows_read_only(parts: &[&str]) -> bool {
             | ["", "v1", "sessions", _, "memory-search"]
             | ["", "v1", "sessions", _, "permission-audits"]
             | ["", "v1", "sessions", _, "skills"]
+            | ["", "v1", "sessions", _, "operator"]
             | ["", "v1", "sessions", _, "reply-targets"]
             | ["", "v1", "sessions", _, "tasks"]
             | ["", "v1", "sessions", _, "tasks", _]
@@ -441,6 +442,9 @@ fn read_path_allows_read_only(parts: &[&str]) -> bool {
             | ["", "v1", "observation-audit"]
             | ["", "v1", "observations"]
             | ["", "v1", "observations", _]
+            | ["", "v1", "observation-transcripts"]
+            | ["", "v1", "observation-transcripts", _]
+            | ["", "v1", "observation-transcripts", _, "segments"]
             | ["", "v1", "skills"]
             | ["", "v1", "skills", _]
             | ["", "v1", "boards"]
@@ -1239,6 +1243,7 @@ mod tests {
             "/v1/sessions/session-1/memory-search",
             "/v1/sessions/session-1/permission-audits",
             "/v1/sessions/session-1/skills",
+            "/v1/sessions/session-1/operator",
             "/v1/sessions/session-1/reply-targets",
             "/v1/sessions/session-1/tasks",
             "/v1/sessions/session-1/tasks/task-1",

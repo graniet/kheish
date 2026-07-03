@@ -45,6 +45,7 @@ const WORKER_ERROR_RETRY_DELAY: Duration = Duration::from_secs(1);
 const DEFAULT_BULK_REPLAY_LIMIT: usize = 100;
 const MAX_BULK_REPLAY_LIMIT: usize = 500;
 const MAX_TERMINAL_DELIVERY_ERROR_DETAIL_CHARS: usize = 512;
+const DELIVERY_IDEMPOTENCY_METADATA_KEY: &str = "delivery_idempotency_key";
 
 #[derive(Debug)]
 struct TerminalDeliveryError {
@@ -1409,6 +1410,23 @@ impl DeliveryQueue {
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
         let mut snapshot = self.snapshot.lock().await;
+        if let Some(idempotency_key) =
+            metadata_string(&response.metadata, DELIVERY_IDEMPOTENCY_METADATA_KEY)
+        {
+            if snapshot
+                .pending
+                .values()
+                .any(|record| delivery_record_matches_idempotency(record, &reply, &idempotency_key))
+                || self.store.load_completed()?.into_iter().any(|record| {
+                    delivery_record_matches_idempotency(&record.record, &reply, &idempotency_key)
+                })
+                || self.store.load_dead_letters()?.into_iter().any(|record| {
+                    delivery_record_matches_idempotency(&record.record, &reply, &idempotency_key)
+                })
+            {
+                return Ok(());
+            }
+        }
         let next_id = snapshot.next_id + 1;
         let record = PendingDeliveryRecord {
             id: format!("delivery-{next_id}"),
@@ -2357,6 +2375,16 @@ fn metadata_string(metadata: &Value, key: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn delivery_record_matches_idempotency(
+    record: &PendingDeliveryRecord,
+    reply: &ReplyHandle,
+    idempotency_key: &str,
+) -> bool {
+    record.reply == *reply
+        && metadata_string(&record.metadata, DELIVERY_IDEMPOTENCY_METADATA_KEY).as_deref()
+            == Some(idempotency_key)
+}
+
 fn next_delivery_candidate(
     snapshot: &DeliveryQueueSnapshot,
     target_backpressure: &TargetBackpressureSnapshot,
@@ -3063,6 +3091,57 @@ mod tests {
                 .count(),
             2
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queued_delivery_idempotency_key_dedupes_same_reply_target_only() -> Result<()> {
+        let temp = tempdir()?;
+        let queue = Arc::new(DeliveryQueue::load(
+            temp.path().join("deliveries.json"),
+            Arc::new(DeliveryDispatcher::new()),
+        )?);
+        let mut envelope = ResponseEnvelope {
+            conversation: ConversationKey {
+                session_id: "session-1".to_string(),
+                thread_id: None,
+            },
+            reply_targets: Vec::new(),
+            reply: Some(ReplyHandle {
+                plugin: "http".to_string(),
+                address: r#"{"url":"https://example.invalid/a"}"#.to_string(),
+            }),
+            content: "hello".to_string(),
+            parts: Vec::new(),
+            artifacts: Vec::new(),
+            metadata: serde_json::json!({
+                "run_id": "run-1",
+                "delivery_idempotency_key": "operator-notification:session-1:call-1",
+            }),
+        };
+
+        queue.enqueue(envelope.clone()).await?;
+        queue.enqueue(envelope.clone()).await?;
+        let pending = queue
+            .list_views(DeliveryListFilter {
+                status: Some(DeliveryStatus::Pending),
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(pending.len(), 1);
+
+        envelope.reply = Some(ReplyHandle {
+            plugin: "http".to_string(),
+            address: r#"{"url":"https://example.invalid/b"}"#.to_string(),
+        });
+        queue.enqueue(envelope).await?;
+        let pending = queue
+            .list_views(DeliveryListFilter {
+                status: Some(DeliveryStatus::Pending),
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(pending.len(), 2);
         Ok(())
     }
 

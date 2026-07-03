@@ -13,8 +13,8 @@ use kheish_skills::{SkillDefinition, SkillRuntimeConfig, SkillScope, SkillSummar
 use kheish_types::{
     ActorRef, AttachmentRef, CapabilityScope, ConversationKey, CredentialScope,
     DYNAMIC_MCP_TOOL_ALLOWLIST_SENTINEL, ModelGenerationConfig, ReasoningConfig, ReasoningEffort,
-    RichOutput, SessionControlState, SessionGoal, SessionGoalStatus, SkillExecutionContext,
-    TaskRecord, TaskStatus, UserQuestionRequest,
+    RichOutput, SessionControlState, SessionGoal, SessionGoalStatus, SessionOperatorConfig,
+    SkillExecutionContext, TaskRecord, TaskStatus, UserQuestionRequest,
 };
 use serde_json::json;
 
@@ -32,6 +32,7 @@ struct FakeControlState {
     generate_image_requests: Vec<(String, GenerateImageToolRequest)>,
     edit_image_requests: Vec<(String, EditImageToolRequest)>,
     parent_clarification_requests: Vec<(String, String, UserQuestionRequest)>,
+    operator_notifications: Vec<(String, Option<String>, OperatorNotificationRequest)>,
     waited_agents: Vec<String>,
     agents: Vec<ManagedAgentSnapshot>,
     run_outputs: BTreeMap<String, String>,
@@ -40,6 +41,7 @@ struct FakeControlState {
     learning_skills: BTreeMap<String, crate::LearningSkillView>,
     session_control: BTreeMap<String, SessionControlState>,
     session_goals: BTreeMap<String, SessionGoal>,
+    session_operators: BTreeMap<String, SessionOperatorConfig>,
     session_permission_modes: BTreeMap<String, Option<PermissionMode>>,
     schedules: BTreeMap<String, ScheduleView>,
     task_output_requests: Vec<(String, String, bool, u64, usize, bool)>,
@@ -112,8 +114,21 @@ impl DaemonToolControl for FakeControl {
         run_id: Option<&str>,
         objective: String,
         token_budget: Option<u64>,
+        replace_if_inactive: bool,
     ) -> Result<SessionGoal> {
         let mut state = self.state.lock().expect("fake control mutex poisoned");
+        if let Some(existing) = state.session_goals.get(session_id) {
+            if existing.status == SessionGoalStatus::Active || !replace_if_inactive {
+                return Err(anyhow!(
+                    "session already has{} goal",
+                    if existing.status == SessionGoalStatus::Active {
+                        " an active"
+                    } else {
+                        " a"
+                    }
+                ));
+            }
+        }
         let goal = SessionGoal {
             goal_id: "goal-1".to_string(),
             session_id: session_id.to_string(),
@@ -147,6 +162,16 @@ impl DaemonToolControl for FakeControl {
             .ok_or_else(|| anyhow!("session has no goal"))?;
         goal.status = SessionGoalStatus::Complete;
         goal.completed_by_run_id = Some(run_id.to_string());
+        Ok(goal.clone())
+    }
+
+    async fn pause_session_goal(&self, session_id: &str, _run_id: &str) -> Result<SessionGoal> {
+        let mut state = self.state.lock().expect("fake control mutex poisoned");
+        let goal = state
+            .session_goals
+            .get_mut(session_id)
+            .ok_or_else(|| anyhow!("session has no goal"))?;
+        goal.status = SessionGoalStatus::Paused;
         Ok(goal.clone())
     }
 
@@ -336,6 +361,40 @@ impl DaemonToolControl for FakeControl {
             run_id: "run-clarification-1".to_string(),
             request_id: request.id,
             response_message_type: PARENT_CLARIFICATION_ANSWER_MESSAGE_TYPE.to_string(),
+        })
+    }
+
+    async fn load_session_operator_config(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionOperatorConfig> {
+        Ok(self
+            .state
+            .lock()
+            .expect("fake control mutex poisoned")
+            .session_operators
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn notify_operator(
+        &self,
+        session_id: &str,
+        run_id: Option<&str>,
+        request: OperatorNotificationRequest,
+    ) -> Result<OperatorNotificationToolResponse> {
+        self.state
+            .lock()
+            .expect("fake control mutex poisoned")
+            .operator_notifications
+            .push((session_id.to_string(), run_id.map(str::to_string), request));
+        Ok(OperatorNotificationToolResponse {
+            queued: true,
+            target_count: 1,
+            session_id: session_id.to_string(),
+            run_id: run_id.map(str::to_string),
+            output_kind: "operator_notification".to_string(),
         })
     }
 
@@ -885,6 +944,57 @@ fn bind_control(control: &Arc<FakeControl>) -> DaemonToolControlHandle {
     handle
 }
 
+#[tokio::test]
+async fn goal_tools_replace_only_inactive_goals_and_allow_pause() -> Result<()> {
+    let control = Arc::new(FakeControl::new());
+    let handle = bind_control(&control);
+    let context = FakeControl::context_with_run("session-a", "agent-parent", "run-1");
+    let create_goal = CreateGoalTool::new(handle.clone());
+    let update_goal = UpdateGoalTool::new(handle.clone());
+
+    let created = create_goal
+        .execute(
+            context.clone(),
+            json!({"objective": "Ship the selected PR"}),
+        )
+        .await?;
+    assert_eq!(created.output["goal"]["status"], "active");
+    assert_eq!(created.output["goal"]["objective"], "Ship the selected PR");
+
+    let error = create_goal
+        .execute(
+            context.clone(),
+            json!({
+                "objective": "Start a different PR",
+                "replace_if_inactive": true,
+            }),
+        )
+        .await
+        .expect_err("active goal must not be replaced");
+    assert_eq!(error.to_string(), "session already has an active goal");
+
+    let paused = update_goal
+        .execute(context.clone(), json!({"status": "paused"}))
+        .await?;
+    assert_eq!(paused.output["goal"]["status"], "paused");
+
+    let replaced = create_goal
+        .execute(
+            context,
+            json!({
+                "objective": "Start a different PR",
+                "token_budget": 500,
+                "replace_if_inactive": true,
+            }),
+        )
+        .await?;
+    assert_eq!(replaced.output["goal"]["objective"], "Start a different PR");
+    assert_eq!(replaced.output["goal"]["status"], "active");
+    assert_eq!(replaced.output["goal"]["token_budget"], 500);
+
+    Ok(())
+}
+
 fn sample_snapshot(agent_id: &str, status: AgentStatus) -> ManagedAgentSnapshot {
     ManagedAgentSnapshot {
         agent: AgentRecord {
@@ -1009,7 +1119,20 @@ fn user_question_tool_descriptors_include_valid_json_shape() -> Result<()> {
         ask_descriptor.schema.fields[0].description,
         questions_field.description
     );
-    for descriptor in [&descriptor, &ask_descriptor] {
+    let ask_operator_descriptor =
+        super::operator::AskOperatorTool::new(DaemonToolControlHandle::new()).descriptor();
+    assert!(
+        ask_operator_descriptor
+            .description
+            .contains(USER_QUESTION_INPUT_EXAMPLE),
+        "ask_operator description should include the same concrete input example: {}",
+        ask_operator_descriptor.description
+    );
+    assert_eq!(
+        ask_operator_descriptor.schema.fields[0].description,
+        questions_field.description
+    );
+    for descriptor in [&descriptor, &ask_descriptor, &ask_operator_descriptor] {
         assert!(
             descriptor
                 .schema
@@ -1475,6 +1598,107 @@ async fn edit_image_tool_preserves_null_asset_ids_without_inference() -> Result<
         .ok_or_else(|| anyhow!("missing edit_image request capture"))?;
     assert!(request.image_asset_ids.is_empty());
     assert!(!request.image_asset_ids_was_omitted);
+    Ok(())
+}
+
+#[tokio::test]
+async fn notify_operator_requires_enabled_session_operator_and_queues_message() -> Result<()> {
+    let control = Arc::new(FakeControl::new());
+    let handle = bind_control(&control);
+    let tool = super::operator::NotifyOperatorTool::new(handle.clone());
+
+    let disabled = tool
+        .execute(
+            FakeControl::context_with_run("session-a", "agent-parent", "run-1"),
+            json!({
+                "message": "Need operator visibility.",
+            }),
+        )
+        .await
+        .expect_err("notify_operator should fail when disabled");
+    assert!(disabled.to_string().contains("not enabled"));
+
+    control
+        .state
+        .lock()
+        .expect("fake control mutex poisoned")
+        .session_operators
+        .insert(
+            "session-a".to_string(),
+            SessionOperatorConfig {
+                enabled: true,
+                display_name: Some("Operator".to_string()),
+                communication_style: Some("short and human".to_string()),
+                allow_notify: true,
+                allow_questions: true,
+            },
+        );
+
+    let response = tool
+        .execute(
+            FakeControl::context_with_run("session-a", "agent-parent", "run-1"),
+            json!({
+                "subject": "Blocked",
+                "message": "Composer is unavailable in the local environment.",
+                "urgency": "blocker",
+            }),
+        )
+        .await?;
+    assert_eq!(response.output["queued"], json!(true));
+    assert_eq!(response.output["target_count"], json!(1));
+
+    let state = control.state.lock().expect("fake control mutex poisoned");
+    assert_eq!(state.operator_notifications.len(), 1);
+    let (session_id, run_id, request) = &state.operator_notifications[0];
+    assert_eq!(session_id, "session-a");
+    assert_eq!(run_id.as_deref(), Some("run-1"));
+    assert_eq!(request.subject.as_deref(), Some("Blocked"));
+    assert_eq!(request.urgency.as_deref(), Some("blocker"));
+    assert_eq!(
+        request.message,
+        "Composer is unavailable in the local environment."
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ask_operator_reuses_structured_user_question_marker() -> Result<()> {
+    let control = Arc::new(FakeControl::new());
+    control
+        .state
+        .lock()
+        .expect("fake control mutex poisoned")
+        .session_operators
+        .insert(
+            "session-a".to_string(),
+            SessionOperatorConfig {
+                enabled: true,
+                allow_notify: true,
+                allow_questions: true,
+                ..SessionOperatorConfig::default()
+            },
+        );
+    let response = super::operator::AskOperatorTool::new(bind_control(&control))
+        .execute(
+            FakeControl::context("session-a", "agent-parent"),
+            json!({
+                "questions": [{
+                    "id": "decision",
+                    "question": "Should I continue with the Docker Compose test path?",
+                    "options": [
+                        {"id": "continue", "label": "Continue"},
+                        {"id": "stop", "label": "Stop"}
+                    ]
+                }]
+            }),
+        )
+        .await?;
+
+    let request = response
+        .output
+        .get("_kheish_pending_user_question")
+        .expect("ask_operator should return pending question marker");
+    assert_eq!(request["questions"][0]["id"], json!("decision"));
     Ok(())
 }
 

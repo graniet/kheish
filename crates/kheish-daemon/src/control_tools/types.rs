@@ -8,7 +8,8 @@ use kheish_runtime::{PermissionMode, PromptMergeMode, ToolExecutionOutput};
 use kheish_skills::{SkillDefinition, SkillSummary};
 use kheish_types::{
     AttachmentRef, CapabilityScope, CredentialScope, ModelGenerationConfig, SessionControlState,
-    SessionGoal, TaskRecord, TaskStatus, ToolSurfaceFilter, UserQuestionRequest,
+    SessionGoal, SessionOperatorConfig, TaskRecord, TaskStatus, ToolSurfaceFilter,
+    UserQuestionRequest,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -416,6 +417,38 @@ pub struct ParentClarificationToolResponse {
     pub response_message_type: String,
 }
 
+/// One non-blocking operator notification emitted by a model-facing tool.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OperatorNotificationRequest {
+    /// Optional short subject rendered above or before the message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// The operator-facing message body.
+    pub message: String,
+    /// Optional urgency label such as `info`, `warning`, `blocker`, or `critical`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub urgency: Option<String>,
+    /// Internal idempotency key derived from the model tool-call id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
+/// Durable response returned after queueing an operator notification.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OperatorNotificationToolResponse {
+    /// Whether the notification was accepted for delivery.
+    pub queued: bool,
+    /// Number of configured reply targets used for this notification.
+    pub target_count: usize,
+    /// Session that owns the operator contact policy.
+    pub session_id: String,
+    /// Run that emitted the notification, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// Stable output kind recorded on delivery metadata.
+    pub output_kind: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct AgentProfileTemplate {
     pub(super) prompt: Option<String>,
@@ -534,6 +567,18 @@ pub trait DaemonToolControl: Send + Sync {
         request: UserQuestionRequest,
     ) -> Result<ParentClarificationToolResponse>;
 
+    /// Loads the configured model-facing operator policy for one session.
+    async fn load_session_operator_config(&self, session_id: &str)
+    -> Result<SessionOperatorConfig>;
+
+    /// Queues one non-blocking operator notification through configured session reply targets.
+    async fn notify_operator(
+        &self,
+        session_id: &str,
+        run_id: Option<&str>,
+        request: OperatorNotificationRequest,
+    ) -> Result<OperatorNotificationToolResponse>;
+
     /// Waits for one agent to reach a terminal state or the timeout to expire.
     async fn wait_agent(
         &self,
@@ -650,10 +695,14 @@ pub trait DaemonToolControl: Send + Sync {
         run_id: Option<&str>,
         objective: String,
         token_budget: Option<u64>,
+        replace_if_inactive: bool,
     ) -> Result<SessionGoal>;
 
     /// Marks the current session goal complete from the current run.
     async fn complete_session_goal(&self, session_id: &str, run_id: &str) -> Result<SessionGoal>;
+
+    /// Pauses the current session goal from the current run.
+    async fn pause_session_goal(&self, session_id: &str, run_id: &str) -> Result<SessionGoal>;
 
     /// Enters durable session-scoped plan mode.
     async fn enter_session_plan_mode(&self, session_id: &str) -> Result<SessionControlState>;

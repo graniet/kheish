@@ -233,4 +233,95 @@ where
         }
         Ok(())
     }
+
+    pub(super) async fn emit_operator_notification(
+        &self,
+        session_id: &str,
+        run_id: Option<&str>,
+        request: crate::control_tools::OperatorNotificationRequest,
+    ) -> Result<crate::control_tools::OperatorNotificationToolResponse> {
+        let targets = self.operator_notification_reply_targets(session_id).await?;
+        anyhow::ensure!(
+            !targets.is_empty(),
+            "operator notification requires at least one configured session reply target"
+        );
+        let message = format_operator_notification_message(&request)?;
+        let output = RichOutput::text(message);
+        let mut metadata = json!({
+            "output_kind": "operator_notification",
+            "run_id": run_id,
+            "urgency": request.urgency,
+        });
+        if let Some(idempotency_key) = request.idempotency_key.as_deref()
+            && let Some(object) = metadata.as_object_mut()
+        {
+            object.insert(
+                "delivery_idempotency_key".to_string(),
+                serde_json::Value::String(idempotency_key.to_string()),
+            );
+        }
+        let envelope = ResponseEnvelope {
+            conversation: self.session_conversation_key(session_id).await?,
+            reply_targets: targets.clone(),
+            reply: targets.first().cloned(),
+            content: output.content.clone(),
+            parts: output.parts.clone(),
+            artifacts: output.artifacts.clone(),
+            metadata,
+        };
+        self.delivery_service.deliver(envelope).await?;
+        self.record_output(
+            DaemonOutputRecord {
+                session_id: session_id.to_string(),
+                run_id: run_id.map(ToString::to_string),
+                content: output.content.clone(),
+                parts: output.parts.clone(),
+                artifacts: output.artifacts.clone(),
+                source_kind: Some(crate::DaemonOutputSourceKind::OperatorNotification),
+                plugin: Some("daemon".to_string()),
+                address: Some(session_id.to_string()),
+            },
+            run_id,
+        )
+        .await?;
+        Ok(crate::control_tools::OperatorNotificationToolResponse {
+            queued: true,
+            target_count: targets.len(),
+            session_id: session_id.to_string(),
+            run_id: run_id.map(ToString::to_string),
+            output_kind: "operator_notification".to_string(),
+        })
+    }
+}
+
+fn format_operator_notification_message(
+    request: &crate::control_tools::OperatorNotificationRequest,
+) -> Result<String> {
+    let message = request.message.trim();
+    anyhow::ensure!(
+        !message.is_empty(),
+        "operator notification message is required"
+    );
+    let mut lines = Vec::new();
+    if let Some(subject) = request
+        .subject
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        lines.push(format!("Subject: {subject}"));
+    }
+    if let Some(urgency) = request
+        .urgency
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        lines.push(format!("Urgency: {urgency}"));
+    }
+    if !lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines.push(message.to_string());
+    Ok(lines.join("\n"))
 }

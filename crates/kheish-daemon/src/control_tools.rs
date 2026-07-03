@@ -4,6 +4,7 @@ mod bash;
 mod channels;
 mod goal;
 mod helpers;
+mod operator;
 mod output;
 mod planning;
 mod scheduling;
@@ -40,6 +41,7 @@ use helpers::{
 pub use helpers::{
     mailbox_request_from_tool, sidechain_request_from_tool, wait_for_agent_snapshot,
 };
+use operator::{AskOperatorTool, NotifyOperatorTool};
 use output::{EditImageTool, EmitOutputTool, GenerateAudioTool, GenerateImageTool};
 use planning::{AskUserQuestionTool, EnterPlanModeTool, ExitPlanModeTool, TodoWriteTool};
 use scheduling::{
@@ -56,9 +58,10 @@ pub use types::{
     DaemonToolControl, DaemonToolControlHandle, EditImageToolRequest, EditImageToolResponse,
     ExitPlanModeOutcome, GenerateAudioToolRequest, GenerateAudioToolResponse,
     GenerateImageToolRequest, GenerateImageToolResponse, ImageToolResponse, ImageToolRouteOverride,
-    MessageAgentToolRequest, PARENT_CLARIFICATION_ANSWER_MESSAGE_TYPE,
-    PARENT_CLARIFICATION_ANSWER_SUBJECT, ParentClarificationToolResponse, SpawnAgentToolRequest,
-    SpawnAgentToolResponse, SpawnIsolation, TaskMutation,
+    MessageAgentToolRequest, OperatorNotificationRequest, OperatorNotificationToolResponse,
+    PARENT_CLARIFICATION_ANSWER_MESSAGE_TYPE, PARENT_CLARIFICATION_ANSWER_SUBJECT,
+    ParentClarificationToolResponse, SpawnAgentToolRequest, SpawnAgentToolResponse, SpawnIsolation,
+    TaskMutation,
 };
 
 /// Registers daemon-backed orchestration tools into the provided runtime.
@@ -107,6 +110,8 @@ pub fn register_daemon_control_tools(
     runtime.register(ExitPlanModeTool::new(control.clone()));
     runtime.register(RequestParentClarificationTool::new(control.clone()));
     runtime.register(AskUserQuestionTool);
+    runtime.register(NotifyOperatorTool::new(control.clone()));
+    runtime.register(AskOperatorTool::new(control.clone()));
     runtime.register(WakeAfterTool::new(control.clone()));
     runtime.register(WakeAtTool::new(control.clone()));
     runtime.register(ScheduleCreateTool::new(control.clone()));

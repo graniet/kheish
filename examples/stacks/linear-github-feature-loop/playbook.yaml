@@ -1,5 +1,5 @@
 playbook_id: linear-github-feature-pr-loop
-version: "0.1.6"
+version: "0.1.14"
 title: Linear to GitHub Feature PR Loop
 objective: Convert eligible Linear feature tickets into reviewed GitHub pull requests.
 description: Generic operator playbook for scheduled Linear intake and GitHub review follow-up.
@@ -10,6 +10,9 @@ inputs:
   - name: repository
     description: GitHub repository scope.
     required: false
+  - name: linear_team_key
+    description: Optional Linear team key to use when the deployment scope is a team rather than a Linear Project.
+    required: false
 roles:
   - role_id: coordinator
     purpose: Select safe work, coordinate subagents, and maintain Linear/GitHub state.
@@ -19,10 +22,19 @@ roles:
     purpose: Review diff, tests, and acceptance criteria until the PR can leave draft status.
 phases:
   - phase_id: discover
-    objective: Identify eligible Linear issues or GitHub review comments.
+    objective: Identify eligible Linear issues or complete GitHub feedback envelopes.
     acceptance_criteria:
+      - An active session goal is checked before scanning for new work.
+      - Existing active goals are continued instead of selecting a different ticket or PR.
+      - A newly selected ticket or PR gets a session goal before GitHub or Linear mutation.
       - Exactly one ticket or PR is selected for the run.
+      - Fresh Linear intake scans unmarked open issues in the configured project or team before concluding there is no work.
+      - When `linear_team_key` is present or the configured project resolves as a team, issues are listed from the resolved Linear team.
+      - Linear intake does not maintain unrelated existing workflow PRs; GitHub follow-up owns those.
+      - Daemon state files and prior run logs are not scanned to discover current flow metadata.
+      - Workflow footers are used for recovery and deduplication, not as the only selector for new Linear work.
       - Existing PRs are detected before new PR creation.
+      - GitHub feedback is inventoried across review summaries, inline threads, replies, and top-level PR comments before action.
       - Previously blocked Linear issues without PRs can be recovered by a later run.
       - Unsafe or ambiguous items are reported instead of auto-mutated.
   - phase_id: plan
@@ -40,6 +52,7 @@ phases:
     objective: Obtain an internal xhigh review score after a durable draft PR exists.
     acceptance_criteria:
       - Review evidence includes diff scope, tests, and remaining risk.
+      - Follow-up reviews treat a GitHub review as an envelope instead of acting on one inline fragment.
       - Follow-up runs recheck stale blocked test evidence before preserving a tests blocker.
       - Scores below 10/10 keep the PR draft and trigger another fix iteration or a blocked report.
       - Reviewer timeout or context-limit failure preserves the latest completed score and does not spawn unbounded review work.
@@ -50,19 +63,25 @@ phases:
       - A coherent ticket-scoped patch is published as a draft PR before the final 10/10 gate.
       - The PR references the Linear ticket.
       - The PR and Linear ticket record PR URL, tests, review score, and blockers.
+      - The PR and Linear ticket record handled GitHub feedback watermarks when feedback is processed.
       - Machine-readable footers never contain placeholder PR URLs after a PR exists.
 acceptance_criteria:
   - Each root run processes at most one ticket or PR.
+  - Safe ticket-scoped work leaves the session goal active until the daemon continuation completes it.
+  - Goals are completed only after current tests, a 10/10 internal review, updated GitHub/Linear footers, and terminal subagents.
+  - Goals are paused only for durable human or external blockers.
   - No duplicate PR is created for an issue with an active workflow PR.
   - Every automatic code mutation has test evidence or an explicit test blocker, plus xhigh review evidence when available.
   - Missing host runtimes are not enough to mark tests blocked until repository-provided Docker Compose or other project-native test commands have been tried or ruled out.
   - Follow-up runs do not preserve a stale `Tests:` blocker without rechecking current project-native test entrypoints.
+  - Follow-up runs do not act on a single inline review fragment before checking sibling review comments, review metadata, and top-level PR comments.
   - Draft PR creation is allowed before a 10/10 review score; leaving draft status is not.
   - Subagents report blockers to the coordinator instead of asking user-facing clarification questions.
   - The workflow stops rather than guessing when human product judgment is required.
 evidence_expectations:
   - The root scheduled run id is available from the Flow projection.
   - Reviewer subagent evidence is recorded in the run output or linked PR/Linear comments.
+  - GitHub feedback inventory evidence is recorded before feedback-driven mutation.
 tools:
   enforce: false
 runtime_defaults:

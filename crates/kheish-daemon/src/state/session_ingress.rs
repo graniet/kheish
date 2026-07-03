@@ -329,6 +329,48 @@ where
         Ok(view)
     }
 
+    pub(crate) async fn set_session_operator_config(
+        &self,
+        session_id: &str,
+        config: Option<SessionOperatorConfig>,
+    ) -> Result<SessionView> {
+        self.run_service
+            .with_session_idle_guard(session_id, || async {
+                self.agent_id_for_session(session_id).await?;
+                let normalized = crate::operator_contact::normalize_session_operator_config(
+                    config.unwrap_or_default(),
+                )?;
+                if normalized.enabled
+                    && normalized.allow_notify
+                    && self
+                        .operator_notification_reply_targets(session_id)
+                        .await?
+                        .is_empty()
+                {
+                    bail!(
+                        "session operator config with notify_operator enabled requires at least one session reply target"
+                    );
+                }
+                self.save_session_operator_config(session_id, normalized)
+                    .await?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                if error.to_string().contains("has active or queued runs") {
+                    anyhow::anyhow!(
+                        "session {session_id} has non-terminal work or live descendants; operator config changes are only allowed while the session is idle"
+                    )
+                } else {
+                    error
+                }
+            })?;
+        let agent_id = self.agent_id_for_session(session_id).await?;
+        let view = self.session_view(session_id, &agent_id).await?;
+        self.publish_snapshot(&view);
+        Ok(view)
+    }
+
     pub(crate) async fn set_session_capability_scope(
         &self,
         session_id: &str,
@@ -369,6 +411,8 @@ where
         let normalized = scope.unwrap_or_default().normalized();
         self.save_session_credential_scope(session_id, normalized)
             .await?;
+        self.clear_invalid_session_reply_targets_for_sessions(vec![session_id.to_string()])
+            .await?;
         let agent_id = self.agent_id_for_session(session_id).await?;
         let view = self.session_view(session_id, &agent_id).await?;
         self.publish_snapshot(&view);
@@ -380,13 +424,33 @@ where
         session_id: &str,
         reply_targets: Vec<ReplyHandle>,
     ) -> Result<SessionView> {
-        self.agent_id_for_session(session_id).await?;
-        let normalized = normalize_reply_targets(None, reply_targets);
-        self.validate_session_reply_targets(session_id, &normalized)
-            .await?;
-        self.session_service
-            .set_session_reply_targets(session_id, normalized)
-            .await?;
+        self.run_service
+            .with_session_idle_guard(session_id, || async {
+                self.agent_id_for_session(session_id).await?;
+                let normalized = normalize_reply_targets(None, reply_targets);
+                let operator = self.load_session_operator_config(session_id).await?;
+                if normalized.is_empty() && operator.enabled && operator.allow_notify {
+                    bail!(
+                        "cannot clear session reply targets while notify_operator is enabled for this session"
+                    );
+                }
+                self.validate_session_reply_targets(session_id, &normalized)
+                    .await?;
+                self.session_service
+                    .set_session_reply_targets(session_id, normalized)
+                    .await?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                if error.to_string().contains("has active or queued runs") {
+                    anyhow::anyhow!(
+                        "session {session_id} has non-terminal work or live descendants; reply-target changes are only allowed while the session is idle"
+                    )
+                } else {
+                    error
+                }
+            })?;
         let agent_id = self.agent_id_for_session(session_id).await?;
         let view = self.session_view(session_id, &agent_id).await?;
         self.publish_snapshot(&view);
@@ -453,11 +517,63 @@ where
                 self.session_service
                     .set_session_reply_targets(&session_id, Vec::new())
                     .await?;
+                let operator = self.load_session_operator_config(&session_id).await?;
+                if operator.enabled && operator.allow_notify {
+                    let mut next = operator;
+                    next.allow_notify = false;
+                    if !next.allow_questions {
+                        next.enabled = false;
+                    }
+                    self.save_session_operator_config(&session_id, next).await?;
+                }
                 if let Ok(agent_id) = self.agent_id_for_session(&session_id).await {
                     let view = self.session_view(&session_id, &agent_id).await?;
                     self.publish_snapshot(&view);
                 }
             }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn clear_invalid_session_reply_targets_referencing_connector(
+        &self,
+        kind: ConnectorKind,
+        name: &str,
+    ) -> Result<()> {
+        let session_ids = self
+            .session_service
+            .cached_reply_target_session_ids_referencing_connector(kind, name)
+            .await;
+        self.clear_invalid_session_reply_targets_for_sessions(session_ids)
+            .await
+    }
+
+    pub(crate) async fn reject_non_idle_reply_target_dependents(
+        &self,
+        kind: ConnectorKind,
+        name: &str,
+    ) -> Result<()> {
+        let session_ids = self
+            .session_service
+            .cached_reply_target_session_ids_referencing_connector(kind, name)
+            .await;
+        let mut non_idle = Vec::new();
+        for session_id in session_ids {
+            if !self
+                .session_is_idle_for_topology_mutation(&session_id)
+                .await?
+            {
+                non_idle.push(session_id);
+            }
+        }
+        if !non_idle.is_empty() {
+            non_idle.sort();
+            bail!(
+                "connector {}/{} is referenced by reply targets on non-idle sessions {}; connector changes are only allowed after those sessions are idle",
+                kind.as_str(),
+                name,
+                non_idle.join(", ")
+            );
         }
         Ok(())
     }
@@ -1117,6 +1233,12 @@ where
                                     route.connector
                                 )
                             })?;
+                    if connector.bot_token.is_none() {
+                        bail!(
+                            "telegram connector {} has no bot token configured for replies",
+                            route.connector
+                        );
+                    }
                     if !connector.allows_chat_id(route.chat_id) {
                         bail!(
                             "telegram reply target chat {} is outside connector {} allowlist",
@@ -1133,6 +1255,15 @@ where
                             route.connector
                         )
                     })?;
+                    if connector
+                        .bot_token_for_team(route.team_id.as_deref())
+                        .is_none()
+                    {
+                        bail!(
+                            "slack connector {} has no bot token configured for replies",
+                            route.connector
+                        );
+                    }
                     if !connector.is_enterprise_allowed(route.enterprise_id.as_deref()) {
                         bail!(
                             "slack reply target enterprise {:?} is outside connector {} allowlist",
@@ -1169,7 +1300,7 @@ where
         Ok(())
     }
 
-    async fn validate_session_reply_targets(
+    pub(super) async fn validate_session_reply_targets(
         &self,
         session_id: &str,
         reply_targets: &[ReplyHandle],
@@ -1270,6 +1401,16 @@ where
 
     pub(crate) async fn session_reply_targets(&self, session_id: &str) -> Vec<ReplyHandle> {
         self.session_service.session_reply_targets(session_id).await
+    }
+
+    pub(super) async fn operator_notification_reply_targets(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<ReplyHandle>> {
+        let targets = normalize_reply_targets(None, self.session_reply_targets(session_id).await);
+        self.validate_session_reply_targets(session_id, &targets)
+            .await?;
+        Ok(targets)
     }
 
     pub(super) async fn resolve_run_reply_targets(

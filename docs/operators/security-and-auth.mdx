@@ -336,6 +336,8 @@ Key material:
 - by default the daemon persists its Ed25519 audit signing key at `state_root/audit-signing.key`
 - you can override that with `KHEISH_EXTERNAL_ACTION_AUDIT_SIGNING_KEY` or `KHEISH_EXTERNAL_ACTION_AUDIT_SIGNING_KEY_FILE`
 
+> **Integrity caveat — keep the signing key off the state root.** By default the key lives inside the state root, next to the records it signs. Anyone who can write to the state directory can therefore forge entries and re-sign the ledger, so the tamper-evidence guarantee only holds against parties who cannot write to `state_root` (for example, a reviewer reading an exported copy). For an integrity guarantee against an attacker who can reach the state directory, store the signing key outside the state root — on a separate volume, a secret manager, or a different host — via `KHEISH_EXTERNAL_ACTION_AUDIT_SIGNING_KEY_FILE`. The daemon emits a startup warning whenever it falls back to the co-located key.
+
 The audit is fail-closed. If the signed external-action audit cannot initialize or becomes unavailable, future external actions are rejected instead of proceeding without durable signed records.
 
 ## Other deployment secrets

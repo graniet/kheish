@@ -911,13 +911,15 @@ where
             .input_metadata_with_goal_binding(session_id, request.metadata.clone())
             .await?;
         let explicit_reply_targets = self.explicit_input_reply_targets(session_id, &request);
-        let should_persist_session_reply_targets = !explicit_reply_targets.is_empty()
+        let should_persist_connector_reply_targets = !explicit_reply_targets.is_empty()
             && !matches!(
                 request.source_plugin.as_deref(),
                 None | Some("daemon") | Some("scheduler")
             );
-        let reply_targets = self.resolve_run_reply_targets(session_id, &request).await?;
+        let preallocated_run_id = preallocated_run_id;
+        let run_id_was_preallocated = preallocated_run_id.is_some();
         let run_id = preallocated_run_id.unwrap_or_else(|| self.next_run_id());
+        let reply_targets = self.resolve_run_reply_targets(session_id, &request).await?;
         let now = now_ms();
         {
             let _runtime_config_snapshot = self.runtime_config_service.snapshot_guard().await;
@@ -985,19 +987,93 @@ where
             reply_targets,
             payload,
         };
-        let view = self
+        let mut owns_connector_reply_target_reservation = false;
+        let should_persist_session_reply_targets = if should_persist_connector_reply_targets
+            && require_idle
+            && run_id_was_preallocated
+        {
+            self.validate_session_reply_targets(session_id, &explicit_reply_targets)
+                .await?;
+            true
+        } else if should_persist_connector_reply_targets {
+            match self
+                .run_service
+                .reserve_idle_submission_slot(session_id, &run_id)
+                .await
+            {
+                Ok(true) => {
+                    owns_connector_reply_target_reservation = true;
+                    if let Err(error) = self
+                        .validate_session_reply_targets(session_id, &explicit_reply_targets)
+                        .await
+                    {
+                        if self
+                            .run_service
+                            .release_idle_submission_slot(session_id, &run_id)
+                            .await
+                            && let Err(promote_error) = self.start_next_queued_run(session_id).await
+                        {
+                            warn!(
+                                session_id = %session_id,
+                                run_id = %run_id,
+                                error = %promote_error,
+                                "failed to promote queued work after releasing invalid connector reply-target reservation"
+                            );
+                        }
+                        return Err(error);
+                    }
+                    true
+                }
+                Ok(false) => false,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        run_id = %run_id,
+                        error = %error,
+                        "failed closed while reserving idle slot for connector-derived session reply targets"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        let scheduled = self
             .schedule_run_with_idle_policy(record, require_idle)
-            .await?;
-        if should_persist_session_reply_targets
-            && let Err(error) = self
+            .await;
+        if scheduled.is_err()
+            && owns_connector_reply_target_reservation
+            && self
+                .run_service
+                .release_idle_submission_slot(session_id, &run_id)
+                .await
+            && let Err(error) = self.start_next_queued_run(session_id).await
+        {
+            warn!(
+                session_id = %session_id,
+                run_id = %run_id,
+                error = %error,
+                "failed to promote queued work after releasing failed connector reply-target reservation"
+            );
+        }
+        let view = scheduled?;
+        if should_persist_session_reply_targets {
+            if let Err(error) = self
                 .remember_session_reply_targets(session_id, explicit_reply_targets)
                 .await
-        {
-            tracing::warn!(
+            {
+                tracing::warn!(
+                    session_id = %session_id,
+                    run_id = %view.run_id,
+                    error = %error,
+                    "failed to persist connector-derived session reply targets after scheduling input run"
+                );
+            }
+        } else if should_persist_connector_reply_targets {
+            tracing::debug!(
                 session_id = %session_id,
                 run_id = %view.run_id,
-                error = %error,
-                "failed to persist connector-derived session reply targets after scheduling input run"
+                "skipped connector-derived session reply-target persistence because the session is not idle"
             );
         }
         Ok(view)
