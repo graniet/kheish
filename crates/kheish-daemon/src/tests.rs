@@ -42204,7 +42204,14 @@ async fn daemon_interrupts_in_flight_runs() -> Result<()> {
 async fn daemon_exposes_runtime_reconfiguration_and_global_sse() -> Result<()> {
     let temp = tempdir()?;
     let state_root = temp.path().join("daemon-state");
-    let (address, shutdown) = scripted_daemon(&state_root, Vec::new()).await?;
+    // The daemon caches the KHEISH_DEBUG_CAPTURE_KEY validation result at
+    // debug-store construction, so boot under the debug-capture env lock —
+    // otherwise a parallel test's invalid-key window poisons this daemon's
+    // health snapshot for its whole lifetime.
+    let (address, shutdown) = {
+        let _env_guard = crate::debug::debug_capture_env_lock();
+        scripted_daemon(&state_root, Vec::new()).await?
+    };
     let client = Client::new();
     let base = format!("http://{address}");
 
@@ -42225,13 +42232,19 @@ async fn daemon_exposes_runtime_reconfiguration_and_global_sse() -> Result<()> {
     assert_eq!(runtime.model.as_deref(), Some("scripted-model"));
     assert_eq!(runtime.permission_mode, PermissionMode::Default);
 
-    let status = client
-        .get(format!("{base}/v1/status"))
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<DaemonStatusView>()
-        .await?;
+    // The health snapshot reads the process-global KHEISH_DEBUG_* variables at
+    // request time; hold the debug-capture env lock so a parallel test cannot
+    // mutate them mid-snapshot and fail the health assertion below.
+    let status = {
+        let _env_guard = crate::debug::debug_capture_env_lock();
+        client
+            .get(format!("{base}/v1/status"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<DaemonStatusView>()
+            .await?
+    };
     assert_eq!(status.status, DaemonReadinessState::Ready);
     assert!(status.ready);
     assert!(status.snapshot_at_ms > 0);
