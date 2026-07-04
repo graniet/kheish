@@ -128,6 +128,35 @@ impl PersonaService {
         Ok(record)
     }
 
+    /// Deletes one persisted persona record and its index entry.
+    ///
+    /// Sessions bound to the persona keep their frozen binding snapshot, so
+    /// deletion never touches session state.
+    pub(crate) async fn delete_persona(&self, persona_id: &str) -> Result<()> {
+        let mut index = self.index.lock().await;
+        let Some(record) = self.store.load_persona(persona_id)? else {
+            // Drop any stale index entry so later lists cannot resurrect the id.
+            if index.personas.remove(persona_id).is_some() {
+                self.store.save_index(&index)?;
+            }
+            bail!("unknown persona {persona_id}");
+        };
+        self.store.delete_persona(persona_id)?;
+        let previous_entry = index.personas.remove(persona_id);
+        if let Err(error) = self.store.save_index(&index) {
+            if let Some(entry) = previous_entry {
+                index.personas.insert(persona_id.to_string(), entry);
+            }
+            return match self.store.save_persona(&record) {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(anyhow!(
+                    "failed to persist persona index after deleting {persona_id}; rollback also failed: {rollback_error}"
+                )),
+            };
+        }
+        Ok(())
+    }
+
     async fn remove_stale_index_entry(&self, persona_id: &str) -> Result<()> {
         let mut index = self.index.lock().await;
         if index.personas.remove(persona_id).is_some() {

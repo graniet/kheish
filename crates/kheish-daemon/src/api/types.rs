@@ -1555,6 +1555,23 @@ pub struct SkillView {
     pub instructions: String,
 }
 
+/// Runtime skill creation payload written to the daemon-managed skill root.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateRuntimeSkillRequest {
+    /// The directory-safe skill name (lowercase ascii alphanumerics or `-`).
+    pub name: String,
+    /// The one-line skill description shown in catalogs.
+    pub description: String,
+    /// The markdown instructions injected when the skill activates.
+    pub instructions: String,
+    /// The optional one-line activation hint shown in catalogs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when_to_use: Option<String>,
+    /// The optional skill version label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
 /// Session creation request payload.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CreateSessionRequest {
@@ -2584,7 +2601,10 @@ pub struct SessionViewSummary {
     #[serde(default, skip_serializing_if = "SessionOperatorConfig::is_inactive")]
     pub operator: SessionOperatorConfig,
     /// Native tool surface adjustments persisted on the session.
-    #[serde(default, skip_serializing_if = "kheish_types::SessionToolOverrides::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "kheish_types::SessionToolOverrides::is_empty"
+    )]
     pub tool_overrides: kheish_types::SessionToolOverrides,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reply_targets: Vec<ReplyHandle>,
@@ -2617,7 +2637,10 @@ pub struct SessionView {
     #[serde(default, skip_serializing_if = "SessionOperatorConfig::is_inactive")]
     pub operator: SessionOperatorConfig,
     /// Native tool surface adjustments persisted on the session.
-    #[serde(default, skip_serializing_if = "kheish_types::SessionToolOverrides::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "kheish_types::SessionToolOverrides::is_empty"
+    )]
     pub tool_overrides: kheish_types::SessionToolOverrides,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reply_targets: Vec<ReplyHandle>,
@@ -3976,6 +3999,19 @@ impl DeliveryListQuery {
     pub fn page_query(&self) -> ListPageQuery {
         list_page_query(self.page, self.cursor.clone())
     }
+}
+
+/// Test delivery creation payload routed through the durable delivery queue.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateDeliveryRequest {
+    /// The session the delivery is attributed to.
+    pub session_id: String,
+    /// The reply plugin that transports the delivery.
+    pub plugin: String,
+    /// The plugin-specific reply address the delivery targets.
+    pub target: String,
+    /// The delivered message content.
+    pub content: String,
 }
 
 /// Delivery replay query parameters.

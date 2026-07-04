@@ -169,6 +169,10 @@ pub struct DeliveryView {
     pub terminal_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replayed_from_delivery_id: Option<String>,
+    /// The delivered message text; populated only on the delivery detail view
+    /// so list payloads stay compact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
     pub content_size_bytes: usize,
     pub parts_count: usize,
     pub artifacts_count: usize,
@@ -1340,6 +1344,11 @@ impl DeliveryDispatcher {
         self.transports.insert(name.into(), Arc::new(transport));
     }
 
+    /// Returns whether one plugin has a registered delivery transport.
+    pub(crate) fn has_transport(&self, plugin: &str) -> bool {
+        self.transports.contains_key(plugin)
+    }
+
     async fn deliver(&self, envelope: ResponseEnvelope) -> Result<()> {
         let reply = envelope
             .reply
@@ -1399,7 +1408,11 @@ impl DeliveryQueue {
         })
     }
 
-    pub(crate) async fn enqueue(&self, response: ResponseEnvelope) -> Result<()> {
+    /// Enqueues one response envelope and returns its durable delivery id.
+    ///
+    /// When a `delivery_idempotency_key` matches an existing record the queue
+    /// keeps the original entry and returns its id instead of duplicating it.
+    pub(crate) async fn enqueue(&self, response: ResponseEnvelope) -> Result<String> {
         let reply = response
             .reply
             .clone()
@@ -1413,18 +1426,43 @@ impl DeliveryQueue {
         if let Some(idempotency_key) =
             metadata_string(&response.metadata, DELIVERY_IDEMPOTENCY_METADATA_KEY)
         {
-            if snapshot
+            let mut existing = snapshot
                 .pending
                 .values()
-                .any(|record| delivery_record_matches_idempotency(record, &reply, &idempotency_key))
-                || self.store.load_completed()?.into_iter().any(|record| {
-                    delivery_record_matches_idempotency(&record.record, &reply, &idempotency_key)
+                .find(|record| {
+                    delivery_record_matches_idempotency(record, &reply, &idempotency_key)
                 })
-                || self.store.load_dead_letters()?.into_iter().any(|record| {
-                    delivery_record_matches_idempotency(&record.record, &reply, &idempotency_key)
-                })
-            {
-                return Ok(());
+                .map(|record| record.id.clone());
+            if existing.is_none() {
+                existing = self
+                    .store
+                    .load_completed()?
+                    .into_iter()
+                    .find(|record| {
+                        delivery_record_matches_idempotency(
+                            &record.record,
+                            &reply,
+                            &idempotency_key,
+                        )
+                    })
+                    .map(|record| record.record.id);
+            }
+            if existing.is_none() {
+                existing = self
+                    .store
+                    .load_dead_letters()?
+                    .into_iter()
+                    .find(|record| {
+                        delivery_record_matches_idempotency(
+                            &record.record,
+                            &reply,
+                            &idempotency_key,
+                        )
+                    })
+                    .map(|record| record.record.id);
+            }
+            if let Some(existing) = existing {
+                return Ok(existing);
             }
         }
         let next_id = snapshot.next_id + 1;
@@ -1447,10 +1485,11 @@ impl DeliveryQueue {
             return Err(error);
         }
         snapshot.next_id = next_id;
+        let delivery_id = record.id.clone();
         snapshot.pending.insert(record.id.clone(), record);
         drop(snapshot);
         self.notify.notify_one();
-        Ok(())
+        Ok(delivery_id)
     }
 
     pub(crate) async fn list_views(&self, filter: DeliveryListFilter) -> Result<Vec<DeliveryView>> {
@@ -1488,7 +1527,50 @@ impl DeliveryQueue {
         let mut views = self.list_views(DeliveryListFilter::default()).await?;
         views.retain(|view| view.delivery_id == delivery_id);
         views.sort_by_key(|view| delivery_status_rank(view.status));
-        Ok(views.into_iter().next())
+        let Some(mut view) = views.into_iter().next() else {
+            return Ok(None);
+        };
+        // Only the detail view carries the payload text; list views stay
+        // compact and keep `content` unset.
+        view.content = self.record_content(delivery_id, view.status).await?;
+        Ok(Some(view))
+    }
+
+    /// Loads the payload text of one delivery record from the store backing
+    /// its current status.
+    async fn record_content(
+        &self,
+        delivery_id: &str,
+        status: DeliveryStatus,
+    ) -> Result<Option<String>> {
+        match status {
+            DeliveryStatus::Pending | DeliveryStatus::Retrying => Ok(self
+                .snapshot
+                .lock()
+                .await
+                .pending
+                .get(delivery_id)
+                .map(|record| record.content.clone())),
+            DeliveryStatus::Delivered => Ok(self
+                .store
+                .load_completed()?
+                .into_iter()
+                .rev()
+                .find(|record| record.record.id == delivery_id)
+                .map(|record| record.record.content)),
+            DeliveryStatus::DeadLettered => Ok(self
+                .store
+                .load_dead_letters()?
+                .into_iter()
+                .rev()
+                .find(|record| record.record.id == delivery_id)
+                .map(|record| record.record.content)),
+        }
+    }
+
+    /// Returns whether one reply plugin dispatches through this queue.
+    pub(crate) fn has_transport(&self, plugin: &str) -> bool {
+        self.dispatcher.has_transport(plugin)
     }
 
     pub(crate) async fn reference_records(
@@ -2215,6 +2297,7 @@ impl DeliveryView {
                 &record.metadata,
                 "replayed_from_delivery_id",
             ),
+            content: None,
             content_size_bytes: record.content.len(),
             parts_count: record.parts.len(),
             artifacts_count: record.artifacts.len(),
@@ -2507,7 +2590,7 @@ impl OutputPlugin for QueuedOutputPlugin {
     }
 
     async fn deliver(&self, response: ResponseEnvelope) -> Result<()> {
-        self.queue.enqueue(response).await
+        self.queue.enqueue(response).await.map(|_| ())
     }
 }
 
@@ -3121,8 +3204,12 @@ mod tests {
             }),
         };
 
-        queue.enqueue(envelope.clone()).await?;
-        queue.enqueue(envelope.clone()).await?;
+        let first = queue.enqueue(envelope.clone()).await?;
+        let deduped = queue.enqueue(envelope.clone()).await?;
+        assert_eq!(
+            first, deduped,
+            "idempotent enqueue should return the original delivery id"
+        );
         let pending = queue
             .list_views(DeliveryListFilter {
                 status: Some(DeliveryStatus::Pending),

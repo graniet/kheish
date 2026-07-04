@@ -1,5 +1,7 @@
 //! Output persistence and delivery methods implemented on [`DaemonState`].
 
+use crate::problems::DaemonProblem;
+
 use super::*;
 
 impl<M> DaemonState<M>
@@ -18,6 +20,58 @@ where
         delivery_id: &str,
     ) -> Result<Option<crate::DeliveryView>> {
         self.delivery_service.get_delivery(delivery_id).await
+    }
+
+    /// Enqueues one operator-submitted test delivery through the durable
+    /// delivery queue and returns its detail view.
+    ///
+    /// The envelope follows the exact path connector outputs take, so the
+    /// operator observes real transport behavior: retries, backpressure, and
+    /// dead-lettering all apply.
+    pub(crate) async fn create_test_delivery(
+        &self,
+        request: crate::CreateDeliveryRequest,
+    ) -> Result<crate::DeliveryView> {
+        let session_id = request.session_id.trim();
+        self.agent_id_for_session(session_id).await?;
+        if request.content.trim().is_empty() {
+            return Err(DaemonProblem::bad_request(
+                "deliveries",
+                "delivery_content_required",
+                "content is required",
+            )
+            .into());
+        }
+        let reply = ReplyHandle {
+            plugin: request.plugin.trim().to_string(),
+            address: request.target.trim().to_string(),
+        };
+        self.validate_persisted_reply_targets(std::slice::from_ref(&reply))?;
+        if !self.delivery_service.is_queued_reply_plugin(&reply.plugin) {
+            return Err(DaemonProblem::bad_request(
+                "deliveries",
+                "delivery_plugin_not_queueable",
+                format!(
+                    "reply plugin `{}` does not deliver through the durable delivery queue",
+                    reply.plugin
+                ),
+            )
+            .into());
+        }
+        let envelope = ResponseEnvelope {
+            conversation: self.session_conversation_key(session_id).await?,
+            reply_targets: vec![reply.clone()],
+            reply: Some(reply),
+            content: request.content,
+            parts: Vec::new(),
+            artifacts: Vec::new(),
+            metadata: json!({ "output_kind": "operator_test_delivery" }),
+        };
+        let delivery_id = self.delivery_service.enqueue(envelope).await?;
+        self.delivery_service
+            .get_delivery(&delivery_id)
+            .await?
+            .ok_or_else(|| anyhow!("delivery {delivery_id} was enqueued but is not readable"))
     }
 
     pub(crate) async fn replay_dead_letter_delivery(

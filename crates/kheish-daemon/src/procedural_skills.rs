@@ -550,7 +550,8 @@ fn validate_runtime_config(runtime: &SkillRuntimeConfig) -> Result<()> {
     Ok(())
 }
 
-fn normalize_single_line(value: &str) -> String {
+/// Collapses all whitespace runs in one value into single spaces.
+pub(crate) fn normalize_single_line(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -622,18 +623,31 @@ fn slice_is_empty<T>(value: &&[T]) -> bool {
 }
 
 fn render_skill_markdown(record: &LearningSkillView) -> Result<String> {
+    render_skill_markdown_parts(
+        &record.skill_name,
+        &record.description,
+        record.version.as_deref(),
+        record.when_to_use.as_deref(),
+        &record.instructions,
+    )
+}
+
+/// Renders one SKILL.md document in the exact format the skill loader parses.
+pub(crate) fn render_skill_markdown_parts(
+    name: &str,
+    description: &str,
+    version: Option<&str>,
+    when_to_use: Option<&str>,
+    instructions: &str,
+) -> Result<String> {
     let frontmatter = SkillFrontmatterFile {
-        name: &record.skill_name,
-        description: &record.description,
-        version: record.version.as_deref(),
-        when_to_use: record.when_to_use.as_deref(),
+        name,
+        description,
+        version,
+        when_to_use,
     };
     let yaml = serde_yaml::to_string(&frontmatter)?;
-    Ok(format!(
-        "---\n{}---\n{}\n",
-        yaml,
-        record.instructions.trim()
-    ))
+    Ok(format!("---\n{}---\n{}\n", yaml, instructions.trim()))
 }
 
 fn render_skill_runtime_config(runtime: &SkillRuntimeConfig) -> Result<String> {

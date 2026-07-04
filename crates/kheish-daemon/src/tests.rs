@@ -44183,6 +44183,441 @@ async fn daemon_exposes_skill_catalog_endpoints() -> Result<()> {
 }
 
 #[tokio::test]
+async fn daemon_runtime_skill_hot_create_persists_and_removes_across_restart() -> Result<()> {
+    async fn spawn_daemon(
+        state_root: &Path,
+        workspace_root: &Path,
+    ) -> Result<(SocketAddr, oneshot::Sender<()>)> {
+        let config = DaemonConfig::new(
+            "127.0.0.1:0".parse::<SocketAddr>()?,
+            state_root,
+            workspace_root,
+        );
+        let provider = OpenAiProviderConfig::new("gpt-test", "test-key");
+        let (service, listener) = build_openai_daemon(config, provider).await?;
+        let address = listener.local_addr()?;
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let _ = service
+                .serve_with_shutdown(listener, async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+        Ok((address, shutdown))
+    }
+
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-runtime-skills");
+    let workspace_root = temp.path().join("workspace");
+    // A file-managed workspace skill proves the daemon refuses to remove
+    // skills it does not own.
+    let file_managed = workspace_root.join("skills").join("file-managed-fixture");
+    fs::create_dir_all(&file_managed)?;
+    fs::write(
+        file_managed.join("SKILL.md"),
+        "---\nname: file-managed-fixture\ndescription: File-managed skill fixture.\n---\nReply with FILE_MANAGED_OK.\n",
+    )?;
+
+    let (address, shutdown) = spawn_daemon(&state_root, &workspace_root).await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+    wait_for_daemon_ready(&client, &base).await?;
+
+    let invalid_name = client
+        .post(format!("{base}/v1/runtime/skills"))
+        .json(&json!({
+            "name": "Bad Name!",
+            "description": "invalid",
+            "instructions": "irrelevant"
+        }))
+        .send()
+        .await?;
+    assert_eq!(invalid_name.status(), StatusCode::BAD_REQUEST);
+
+    let create = client
+        .post(format!("{base}/v1/runtime/skills"))
+        .json(&json!({
+            "name": "hot-created-fixture",
+            "description": "Validate runtime skill hot-creation.",
+            "instructions": "Reply with exactly HOT_CREATED_FIXTURE_OK.",
+            "when_to_use": "Use when the operator asks for the hot-created fixture.",
+            "version": "1"
+        }))
+        .send()
+        .await?;
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let created = create.json::<SkillView>().await?;
+    assert_eq!(created.name, "hot-created-fixture");
+    assert_eq!(created.description, "Validate runtime skill hot-creation.");
+    assert_eq!(
+        created.when_to_use.as_deref(),
+        Some("Use when the operator asks for the hot-created fixture.")
+    );
+    assert_eq!(created.version.as_deref(), Some("1"));
+    assert!(created.instructions.contains("HOT_CREATED_FIXTURE_OK"));
+    assert!(
+        Path::new(&created.skill_root).ends_with(Path::new("skills").join("hot-created-fixture")),
+        "hot-created skills live under the daemon skill root: {}",
+        created.skill_root
+    );
+
+    let duplicate = client
+        .post(format!("{base}/v1/runtime/skills"))
+        .json(&json!({
+            "name": "hot-created-fixture",
+            "description": "duplicate",
+            "instructions": "duplicate"
+        }))
+        .send()
+        .await?;
+    assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+
+    let shadow = client
+        .post(format!("{base}/v1/runtime/skills"))
+        .json(&json!({
+            "name": "file-managed-fixture",
+            "description": "shadow attempt",
+            "instructions": "shadow attempt"
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        shadow.status(),
+        StatusCode::CONFLICT,
+        "names already loaded from any root must be refused"
+    );
+
+    let listed = client
+        .get(format!("{base}/v1/skills"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<SkillSummaryView>>()
+        .await?;
+    assert!(
+        listed
+            .iter()
+            .any(|skill| skill.name == "hot-created-fixture")
+    );
+
+    // The skill document must survive a daemon restart on the same state root.
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+    let (address, shutdown) = spawn_daemon(&state_root, &workspace_root).await?;
+    let base = format!("http://{address}");
+    wait_for_daemon_ready(&client, &base).await?;
+
+    let reloaded = client
+        .get(format!("{base}/v1/skills/hot-created-fixture"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SkillView>()
+        .await?;
+    assert_eq!(reloaded.description, "Validate runtime skill hot-creation.");
+    assert!(reloaded.instructions.contains("HOT_CREATED_FIXTURE_OK"));
+
+    let file_managed_delete = client
+        .delete(format!("{base}/v1/runtime/skills/file-managed-fixture"))
+        .send()
+        .await?;
+    assert_eq!(file_managed_delete.status(), StatusCode::CONFLICT);
+    assert!(
+        file_managed_delete.text().await?.contains("file-managed"),
+        "file-managed skills should be refused with an explanatory conflict"
+    );
+
+    let removed = client
+        .delete(format!("{base}/v1/runtime/skills/hot-created-fixture"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<RuntimeSettingsView>()
+        .await?;
+    assert!(
+        !removed.skills.roots.is_empty(),
+        "removal returns the refreshed runtime settings"
+    );
+
+    let missing = client
+        .get(format!("{base}/v1/skills/hot-created-fixture"))
+        .send()
+        .await?;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    let missing_delete = client
+        .delete(format!("{base}/v1/runtime/skills/hot-created-fixture"))
+        .send()
+        .await?;
+    assert_eq!(missing_delete.status(), StatusCode::NOT_FOUND);
+
+    // Removal must also survive a restart: the directory is gone.
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+    let (address, shutdown) = spawn_daemon(&state_root, &workspace_root).await?;
+    let base = format!("http://{address}");
+    wait_for_daemon_ready(&client, &base).await?;
+    let after_restart = client
+        .get(format!("{base}/v1/skills/hot-created-fixture"))
+        .send()
+        .await?;
+    assert_eq!(after_restart.status(), StatusCode::NOT_FOUND);
+    let file_managed_still = client
+        .get(format!("{base}/v1/skills/file-managed-fixture"))
+        .send()
+        .await?;
+    assert_eq!(file_managed_still.status(), StatusCode::OK);
+
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_persona_delete_removes_record_and_keeps_bound_sessions() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-persona-delete");
+    let (address, shutdown) = scripted_daemon(&state_root, Vec::new()).await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+
+    create_test_persona(
+        &client,
+        &base,
+        "persona-delete-demo",
+        "Deletable",
+        "Reply as Deletable.",
+    )
+    .await?;
+    let session = create_test_session_with_persona(
+        &client,
+        &base,
+        "persona-delete-session",
+        Some("persona-delete-demo"),
+    )
+    .await?;
+    assert_eq!(
+        session
+            .persona
+            .as_ref()
+            .map(|persona| persona.persona_id.as_str()),
+        Some("persona-delete-demo")
+    );
+
+    let deleted = client
+        .delete(format!("{base}/v1/personas/persona-delete-demo"))
+        .send()
+        .await?;
+    assert_eq!(deleted.status(), StatusCode::OK);
+    assert_eq!(deleted.json::<Value>().await?["deleted"], json!(true));
+
+    let missing = client
+        .get(format!("{base}/v1/personas/persona-delete-demo"))
+        .send()
+        .await?;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    let missing_delete = client
+        .delete(format!("{base}/v1/personas/persona-delete-demo"))
+        .send()
+        .await?;
+    assert_eq!(missing_delete.status(), StatusCode::NOT_FOUND);
+
+    let personas = client
+        .get(format!("{base}/v1/personas"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<PersonaSummaryView>>()
+        .await?;
+    assert!(
+        personas
+            .iter()
+            .all(|persona| persona.persona_id != "persona-delete-demo")
+    );
+
+    // Bound sessions keep their frozen persona snapshot after deletion.
+    let session = client
+        .get(format!("{base}/v1/sessions/persona-delete-session"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionView>()
+        .await?;
+    assert_eq!(
+        session
+            .persona
+            .as_ref()
+            .map(|persona| persona.persona_id.as_str()),
+        Some("persona-delete-demo")
+    );
+
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_test_delivery_endpoint_flows_through_the_real_queue() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-test-delivery");
+    let (address, shutdown) = scripted_daemon(&state_root, Vec::new()).await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+
+    create_test_session(&client, &base, "test-delivery-demo").await?;
+
+    let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let sink = captured.clone();
+    let hook_router = Router::new().route(
+        "/hook",
+        post(move |Json(body): Json<Value>| {
+            let sink = sink.clone();
+            async move {
+                sink.lock().push(body);
+                StatusCode::OK
+            }
+        }),
+    );
+    let hook_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let hook_address = hook_listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(hook_listener, hook_router).await;
+    });
+    let target = crate::connectors::encode_http_reply_route(&crate::connectors::HttpReplyRoute {
+        url: format!("http://{hook_address}/hook"),
+        allow_private_network: true,
+        headers: BTreeMap::new(),
+    });
+
+    let unknown_plugin = client
+        .post(format!("{base}/v1/deliveries"))
+        .json(&json!({
+            "session_id": "test-delivery-demo",
+            "plugin": "missing-plugin",
+            "target": "anywhere",
+            "content": "hello"
+        }))
+        .send()
+        .await?;
+    assert_eq!(unknown_plugin.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        unknown_plugin
+            .text()
+            .await?
+            .contains("unknown reply plugin")
+    );
+
+    let unqueued_plugin = client
+        .post(format!("{base}/v1/deliveries"))
+        .json(&json!({
+            "session_id": "test-delivery-demo",
+            "plugin": "daemon",
+            "target": "test-delivery-demo",
+            "content": "hello"
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        unqueued_plugin.status(),
+        StatusCode::BAD_REQUEST,
+        "plugins without a queue transport cannot take test deliveries"
+    );
+
+    let unknown_session = client
+        .post(format!("{base}/v1/deliveries"))
+        .json(&json!({
+            "session_id": "missing-session",
+            "plugin": "http",
+            "target": target,
+            "content": "hello"
+        }))
+        .send()
+        .await?;
+    assert_eq!(unknown_session.status(), StatusCode::NOT_FOUND);
+
+    let empty_content = client
+        .post(format!("{base}/v1/deliveries"))
+        .json(&json!({
+            "session_id": "test-delivery-demo",
+            "plugin": "http",
+            "target": target,
+            "content": "  "
+        }))
+        .send()
+        .await?;
+    assert_eq!(empty_content.status(), StatusCode::BAD_REQUEST);
+
+    let response = client
+        .post(format!("{base}/v1/deliveries"))
+        .json(&json!({
+            "session_id": "test-delivery-demo",
+            "plugin": "http",
+            "target": target,
+            "content": "TEST_DELIVERY_CONTENT_OK"
+        }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let created = response.json::<crate::DeliveryView>().await?;
+    assert_eq!(created.session_id, "test-delivery-demo");
+    assert_eq!(created.plugin, "http");
+    assert_eq!(created.content.as_deref(), Some("TEST_DELIVERY_CONTENT_OK"));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let delivered = loop {
+        let view = client
+            .get(format!("{base}/v1/deliveries/{}", created.delivery_id))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<crate::DeliveryView>()
+            .await?;
+        if view.status == crate::DeliveryStatus::Delivered {
+            break view;
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the test delivery to complete: {view:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        delivered.content.as_deref(),
+        Some("TEST_DELIVERY_CONTENT_OK"),
+        "the detail view exposes the delivered content"
+    );
+    assert!(delivered.delivered_at_ms.is_some());
+
+    let received = captured.lock().clone();
+    assert_eq!(received.len(), 1, "the webhook received the real delivery");
+    assert_eq!(received[0]["content"], json!("TEST_DELIVERY_CONTENT_OK"));
+    assert_eq!(received[0]["session_id"], json!("test-delivery-demo"));
+
+    // List payloads stay compact: no content key on list views.
+    let listed = client
+        .get(format!(
+            "{base}/v1/deliveries?session_id=test-delivery-demo"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    let listed = listed
+        .as_array()
+        .context("delivery list should be an array")?;
+    assert_eq!(listed.len(), 1);
+    assert!(
+        listed[0].get("content").is_none(),
+        "list views must not inline delivery content: {listed:#?}"
+    );
+
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn daemon_asset_endpoints_and_attachment_inputs_roundtrip() -> Result<()> {
     let temp = tempdir()?;
     let state_root = temp.path().join("daemon-state");

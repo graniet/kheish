@@ -65,13 +65,13 @@ use super::types::{
     SetLearningPolicyRequest, SetModelRequest, SetPermissionModeRequest, SetRunMemoryPolicyRequest,
     SetSessionCapabilityScopeRequest, SetSessionCredentialScopeRequest, SetSessionGoalRequest,
     SetSessionOperatorConfigRequest, SetSessionPersonaRequest, SetSessionReplyTargetsRequest,
-    SetSessionToolOverridesRequest,
-    SetSessionRoutePolicyRequest, SetSystemPromptRequest, SetToolRuntimeLimitsRequest,
-    SkillListQuery, SkillSummaryView, SkillView, SpawnSidechainRequest, StackApplyRequest,
-    StackDownRequest, StackImportRequest, StackManifestRequest, StackPlanRequest,
-    StartProjectTaskRequest, StopTaskRequest, SubmitInputRequest, SubmitRunRequest,
-    SupersedeLearningRequest, TaskListQuery, TaskOutputQuery, UpdateBoardRequest,
-    UpdateChannelRequest, UpdatePersonaRequest, UpdateProjectRequest, UpdateProjectTaskRequest,
+    SetSessionRoutePolicyRequest, SetSessionToolOverridesRequest, SetSystemPromptRequest,
+    SetToolRuntimeLimitsRequest, SkillListQuery, SkillSummaryView, SkillView,
+    SpawnSidechainRequest, StackApplyRequest, StackDownRequest, StackImportRequest,
+    StackManifestRequest, StackPlanRequest, StartProjectTaskRequest, StopTaskRequest,
+    SubmitInputRequest, SubmitRunRequest, SupersedeLearningRequest, TaskListQuery, TaskOutputQuery,
+    UpdateBoardRequest, UpdateChannelRequest, UpdatePersonaRequest, UpdateProjectRequest,
+    UpdateProjectTaskRequest,
 };
 use crate::assets::MAX_ASSET_BYTES;
 use crate::problems::DaemonProblem;
@@ -709,13 +709,20 @@ where
         )
         .route(
             "/v1/personas/{persona_id}",
-            get(get_persona::<M>).put(update_persona::<M>),
+            get(get_persona::<M>)
+                .put(update_persona::<M>)
+                .delete(delete_persona::<M>),
         )
         .route("/v1/runtime/model", post(set_model::<M>))
         .route("/v1/runtime/mcp/servers", post(add_mcp_server::<M>))
         .route(
             "/v1/runtime/mcp/servers/{name}",
             delete(remove_mcp_server::<M>),
+        )
+        .route("/v1/runtime/skills", post(create_runtime_skill::<M>))
+        .route(
+            "/v1/runtime/skills/{skill_name}",
+            delete(remove_runtime_skill::<M>),
         )
         .route(
             "/v1/runtime/revisions",
@@ -894,7 +901,10 @@ where
         )
         .route("/v1/runs/{run_id}/stream", get(stream_run_events::<M>))
         .route("/v1/runs/{run_id}/cancel", post(cancel_run::<M>))
-        .route("/v1/deliveries", get(list_deliveries::<M>))
+        .route(
+            "/v1/deliveries",
+            get(list_deliveries::<M>).post(create_delivery::<M>),
+        )
         .route(
             "/v1/deliveries/dead-letter",
             get(list_dead_letter_deliveries::<M>),
@@ -1793,6 +1803,14 @@ const CONTROL_PLANE_OPENAPI_ROUTES: &[OpenApiRouteSpec] = &[
         methods: &["DELETE"],
     },
     OpenApiRouteSpec {
+        path: "/v1/runtime/skills",
+        methods: &["POST"],
+    },
+    OpenApiRouteSpec {
+        path: "/v1/runtime/skills/{skill_name}",
+        methods: &["DELETE"],
+    },
+    OpenApiRouteSpec {
         path: "/v1/runtime/revisions",
         methods: &["GET"],
     },
@@ -2466,7 +2484,7 @@ const CONTROL_PLANE_OPENAPI_ROUTES: &[OpenApiRouteSpec] = &[
     },
     OpenApiRouteSpec {
         path: "/v1/personas/{persona_id}",
-        methods: &["GET", "PUT"],
+        methods: &["GET", "PUT", "DELETE"],
     },
     OpenApiRouteSpec {
         path: "/v1/schedules",
@@ -2494,7 +2512,7 @@ const CONTROL_PLANE_OPENAPI_ROUTES: &[OpenApiRouteSpec] = &[
     },
     OpenApiRouteSpec {
         path: "/v1/deliveries",
-        methods: &["GET"],
+        methods: &["GET", "POST"],
     },
     OpenApiRouteSpec {
         path: "/v1/deliveries/dead-letter",
@@ -5023,6 +5041,34 @@ where
         .map_err(internal_error)
 }
 
+async fn create_runtime_skill<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    Json(request): Json<crate::CreateRuntimeSkillRequest>,
+) -> Result<(StatusCode, Json<SkillView>), ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    state
+        .add_runtime_skill(request)
+        .await
+        .map(|view| (StatusCode::CREATED, Json(view)))
+        .map_err(internal_error)
+}
+
+async fn remove_runtime_skill<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    AxumPath(skill_name): AxumPath<String>,
+) -> Result<Json<RuntimeSettingsView>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    state
+        .remove_runtime_skill(&skill_name)
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
 async fn set_model<M>(
     State(state): State<Arc<DaemonState<M>>>,
     Json(request): Json<SetModelRequest>,
@@ -5360,6 +5406,20 @@ where
         .await
         .map(PersonaView::from)
         .map(Json)
+        .map_err(internal_error)
+}
+
+async fn delete_persona<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    AxumPath(persona_id): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    state
+        .delete_persona_record(&persona_id)
+        .await
+        .map(|()| Json(serde_json::json!({ "deleted": true })))
         .map_err(internal_error)
 }
 
@@ -6577,6 +6637,20 @@ where
         "delivery_time_asc,delivery_id_asc",
         delivery_page_key,
     )
+}
+
+async fn create_delivery<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    Json(request): Json<crate::CreateDeliveryRequest>,
+) -> Result<(StatusCode, Json<crate::DeliveryView>), ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    state
+        .create_test_delivery(request)
+        .await
+        .map(|view| (StatusCode::ACCEPTED, Json(view)))
+        .map_err(internal_error)
 }
 
 async fn list_dead_letter_deliveries<M>(

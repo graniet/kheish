@@ -1,6 +1,7 @@
 //! Runtime configuration and hook-dispatch methods implemented on [`DaemonState`].
 
 use crate::problems::DaemonProblem;
+use crate::procedural_skills::normalize_single_line;
 
 use super::*;
 
@@ -296,6 +297,141 @@ where
         entries.remove(name);
         self.mcp_overlay.save(&entries)?;
         self.refresh_mcp_runtime_snapshot().await;
+        let runtime = self.runtime_settings_unlocked();
+        self.events.publish(DaemonEvent::RuntimeUpdated {
+            runtime: runtime.clone(),
+        });
+        Ok(runtime)
+    }
+
+    /// Creates one daemon-managed skill under the state-root skill directory.
+    ///
+    /// The document lands in `<state_root>/skills/<name>/SKILL.md` using the
+    /// exact frontmatter format the skill loader parses, so a hot-created
+    /// skill reloads at every boot exactly like a file-managed one.
+    pub(crate) async fn add_runtime_skill(
+        &self,
+        request: crate::CreateRuntimeSkillRequest,
+    ) -> Result<crate::SkillView> {
+        let name = request.name.trim();
+        if name.is_empty()
+            || name.len() > 64
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        {
+            return Err(DaemonProblem::bad_request(
+                "skills",
+                "skill_name_invalid",
+                "runtime skill names use 1-64 lowercase ascii alphanumerics or `-`",
+            )
+            .into());
+        }
+        let description = normalize_single_line(&request.description);
+        if description.is_empty() {
+            return Err(DaemonProblem::bad_request(
+                "skills",
+                "skill_description_required",
+                "description is required",
+            )
+            .into());
+        }
+        let when_to_use = request
+            .when_to_use
+            .as_deref()
+            .map(normalize_single_line)
+            .filter(|value| !value.is_empty());
+        let version = request
+            .version
+            .as_deref()
+            .map(normalize_single_line)
+            .filter(|value| !value.is_empty());
+        let instructions = request.instructions.trim();
+        if instructions.is_empty() {
+            return Err(DaemonProblem::bad_request(
+                "skills",
+                "skill_instructions_required",
+                "instructions are required",
+            )
+            .into());
+        }
+        let _guard = self.skill_mutation.lock().await;
+        if self.skills.get(name).is_some() {
+            return Err(DaemonProblem::conflict(
+                "skills",
+                "skill_exists",
+                format!("skill `{name}` already exists"),
+            )
+            .into());
+        }
+        let skill_dir = crate::builders::daemon_skill_root(&self.state_root).join(name);
+        if skill_dir.exists() {
+            return Err(DaemonProblem::conflict(
+                "skills",
+                "skill_exists",
+                format!("skill directory `{name}` already exists under the daemon skill root"),
+            )
+            .into());
+        }
+        std::fs::create_dir_all(&skill_dir)
+            .with_context(|| format!("failed to create {}", skill_dir.display()))?;
+        let markdown = crate::procedural_skills::render_skill_markdown_parts(
+            name,
+            &description,
+            version.as_deref(),
+            when_to_use.as_deref(),
+            instructions,
+        )?;
+        if let Err(error) =
+            kheish_session::atomic_write(&skill_dir.join("SKILL.md"), markdown.as_bytes())
+        {
+            let _ = std::fs::remove_dir_all(&skill_dir);
+            return Err(error);
+        }
+        self.skills.reload();
+        let Some(skill) = self.skills.get(name) else {
+            // A document the loader rejects must not linger half-created.
+            let _ = std::fs::remove_dir_all(&skill_dir);
+            self.skills.reload();
+            bail!("skill `{name}` was written but did not load; the write was rolled back");
+        };
+        self.events.publish(DaemonEvent::RuntimeUpdated {
+            runtime: self.runtime_settings_unlocked(),
+        });
+        Ok(crate::SkillView::from(skill))
+    }
+
+    /// Removes one daemon-managed skill directory and retires it from the
+    /// catalog.
+    ///
+    /// Skills discovered from workspace or user roots are file-managed and
+    /// refused here — delete the directory at its source instead.
+    pub(crate) async fn remove_runtime_skill(&self, name: &str) -> Result<RuntimeSettingsView> {
+        let _guard = self.skill_mutation.lock().await;
+        let Some(skill) = self.skills.get(name) else {
+            return Err(DaemonProblem::not_found(
+                "skills",
+                "skill_not_found",
+                format!("unknown skill {name}"),
+            )
+            .into());
+        };
+        let root = crate::builders::daemon_skill_root(&self.state_root);
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
+        if skill.skill_root == root || !skill.skill_root.starts_with(&root) {
+            return Err(DaemonProblem::conflict(
+                "skills",
+                "skill_file_managed",
+                format!(
+                    "skill `{name}` comes from the file-managed root {}; remove it on disk instead",
+                    skill.skill_root.display()
+                ),
+            )
+            .into());
+        }
+        std::fs::remove_dir_all(&skill.skill_root)
+            .with_context(|| format!("failed to remove {}", skill.skill_root.display()))?;
+        self.skills.reload();
         let runtime = self.runtime_settings_unlocked();
         self.events.publish(DaemonEvent::RuntimeUpdated {
             runtime: runtime.clone(),

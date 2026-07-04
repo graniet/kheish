@@ -174,6 +174,11 @@ where
             .await
     }
 
+    /// Deletes one persona record; sessions keep their frozen bound copy.
+    pub(crate) async fn delete_persona_record(&self, persona_id: &str) -> Result<()> {
+        self.persona_service.delete_persona(persona_id).await
+    }
+
     pub(crate) async fn load_session_persona_binding(
         &self,
         session_id: &str,

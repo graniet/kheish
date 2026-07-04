@@ -102,6 +102,17 @@ impl DeliveryService {
         self.output_host.deliver(envelope).await
     }
 
+    /// Enqueues one response envelope on the durable delivery queue and
+    /// returns its delivery id.
+    pub(crate) async fn enqueue(&self, envelope: ResponseEnvelope) -> Result<String> {
+        self.queue.enqueue(envelope).await
+    }
+
+    /// Returns whether one reply plugin delivers through the durable queue.
+    pub(crate) fn is_queued_reply_plugin(&self, plugin: &str) -> bool {
+        self.queue.has_transport(plugin)
+    }
+
     /// Returns redacted operator views for queued, delivered, and dead-lettered deliveries.
     pub(crate) async fn list_deliveries(
         &self,

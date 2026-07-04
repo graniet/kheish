@@ -320,6 +320,8 @@ pub(crate) struct DaemonState<M> {
     mcp_overlay: crate::services::McpOverlayService,
     auth_manager: Arc<AuthManager>,
     skills: Arc<SharedSkillRegistry>,
+    /// Serializes daemon-managed skill directory mutations against reloads.
+    skill_mutation: tokio::sync::Mutex<()>,
     connectors: Arc<ConnectorRegistry>,
     external_connector_runtime: Arc<ExternalConnectorRuntimeService>,
     connector_service: Arc<ConnectorService>,
@@ -568,6 +570,7 @@ where
             mcp_manager,
             auth_manager,
             skills,
+            skill_mutation: tokio::sync::Mutex::new(()),
             connectors,
             external_connector_runtime,
             connector_service,

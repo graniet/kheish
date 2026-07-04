@@ -12,9 +12,7 @@ use tokio::sync::mpsc;
 use kheish_agent::{AgentOrchestrator, AgentSupervisor};
 use kheish_auth::{AuthManager, AuthSlotId};
 use kheish_core::{HookDispatcher, LoopPolicy, ModelDriver};
-use kheish_mcp::{
-    CodexCompatOptions, McpLoadOptions, McpManager, McpResolvedSecrets,
-};
+use kheish_mcp::{CodexCompatOptions, McpLoadOptions, McpManager, McpResolvedSecrets};
 use kheish_output::OutputHost;
 use kheish_runtime::{
     AgentRuntimeDependencies, DebugCaptureLevel, DebugControl, ModelBudget, ModelRetryPolicy,
@@ -51,6 +49,14 @@ use crate::{
     DaemonOutputSourceKind, DaemonState, FileDaemonStore, FileDebugStore,
 };
 use kheish_coding_tools::{CodingToolConfig, register_default_coding_tools};
+
+/// Returns the daemon-managed skill root under one state root.
+///
+/// Skills created through the runtime API live here; the same path joins the
+/// skill discovery roots at boot so hot-created skills reload like file ones.
+pub(crate) fn daemon_skill_root(state_root: &Path) -> std::path::PathBuf {
+    state_root.join("skills")
+}
 
 pub(crate) fn daemon_model_retry_policy() -> ModelRetryPolicy {
     ModelRetryPolicy {
@@ -619,29 +625,27 @@ where
     let mut permission_rules = default_session_permission_rules();
     extend(&mut tools, &mut permission_rules)?;
     permission_rules.push(allow_all_session_permission_rule());
-    let mcp_resolved_secrets =
-        mcp_resolved_secrets_from_auth_store(auth_manager.as_ref()).await?;
-    let configured_manager = if config.mcp_config_path.is_some()
-        || !config.mcp_catalog_profiles.is_empty()
-    {
-        McpManager::from_load_options(
-            config.workspace_root.clone(),
-            McpLoadOptions {
-                codex: CodexCompatOptions {
-                    config_path: config.mcp_config_path.clone(),
-                    credentials_path: config.mcp_credentials_path.clone(),
+    let mcp_resolved_secrets = mcp_resolved_secrets_from_auth_store(auth_manager.as_ref()).await?;
+    let configured_manager =
+        if config.mcp_config_path.is_some() || !config.mcp_catalog_profiles.is_empty() {
+            McpManager::from_load_options(
+                config.workspace_root.clone(),
+                McpLoadOptions {
+                    codex: CodexCompatOptions {
+                        config_path: config.mcp_config_path.clone(),
+                        credentials_path: config.mcp_credentials_path.clone(),
+                        resolved_secrets: mcp_resolved_secrets.clone(),
+                    },
+                    catalog_profiles: config.mcp_catalog_profiles.clone(),
                     resolved_secrets: mcp_resolved_secrets.clone(),
                 },
-                catalog_profiles: config.mcp_catalog_profiles.clone(),
-                resolved_secrets: mcp_resolved_secrets.clone(),
-            },
-            Some(auth_manager.clone()),
-            observer.clone(),
-        )
-        .await?
-    } else {
-        None
-    };
+                Some(auth_manager.clone()),
+                observer.clone(),
+            )
+            .await?
+        } else {
+            None
+        };
     // A daemon without any startup MCP configuration still gets a manager so
     // servers can be connected through the runtime API.
     let manager = configured_manager.unwrap_or_else(|| {
@@ -782,7 +786,7 @@ where
     tools.set_hook_dispatcher(hook_dispatcher.clone());
     let tools = Arc::new(tools);
     let runtime_tools = tools.clone();
-    let daemon_skill_root = config.state_root.join("skills");
+    let daemon_skill_root = daemon_skill_root(&config.state_root);
     std::fs::create_dir_all(&daemon_skill_root).with_context(|| {
         format!(
             "failed to create daemon skill root {}",
