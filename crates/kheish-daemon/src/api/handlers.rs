@@ -195,12 +195,26 @@ where
 {
     let limit = normalize_page_limit(limit)?;
     let cursor_key = page.cursor.as_deref().map(decode_page_cursor).transpose()?;
+    // Direction is carried by the order label so every list endpoint keeps
+    // its existing ascending signature; only labels ending in `_desc` flip.
+    let descending = order.ends_with("_desc");
 
     items.sort_by_key(|item| key(item));
+    if descending {
+        items.reverse();
+    }
     let total_count = items.len();
     let mut filtered = items
         .into_iter()
-        .filter(|item| cursor_key.as_ref().is_none_or(|cursor| key(item) > *cursor))
+        .filter(|item| {
+            cursor_key.as_ref().is_none_or(|cursor| {
+                if descending {
+                    key(item) < *cursor
+                } else {
+                    key(item) > *cursor
+                }
+            })
+        })
         .take(limit + 1)
         .collect::<Vec<_>>();
     let has_more = filtered.len() > limit;
@@ -6282,13 +6296,19 @@ where
 
     let page = query.page_query();
     if page.enabled() {
-        return list_or_page(
-            runs,
-            &page,
-            query.limit,
-            "submitted_at_ms_asc,run_id_asc",
-            run_page_key,
-        );
+        let order = match query.order.as_deref() {
+            None | Some("asc") => "submitted_at_ms_asc,run_id_asc",
+            Some("desc") => "submitted_at_ms_desc,run_id_desc",
+            Some(other) => {
+                return Err(ApiError::coded(
+                    StatusCode::BAD_REQUEST,
+                    "pagination",
+                    "invalid_order",
+                    format!("unknown order '{other}': expected 'asc' or 'desc'"),
+                ));
+            }
+        };
+        return list_or_page(runs, &page, query.limit, order, run_page_key);
     }
 
     if let Some(limit) = query.limit {

@@ -3935,6 +3935,8 @@ pub struct RunListQuery {
     pub page: Option<bool>,
     pub cursor: Option<String>,
     pub limit: Option<usize>,
+    /// Page order: `asc` (default) or `desc` (newest first).
+    pub order: Option<String>,
     pub priority_active: Option<bool>,
     pub session_id: Option<String>,
 }

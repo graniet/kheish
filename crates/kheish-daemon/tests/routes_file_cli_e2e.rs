@@ -1499,6 +1499,45 @@ async fn control_plane_pagination_contract_real_daemon() -> Result<()> {
     assert_eq!(runs_page.pagination.limit, 1);
     assert_eq!(runs_page.pagination.order, "submitted_at_ms_asc,run_id_asc");
 
+    let runs_desc: kheish_daemon::ListPage<RunView> = client
+        .get(format!("{base_url}/v1/runs?page=true&limit=1&order=desc"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(runs_desc.pagination.order, "submitted_at_ms_desc,run_id_desc");
+    if runs_desc.pagination.total_count > 0 {
+        let newest = runs_desc.items.first().context("desc first item")?;
+        let oldest = runs_page.items.first().context("asc first item")?;
+        assert!(
+            newest.submitted_at_ms >= oldest.submitted_at_ms,
+            "desc order should start from the newest run"
+        );
+        if let Some(cursor) = &runs_desc.pagination.next_cursor {
+            let follow_up: kheish_daemon::ListPage<RunView> = client
+                .get(format!(
+                    "{base_url}/v1/runs?page=true&limit=1&order=desc&cursor={}",
+                    urlencoding::encode(cursor)
+                ))
+                .send()
+                .await?
+                .json()
+                .await?;
+            for older in &follow_up.items {
+                assert!(
+                    older.submitted_at_ms <= newest.submitted_at_ms,
+                    "desc cursor should keep walking backwards in time"
+                );
+            }
+        }
+    }
+
+    let bad_order = client
+        .get(format!("{base_url}/v1/runs?page=true&order=sideways"))
+        .send()
+        .await?;
+    assert_eq!(bad_order.status(), reqwest::StatusCode::BAD_REQUEST);
+
     let assets_page: kheish_daemon::ListPage<kheish_daemon::AssetSummaryView> = client
         .get(format!("{base_url}/v1/assets?page=true&limit=1"))
         .send()
