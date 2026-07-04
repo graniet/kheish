@@ -72,7 +72,7 @@ use live_support::{
 };
 
 const SAMPLE_PNG_BASE64: &str =
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aS1QAAAAASUVORK5CYII=";
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGNoAAAAggCBd81ytgAAAABJRU5ErkJggg==";
 
 const OPENAI_OK_RESPONSE: &str = concat!(
     "event: response.output_item.added\n",
