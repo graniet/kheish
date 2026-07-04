@@ -57045,3 +57045,533 @@ async fn daemon_filters_session_sse_streams() -> Result<()> {
     let _ = shutdown.send(());
     Ok(())
 }
+
+fn output_contract_schema_json() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "status": {"type": "string"},
+            "count": {"type": "number"},
+        },
+        "required": ["status", "count"],
+        "additionalProperties": false,
+    })
+}
+
+/// The canonical rendering of `output_contract_schema_json`: object keys and
+/// the required list come back sorted because the internal schema stores
+/// fields in BTreeMaps.
+fn output_contract_schema_canonical() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "count": {"type": "number"},
+            "status": {"type": "string"},
+        },
+        "required": ["count", "status"],
+        "additionalProperties": false,
+    })
+}
+
+async fn put_output_contract(
+    client: &Client,
+    base: &str,
+    session_id: &str,
+    schema: Value,
+    max_repair_attempts: Option<u8>,
+) -> Result<reqwest::Response> {
+    Ok(client
+        .put(format!("{base}/v1/sessions/{session_id}/output-contract"))
+        .json(&json!({
+            "schema": schema,
+            "max_repair_attempts": max_repair_attempts,
+        }))
+        .send()
+        .await?)
+}
+
+async fn submit_test_input_with_http_target(
+    client: &Client,
+    base: &str,
+    session_id: &str,
+    content: &str,
+    target: &str,
+) -> Result<RunView> {
+    Ok(client
+        .post(format!("{base}/v1/sessions/{session_id}/runs"))
+        .json(&json!({
+            "content": content,
+            "generation": {},
+            "reply_targets": [{"type": "raw", "plugin": "http", "address": target}],
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<RunView>()
+        .await?)
+}
+
+/// Spawns a local webhook receiver and returns its encoded http reply route
+/// plus the captured POST bodies.
+async fn spawn_output_contract_webhook() -> Result<(String, Arc<Mutex<Vec<Value>>>)> {
+    let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let sink = captured.clone();
+    let hook_router = Router::new().route(
+        "/hook",
+        post(move |Json(body): Json<Value>| {
+            let sink = sink.clone();
+            async move {
+                sink.lock().push(body);
+                StatusCode::OK
+            }
+        }),
+    );
+    let hook_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let hook_address = hook_listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(hook_listener, hook_router).await;
+    });
+    let target = crate::connectors::encode_http_reply_route(&crate::connectors::HttpReplyRoute {
+        url: format!("http://{hook_address}/hook"),
+        allow_private_network: true,
+        headers: BTreeMap::new(),
+    });
+    Ok((target, captured))
+}
+
+#[tokio::test]
+async fn session_output_contract_roundtrip_validation_and_clamping() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-output-contract");
+    let (address, shutdown) = scripted_daemon(&state_root, Vec::new()).await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+    create_test_session(&client, &base, "contract-demo").await?;
+
+    let unset = client
+        .get(format!("{base}/v1/sessions/contract-demo/output-contract"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    assert_eq!(unset, Value::Null);
+
+    // Unsupported keywords are rejected with their JSON paths, never dropped.
+    let rejected = put_output_contract(
+        &client,
+        &base,
+        "contract-demo",
+        json!({
+            "type": "object",
+            "properties": {"status": {"type": "string", "enum": ["open"]}},
+            "required": ["status"],
+            "additionalProperties": false,
+        }),
+        None,
+    )
+    .await?;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        rejected
+            .text()
+            .await?
+            .contains("unsupported JSON Schema keyword `enum`")
+    );
+
+    // A valid contract lands, with the repair budget clamped to the ceiling.
+    let accepted = put_output_contract(
+        &client,
+        &base,
+        "contract-demo",
+        output_contract_schema_json(),
+        Some(99),
+    )
+    .await?;
+    assert_eq!(accepted.status(), StatusCode::OK);
+    let view = accepted.json::<SessionView>().await?;
+    let contract = view
+        .output_contract
+        .expect("contract projected on the view");
+    assert_eq!(contract.schema, output_contract_schema_canonical());
+    assert_eq!(
+        contract.max_repair_attempts,
+        Some(kheish_types::MAX_OUTPUT_CONTRACT_REPAIR_ATTEMPTS)
+    );
+
+    let fetched = client
+        .get(format!("{base}/v1/sessions/contract-demo/output-contract"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    assert_eq!(fetched["schema"], output_contract_schema_canonical());
+
+    let cleared = client
+        .delete(format!("{base}/v1/sessions/contract-demo/output-contract"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionView>()
+        .await?;
+    assert!(cleared.output_contract.is_none());
+
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_output_contract_persists_across_restart() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-output-contract-restart");
+
+    let (address, shutdown) = scripted_daemon(&state_root, Vec::new()).await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+    create_test_session(&client, &base, "contract-restart-demo").await?;
+    let accepted = put_output_contract(
+        &client,
+        &base,
+        "contract-restart-demo",
+        output_contract_schema_json(),
+        Some(2),
+    )
+    .await?;
+    assert_eq!(accepted.status(), StatusCode::OK);
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+
+    let (address, shutdown) = scripted_daemon(&state_root, Vec::new()).await?;
+    let base = format!("http://{address}");
+    let fetched = client
+        .get(format!(
+            "{base}/v1/sessions/contract-restart-demo/output-contract"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    assert_eq!(fetched["schema"], output_contract_schema_canonical());
+    assert_eq!(fetched["max_repair_attempts"], json!(2));
+
+    let _ = shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn structured_output_contract_delivers_canonical_json_to_webhook() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-contract-webhook");
+    // The model answers with a fenced, whitespace-heavy payload: the wire
+    // must still carry the canonical re-serialized JSON.
+    let (address, shutdown) = scripted_daemon(
+        &state_root,
+        vec![Ok(scripted_events(
+            "assistant-json",
+            "```json\n{\"status\": \"ok\",   \"count\": 3}\n```",
+            kheish_types::ModelFinishReason::Completed,
+        ))],
+    )
+    .await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+    create_test_session(&client, &base, "contract-webhook-demo").await?;
+    let accepted = put_output_contract(
+        &client,
+        &base,
+        "contract-webhook-demo",
+        output_contract_schema_json(),
+        None,
+    )
+    .await?;
+    assert_eq!(accepted.status(), StatusCode::OK);
+
+    let (target, captured) = spawn_output_contract_webhook().await?;
+    let run = submit_test_input_with_http_target(
+        &client,
+        &base,
+        "contract-webhook-demo",
+        "Summarize the queue state.",
+        &target,
+    )
+    .await?;
+    wait_for_run_status(&client, &base, &run.run_id, &[DaemonRunStatus::Completed]).await?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let received = loop {
+        let received = captured.lock().clone();
+        if !received.is_empty() {
+            break received;
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the contract delivery to reach the webhook"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(received.len(), 1);
+    assert_eq!(
+        received[0]["content"],
+        json!("{\"count\":3,\"status\":\"ok\"}"),
+        "content is the canonical minified JSON, fences stripped"
+    );
+    assert_eq!(
+        received[0]["metadata"]["output_kind"],
+        json!("structured_output")
+    );
+    assert_eq!(
+        received[0]["metadata"]["structured_output"],
+        json!({"status": "ok", "count": 3}),
+        "the parsed payload travels as real JSON in metadata"
+    );
+
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn structured_output_contract_repairs_invalid_final_answer() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-contract-repair");
+    let (address, shutdown) = scripted_daemon(
+        &state_root,
+        vec![
+            Ok(scripted_events(
+                "assistant-prose",
+                "Everything looks fine, three items pending.",
+                kheish_types::ModelFinishReason::Completed,
+            )),
+            Ok(scripted_events(
+                "assistant-json",
+                "{\"status\": \"ok\", \"count\": 3}",
+                kheish_types::ModelFinishReason::Completed,
+            )),
+        ],
+    )
+    .await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+    create_test_session(&client, &base, "contract-repair-demo").await?;
+    put_output_contract(
+        &client,
+        &base,
+        "contract-repair-demo",
+        output_contract_schema_json(),
+        None,
+    )
+    .await?
+    .error_for_status()?;
+
+    let (target, captured) = spawn_output_contract_webhook().await?;
+    let run = submit_test_input_with_http_target(
+        &client,
+        &base,
+        "contract-repair-demo",
+        "Summarize the queue state.",
+        &target,
+    )
+    .await?;
+    wait_for_run_status(&client, &base, &run.run_id, &[DaemonRunStatus::Completed]).await?;
+
+    // The corrective turn is visible in the session journal, carrying the
+    // validator error back to the model.
+    let events = client
+        .get(format!("{base}/v1/sessions/contract-repair-demo/events"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    let journal = serde_json::to_string(&events)?;
+    assert!(journal.contains("Validation failed"));
+    assert!(journal.contains("not valid JSON"));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let received = loop {
+        let received = captured.lock().clone();
+        if !received.is_empty() {
+            break received;
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the repaired delivery"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        received.len(),
+        1,
+        "only the conformant payload is delivered"
+    );
+    assert_eq!(
+        received[0]["content"],
+        json!("{\"count\":3,\"status\":\"ok\"}")
+    );
+
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn structured_output_contract_fails_closed_after_exhausted_repairs() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-contract-fail-closed");
+    let (address, shutdown) = scripted_daemon(
+        &state_root,
+        vec![
+            Ok(scripted_events(
+                "assistant-bad-1",
+                "not json at all",
+                kheish_types::ModelFinishReason::Completed,
+            )),
+            Ok(scripted_events(
+                "assistant-bad-2",
+                "{\"status\": \"ok\"}",
+                kheish_types::ModelFinishReason::Completed,
+            )),
+        ],
+    )
+    .await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+    create_test_session(&client, &base, "contract-fail-demo").await?;
+    put_output_contract(
+        &client,
+        &base,
+        "contract-fail-demo",
+        output_contract_schema_json(),
+        Some(1),
+    )
+    .await?
+    .error_for_status()?;
+
+    let (target, captured) = spawn_output_contract_webhook().await?;
+    let run = submit_test_input_with_http_target(
+        &client,
+        &base,
+        "contract-fail-demo",
+        "Summarize the queue state.",
+        &target,
+    )
+    .await?;
+    let failed =
+        wait_for_run_status(&client, &base, &run.run_id, &[DaemonRunStatus::Failed]).await?;
+    let error = failed.error.unwrap_or_default();
+    assert!(
+        error.contains("structured output contract unsatisfied after 1 repair attempts"),
+        "unexpected run error: {error}"
+    );
+    assert!(error.contains("missing required field `count`"));
+
+    // Fail-closed: nothing left the daemon.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        captured.lock().is_empty(),
+        "no payload may reach the webhook"
+    );
+    let deliveries = client
+        .get(format!(
+            "{base}/v1/deliveries?session_id=contract-fail-demo"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<crate::DeliveryView>>()
+        .await?;
+    assert!(deliveries.is_empty(), "no delivery may be enqueued");
+
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn structured_output_contract_overrides_emit_output() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-contract-emit-output");
+    let (address, shutdown) = scripted_daemon(
+        &state_root,
+        vec![
+            Ok(vec![
+                ModelStreamEvent::MessageId {
+                    value: "assistant-emit".to_string(),
+                },
+                ModelStreamEvent::ToolCall {
+                    call: kheish_types::ToolCallRecord {
+                        id: "emit-prose".to_string(),
+                        name: "emit_output".to_string(),
+                        input: json!({
+                            "content": "Here is a friendly prose summary.",
+                        }),
+                        assistant_message_id: None,
+                        assistant_provider_response_id: None,
+                    },
+                },
+                ModelStreamEvent::Stop {
+                    reason: kheish_types::ModelFinishReason::ToolCalls,
+                },
+            ]),
+            Ok(scripted_events(
+                "assistant-json",
+                "{\"status\": \"ok\", \"count\": 1}",
+                kheish_types::ModelFinishReason::Completed,
+            )),
+        ],
+    )
+    .await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+    create_test_session(&client, &base, "contract-emit-demo").await?;
+    put_output_contract(
+        &client,
+        &base,
+        "contract-emit-demo",
+        output_contract_schema_json(),
+        None,
+    )
+    .await?
+    .error_for_status()?;
+
+    let (target, captured) = spawn_output_contract_webhook().await?;
+    let run = submit_test_input_with_http_target(
+        &client,
+        &base,
+        "contract-emit-demo",
+        "Summarize the queue state.",
+        &target,
+    )
+    .await?;
+    wait_for_run_status(&client, &base, &run.run_id, &[DaemonRunStatus::Completed]).await?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let received = loop {
+        let received = captured.lock().clone();
+        if !received.is_empty() {
+            break received;
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the contract delivery"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(received.len(), 1);
+    assert_eq!(
+        received[0]["content"],
+        json!("{\"count\":1,\"status\":\"ok\"}"),
+        "the validated payload wins over emit_output prose"
+    );
+    assert_eq!(
+        received[0]["metadata"]["output_kind"],
+        json!("structured_output")
+    );
+
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+    Ok(())
+}
