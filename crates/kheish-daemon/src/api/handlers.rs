@@ -343,6 +343,7 @@ where
 {
     let probe_state = state.clone();
     let stack_routes = Router::new()
+        .route("/v1/stacks", get(list_stacks::<M>))
         .route("/v1/stacks/validate", post(validate_stack::<M>))
         .route("/v1/stacks/plan", post(plan_stack::<M>))
         .route("/v1/stacks/apply", post(apply_stack::<M>))
@@ -2185,6 +2186,10 @@ const CONTROL_PLANE_OPENAPI_ROUTES: &[OpenApiRouteSpec] = &[
         methods: &["POST"],
     },
     OpenApiRouteSpec {
+        path: "/v1/stacks",
+        methods: &["GET"],
+    },
+    OpenApiRouteSpec {
         path: "/v1/stacks/validate",
         methods: &["POST"],
     },
@@ -3815,6 +3820,70 @@ where
     .await
     .map(Json)
     .map_err(internal_error)
+}
+
+/// Lists every ledger-owned stack with a compact per-resource-type summary,
+/// so consoles can enumerate stacks without knowing ownership ids up front.
+async fn list_stacks<M>(State(state): State<Arc<DaemonState<M>>>) -> Result<Json<Value>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    let path = crate::stack::stack_ledger_path(state.state_root());
+    let ledger = match tokio::fs::read(&path).await {
+        Ok(bytes) => serde_json::from_slice::<Value>(&bytes).map_err(|error| {
+            internal_error(anyhow!(
+                "failed to parse stack ledger {}: {error}",
+                path.display()
+            ))
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return json_value(serde_json::json!([]));
+        }
+        Err(error) => {
+            return Err(internal_error(
+                anyhow!(error).context(format!("failed to read {}", path.display())),
+            ));
+        }
+    };
+    let mut summaries = Vec::new();
+    if let Some(stacks) = ledger.get("stacks").and_then(Value::as_object) {
+        for (ownership_id, stack) in stacks {
+            let resources = stack
+                .get("resources")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let mut by_type = serde_json::Map::new();
+            let mut updated_at_ms: Option<u64> = None;
+            for (key, resource) in &resources {
+                let resource_type = key.split('/').next().unwrap_or("resource");
+                let count = by_type
+                    .get(resource_type)
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                by_type.insert(resource_type.to_string(), Value::from(count + 1));
+                if let Some(applied) = resource.get("last_applied_at_ms").and_then(Value::as_u64) {
+                    updated_at_ms = Some(updated_at_ms.unwrap_or(0).max(applied));
+                }
+            }
+            if let Some(last_operation_at_ms) = stack
+                .get("operations")
+                .and_then(Value::as_array)
+                .and_then(|operations| operations.last())
+                .and_then(|operation| operation.get("at_ms"))
+                .and_then(Value::as_u64)
+            {
+                updated_at_ms = Some(updated_at_ms.unwrap_or(0).max(last_operation_at_ms));
+            }
+            summaries.push(serde_json::json!({
+                "ownership_id": ownership_id,
+                "resource_count": resources.len(),
+                "updated_at_ms": updated_at_ms,
+                "resources": Value::Object(by_type),
+            }));
+        }
+    }
+    json_value(Value::Array(summaries))
 }
 
 async fn get_stack_ledger<M>(

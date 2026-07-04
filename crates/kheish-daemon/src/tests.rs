@@ -6429,6 +6429,31 @@ spec:
         "stack apply should create the schedule: {apply:#?}"
     );
 
+    // The applied stack is enumerable without knowing its ownership id.
+    let stacks = client
+        .get(format!("{base}/v1/stacks"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<serde_json::Value>>()
+        .await?;
+    let summary = stacks
+        .iter()
+        .find(|entry| entry["ownership_id"] == serde_json::json!(apply.ownership_id))
+        .context("applied stack missing from GET /v1/stacks")?;
+    assert!(
+        summary["resource_count"].as_u64().unwrap_or(0) >= 3,
+        "stack summary should count applied resources: {summary}"
+    );
+    assert!(
+        summary["resources"]["schedule"].as_u64().unwrap_or(0) >= 1,
+        "stack summary should tally schedules by type: {summary}"
+    );
+    assert!(
+        summary["updated_at_ms"].as_u64().unwrap_or(0) > 0,
+        "stack summary should expose the last apply time: {summary}"
+    );
+
     let schedules = client
         .get(format!("{base}/v1/schedules"))
         .send()
