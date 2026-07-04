@@ -3933,8 +3933,19 @@ fn route_policy_matches(
         (None, _) => true,
         (Some(_), None) => false,
         (Some(desired_generation), Some(live_generation)) => {
-            let desired_value = serde_json::to_value(desired_generation).unwrap_or_default();
+            let mut desired_value = serde_json::to_value(desired_generation).unwrap_or_default();
             let live_value = serde_json::to_value(live_generation).unwrap_or_default();
+            // Non-optional generation fields serialize their type defaults
+            // even when the manifest never mentioned them; a default value in
+            // the desired manifest means "unspecified", not a pin.
+            let default_value =
+                serde_json::to_value(kheish_runtime::ModelGenerationConfig::default())
+                    .unwrap_or_default();
+            if let (Value::Object(desired_map), Value::Object(default_map)) =
+                (&mut desired_value, &default_value)
+            {
+                desired_map.retain(|key, value| default_map.get(key) != Some(value));
+            }
             json_is_subset(&desired_value, &live_value)
         }
     }
@@ -6135,6 +6146,20 @@ mod tests {
         )
         .unwrap();
         assert!(!route_policy_matches(&live, &desired_model));
+
+        // Type-default generation fields the manifest never mentioned must
+        // not flag drift against a live session that tuned them.
+        let live_tuned: kheish_types::SessionRoutePolicy =
+            serde_json::from_value(serde_json::json!({
+                "provider": "openai",
+                "generation": { "model": "gpt-5.4", "allow_parallel_tool_calls": false },
+            }))
+            .unwrap();
+        let desired_pinned_model: kheish_types::SessionRoutePolicy = serde_json::from_value(
+            serde_json::json!({ "provider": "openai", "generation": { "model": "gpt-5.4" } }),
+        )
+        .unwrap();
+        assert!(route_policy_matches(&live_tuned, &desired_pinned_model));
 
         // Provider drift stays drift.
         let desired_other: kheish_types::SessionRoutePolicy =
