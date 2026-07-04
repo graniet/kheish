@@ -43,12 +43,15 @@ pub use memory::{
 };
 pub use model::{
     ApiUsage, CAPPED_DEFAULT_MAX_OUTPUT_TOKENS, COMPLETION_REQUIREMENTS_METADATA_KEY,
-    CompletionRequirement, ESCALATED_MAX_OUTPUT_TOKENS, ModelFinishReason, ModelGenerationConfig,
+    CompletionRequirement, DEFAULT_OUTPUT_CONTRACT_REPAIR_ATTEMPTS, ESCALATED_MAX_OUTPUT_TOKENS,
+    MAX_OUTPUT_CONTRACT_REPAIR_ATTEMPTS, ModelFinishReason, ModelGenerationConfig,
     ModelMaxOutputTokens, ModelProviderError, ModelUsage, ProviderErrorKind, ReasoningConfig,
-    ReasoningEffort, ReasoningSummary, ResponseFormat, StructuredFieldSchema, StructuredValueKind,
-    ToolChoice, capped_default_max_output_tokens, classify_provider_error_message,
+    ReasoningEffort, ReasoningSummary, ResponseFormat, STRUCTURED_OUTPUT_CONTRACT_METADATA_KEY,
+    StructuredFieldSchema, StructuredOutputContract, StructuredValueKind, ToolChoice,
+    capped_default_max_output_tokens, classify_provider_error_message,
     completion_requirements_from_metadata, extract_json_text,
-    metadata_with_completion_requirements, model_context_window, model_max_output_tokens,
+    metadata_with_completion_requirements, metadata_with_structured_output_contract,
+    model_context_window, model_max_output_tokens, structured_output_contract_from_metadata,
 };
 pub use prompt::{PromptProjection, ProviderInputItem, ProviderPrompt, SystemPromptSection};
 pub use routing::{

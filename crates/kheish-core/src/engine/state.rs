@@ -118,6 +118,9 @@ pub struct RunOutcome {
     pub status: RunStatus,
     pub pending_batch: Option<PendingToolBatch>,
     pub pending_question: Option<PendingUserQuestion>,
+    /// The contract-validated final payload, when the run carried a
+    /// structured output contract. Completed runs only.
+    pub structured_output: Option<serde_json::Value>,
     pub trace: RunTrace,
     pub snapshot: RunSnapshot,
 }

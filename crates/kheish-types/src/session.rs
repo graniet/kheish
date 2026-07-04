@@ -1107,6 +1107,10 @@ pub struct RunMetaSnapshot {
     pub completion_requirements: Vec<CompletionRequirement>,
     #[serde(default)]
     pub completion_follow_up_count: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_contract: Option<crate::StructuredOutputContract>,
+    #[serde(default)]
+    pub output_contract_repair_count: u8,
     #[serde(default)]
     pub permission_denied_retry_count: u8,
     #[serde(default)]

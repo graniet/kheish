@@ -6,6 +6,8 @@ use serde_json::Value;
 
 /// Stable metadata key used to carry run completion requirements.
 pub const COMPLETION_REQUIREMENTS_METADATA_KEY: &str = "completion_requirements";
+/// Stable metadata key carrying the structured output contract of a run.
+pub const STRUCTURED_OUTPUT_CONTRACT_METADATA_KEY: &str = "structured_output_contract";
 /// Claude Code-style capped default output token ceiling.
 pub const CAPPED_DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8_000;
 /// Claude Code-style escalated output token ceiling used for recovery.
@@ -590,6 +592,69 @@ fn convert_json_schema_node(
             StructuredFieldSchema::new(StructuredValueKind::Any)
         }
     }
+}
+
+/// A structured output contract: when set on a session, the final answer of
+/// every run must be a single JSON value matching the schema. The engine
+/// validates at the completion boundary and repairs with bounded corrective
+/// turns; the validated payload becomes the delivered output.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StructuredOutputContract {
+    /// The schema the final answer must match.
+    pub schema: StructuredFieldSchema,
+    /// The maximum number of corrective turns after a failed validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_repair_attempts: Option<u8>,
+}
+
+/// The default number of corrective turns granted to a contract.
+pub const DEFAULT_OUTPUT_CONTRACT_REPAIR_ATTEMPTS: u8 = 3;
+/// The hard ceiling on corrective turns, whatever the contract asks for.
+pub const MAX_OUTPUT_CONTRACT_REPAIR_ATTEMPTS: u8 = 5;
+
+impl StructuredOutputContract {
+    /// Returns the effective repair budget: the configured value clamped to
+    /// the hard ceiling, or the default when unset.
+    pub fn effective_max_repair_attempts(&self) -> u8 {
+        self.max_repair_attempts
+            .unwrap_or(DEFAULT_OUTPUT_CONTRACT_REPAIR_ATTEMPTS)
+            .min(MAX_OUTPUT_CONTRACT_REPAIR_ATTEMPTS)
+    }
+}
+
+/// Reads the structured output contract from run metadata, if any.
+pub fn structured_output_contract_from_metadata(
+    metadata: &Value,
+) -> serde_json::Result<Option<StructuredOutputContract>> {
+    metadata
+        .get(STRUCTURED_OUTPUT_CONTRACT_METADATA_KEY)
+        .filter(|value| !value.is_null())
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+}
+
+/// Returns metadata with the structured output contract merged in under the
+/// stable key.
+pub fn metadata_with_structured_output_contract(
+    metadata: Value,
+    contract: &StructuredOutputContract,
+) -> serde_json::Result<Value> {
+    let mut object = match metadata {
+        Value::Object(map) => map,
+        Value::Null => serde_json::Map::new(),
+        other => {
+            let mut map = serde_json::Map::new();
+            map.insert("user_metadata".to_string(), other);
+            map
+        }
+    };
+    object.insert(
+        STRUCTURED_OUTPUT_CONTRACT_METADATA_KEY.to_string(),
+        serde_json::to_value(contract)?,
+    );
+    Ok(Value::Object(object))
 }
 
 /// Describes the requested response format for one model turn.

@@ -689,6 +689,9 @@ impl AgentEngine {
         let mut snapshot_turns = Vec::new();
         let mut snapshot_checkpoints = Vec::new();
         let mut pending_generation = generation.clone();
+        // The latest assistant answer text, tracked only under an output
+        // contract: the completion boundary validates it against the schema.
+        let mut last_assistant_text: Option<String> = None;
         self.autocompact_tracking = AutocompactTracking {
             consecutive_failures: run_meta.autocompact.consecutive_failures,
             last_compacted_turn: run_meta.autocompact.last_compacted_turn,
@@ -852,6 +855,9 @@ impl AgentEngine {
             let mut assistant_message = model_turn.assistant_message;
             if assistant_message.api_usage.is_none() {
                 assistant_message.api_usage = assistant_usage.clone();
+            }
+            if run_meta.output_contract.is_some() {
+                last_assistant_text = Some(assistant_message.content.clone());
             }
             self.append_message(assistant_message);
 
@@ -1056,6 +1062,33 @@ impl AgentEngine {
                     );
                     continue;
                 }
+                let mut structured_output = None;
+                if let Some(contract) = run_meta.output_contract.clone() {
+                    let answer = last_assistant_text.clone().unwrap_or_default();
+                    match Self::contract_conformant_output(&contract, &answer) {
+                        Ok(value) => structured_output = Some(value),
+                        Err(error) => {
+                            if run_meta.output_contract_repair_count
+                                >= contract.effective_max_repair_attempts()
+                            {
+                                bail!(
+                                    "structured output contract unsatisfied after {} repair attempts: {error}",
+                                    run_meta.output_contract_repair_count
+                                );
+                            }
+                            self.append_output_contract_repair_message(
+                                turn,
+                                &error,
+                                &contract.schema,
+                            );
+                            run_meta.output_contract_repair_count =
+                                run_meta.output_contract_repair_count.saturating_add(1);
+                            pending_generation =
+                                Self::output_contract_repair_generation(&generation);
+                            continue;
+                        }
+                    }
+                }
                 Self::sync_run_meta_autocompact(&mut run_meta, &self.autocompact_tracking);
                 return self.build_completed_outcome(
                     turn,
@@ -1064,6 +1097,7 @@ impl AgentEngine {
                     trace,
                     snapshot_turns,
                     snapshot_checkpoints,
+                    structured_output,
                 );
             }
         }
@@ -1358,6 +1392,7 @@ impl AgentEngine {
         trace: RunTrace,
         snapshot_turns: Vec<TurnSnapshot>,
         snapshot_checkpoints: Vec<CheckpointSnapshot>,
+        structured_output: Option<serde_json::Value>,
     ) -> Result<RunOutcome> {
         let final_state = self.build_final_state_snapshot()?;
         Ok(RunOutcome {
@@ -1367,6 +1402,7 @@ impl AgentEngine {
             status: RunStatus::Completed,
             pending_batch: None,
             pending_question: None,
+            structured_output,
             trace: trace.clone(),
             snapshot: RunSnapshot {
                 run_meta,
@@ -1396,6 +1432,7 @@ impl AgentEngine {
             status: RunStatus::WaitingForApproval { requests },
             pending_batch,
             pending_question: None,
+            structured_output: None,
             trace: trace.clone(),
             snapshot: RunSnapshot {
                 run_meta,
@@ -1425,6 +1462,7 @@ impl AgentEngine {
             status: RunStatus::WaitingForUserQuestion { requests },
             pending_batch: None,
             pending_question: Some(pending_question),
+            structured_output: None,
             trace: trace.clone(),
             snapshot: RunSnapshot {
                 run_meta,
@@ -1465,6 +1503,8 @@ impl AgentEngine {
     ) -> Result<RunMetaSnapshot> {
         let completion_requirements =
             kheish_types::completion_requirements_from_metadata(&input.metadata)?;
+        let output_contract =
+            kheish_types::structured_output_contract_from_metadata(&input.metadata)?;
         let learned_context = kheish_types::learned_context_from_metadata(&input.metadata)?;
         let recovered_memory = kheish_types::recovered_memory_from_metadata(&input.metadata)?;
         let visible_skills = kheish_types::session_visible_skills_from_metadata(&input.metadata)?;
@@ -1476,6 +1516,8 @@ impl AgentEngine {
             input_event_offset,
             completion_requirements,
             completion_follow_up_count: 0,
+            output_contract,
+            output_contract_repair_count: 0,
             max_output_tokens_recovery_count: 0,
             permission_denied_retry_count: 0,
             recovered_memory,
@@ -1683,6 +1725,48 @@ impl AgentEngine {
             return generation;
         }
         base.clone()
+    }
+
+    /// Parses and validates the run's final answer against its contract.
+    fn contract_conformant_output(
+        contract: &kheish_types::StructuredOutputContract,
+        answer: &str,
+    ) -> std::result::Result<serde_json::Value, String> {
+        let candidate = kheish_types::extract_json_text(answer);
+        let value: serde_json::Value = serde_json::from_str(candidate)
+            .map_err(|error| format!("final answer is not valid JSON: {error}"))?;
+        contract.schema.validate_value(&value)?;
+        Ok(value)
+    }
+
+    fn append_output_contract_repair_message(
+        &mut self,
+        turn: usize,
+        error: &str,
+        schema: &kheish_types::StructuredFieldSchema,
+    ) {
+        let rendered_schema = serde_json::to_string_pretty(&schema.to_json_schema())
+            .unwrap_or_else(|_| "{}".to_string());
+        let content = format!(
+            "Your final answer must be a single JSON value matching the output contract.\n\
+             Validation failed: {error}.\n\
+             Reply with ONLY the corrected JSON \u{2014} no prose, no Markdown fences.\n\
+             Schema:\n{rendered_schema}"
+        );
+        self.append_message(MessageRecord::new(
+            format!("user-output-contract-repair-{turn}"),
+            Role::User,
+            content,
+        ));
+    }
+
+    /// Repair turns must answer in text: tools are withheld entirely so the
+    /// model cannot wander off instead of correcting its payload.
+    fn output_contract_repair_generation(base: &ModelGenerationConfig) -> ModelGenerationConfig {
+        let mut generation = base.clone();
+        generation.tool_choice = ToolChoice::None;
+        generation.allow_parallel_tool_calls = false;
+        generation
     }
 
     fn completion_follow_up_generation(
@@ -4570,6 +4654,227 @@ mod tests {
                     && message.content.contains("The task is not complete yet.")
         )));
 
+        Ok(())
+    }
+
+    fn status_contract(max_repair_attempts: Option<u8>) -> kheish_types::StructuredOutputContract {
+        kheish_types::StructuredOutputContract {
+            schema: kheish_types::StructuredFieldSchema::from_json_schema(&json!({
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string"},
+                    "count": {"type": "number"},
+                },
+                "required": ["status", "count"],
+                "additionalProperties": false,
+            }))
+            .expect("test schema uses the supported subset"),
+            max_repair_attempts,
+        }
+    }
+
+    fn contract_input(session_id: &str) -> Result<InputEnvelope> {
+        let mut input = InputEnvelope::text(
+            "daemon",
+            "api",
+            session_id,
+            "user-1",
+            "Summarize the queue state.",
+        );
+        input.metadata = kheish_types::metadata_with_structured_output_contract(
+            serde_json::Value::Null,
+            &status_contract(None),
+        )?;
+        Ok(input)
+    }
+
+    fn text_turn(id: &str, content: &str) -> ModelTurn {
+        ModelTurn {
+            assistant_message: MessageRecord::new(id, Role::Assistant, content),
+            tool_calls: Vec::new(),
+            finish_reason: ModelFinishReason::Completed,
+            usage: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn output_contract_repairs_a_nonconforming_final_answer() -> Result<()> {
+        let conversation = ConversationKey {
+            session_id: "session-oc-1".to_string(),
+            thread_id: None,
+        };
+        let mut engine = AgentEngine::new(
+            conversation,
+            LoopPolicy {
+                max_turns: 4,
+                keep_last_messages: 3,
+                ..LoopPolicy::default()
+            },
+        );
+        let model = ScriptedModel::new(vec![
+            text_turn("assistant-prose", "Everything looks fine, 3 items pending."),
+            text_turn("assistant-json", "{\"status\": \"ok\", \"count\": 3}"),
+        ]);
+
+        let outcome = engine
+            .run_input(contract_input("session-oc-1")?, &model, &EchoToolExecutor)
+            .await?;
+
+        assert_eq!(outcome.status, RunStatus::Completed);
+        assert_eq!(
+            outcome.structured_output,
+            Some(json!({"status": "ok", "count": 3}))
+        );
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        // The repair turn withholds tools entirely so the model must answer.
+        assert_eq!(requests[1].generation.tool_choice, ToolChoice::None);
+        assert!(engine.journal().iter().any(|entry| matches!(
+            &entry.event,
+            SessionEvent::MessageAppended { message }
+                if message.role == Role::User
+                    && message.content.contains("Validation failed")
+        )));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn output_contract_fails_closed_after_exhausted_repairs() -> Result<()> {
+        let conversation = ConversationKey {
+            session_id: "session-oc-2".to_string(),
+            thread_id: None,
+        };
+        let mut engine = AgentEngine::new(
+            conversation,
+            LoopPolicy {
+                max_turns: 6,
+                keep_last_messages: 3,
+                ..LoopPolicy::default()
+            },
+        );
+        let model = ScriptedModel::new(vec![
+            text_turn("assistant-bad-1", "not json"),
+            text_turn("assistant-bad-2", "{\"status\": \"ok\"}"),
+        ]);
+        let mut input = InputEnvelope::text(
+            "daemon",
+            "api",
+            "session-oc-2",
+            "user-1",
+            "Summarize the queue state.",
+        );
+        input.metadata = kheish_types::metadata_with_structured_output_contract(
+            serde_json::Value::Null,
+            &status_contract(Some(1)),
+        )?;
+
+        let error = engine
+            .run_input(input, &model, &EchoToolExecutor)
+            .await
+            .expect_err("exhausted repairs must fail the run");
+        let message = error.to_string();
+        assert!(
+            message.contains("structured output contract unsatisfied after 1 repair attempts"),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains("missing required field `count`"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn output_contract_allows_tool_call_turns_before_the_final_answer() -> Result<()> {
+        let conversation = ConversationKey {
+            session_id: "session-oc-3".to_string(),
+            thread_id: None,
+        };
+        let mut engine = AgentEngine::new(
+            conversation,
+            LoopPolicy {
+                max_turns: 4,
+                keep_last_messages: 3,
+                ..LoopPolicy::default()
+            },
+        );
+        let model = ScriptedModel::new(vec![
+            ModelTurn {
+                assistant_message: MessageRecord::new("assistant-tool", Role::Assistant, ""),
+                tool_calls: vec![ToolCallRecord {
+                    id: "call-echo".to_string(),
+                    name: "echo".to_string(),
+                    input: json!({"text": "ping"}),
+                    assistant_message_id: None,
+                    assistant_provider_response_id: None,
+                }],
+                finish_reason: ModelFinishReason::ToolCalls,
+                usage: None,
+            },
+            text_turn(
+                "assistant-json",
+                "```json\n{\"status\": \"ok\", \"count\": 1}\n```",
+            ),
+        ]);
+
+        let outcome = engine
+            .run_input(contract_input("session-oc-3")?, &model, &EchoToolExecutor)
+            .await?;
+
+        assert_eq!(outcome.status, RunStatus::Completed);
+        // Fenced JSON is extracted leniently, then validated strictly.
+        assert_eq!(
+            outcome.structured_output,
+            Some(json!({"status": "ok", "count": 1}))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_meta_snapshot_defaults_contract_fields_on_old_payloads() -> Result<()> {
+        let contract = status_contract(Some(2));
+        let mut meta = RunMetaSnapshot {
+            session_id: "s".to_string(),
+            thread_id: None,
+            input_source_plugin: "daemon".to_string(),
+            input_source_kind: "api".to_string(),
+            input_event_offset: 0,
+            completion_requirements: Vec::new(),
+            completion_follow_up_count: 0,
+            output_contract: Some(contract.clone()),
+            output_contract_repair_count: 2,
+            permission_denied_retry_count: 0,
+            max_output_tokens_recovery_count: 0,
+            recovered_memory: None,
+            learned_context: None,
+            visible_skills: None,
+            autocompact: kheish_types::AutocompactTracking::default(),
+            policy: RunPolicySnapshot {
+                max_turns: 1,
+                keep_last_messages: 1,
+                snip_token_budget: 0,
+                snip_keep_minimum_messages: 0,
+                microcompact_keep_recent: 0,
+                microcompact_idle_timeout_ms: None,
+                session_memory_min_tokens: 0,
+                session_memory_max_tokens: 0,
+                autocompact_threshold_tokens: 0,
+                autocompact_buffer_tokens: 0,
+            },
+            engine_version: "test".to_string(),
+        };
+        let round_tripped: RunMetaSnapshot = serde_json::from_str(&serde_json::to_string(&meta)?)?;
+        assert_eq!(round_tripped.output_contract, Some(contract));
+        assert_eq!(round_tripped.output_contract_repair_count, 2);
+
+        // A payload persisted before the feature deserializes with defaults.
+        meta.output_contract = None;
+        meta.output_contract_repair_count = 0;
+        let mut legacy = serde_json::to_value(&meta)?;
+        legacy
+            .as_object_mut()
+            .expect("meta serializes as an object")
+            .remove("output_contract_repair_count");
+        let restored: RunMetaSnapshot = serde_json::from_value(legacy)?;
+        assert_eq!(restored.output_contract, None);
+        assert_eq!(restored.output_contract_repair_count, 0);
         Ok(())
     }
 
