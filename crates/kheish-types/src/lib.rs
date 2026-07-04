@@ -47,8 +47,8 @@ pub use model::{
     ModelMaxOutputTokens, ModelProviderError, ModelUsage, ProviderErrorKind, ReasoningConfig,
     ReasoningEffort, ReasoningSummary, ResponseFormat, StructuredFieldSchema, StructuredValueKind,
     ToolChoice, capped_default_max_output_tokens, classify_provider_error_message,
-    completion_requirements_from_metadata, metadata_with_completion_requirements,
-    model_context_window, model_max_output_tokens,
+    completion_requirements_from_metadata, extract_json_text,
+    metadata_with_completion_requirements, model_context_window, model_max_output_tokens,
 };
 pub use prompt::{PromptProjection, ProviderInputItem, ProviderPrompt, SystemPromptSection};
 pub use routing::{
@@ -66,10 +66,10 @@ pub use session::{
     SESSION_CONTROL_STATE_METADATA_KEY, SESSION_CREDENTIAL_SCOPE_METADATA_KEY,
     SESSION_EXECUTION_IDENTITY_METADATA_KEY, SESSION_GOAL_METADATA_KEY,
     SESSION_OPERATOR_CONFIG_METADATA_KEY, SESSION_PERSONA_BINDING_METADATA_KEY,
-    SESSION_TOOL_OVERRIDES_METADATA_KEY, SessionToolOverrides, session_tool_overrides_from_metadata,
-    SESSION_REPLY_TARGETS_METADATA_KEY, SESSION_ROUTE_POLICY_METADATA_KEY, SessionCheckpoint,
-    SessionControlState, SessionEvent, SessionExecutionIdentity, SessionGoal, SessionGoalStatus,
-    SessionGoalUsageAccount, SessionOperatorConfig, SessionPersonaBinding, SessionRoutePolicy,
+    SESSION_REPLY_TARGETS_METADATA_KEY, SESSION_ROUTE_POLICY_METADATA_KEY,
+    SESSION_TOOL_OVERRIDES_METADATA_KEY, SessionCheckpoint, SessionControlState, SessionEvent,
+    SessionExecutionIdentity, SessionGoal, SessionGoalStatus, SessionGoalUsageAccount,
+    SessionOperatorConfig, SessionPersonaBinding, SessionRoutePolicy, SessionToolOverrides,
     SystemPromptSectionSnapshot, TaskArchiveReason, TaskRecord, TaskStatus, TodoItem,
     ToolCallSnapshot, ToolExecutionTrace, ToolResultSnapshot, TurnSnapshot, TurnTrace,
     UNBOUNDED_AGENT_MAX_TURNS, hook_runtime_state_from_metadata, metadata_with_hook_runtime_state,
@@ -82,6 +82,7 @@ pub use session::{
     session_execution_identity_from_metadata, session_goal_from_metadata,
     session_operator_config_from_metadata, session_persona_binding_from_metadata,
     session_reply_targets_from_metadata, session_route_policy_from_metadata,
+    session_tool_overrides_from_metadata,
 };
 pub use skills::{
     ActiveSkillSnapshot, SESSION_SKILLS_STATE_METADATA_KEY, SESSION_VISIBLE_SKILLS_METADATA_KEY,

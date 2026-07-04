@@ -41,7 +41,6 @@ use super::errors::{safe_error_payload_for_level, sanitize_upstream_error_messag
 use super::prompt::{
     NormalizedConversationItem, NormalizedProviderPrompt, normalize_provider_prompt,
 };
-use super::schema::structured_schema_json;
 use super::sse::{JsonSseEvent, parse_json_sse_frame, pop_sse_frame};
 
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1/responses";
@@ -896,7 +895,7 @@ fn openai_tool_parameters_schema(schema: &Value) -> (Value, bool) {
 fn openai_structured_response_schema(
     schema: &StructuredFieldSchema,
 ) -> Result<Value, ProviderError> {
-    let schema = structured_schema_json(schema);
+    let schema = schema.to_json_schema();
     openai_strict_tool_schema(&schema).ok_or_else(|| ProviderError {
         message: "OpenAI structured response schema is not strict-compatible".to_string(),
         retryable: false,

@@ -7,7 +7,6 @@ mod google;
 mod openai;
 mod openrouter;
 mod prompt;
-mod schema;
 mod sse;
 #[cfg(test)]
 mod test_fixtures;

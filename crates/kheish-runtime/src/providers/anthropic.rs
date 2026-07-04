@@ -37,7 +37,6 @@ use super::attachments::{
 };
 use super::errors::{safe_error_payload_for_level, sanitize_upstream_error_message};
 use super::prompt::{NormalizedConversationItem, normalize_provider_prompt};
-use super::schema::structured_schema_json;
 use super::sse::{JsonSseEvent, parse_json_sse_frame, pop_sse_frame};
 
 const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -973,7 +972,7 @@ fn anthropic_prompt_from_items(
     if let ResponseFormat::StructuredJson { schema } = &generation.response_format {
         system.push(format!(
             "Return only valid JSON that matches this schema. Do not wrap it in Markdown.\n{}",
-            serde_json::to_string_pretty(&structured_schema_json(schema))
+            serde_json::to_string_pretty(&schema.to_json_schema())
                 .expect("structured schema serializes")
         ));
     }

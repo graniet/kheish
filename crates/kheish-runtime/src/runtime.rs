@@ -21,17 +21,17 @@ use kheish_types::{
     InputEnvelope, InputPayload, LearnedContextBundle, ModelGenerationConfig, PendingToolBatch,
     PendingUserQuestion, PostCompactRestoration, RecoveredMemoryBundle, ReplyHandle,
     RetainedUserInput, RichOutput, Role, RunMetaSnapshot, RunStatus, SessionControlState,
-    SessionExecutionIdentity, SessionGoal, SessionOperatorConfig, SessionToolOverrides, SessionPersonaBinding,
-    SessionSkillsState, SkillExecutionContext, SourceRef, SystemPromptSection, ToolDefinition,
-    ToolSurfaceFilter, UserQuestionResolution, WorkspaceSnapshot, hook_runtime_state_from_metadata,
-    learned_context_from_metadata, model_context_window, model_max_output_tokens,
-    normalize_reply_targets, recovered_memory_from_metadata,
-    session_capability_scope_from_metadata, session_control_state_from_metadata,
-    session_credential_scope_from_metadata, session_execution_identity_from_metadata,
-    session_goal_from_metadata, session_operator_config_from_metadata,
-    session_tool_overrides_from_metadata,
-    session_persona_binding_from_metadata, session_reply_targets_from_metadata,
-    session_skills_state_from_metadata, session_visible_skills_from_metadata,
+    SessionExecutionIdentity, SessionGoal, SessionOperatorConfig, SessionPersonaBinding,
+    SessionSkillsState, SessionToolOverrides, SkillExecutionContext, SourceRef,
+    SystemPromptSection, ToolDefinition, ToolSurfaceFilter, UserQuestionResolution,
+    WorkspaceSnapshot, hook_runtime_state_from_metadata, learned_context_from_metadata,
+    model_context_window, model_max_output_tokens, normalize_reply_targets,
+    recovered_memory_from_metadata, session_capability_scope_from_metadata,
+    session_control_state_from_metadata, session_credential_scope_from_metadata,
+    session_execution_identity_from_metadata, session_goal_from_metadata,
+    session_operator_config_from_metadata, session_persona_binding_from_metadata,
+    session_reply_targets_from_metadata, session_skills_state_from_metadata,
+    session_tool_overrides_from_metadata, session_visible_skills_from_metadata,
 };
 
 use crate::execution::{current_cancellation_token, current_execution_scope};
@@ -2991,8 +2991,8 @@ mod tests {
         HookEventName, HookInvocation, InputContentPart, InputEnvelope, LearnedContextBundle,
         LearnedContextEntry, MessageRecord, ModelGenerationConfig, RecoveredMemoryBundle,
         ReplyHandle, Role, SESSION_PERSONA_BINDING_METADATA_KEY, SessionControlState, SessionEvent,
-        SessionOperatorConfig, SessionPersonaBinding, ToolDefinition, ToolResultRecord,
-        ToolSurfaceFilter, asset_storage_uri, hook_runtime_state_from_metadata, SessionToolOverrides,
+        SessionOperatorConfig, SessionPersonaBinding, SessionToolOverrides, ToolDefinition,
+        ToolResultRecord, ToolSurfaceFilter, asset_storage_uri, hook_runtime_state_from_metadata,
     };
 
     struct ScriptedProvider(Mutex<VecDeque<Result<Vec<ModelStreamEvent>, ProviderError>>>);
@@ -3301,7 +3301,10 @@ mod tests {
         assert!(adjusted.allows("read_file"));
 
         // Enabling operator tools never bypasses the operator policy.
-        runtime.session_tool_overrides.enable.push("ask_operator".to_string());
+        runtime
+            .session_tool_overrides
+            .enable
+            .push("ask_operator".to_string());
         let still_gated = runtime.effective_tool_surface();
         assert!(!still_gated.allows("ask_operator"));
     }

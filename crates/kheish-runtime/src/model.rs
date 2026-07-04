@@ -385,23 +385,30 @@ where
                             turn: attempt_request.turn,
                             attempt,
                         }));
-                    if let kheish_types::ResponseFormat::StructuredJson { schema } =
-                        &attempt_request.generation.response_format
-                    {
-                        let value = if let Some(value) = structured_output.as_ref() {
-                            value
-                        } else {
-                            structured_output =
-                                Some(serde_json::from_str::<Value>(&text).map_err(|error| {
-                                    anyhow!("structured output parse error: {error}")
-                                })?);
-                            structured_output
-                                .as_ref()
-                                .expect("structured output must be available after parse")
-                        };
-                        validate_structured_output(&value, schema)?;
-                        if text.is_empty() {
-                            text = serde_json::to_string(&value)?;
+                    // Structured validation only applies to final text turns:
+                    // a tool-call turn legitimately carries no answer text and
+                    // must not be parsed as JSON.
+                    if tool_calls.is_empty() {
+                        if let kheish_types::ResponseFormat::StructuredJson { schema } =
+                            &attempt_request.generation.response_format
+                        {
+                            let value = if let Some(value) = structured_output.as_ref() {
+                                value
+                            } else {
+                                structured_output =
+                                    Some(serde_json::from_str::<Value>(&text).map_err(
+                                        |error| anyhow!("structured output parse error: {error}"),
+                                    )?);
+                                structured_output
+                                    .as_ref()
+                                    .expect("structured output must be available after parse")
+                            };
+                            schema.validate_value(value).map_err(|error| {
+                                anyhow!("structured output validation error: {error}")
+                            })?;
+                            if text.is_empty() {
+                                text = serde_json::to_string(&value)?;
+                            }
                         }
                     }
                     let resolved_finish_reason = finish_reason.unwrap_or_else(|| {
@@ -668,51 +675,6 @@ impl<P> ModelRuntime<P> {
                 }),
             },
         ));
-    }
-}
-
-fn validate_structured_output(value: &Value, schema: &StructuredFieldSchema) -> Result<()> {
-    match schema.kind {
-        StructuredValueKind::Any => Ok(()),
-        StructuredValueKind::String if value.is_string() => Ok(()),
-        StructuredValueKind::Number if value.is_number() => Ok(()),
-        StructuredValueKind::Boolean if value.is_boolean() => Ok(()),
-        StructuredValueKind::Object => {
-            let object = value
-                .as_object()
-                .ok_or_else(|| anyhow!("structured output must be an object"))?;
-            for name in object.keys() {
-                if !schema.fields.contains_key(name) && !schema.optional_fields.contains_key(name) {
-                    bail!("unknown structured field {name}");
-                }
-            }
-            for (name, field_schema) in &schema.fields {
-                let field_value = object
-                    .get(name)
-                    .ok_or_else(|| anyhow!("missing required structured field {name}"))?;
-                validate_structured_output(field_value, field_schema)?;
-            }
-            for (name, field_schema) in &schema.optional_fields {
-                if let Some(field_value) = object.get(name) {
-                    if !field_value.is_null() {
-                        validate_structured_output(field_value, field_schema)?;
-                    }
-                }
-            }
-            Ok(())
-        }
-        StructuredValueKind::Array => {
-            let items = value
-                .as_array()
-                .ok_or_else(|| anyhow!("structured output must be an array"))?;
-            if let Some(item_schema) = &schema.items {
-                for item in items {
-                    validate_structured_output(item, item_schema)?;
-                }
-            }
-            Ok(())
-        }
-        _ => bail!("structured output type mismatch"),
     }
 }
 
@@ -1116,6 +1078,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_runtime_skips_structured_validation_on_tool_call_turns() -> Result<()> {
+        let observer = InMemoryObserver::shared();
+        let runtime = ModelRuntime::new(
+            ScriptedProvider::new(vec![Ok(vec![
+                ModelStreamEvent::ToolCall {
+                    call: ToolCallRecord {
+                        id: "call-1".to_string(),
+                        name: "echo".to_string(),
+                        input: json!({"text": "ping"}),
+                        assistant_message_id: None,
+                        assistant_provider_response_id: None,
+                    },
+                },
+                ModelStreamEvent::Stop {
+                    reason: ModelFinishReason::ToolCalls,
+                },
+            ])]),
+            ModelRetryPolicy::default(),
+            ModelBudget::default(),
+            observer,
+        );
+
+        // A tool-call turn has no answer text; with a structured response
+        // format it must not be parsed as JSON (this used to hard-fail).
+        let turn = runtime
+            .next_turn(default_request(
+                "session-tools",
+                ResponseFormat::StructuredJson {
+                    schema: StructuredFieldSchema::new(StructuredValueKind::Object),
+                },
+            ))
+            .await?;
+
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.finish_reason, ModelFinishReason::ToolCalls);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn model_runtime_validates_structured_output() -> Result<()> {
         let observer = InMemoryObserver::shared();
         let runtime = ModelRuntime::new(
@@ -1220,7 +1221,7 @@ mod tests {
             .await
             .expect_err("unknown structured field must be rejected");
 
-        assert!(error.to_string().contains("unknown structured field extra"));
+        assert!(error.to_string().contains("$: unknown field `extra`"));
         Ok(())
     }
 

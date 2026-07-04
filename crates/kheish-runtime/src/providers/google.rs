@@ -34,7 +34,6 @@ use super::attachments::{
 };
 use super::errors::sanitize_upstream_error_message;
 use super::prompt::{NormalizedConversationItem, normalize_provider_prompt};
-use super::schema::structured_schema_json;
 
 const DEFAULT_GOOGLE_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const DEFAULT_GOOGLE_MODEL: &str = "gemini-2.5-flash";
@@ -460,10 +459,7 @@ impl GoogleProvider {
                 "responseMimeType".to_string(),
                 Value::String("application/json".to_string()),
             );
-            generation_config.insert(
-                "responseJsonSchema".to_string(),
-                structured_schema_json(schema),
-            );
+            generation_config.insert("responseJsonSchema".to_string(), schema.to_json_schema());
         }
         if !generation_config.is_empty() {
             body.insert(

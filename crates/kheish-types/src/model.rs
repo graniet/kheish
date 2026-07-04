@@ -287,7 +287,7 @@ impl Default for ToolChoice {
 }
 
 /// Describes the supported structured output value kinds.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StructuredValueKind {
     /// Any JSON value.
@@ -310,8 +310,10 @@ pub struct StructuredFieldSchema {
     /// The JSON value kind accepted by this schema node.
     pub kind: StructuredValueKind,
     /// Required object fields keyed by property name.
+    #[serde(default)]
     pub fields: BTreeMap<String, StructuredFieldSchema>,
     /// Optional object fields keyed by property name.
+    #[serde(default)]
     pub optional_fields: BTreeMap<String, StructuredFieldSchema>,
     /// Array item schema when `kind` is `StructuredValueKind::Array`.
     pub items: Option<Box<StructuredFieldSchema>>,
@@ -325,6 +327,267 @@ impl StructuredFieldSchema {
             fields: BTreeMap::new(),
             optional_fields: BTreeMap::new(),
             items: None,
+        }
+    }
+
+    /// Validates a JSON value against this schema, reporting the JSON path
+    /// of the first mismatch (for example `$.items[2].price: expected a
+    /// number`). The path quality matters: it is fed back verbatim to the
+    /// model as repair guidance.
+    pub fn validate_value(&self, value: &Value) -> Result<(), String> {
+        validate_value_at(self, value, "$")
+    }
+
+    /// Renders this schema as a plain JSON Schema fragment. Objects are
+    /// closed (`additionalProperties: false`) and required fields listed,
+    /// matching what the validator actually enforces.
+    pub fn to_json_schema(&self) -> Value {
+        match self.kind {
+            StructuredValueKind::Any => serde_json::json!({}),
+            StructuredValueKind::String => serde_json::json!({"type": "string"}),
+            StructuredValueKind::Number => serde_json::json!({"type": "number"}),
+            StructuredValueKind::Boolean => serde_json::json!({"type": "boolean"}),
+            StructuredValueKind::Object => {
+                let mut properties = serde_json::Map::new();
+                let mut required = Vec::new();
+                for (name, field_schema) in &self.fields {
+                    properties.insert(name.clone(), field_schema.to_json_schema());
+                    required.push(Value::String(name.clone()));
+                }
+                for (name, field_schema) in &self.optional_fields {
+                    properties.insert(name.clone(), field_schema.to_json_schema());
+                }
+                serde_json::json!({
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                    "additionalProperties": false,
+                })
+            }
+            StructuredValueKind::Array => serde_json::json!({
+                "type": "array",
+                "items": self
+                    .items
+                    .as_ref()
+                    .map(|items| items.to_json_schema())
+                    .unwrap_or_else(|| serde_json::json!({})),
+            }),
+        }
+    }
+
+    /// Parses a strict JSON Schema subset into the internal schema.
+    ///
+    /// Every unsupported keyword is collected and reported with its path —
+    /// never silently dropped: a contract must not accept constraints it
+    /// cannot enforce. (The lenient converter in `kheish-mcp` exists for
+    /// tool schemas, where falling back to unstructured handling is safe;
+    /// for contracts, only the strict form is acceptable.)
+    pub fn from_json_schema(schema: &Value) -> Result<Self, String> {
+        let mut issues = Vec::new();
+        let converted = convert_json_schema_node(schema, "$", &mut issues);
+        if issues.is_empty() {
+            Ok(converted)
+        } else {
+            Err(issues.join("; "))
+        }
+    }
+}
+
+/// Extracts the JSON candidate from a model answer: trims whitespace and
+/// strips one surrounding Markdown fence pair. Extraction is lenient so a
+/// well-formed payload inside a fence is not rejected for cosmetics —
+/// validation stays strict.
+pub fn extract_json_text(text: &str) -> &str {
+    let trimmed = text.trim();
+    let Some(rest) = trimmed.strip_prefix("```") else {
+        return trimmed;
+    };
+    let Some(newline) = rest.find('\n') else {
+        return trimmed;
+    };
+    let body = &rest[newline + 1..];
+    match body.rfind("```") {
+        Some(end) => body[..end].trim(),
+        None => trimmed,
+    }
+}
+
+fn validate_value_at(
+    schema: &StructuredFieldSchema,
+    value: &Value,
+    path: &str,
+) -> Result<(), String> {
+    match schema.kind {
+        StructuredValueKind::Any => Ok(()),
+        StructuredValueKind::String if value.is_string() => Ok(()),
+        StructuredValueKind::Number if value.is_number() => Ok(()),
+        StructuredValueKind::Boolean if value.is_boolean() => Ok(()),
+        StructuredValueKind::Object => {
+            let object = value
+                .as_object()
+                .ok_or_else(|| format!("{path}: expected an object, got {}", value_kind(value)))?;
+            for name in object.keys() {
+                if !schema.fields.contains_key(name) && !schema.optional_fields.contains_key(name) {
+                    return Err(format!("{path}: unknown field `{name}`"));
+                }
+            }
+            for (name, field_schema) in &schema.fields {
+                let field_value = object
+                    .get(name)
+                    .ok_or_else(|| format!("{path}: missing required field `{name}`"))?;
+                validate_value_at(field_schema, field_value, &format!("{path}.{name}"))?;
+            }
+            for (name, field_schema) in &schema.optional_fields {
+                if let Some(field_value) = object.get(name) {
+                    if !field_value.is_null() {
+                        validate_value_at(field_schema, field_value, &format!("{path}.{name}"))?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        StructuredValueKind::Array => {
+            let items = value
+                .as_array()
+                .ok_or_else(|| format!("{path}: expected an array, got {}", value_kind(value)))?;
+            if let Some(item_schema) = &schema.items {
+                for (index, item) in items.iter().enumerate() {
+                    validate_value_at(item_schema, item, &format!("{path}[{index}]"))?;
+                }
+            }
+            Ok(())
+        }
+        StructuredValueKind::String
+        | StructuredValueKind::Number
+        | StructuredValueKind::Boolean => Err(format!(
+            "{path}: expected a {}, got {}",
+            kind_label(schema.kind),
+            value_kind(value)
+        )),
+    }
+}
+
+fn kind_label(kind: StructuredValueKind) -> &'static str {
+    match kind {
+        StructuredValueKind::Any => "value",
+        StructuredValueKind::String => "string",
+        StructuredValueKind::Number => "number",
+        StructuredValueKind::Boolean => "boolean",
+        StructuredValueKind::Object => "object",
+        StructuredValueKind::Array => "array",
+    }
+}
+
+fn value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+const SUPPORTED_JSON_SCHEMA_KEYWORDS: &[&str] = &[
+    "type",
+    "properties",
+    "required",
+    "additionalProperties",
+    "items",
+    "description",
+];
+
+fn convert_json_schema_node(
+    schema: &Value,
+    path: &str,
+    issues: &mut Vec<String>,
+) -> StructuredFieldSchema {
+    let Some(object) = schema.as_object() else {
+        issues.push(format!("{path}: schema node must be a JSON object"));
+        return StructuredFieldSchema::new(StructuredValueKind::Any);
+    };
+    for key in object.keys() {
+        let root_only = path == "$" && (key == "$schema" || key == "title");
+        if !SUPPORTED_JSON_SCHEMA_KEYWORDS.contains(&key.as_str()) && !root_only {
+            issues.push(format!("{path}: unsupported JSON Schema keyword `{key}`"));
+        }
+    }
+    let kind = match object.get("type") {
+        Some(Value::String(kind)) => kind.as_str(),
+        Some(_) => {
+            issues.push(format!("{path}: `type` must be a single string"));
+            return StructuredFieldSchema::new(StructuredValueKind::Any);
+        }
+        None => {
+            if object.contains_key("properties") || object.contains_key("items") {
+                issues.push(format!("{path}: missing `type` next to properties/items"));
+            }
+            return StructuredFieldSchema::new(StructuredValueKind::Any);
+        }
+    };
+    match kind {
+        "string" => StructuredFieldSchema::new(StructuredValueKind::String),
+        "number" | "integer" => StructuredFieldSchema::new(StructuredValueKind::Number),
+        "boolean" => StructuredFieldSchema::new(StructuredValueKind::Boolean),
+        "array" => {
+            let mut array = StructuredFieldSchema::new(StructuredValueKind::Array);
+            if let Some(items) = object.get("items") {
+                array.items = Some(Box::new(convert_json_schema_node(
+                    items,
+                    &format!("{path}.items"),
+                    issues,
+                )));
+            }
+            array
+        }
+        "object" => {
+            if object.get("additionalProperties") != Some(&Value::Bool(false)) {
+                issues.push(format!(
+                    "{path}: objects must set `additionalProperties: false` (the contract rejects unknown fields)"
+                ));
+            }
+            let required: std::collections::BTreeSet<&str> = object
+                .get("required")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            let properties = object.get("properties").and_then(Value::as_object);
+            let mut fields = BTreeMap::new();
+            let mut optional_fields = BTreeMap::new();
+            if let Some(properties) = properties {
+                for (name, field_schema) in properties {
+                    let child = convert_json_schema_node(
+                        field_schema,
+                        &format!("{path}.properties.{name}"),
+                        issues,
+                    );
+                    if required.contains(name.as_str()) {
+                        fields.insert(name.clone(), child);
+                    } else {
+                        optional_fields.insert(name.clone(), child);
+                    }
+                }
+            }
+            for name in &required {
+                if properties.is_none_or(|entries| !entries.contains_key(*name)) {
+                    issues.push(format!(
+                        "{path}: required field `{name}` is not declared in properties"
+                    ));
+                }
+            }
+            StructuredFieldSchema {
+                kind: StructuredValueKind::Object,
+                fields,
+                optional_fields,
+                items: None,
+            }
+        }
+        other => {
+            issues.push(format!("{path}: unsupported `type` value `{other}`"));
+            StructuredFieldSchema::new(StructuredValueKind::Any)
         }
     }
 }
@@ -602,8 +865,104 @@ mod tests {
 
     use super::{
         ModelGenerationConfig, ReasoningConfig, ReasoningEffort, ReasoningSummary,
-        model_context_window, model_max_output_tokens,
+        StructuredFieldSchema, extract_json_text, model_context_window, model_max_output_tokens,
     };
+
+    fn order_schema() -> StructuredFieldSchema {
+        StructuredFieldSchema::from_json_schema(&json!({
+            "type": "object",
+            "properties": {
+                "status": {"type": "string"},
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"price": {"type": "number"}},
+                        "required": ["price"],
+                        "additionalProperties": false,
+                    },
+                },
+                "note": {"type": "string"},
+            },
+            "required": ["status", "items"],
+            "additionalProperties": false,
+        }))
+        .expect("supported schema subset")
+    }
+
+    #[test]
+    fn strict_json_schema_conversion_supports_the_documented_subset() {
+        let schema = order_schema();
+        assert!(schema.fields.contains_key("status"));
+        assert!(schema.fields.contains_key("items"));
+        assert!(schema.optional_fields.contains_key("note"));
+    }
+
+    #[test]
+    fn strict_json_schema_conversion_rejects_unsupported_keywords_with_paths() {
+        let error = StructuredFieldSchema::from_json_schema(&json!({
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "enum": ["open", "closed"]},
+                "kind": {"oneOf": [{"type": "string"}]},
+            },
+            "required": ["status"],
+            "additionalProperties": false,
+        }))
+        .expect_err("enum and oneOf are unsupported");
+        assert!(error.contains("$.properties.status: unsupported JSON Schema keyword `enum`"));
+        assert!(error.contains("$.properties.kind: unsupported JSON Schema keyword `oneOf`"));
+    }
+
+    #[test]
+    fn strict_json_schema_conversion_requires_closed_objects() {
+        let error = StructuredFieldSchema::from_json_schema(&json!({
+            "type": "object",
+            "properties": {"status": {"type": "string"}},
+            "required": ["status", "missing"],
+        }))
+        .expect_err("open object and undeclared required field");
+        assert!(error.contains("additionalProperties: false"));
+        assert!(error.contains("required field `missing` is not declared"));
+    }
+
+    #[test]
+    fn validate_value_reports_json_paths() {
+        let schema = order_schema();
+        let error = schema
+            .validate_value(&json!({
+                "status": "open",
+                "items": [{"price": 10}, {"price": "free"}],
+            }))
+            .expect_err("string price must fail");
+        assert_eq!(error, "$.items[1].price: expected a number, got a string");
+
+        let error = schema
+            .validate_value(&json!({"status": "open", "items": [], "extra": 1}))
+            .expect_err("unknown field must fail");
+        assert_eq!(error, "$: unknown field `extra`");
+
+        schema
+            .validate_value(&json!({"status": "open", "items": [{"price": 3.5}]}))
+            .expect("conformant payload validates");
+    }
+
+    #[test]
+    fn extract_json_text_strips_a_single_fence_pair() {
+        assert_eq!(extract_json_text("  {\"a\": 1} "), "{\"a\": 1}");
+        assert_eq!(extract_json_text("```json\n{\"a\": 1}\n```"), "{\"a\": 1}");
+        assert_eq!(extract_json_text("```\n[1, 2]\n```"), "[1, 2]");
+        assert_eq!(extract_json_text("``` not a fence"), "``` not a fence");
+    }
+
+    #[test]
+    fn to_json_schema_round_trips_through_strict_conversion() {
+        let schema = order_schema();
+        let rendered = schema.to_json_schema();
+        let reparsed =
+            StructuredFieldSchema::from_json_schema(&rendered).expect("canonical render reparses");
+        assert_eq!(schema, reparsed);
+    }
 
     #[test]
     fn gemini_models_use_known_context_windows() {
