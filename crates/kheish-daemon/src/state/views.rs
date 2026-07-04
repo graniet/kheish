@@ -804,6 +804,71 @@ where
         Ok(AssetView::from(asset))
     }
 
+    /// Stores one workspace file as a daemon-owned asset with provenance —
+    /// the bridge agents use to hand generated files (reports, PDFs) to the
+    /// operator-facing asset store. The path is resolved inside the daemon
+    /// workspace root; escapes are rejected.
+    pub(crate) async fn store_workspace_asset(
+        &self,
+        session_id: &str,
+        run_id: Option<&str>,
+        tool_call_id: Option<&str>,
+        path: &str,
+        label: Option<&str>,
+        declared_media_type: Option<&str>,
+    ) -> Result<AssetView> {
+        let resolved = kheish_runtime::bounded_workspace_root(
+            &self.workspace_root,
+            std::path::Path::new(path),
+        )?;
+        let file_name = label
+            .map(str::to_string)
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| {
+                resolved
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .ok_or_else(|| anyhow!("cannot derive a file name from {path}"))?;
+        let provenance = crate::assets::AssetProvenanceRecord {
+            kind: "workspace_export".to_string(),
+            tool_name: "store_asset".to_string(),
+            session_id: Some(session_id.to_string()),
+            run_id: run_id.map(str::to_string),
+            tool_call_id: tool_call_id.map(str::to_string),
+            route_id: None,
+            provider: "workspace".to_string(),
+            model: "file".to_string(),
+            prompt_sha256: {
+                use sha2::Digest as _;
+                hex::encode(sha2::Sha256::digest(path.as_bytes()))
+            },
+            source_assets: Vec::new(),
+            output_index: 0,
+            output_count: 1,
+        };
+        let assets = self.assets.clone();
+        let declared = declared_media_type.map(str::to_string);
+        let record = tokio::task::spawn_blocking(move || {
+            anyhow::ensure!(
+                resolved.is_file(),
+                "workspace path {} is not a file",
+                resolved.display()
+            );
+            let bytes = std::fs::read(&resolved)
+                .with_context(|| format!("failed to read workspace file {}", resolved.display()))?;
+            assets.import_bytes_with_provenance(
+                &file_name,
+                declared.as_deref(),
+                &bytes,
+                Some(provenance),
+            )
+        })
+        .await
+        .context("asset export task failed")??;
+        Ok(AssetView::from(&record))
+    }
+
     pub(super) async fn live_snapshot(&self, agent_id: &AgentId) -> Result<ManagedAgentSnapshot> {
         let snapshot = if self.orchestrator.has_runtime(agent_id) {
             self.orchestrator.snapshot(agent_id).await?

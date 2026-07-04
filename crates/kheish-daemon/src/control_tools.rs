@@ -42,7 +42,7 @@ pub use helpers::{
     mailbox_request_from_tool, sidechain_request_from_tool, wait_for_agent_snapshot,
 };
 use operator::{AskOperatorTool, NotifyOperatorTool};
-use output::{EditImageTool, EmitOutputTool, GenerateAudioTool, GenerateImageTool};
+use output::{EditImageTool, EmitOutputTool, GenerateAudioTool, GenerateImageTool, StoreAssetTool};
 use planning::{AskUserQuestionTool, EnterPlanModeTool, ExitPlanModeTool, TodoWriteTool};
 use scheduling::{
     ScheduleCancelTool, ScheduleCreateTool, ScheduleGetTool, ScheduleListTool, SchedulePauseTool,
@@ -84,6 +84,7 @@ pub fn register_daemon_control_tools(
         runtime.register(EditImageTool::new(control.clone()));
     }
     runtime.register(EmitOutputTool::new(control.clone()));
+    runtime.register(StoreAssetTool::new(control.clone()));
     runtime.register(ReadChannelThreadTool::new(control.clone()));
     runtime.register(SetChannelReactionTool::new(control.clone()));
     runtime.register(CreateChannelStimulusTool::new(control.clone()));

@@ -617,6 +617,17 @@ pub trait DaemonToolControl: Send + Sync {
     /// Loads one daemon-owned promoted learning skill record by name when it exists.
     async fn get_learning_skill(&self, name: &str) -> Result<Option<crate::LearningSkillView>>;
 
+    /// Stores one session-workspace file as a daemon-owned asset.
+    async fn store_workspace_asset(
+        &self,
+        session_id: &str,
+        run_id: Option<&str>,
+        tool_call_id: Option<&str>,
+        path: &str,
+        label: Option<&str>,
+        media_type: Option<&str>,
+    ) -> Result<crate::AssetView>;
+
     /// Loads one daemon-owned attachment reference by asset identifier.
     async fn load_asset_attachment(
         &self,

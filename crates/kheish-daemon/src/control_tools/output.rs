@@ -63,6 +63,78 @@ impl EditImageTool {
     }
 }
 
+/// Stores a session-workspace file as a daemon-owned asset — the bridge
+/// between files an agent writes (reports, PDFs, exports) and the
+/// operator-facing asset store.
+pub(crate) struct StoreAssetTool {
+    control: DaemonToolControlHandle,
+}
+
+impl StoreAssetTool {
+    pub(crate) fn new(control: DaemonToolControlHandle) -> Self {
+        Self { control }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct StoreAssetRequest {
+    path: String,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    media_type: Option<String>,
+}
+
+#[async_trait]
+impl Tool for StoreAssetTool {
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: "store_asset".to_string(),
+            description: "Store a file from the session workspace as a daemon-owned asset. Returns the asset_id; reference it in emit_output parts or artifact_ids to deliver the file to the user.".to_string(),
+            schema: ToolSchema {
+                fields: vec![
+                    build_string_field(
+                        "path",
+                        "Workspace-relative path of the file to store (escaping the workspace is rejected).",
+                        true,
+                    ),
+                    build_string_field(
+                        "label",
+                        "Optional display file name recorded on the asset; defaults to the file's own name.",
+                        false,
+                    ),
+                    build_string_field(
+                        "media_type",
+                        "Optional declared MIME type; inferred from the file when omitted.",
+                        false,
+                    ),
+                ],
+            },
+            timeout_ms: 30_000,
+            sandbox: SandboxProfile::Inherited,
+            allows_parallel: true,
+        }
+    }
+
+    async fn execute(&self, ctx: ToolContext, input: Value) -> Result<ToolExecutionOutput> {
+        let session_id = execution_session_id(&ctx)?.to_string();
+        let run_id = execution_run_id(&ctx).map(str::to_string);
+        let request = deserialize_tool_request::<StoreAssetRequest>(input)?;
+        let control = self.control.resolve()?;
+        let asset = control
+            .store_workspace_asset(
+                &session_id,
+                run_id.as_deref(),
+                Some(ctx.call_id.as_str()),
+                &request.path,
+                request.label.as_deref(),
+                request.media_type.as_deref(),
+            )
+            .await?;
+        Ok(ToolExecutionOutput::json(serde_json::to_value(asset)?))
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct EmitOutputRequest {
     #[serde(default)]

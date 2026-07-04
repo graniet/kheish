@@ -187,6 +187,20 @@ where
         Ok(self.0.learning_skill_service.get(name).await)
     }
 
+    async fn store_workspace_asset(
+        &self,
+        session_id: &str,
+        run_id: Option<&str>,
+        tool_call_id: Option<&str>,
+        path: &str,
+        label: Option<&str>,
+        media_type: Option<&str>,
+    ) -> Result<crate::AssetView> {
+        self.0
+            .store_workspace_asset(session_id, run_id, tool_call_id, path, label, media_type)
+            .await
+    }
+
     async fn load_asset_attachment(
         &self,
         _session_id: &str,

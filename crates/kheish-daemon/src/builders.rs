@@ -1081,6 +1081,7 @@ mod tests {
                 "schedule_trigger_now",
                 "set_channel_reaction",
                 "spawn_agent",
+                "store_asset",
                 "task_create",
                 "task_delete",
                 "task_get",

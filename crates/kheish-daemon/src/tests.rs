@@ -57575,3 +57575,99 @@ async fn structured_output_contract_overrides_emit_output() -> Result<()> {
     wait_for_daemon_shutdown(&client, &base).await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn store_asset_tool_exports_workspace_files_and_rejects_escapes() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-store-asset");
+    let (address, shutdown) = scripted_daemon(
+        &state_root,
+        vec![
+            Ok(vec![
+                ModelStreamEvent::MessageId {
+                    value: "assistant-store".to_string(),
+                },
+                ModelStreamEvent::ToolCall {
+                    call: kheish_types::ToolCallRecord {
+                        id: "store-ok".to_string(),
+                        name: "store_asset".to_string(),
+                        input: json!({ "path": "reports/ghost.md", "label": "poeme.md" }),
+                        assistant_message_id: None,
+                        assistant_provider_response_id: None,
+                    },
+                },
+                ModelStreamEvent::Stop {
+                    reason: kheish_types::ModelFinishReason::ToolCalls,
+                },
+            ]),
+            Ok(vec![
+                ModelStreamEvent::MessageId {
+                    value: "assistant-escape".to_string(),
+                },
+                ModelStreamEvent::ToolCall {
+                    call: kheish_types::ToolCallRecord {
+                        id: "store-escape".to_string(),
+                        name: "store_asset".to_string(),
+                        input: json!({ "path": "../outside.txt" }),
+                        assistant_message_id: None,
+                        assistant_provider_response_id: None,
+                    },
+                },
+                ModelStreamEvent::Stop {
+                    reason: kheish_types::ModelFinishReason::ToolCalls,
+                },
+            ]),
+            Ok(scripted_events(
+                "assistant-done",
+                "Stored the report as an asset.",
+                kheish_types::ModelFinishReason::Completed,
+            )),
+        ],
+    )
+    .await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+
+    // The scripted harness runs sessions against the state root as workspace.
+    tokio::fs::create_dir_all(state_root.join("reports")).await?;
+    tokio::fs::write(
+        state_root.join("reports/ghost.md"),
+        b"# Ghost in the Shell\n\nUn poeme.",
+    )
+    .await?;
+    tokio::fs::write(temp.path().join("outside.txt"), b"secret").await?;
+
+    create_test_session(&client, &base, "store-asset-demo").await?;
+    let run = submit_test_input(&client, &base, "store-asset-demo", "Store the report.").await?;
+    wait_for_run_status(&client, &base, &run.run_id, &[DaemonRunStatus::Completed]).await?;
+
+    // The workspace file became a daemon-owned asset with its label.
+    let assets = client
+        .get(format!("{base}/v1/assets"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<AssetSummaryView>>()
+        .await?;
+    let stored = assets
+        .iter()
+        .find(|asset| asset.file_name == "poeme.md")
+        .expect("the exported workspace file must be listed as an asset");
+    assert_eq!(stored.media_type, "text/markdown");
+    assert!(stored.byte_length > 0);
+
+    // The escape attempt failed as a tool error without killing the run.
+    let events = client
+        .get(format!("{base}/v1/sessions/store-asset-demo/events"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    let journal = serde_json::to_string(&events)?;
+    assert!(journal.contains("escapes workspace root"));
+
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+    Ok(())
+}

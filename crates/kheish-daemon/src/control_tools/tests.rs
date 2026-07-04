@@ -31,6 +31,7 @@ struct FakeControlState {
     mailbox_requests: Vec<(String, MessageAgentToolRequest)>,
     generate_audio_requests: Vec<(String, Option<String>, GenerateAudioToolRequest)>,
     generate_image_requests: Vec<(String, GenerateImageToolRequest)>,
+    store_asset_requests: Vec<(String, String, Option<String>)>,
     edit_image_requests: Vec<(String, EditImageToolRequest)>,
     parent_clarification_requests: Vec<(String, String, UserQuestionRequest)>,
     operator_notifications: Vec<(String, Option<String>, OperatorNotificationRequest)>,
@@ -453,6 +454,43 @@ impl DaemonToolControl for FakeControl {
 
     async fn get_learning_skill(&self, name: &str) -> Result<Option<crate::LearningSkillView>> {
         Ok(self.state.lock().learning_skills.get(name).cloned())
+    }
+
+    async fn store_workspace_asset(
+        &self,
+        session_id: &str,
+        _run_id: Option<&str>,
+        _tool_call_id: Option<&str>,
+        path: &str,
+        label: Option<&str>,
+        _media_type: Option<&str>,
+    ) -> Result<crate::AssetView> {
+        self.state.lock().store_asset_requests.push((
+            session_id.to_string(),
+            path.to_string(),
+            label.map(str::to_string),
+        ));
+        let file_name = label
+            .map(str::to_string)
+            .unwrap_or_else(|| path.rsplit('/').next().unwrap_or(path).to_string());
+        Ok(crate::AssetView {
+            asset_id: "asset-stored".to_string(),
+            media_type: "application/pdf".to_string(),
+            file_name,
+            sha256: "abc123".to_string(),
+            byte_length: 4,
+            created_at_ms: 0,
+            uri: "asset://raw/asset-stored.pdf".to_string(),
+            text_uri: None,
+            text_sha256: None,
+            text_byte_length: None,
+            preview_image_uri: None,
+            preview_image_media_type: None,
+            preview_image_sha256: None,
+            preview_image_byte_length: None,
+            derivation_ids: Vec::new(),
+            provenance: Vec::new(),
+        })
     }
 
     async fn load_asset_attachment(
@@ -1761,6 +1799,32 @@ async fn spawn_agent_allows_background_timeout_without_inline_wait() -> Result<(
     let state = control.state.lock();
     assert_eq!(state.spawn_requests.len(), 1);
     assert!(state.waited_agents.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn store_asset_tool_bridges_workspace_files_to_the_asset_store() -> Result<()> {
+    let control = Arc::new(FakeControl::new());
+    let handle = bind_control(&control);
+
+    let response = super::output::StoreAssetTool::new(handle)
+        .execute(
+            FakeControl::context("session-a", "agent-parent"),
+            json!({ "path": "reports/ghost.pdf", "label": "poeme.pdf" }),
+        )
+        .await?;
+
+    assert_eq!(response.output["asset_id"], "asset-stored");
+    assert_eq!(response.output["file_name"], "poeme.pdf");
+    let state = control.state.lock();
+    assert_eq!(
+        state.store_asset_requests,
+        vec![(
+            "session-a".to_string(),
+            "reports/ghost.pdf".to_string(),
+            Some("poeme.pdf".to_string()),
+        )]
+    );
     Ok(())
 }
 
