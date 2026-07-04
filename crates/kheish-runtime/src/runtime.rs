@@ -29,9 +29,10 @@ use kheish_types::{
     recovered_memory_from_metadata, session_capability_scope_from_metadata,
     session_control_state_from_metadata, session_credential_scope_from_metadata,
     session_execution_identity_from_metadata, session_goal_from_metadata,
-    session_operator_config_from_metadata, session_persona_binding_from_metadata,
-    session_reply_targets_from_metadata, session_skills_state_from_metadata,
-    session_tool_overrides_from_metadata, session_visible_skills_from_metadata,
+    session_operator_config_from_metadata, session_output_contract_from_metadata,
+    session_persona_binding_from_metadata, session_reply_targets_from_metadata,
+    session_skills_state_from_metadata, session_tool_overrides_from_metadata,
+    session_visible_skills_from_metadata,
 };
 
 use crate::execution::{current_cancellation_token, current_execution_scope};
@@ -227,6 +228,7 @@ pub struct AgentRuntime<M> {
     session_goal: Option<SessionGoal>,
     session_operator: SessionOperatorConfig,
     session_tool_overrides: SessionToolOverrides,
+    session_output_contract: Option<kheish_types::StructuredOutputContract>,
     session_reply_targets: Vec<ReplyHandle>,
     session_capability_scope: CapabilityScope,
     session_credential_scope: CredentialScope,
@@ -529,6 +531,7 @@ fn build_runtime_system_sections<M>(
     session_persona: Option<&SessionPersonaBinding>,
     agent_prompt: Option<&AgentPromptOverride>,
     completion_requirements: &[CompletionRequirement],
+    output_contract: Option<&kheish_types::StructuredOutputContract>,
     session_control: &SessionControlState,
     session_goal: Option<&SessionGoal>,
     session_operator: &SessionOperatorConfig,
@@ -555,6 +558,11 @@ fn build_runtime_system_sections<M>(
         mcp_server_instructions,
         workspace_root_override,
     );
+    if let Some(contract) = output_contract {
+        sections.push(crate::system_prompt::output_contract_section(
+            &contract.schema,
+        ));
+    }
     let execution_scope = current_execution_scope();
     if let Some(section) = active_route_section(
         execution_scope
@@ -1101,6 +1109,7 @@ where
             None,
             agent_prompt.as_ref(),
             &[],
+            None,
             &SessionControlState::default(),
             None,
             &SessionOperatorConfig::default(),
@@ -1132,6 +1141,7 @@ where
             session_goal: None,
             session_operator: SessionOperatorConfig::default(),
             session_tool_overrides: SessionToolOverrides::default(),
+            session_output_contract: None,
             session_reply_targets: Vec::new(),
             session_control: SessionControlState::default(),
             session_capability_scope: CapabilityScope::default(),
@@ -1164,6 +1174,7 @@ where
         let session_goal = session_goal_from_metadata(&stored_metadata)?;
         let session_operator = session_operator_config_from_metadata(&stored_metadata)?;
         let session_tool_overrides = session_tool_overrides_from_metadata(&stored_metadata)?;
+        let session_output_contract = session_output_contract_from_metadata(&stored_metadata)?;
         let session_reply_targets =
             session_reply_targets_from_metadata(&stored_metadata)?.unwrap_or_default();
         let session_persona = session_persona_binding_from_metadata(&stored_metadata)?;
@@ -1211,6 +1222,7 @@ where
                 .as_ref()
                 .map(|meta| meta.completion_requirements.clone())
                 .unwrap_or_default(),
+            session_output_contract.as_ref(),
             &session_control,
             session_goal.as_ref(),
             &session_operator,
@@ -1254,6 +1266,7 @@ where
             session_goal,
             session_operator,
             session_tool_overrides,
+            session_output_contract,
             session_reply_targets,
             session_capability_scope,
             session_credential_scope,
@@ -1356,6 +1369,13 @@ where
             "session is waiting for user interaction before accepting new input"
         );
         self.refresh_session_state().await?;
+        // The session contract rides the run's metadata so the engine can
+        // enforce it at the completion boundary, whatever the input kind.
+        let mut input = input;
+        if let Some(contract) = &self.session_output_contract {
+            input.metadata =
+                kheish_types::metadata_with_structured_output_contract(input.metadata, contract)?;
+        }
         let generation = merge_generation(&self.default_generation, &generation);
         debug!(
             session_id = %self.engine.conversation().session_id,
@@ -1842,6 +1862,7 @@ where
             self.session_persona.as_ref(),
             self.agent_prompt.as_ref(),
             completion_requirements,
+            self.session_output_contract.as_ref(),
             &self.session_control,
             self.session_goal.as_ref(),
             &self.session_operator,
@@ -1871,6 +1892,7 @@ where
         self.session_goal = session_goal_from_metadata(&metadata)?;
         self.session_operator = session_operator_config_from_metadata(&metadata)?;
         self.session_tool_overrides = session_tool_overrides_from_metadata(&metadata)?;
+        self.session_output_contract = session_output_contract_from_metadata(&metadata)?;
         self.session_reply_targets =
             session_reply_targets_from_metadata(&metadata)?.unwrap_or_default();
         self.session_capability_scope = session_capability_scope_from_metadata(&metadata)?;
@@ -2512,27 +2534,45 @@ where
         self.record_run_debug_artifacts(outcome);
 
         let output_dispatch = if matches!(outcome.status, RunStatus::Completed) {
-            let rich_output = self.rich_output_from_new_records(previous_event_count);
-            let output_kind = if rich_output.is_some() {
-                "emit_output"
-            } else {
-                "assistant_text"
-            };
-            let rich_output = rich_output.or_else(|| {
-                self.engine
-                    .replay_from_journal()
-                    .messages
-                    .into_iter()
-                    .rev()
-                    .find(|message| message.role == Role::Assistant)
-                    .map(|message| RichOutput::text(message.content))
-            });
+            // A contract-validated payload IS the delivery: it wins over
+            // emit_output, and re-serializing the parsed value guarantees
+            // fences or prose never leak into the outputs.
+            let (rich_output, output_kind, structured_payload) =
+                if let Some(value) = outcome.structured_output.as_ref() {
+                    (
+                        Some(RichOutput::text(serde_json::to_string(value)?)),
+                        "structured_output",
+                        Some(value.clone()),
+                    )
+                } else {
+                    let rich_output = self.rich_output_from_new_records(previous_event_count);
+                    let output_kind = if rich_output.is_some() {
+                        "emit_output"
+                    } else {
+                        "assistant_text"
+                    };
+                    let rich_output = rich_output.or_else(|| {
+                        self.engine
+                            .replay_from_journal()
+                            .messages
+                            .into_iter()
+                            .rev()
+                            .find(|message| message.role == Role::Assistant)
+                            .map(|message| RichOutput::text(message.content))
+                    });
+                    (rich_output, output_kind, None)
+                };
             if let Some(output) = rich_output {
                 let mut metadata = serde_json::Map::new();
                 metadata.insert(
                     "output_kind".to_string(),
                     Value::String(output_kind.to_string()),
                 );
+                if let Some(value) = structured_payload {
+                    // http/external transports POST metadata verbatim, so the
+                    // payload travels as real JSON next to the string content.
+                    metadata.insert("structured_output".to_string(), value);
+                }
                 if let Some(run_id) = run_id {
                     metadata.insert("run_id".to_string(), Value::String(run_id.to_string()));
                 }

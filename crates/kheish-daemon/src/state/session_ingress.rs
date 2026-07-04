@@ -21,6 +21,7 @@ where
             kheish_types::RECOVERED_MEMORY_METADATA_KEY,
             kheish_types::SESSION_SKILLS_STATE_METADATA_KEY,
             kheish_types::SESSION_VISIBLE_SKILLS_METADATA_KEY,
+            kheish_types::STRUCTURED_OUTPUT_CONTRACT_METADATA_KEY,
             KHEISH_FLOW_METADATA_KEY,
         ] {
             object.remove(key);

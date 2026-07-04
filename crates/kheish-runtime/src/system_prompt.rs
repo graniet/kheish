@@ -310,6 +310,30 @@ fn is_git_repository(workspace_root: &PathBuf) -> bool {
 }
 
 /// Builds one provider-neutral section describing the effective route pinned to the current run.
+/// Builds the prompt section describing a session's structured output
+/// contract: first-try conformance is the nominal path, the engine's
+/// bounded repair turns are only the backstop.
+pub fn output_contract_section(
+    schema: &kheish_types::StructuredFieldSchema,
+) -> SystemPromptSection {
+    let rendered =
+        serde_json::to_string_pretty(&schema.to_json_schema()).unwrap_or_else(|_| "{}".to_string());
+    SystemPromptSection {
+        name: "output_contract".to_string(),
+        content: [
+            "# Output Contract".to_string(),
+            "Your FINAL assistant message must be a single JSON value matching this schema."
+                .to_string(),
+            "No prose, no Markdown fences around it — the raw JSON is delivered verbatim to the configured outputs."
+                .to_string(),
+            "You may use tools freely during the run; only the final message is the deliverable."
+                .to_string(),
+            format!("Schema:\n{rendered}"),
+        ]
+        .join("\n"),
+    }
+}
+
 pub fn active_route_section(
     provider: Option<&str>,
     model: Option<&str>,
