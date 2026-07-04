@@ -440,10 +440,8 @@ fn validate_value_at(
                 validate_value_at(field_schema, field_value, &format!("{path}.{name}"))?;
             }
             for (name, field_schema) in &schema.optional_fields {
-                if let Some(field_value) = object.get(name) {
-                    if !field_value.is_null() {
-                        validate_value_at(field_schema, field_value, &format!("{path}.{name}"))?;
-                    }
+                if let Some(field_value) = object.get(name).filter(|value| !value.is_null()) {
+                    validate_value_at(field_schema, field_value, &format!("{path}.{name}"))?;
                 }
             }
             Ok(())
