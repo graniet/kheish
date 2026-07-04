@@ -371,6 +371,48 @@ where
         Ok(view)
     }
 
+    /// Replaces the session's native tool surface overrides.
+    ///
+    /// Names are trimmed and deduplicated; a name in both lists is a caller
+    /// bug and is rejected. Applied on the next run turn.
+    pub(crate) async fn set_session_tool_overrides(
+        &self,
+        session_id: &str,
+        overrides: Option<kheish_types::SessionToolOverrides>,
+    ) -> Result<SessionView> {
+        let mut normalized = overrides.unwrap_or_default();
+        normalized.enable = normalize_tool_override_names(&normalized.enable);
+        normalized.disable = normalize_tool_override_names(&normalized.disable);
+        if let Some(conflict) = normalized
+            .enable
+            .iter()
+            .find(|name| normalized.disable.contains(name))
+        {
+            bail!("tool `{conflict}` cannot be both enabled and disabled");
+        }
+        self.run_service
+            .with_session_idle_guard(session_id, || async {
+                self.agent_id_for_session(session_id).await?;
+                self.save_session_tool_overrides(session_id, &normalized)
+                    .await?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                if error.to_string().contains("has active or queued runs") {
+                    anyhow::anyhow!(
+                        "session {session_id} has non-terminal work or live descendants; tool-override changes are only allowed while the session is idle"
+                    )
+                } else {
+                    error
+                }
+            })?;
+        let agent_id = self.agent_id_for_session(session_id).await?;
+        let view = self.session_view(session_id, &agent_id).await?;
+        self.publish_snapshot(&view);
+        Ok(view)
+    }
+
     pub(crate) async fn set_session_capability_scope(
         &self,
         session_id: &str,
@@ -1690,4 +1732,16 @@ fn render_mailbox_message_context(index: usize, message: &MailboxMessage) -> Str
         }
     }
     lines.join("\n")
+}
+
+fn normalize_tool_override_names(values: &[String]) -> Vec<String> {
+    let mut normalized: Vec<String> = Vec::new();
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() || normalized.iter().any(|entry| entry == trimmed) {
+            continue;
+        }
+        normalized.push(trimmed.to_string());
+    }
+    normalized
 }

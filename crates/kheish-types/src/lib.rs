@@ -66,6 +66,7 @@ pub use session::{
     SESSION_CONTROL_STATE_METADATA_KEY, SESSION_CREDENTIAL_SCOPE_METADATA_KEY,
     SESSION_EXECUTION_IDENTITY_METADATA_KEY, SESSION_GOAL_METADATA_KEY,
     SESSION_OPERATOR_CONFIG_METADATA_KEY, SESSION_PERSONA_BINDING_METADATA_KEY,
+    SESSION_TOOL_OVERRIDES_METADATA_KEY, SessionToolOverrides, session_tool_overrides_from_metadata,
     SESSION_REPLY_TARGETS_METADATA_KEY, SESSION_ROUTE_POLICY_METADATA_KEY, SessionCheckpoint,
     SessionControlState, SessionEvent, SessionExecutionIdentity, SessionGoal, SessionGoalStatus,
     SessionGoalUsageAccount, SessionOperatorConfig, SessionPersonaBinding, SessionRoutePolicy,

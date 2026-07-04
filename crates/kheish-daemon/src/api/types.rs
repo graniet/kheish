@@ -1594,6 +1594,13 @@ pub struct SetSessionOperatorConfigRequest {
     pub operator: SessionOperatorConfig,
 }
 
+/// Session tool-overrides update payload.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetSessionToolOverridesRequest {
+    #[serde(flatten)]
+    pub tool_overrides: kheish_types::SessionToolOverrides,
+}
+
 /// Session operator-contact policy projected through the control plane.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionOperatorConfigView {
@@ -2576,6 +2583,9 @@ pub struct SessionViewSummary {
     pub persona: Option<SessionPersonaSummaryView>,
     #[serde(default, skip_serializing_if = "SessionOperatorConfig::is_inactive")]
     pub operator: SessionOperatorConfig,
+    /// Native tool surface adjustments persisted on the session.
+    #[serde(default, skip_serializing_if = "kheish_types::SessionToolOverrides::is_empty")]
+    pub tool_overrides: kheish_types::SessionToolOverrides,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reply_targets: Vec<ReplyHandle>,
 }
@@ -2606,6 +2616,9 @@ pub struct SessionView {
     pub persona: Option<SessionPersonaSummaryView>,
     #[serde(default, skip_serializing_if = "SessionOperatorConfig::is_inactive")]
     pub operator: SessionOperatorConfig,
+    /// Native tool surface adjustments persisted on the session.
+    #[serde(default, skip_serializing_if = "kheish_types::SessionToolOverrides::is_empty")]
+    pub tool_overrides: kheish_types::SessionToolOverrides,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reply_targets: Vec<ReplyHandle>,
     pub outputs: Vec<DaemonOutputRecord>,

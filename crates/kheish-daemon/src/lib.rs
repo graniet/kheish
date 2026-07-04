@@ -44,6 +44,7 @@ mod tests;
 
 pub use api::{
     AddMcpServerRequest,
+    SetSessionToolOverridesRequest,
     AckMailboxResponse, AgentAuditListQuery, AgentSummaryCountsView, AgentSummaryListPage,
     AgentSummaryListQuery, AgentSummaryView, AssetDeleteQuery, AssetDeletionFileView,
     AssetDeletionPlanView, AssetGcPlanView, AssetGcRequest, AssetListQuery, AssetReferenceView,

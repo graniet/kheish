@@ -352,6 +352,15 @@ where
                         .await?,
                 )
             }
+            ["v1", "sessions", session_id, "tool-overrides"] => {
+                let request =
+                    serde_json::from_value::<crate::SetSessionToolOverridesRequest>(body)?;
+                encode_response(
+                    self.state
+                        .set_session_tool_overrides(session_id, Some(request.tool_overrides))
+                        .await?,
+                )
+            }
             ["v1", "sessions", session_id, "reply-targets"] => {
                 let request = serde_json::from_value::<crate::SetSessionReplyTargetsRequest>(body)?;
                 let reply_targets = request
@@ -1210,6 +1219,7 @@ fn validate_stack(context: &StackContext) -> Result<StackValidation> {
         &mut validation,
     );
     validate_session_operator_configs(document, &mut validation);
+    validate_session_tool_overrides(document, &mut validation);
     validate_mcp_requirement_details(&document.spec.requires.mcp, &mut validation);
     validate_unique(
         "spec.playbooks[] playbook_id/version",
@@ -1249,6 +1259,33 @@ fn validate_stack(context: &StackContext) -> Result<StackValidation> {
     }
     validation.valid = validation.errors.is_empty();
     Ok(validation)
+}
+
+fn validate_session_tool_overrides(document: &StackDocument, validation: &mut StackValidation) {
+    for (index, session) in document.spec.sessions.iter().enumerate() {
+        let Some(overrides) = session.tool_overrides.as_ref() else {
+            continue;
+        };
+        if overrides
+            .enable
+            .iter()
+            .chain(overrides.disable.iter())
+            .any(|name| name.trim().is_empty())
+        {
+            validation.errors.push(format!(
+                "spec.sessions[{index}].tool_overrides entries cannot be empty"
+            ));
+        }
+        if let Some(conflict) = overrides
+            .enable
+            .iter()
+            .find(|name| overrides.disable.contains(name))
+        {
+            validation.errors.push(format!(
+                "spec.sessions[{index}].tool_overrides lists `{conflict}` in both enable and disable"
+            ));
+        }
+    }
 }
 
 fn validate_session_operator_configs(document: &StackDocument, validation: &mut StackValidation) {
@@ -3282,6 +3319,14 @@ where
             apply_session_operator(client, &encoded, desired_operator).await?;
             apply_session_reply_targets(client, &encoded, session).await?;
         }
+        client
+            .post_json::<_, crate::SessionView>(
+                &format!("/v1/sessions/{encoded}/tool-overrides"),
+                &crate::SetSessionToolOverridesRequest {
+                    tool_overrides: session.tool_overrides.clone().unwrap_or_default(),
+                },
+            )
+            .await?;
         ledger.record_resource(&context.ownership_id(), &key, session.digest.clone());
         ledger.save(ledger_path).await?;
         report.applied.push(StackAction::new(
@@ -3914,6 +3959,7 @@ fn session_matches(live: &crate::SessionView, desired: &ResolvedSession) -> bool
             &desired.route_policy.clone().unwrap_or_default(),
         )
         && live.operator == desired.operator.clone().unwrap_or_default()
+        && live.tool_overrides == desired.tool_overrides.clone().unwrap_or_default()
         && live.reply_targets == desired_reply_targets
 }
 
@@ -4785,6 +4831,8 @@ struct StackSessionSpec {
     operator: Option<kheish_types::SessionOperatorConfig>,
     #[serde(default)]
     reply_targets: Option<Vec<crate::SessionReplyTargetRequest>>,
+    #[serde(default)]
+    tool_overrides: Option<kheish_types::SessionToolOverrides>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -5080,6 +5128,7 @@ impl ResolvedStack {
                         .map(crate::operator_contact::normalize_session_operator_config)
                         .transpose()?,
                     reply_targets: session.reply_targets.clone(),
+                    tool_overrides: session.tool_overrides.clone(),
                     digest: String::new(),
                 };
                 let digest = digest_serializable(&resolved.desired_value())?;
@@ -5402,6 +5451,7 @@ struct ResolvedSession {
     route_policy: Option<kheish_types::SessionRoutePolicy>,
     operator: Option<kheish_types::SessionOperatorConfig>,
     reply_targets: Option<Vec<crate::SessionReplyTargetRequest>>,
+    tool_overrides: Option<kheish_types::SessionToolOverrides>,
     digest: String,
 }
 
@@ -5416,6 +5466,7 @@ impl ResolvedSession {
             "route_policy": self.route_policy,
             "operator": self.operator,
             "reply_targets": self.reply_targets,
+            "tool_overrides": self.tool_overrides,
         })
     }
 }
@@ -6334,6 +6385,7 @@ mod tests {
                 effective_credential_scope: request.credential_scope.unwrap_or_default(),
                 persona,
                 operator: Default::default(),
+                tool_overrides: kheish_types::SessionToolOverrides::default(),
                 reply_targets: Vec::new(),
                 outputs: Vec::new(),
             })
@@ -6655,6 +6707,17 @@ mod tests {
                         .get_mut(*session_id)
                         .ok_or_else(|| anyhow!("session {session_id} not found"))?;
                     session.operator = request.operator;
+                    encode_response(session.clone())
+                }
+                ["v1", "sessions", session_id, "tool-overrides"] => {
+                    let request = serde_json::from_value::<crate::SetSessionToolOverridesRequest>(
+                        serde_json::to_value(body)?,
+                    )?;
+                    let mut sessions = self.state.sessions.lock();
+                    let session = sessions
+                        .get_mut(*session_id)
+                        .ok_or_else(|| anyhow!("session {session_id} not found"))?;
+                    session.tool_overrides = request.tool_overrides;
                     encode_response(session.clone())
                 }
                 ["v1", "sessions", session_id, "reply-targets"] => {

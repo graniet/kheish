@@ -418,6 +418,7 @@ where
         let credential_scope = self.load_session_credential_scope(session_id).await?;
         let persona_binding = self.load_session_persona_binding(session_id).await?;
         let operator = self.load_session_operator_config(session_id).await?;
+        let tool_overrides = self.load_session_tool_overrides(session_id).await?;
         let reply_targets = self.session_reply_targets(session_id).await;
         let effective_capability_scope =
             effective_session_capability_scope(persona_binding.as_ref(), &capability_scope);
@@ -435,6 +436,7 @@ where
             effective_credential_scope,
             persona,
             operator,
+            tool_overrides,
             reply_targets,
             outputs: self.delivery_service.session_outputs(session_id).await?,
         })
@@ -483,6 +485,7 @@ where
             let capability_scope = self.load_session_capability_scope(&session_id).await?;
             let credential_scope = self.load_session_credential_scope(&session_id).await?;
             let operator = self.load_session_operator_config(&session_id).await?;
+            let tool_overrides = self.load_session_tool_overrides(&session_id).await?;
             let reply_targets = self.session_reply_targets(&session_id).await;
             let effective_capability_scope =
                 effective_session_capability_scope(persona_binding.as_ref(), &capability_scope);
@@ -501,6 +504,7 @@ where
                 effective_credential_scope,
                 persona,
                 operator,
+                tool_overrides,
                 reply_targets,
             });
         }

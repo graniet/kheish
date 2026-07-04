@@ -165,6 +165,25 @@ where
             .await
     }
 
+    pub(crate) async fn load_session_tool_overrides(
+        &self,
+        session_id: &str,
+    ) -> Result<kheish_types::SessionToolOverrides> {
+        self.session_service
+            .load_session_tool_overrides(session_id)
+            .await
+    }
+
+    pub(crate) async fn save_session_tool_overrides(
+        &self,
+        session_id: &str,
+        overrides: &kheish_types::SessionToolOverrides,
+    ) -> Result<kheish_types::SessionToolOverrides> {
+        self.session_service
+            .save_session_tool_overrides(session_id, overrides)
+            .await
+    }
+
     pub(crate) async fn load_session_capability_scope(
         &self,
         session_id: &str,

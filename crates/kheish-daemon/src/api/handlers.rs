@@ -65,6 +65,7 @@ use super::types::{
     SetLearningPolicyRequest, SetModelRequest, SetPermissionModeRequest, SetRunMemoryPolicyRequest,
     SetSessionCapabilityScopeRequest, SetSessionCredentialScopeRequest, SetSessionGoalRequest,
     SetSessionOperatorConfigRequest, SetSessionPersonaRequest, SetSessionReplyTargetsRequest,
+    SetSessionToolOverridesRequest,
     SetSessionRoutePolicyRequest, SetSystemPromptRequest, SetToolRuntimeLimitsRequest,
     SkillListQuery, SkillSummaryView, SkillView, SpawnSidechainRequest, StackApplyRequest,
     StackDownRequest, StackImportRequest, StackManifestRequest, StackPlanRequest,
@@ -796,6 +797,13 @@ where
                 .post(set_session_operator_config::<M>)
                 .put(replace_session_operator_config::<M>)
                 .delete(clear_session_operator_config::<M>),
+        )
+        .route(
+            "/v1/sessions/{session_id}/tool-overrides",
+            get(get_session_tool_overrides::<M>)
+                .post(set_session_tool_overrides::<M>)
+                .put(set_session_tool_overrides::<M>)
+                .delete(clear_session_tool_overrides::<M>),
         )
         .route(
             "/v1/sessions/{session_id}/capability-scope",
@@ -1935,6 +1943,10 @@ const CONTROL_PLANE_OPENAPI_ROUTES: &[OpenApiRouteSpec] = &[
     OpenApiRouteSpec {
         path: "/v1/sessions/{session_id}/route-policy",
         methods: &["POST", "PUT", "DELETE"],
+    },
+    OpenApiRouteSpec {
+        path: "/v1/sessions/{session_id}/tool-overrides",
+        methods: &["GET", "POST", "PUT", "DELETE"],
     },
     OpenApiRouteSpec {
         path: "/v1/sessions/{session_id}/operator",
@@ -5703,6 +5715,49 @@ where
 {
     state
         .set_session_credential_scope(&session_id, None)
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn get_session_tool_overrides<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Result<Json<kheish_types::SessionToolOverrides>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    state
+        .load_session_tool_overrides(&session_id)
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn set_session_tool_overrides<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    AxumPath(session_id): AxumPath<String>,
+    Json(request): Json<SetSessionToolOverridesRequest>,
+) -> Result<Json<SessionView>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    state
+        .set_session_tool_overrides(&session_id, Some(request.tool_overrides))
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn clear_session_tool_overrides<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Result<Json<SessionView>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    state
+        .set_session_tool_overrides(&session_id, None)
         .await
         .map(Json)
         .map_err(internal_error)

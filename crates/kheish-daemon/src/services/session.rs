@@ -670,6 +670,43 @@ impl SessionService {
         Ok(config.clone())
     }
 
+    /// Loads the native tool surface overrides for one session.
+    pub(crate) async fn load_session_tool_overrides(
+        &self,
+        session_id: &str,
+    ) -> Result<kheish_types::SessionToolOverrides> {
+        self.sessions
+            .load_metadata_value(session_id, kheish_types::SESSION_TOOL_OVERRIDES_METADATA_KEY)
+            .await?
+            .filter(|value| !value.is_null())
+            .map(serde_json::from_value)
+            .transpose()
+            .map(|state| state.unwrap_or_default())
+            .map_err(Into::into)
+    }
+
+    /// Persists the native tool surface overrides for one session.
+    pub(crate) async fn save_session_tool_overrides(
+        &self,
+        session_id: &str,
+        overrides: &kheish_types::SessionToolOverrides,
+    ) -> Result<kheish_types::SessionToolOverrides> {
+        self.sessions
+            .append(
+                session_id,
+                PersistedSessionRecord::Metadata {
+                    key: kheish_types::SESSION_TOOL_OVERRIDES_METADATA_KEY.to_string(),
+                    value: if overrides.is_empty() {
+                        Value::Null
+                    } else {
+                        serde_json::to_value(overrides)?
+                    },
+                },
+            )
+            .await?;
+        Ok(overrides.clone())
+    }
+
     /// Loads the stored session capability scope override for one session.
     pub(crate) async fn load_session_capability_scope(
         &self,

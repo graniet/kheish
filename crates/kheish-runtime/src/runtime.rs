@@ -21,7 +21,7 @@ use kheish_types::{
     InputEnvelope, InputPayload, LearnedContextBundle, ModelGenerationConfig, PendingToolBatch,
     PendingUserQuestion, PostCompactRestoration, RecoveredMemoryBundle, ReplyHandle,
     RetainedUserInput, RichOutput, Role, RunMetaSnapshot, RunStatus, SessionControlState,
-    SessionExecutionIdentity, SessionGoal, SessionOperatorConfig, SessionPersonaBinding,
+    SessionExecutionIdentity, SessionGoal, SessionOperatorConfig, SessionToolOverrides, SessionPersonaBinding,
     SessionSkillsState, SkillExecutionContext, SourceRef, SystemPromptSection, ToolDefinition,
     ToolSurfaceFilter, UserQuestionResolution, WorkspaceSnapshot, hook_runtime_state_from_metadata,
     learned_context_from_metadata, model_context_window, model_max_output_tokens,
@@ -29,6 +29,7 @@ use kheish_types::{
     session_capability_scope_from_metadata, session_control_state_from_metadata,
     session_credential_scope_from_metadata, session_execution_identity_from_metadata,
     session_goal_from_metadata, session_operator_config_from_metadata,
+    session_tool_overrides_from_metadata,
     session_persona_binding_from_metadata, session_reply_targets_from_metadata,
     session_skills_state_from_metadata, session_visible_skills_from_metadata,
 };
@@ -225,6 +226,7 @@ pub struct AgentRuntime<M> {
     session_control: SessionControlState,
     session_goal: Option<SessionGoal>,
     session_operator: SessionOperatorConfig,
+    session_tool_overrides: SessionToolOverrides,
     session_reply_targets: Vec<ReplyHandle>,
     session_capability_scope: CapabilityScope,
     session_credential_scope: CredentialScope,
@@ -1129,6 +1131,7 @@ where
             session_persona: None,
             session_goal: None,
             session_operator: SessionOperatorConfig::default(),
+            session_tool_overrides: SessionToolOverrides::default(),
             session_reply_targets: Vec::new(),
             session_control: SessionControlState::default(),
             session_capability_scope: CapabilityScope::default(),
@@ -1160,6 +1163,7 @@ where
         let session_control = session_control_state_from_metadata(&stored_metadata)?;
         let session_goal = session_goal_from_metadata(&stored_metadata)?;
         let session_operator = session_operator_config_from_metadata(&stored_metadata)?;
+        let session_tool_overrides = session_tool_overrides_from_metadata(&stored_metadata)?;
         let session_reply_targets =
             session_reply_targets_from_metadata(&stored_metadata)?.unwrap_or_default();
         let session_persona = session_persona_binding_from_metadata(&stored_metadata)?;
@@ -1249,6 +1253,7 @@ where
             session_control,
             session_goal,
             session_operator,
+            session_tool_overrides,
             session_reply_targets,
             session_capability_scope,
             session_credential_scope,
@@ -1865,6 +1870,7 @@ where
         self.session_control = session_control_state_from_metadata(&metadata)?;
         self.session_goal = session_goal_from_metadata(&metadata)?;
         self.session_operator = session_operator_config_from_metadata(&metadata)?;
+        self.session_tool_overrides = session_tool_overrides_from_metadata(&metadata)?;
         self.session_reply_targets =
             session_reply_targets_from_metadata(&metadata)?.unwrap_or_default();
         self.session_capability_scope = session_capability_scope_from_metadata(&metadata)?;
@@ -2329,6 +2335,22 @@ where
             if !visible_mcp_tools.contains(tool_name)
                 && !filter.denylist.iter().any(|entry| entry == tool_name)
             {
+                filter.denylist.push(tool_name.clone());
+            }
+        }
+        // Session tool overrides adjust the profile surface. Applied before
+        // the operator gating below so enabling operator tools here can
+        // never bypass the session operator policy.
+        for tool_name in &self.session_tool_overrides.enable {
+            filter.denylist.retain(|entry| entry != tool_name);
+            if !filter.allowlist.is_empty()
+                && !filter.allowlist.iter().any(|entry| entry == tool_name)
+            {
+                filter.allowlist.push(tool_name.clone());
+            }
+        }
+        for tool_name in &self.session_tool_overrides.disable {
+            if !filter.denylist.iter().any(|entry| entry == tool_name) {
                 filter.denylist.push(tool_name.clone());
             }
         }
@@ -2970,7 +2992,7 @@ mod tests {
         LearnedContextEntry, MessageRecord, ModelGenerationConfig, RecoveredMemoryBundle,
         ReplyHandle, Role, SESSION_PERSONA_BINDING_METADATA_KEY, SessionControlState, SessionEvent,
         SessionOperatorConfig, SessionPersonaBinding, ToolDefinition, ToolResultRecord,
-        ToolSurfaceFilter, asset_storage_uri, hook_runtime_state_from_metadata,
+        ToolSurfaceFilter, asset_storage_uri, hook_runtime_state_from_metadata, SessionToolOverrides,
     };
 
     struct ScriptedProvider(Mutex<VecDeque<Result<Vec<ModelStreamEvent>, ProviderError>>>);
@@ -3249,6 +3271,39 @@ mod tests {
             .expect("question-only operator section");
         assert!(!section.content.contains("notify_operator"));
         assert!(section.content.contains("ask_operator"));
+    }
+
+    #[test]
+    fn effective_tool_surface_honors_session_tool_overrides() {
+        let session_root = unique_session_root("kheish-runtime-tool-overrides-surface");
+        let (_sessions, mut runtime) = runtime_with_hook_dispatcher(
+            &session_root,
+            "tool-overrides-session",
+            Arc::new(NoopHookDispatcher),
+        );
+        // Default async profile: ask_user_question denied, bash allowed.
+        runtime.tool_surface = ToolSurfaceFilter {
+            allowlist: vec!["bash".to_string(), "read_file".to_string()],
+            denylist: vec!["ask_user_question".to_string()],
+        };
+
+        let base = runtime.effective_tool_surface();
+        assert!(!base.allows("ask_user_question"));
+        assert!(base.allows("bash"));
+
+        runtime.session_tool_overrides = SessionToolOverrides {
+            enable: vec!["ask_user_question".to_string()],
+            disable: vec!["bash".to_string()],
+        };
+        let adjusted = runtime.effective_tool_surface();
+        assert!(adjusted.allows("ask_user_question"));
+        assert!(!adjusted.allows("bash"));
+        assert!(adjusted.allows("read_file"));
+
+        // Enabling operator tools never bypasses the operator policy.
+        runtime.session_tool_overrides.enable.push("ask_operator".to_string());
+        let still_gated = runtime.effective_tool_surface();
+        assert!(!still_gated.allows("ask_operator"));
     }
 
     #[test]

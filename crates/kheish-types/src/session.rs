@@ -32,6 +32,9 @@ pub const SESSION_EXECUTION_IDENTITY_METADATA_KEY: &str = "session_execution_ide
 pub const SESSION_REPLY_TARGETS_METADATA_KEY: &str = "session_reply_targets";
 /// Stable metadata key used to persist one model-facing operator contact policy.
 pub const SESSION_OPERATOR_CONFIG_METADATA_KEY: &str = "session_operator_config";
+
+/// Stable metadata key carrying per-session native tool surface overrides.
+pub const SESSION_TOOL_OVERRIDES_METADATA_KEY: &str = "session_tool_overrides";
 /// Stable metadata key used to persist hook runtime state.
 pub const HOOK_RUNTIME_STATE_METADATA_KEY: &str = "hook_runtime_state";
 /// Sentinel value for an unbounded autonomous-agent turn policy.
@@ -391,6 +394,31 @@ impl SessionExecutionIdentity {
     }
 }
 
+/// Per-session adjustments to the agent's native tool surface.
+///
+/// The built-in agent profile stays the fail-closed default; overrides let a
+/// stack opt one session into tools the profile denies (`ask_user_question`,
+/// plan mode…) or retire tools it allows. Operator-contact tools keep their
+/// own gating: enabling them here never bypasses the session operator config.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionToolOverrides {
+    /// Tool names added to the session's surface.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enable: Vec<String>,
+    /// Tool names removed from the session's surface.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disable: Vec<String>,
+}
+
+impl SessionToolOverrides {
+    /// True when the overrides change nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.enable.is_empty() && self.disable.is_empty()
+    }
+}
+
 /// Session-scoped policy that tells the model how it may contact a human operator.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -734,6 +762,18 @@ pub fn session_operator_config_from_metadata(
         .cloned()
         .map(serde_json::from_value)
         .unwrap_or_else(|| Ok(SessionOperatorConfig::default()))
+}
+
+/// Decodes the native tool surface overrides from persisted session metadata.
+pub fn session_tool_overrides_from_metadata(
+    metadata: &Value,
+) -> serde_json::Result<SessionToolOverrides> {
+    metadata
+        .get(SESSION_TOOL_OVERRIDES_METADATA_KEY)
+        .filter(|value| !value.is_null())
+        .cloned()
+        .map(serde_json::from_value)
+        .unwrap_or_else(|| Ok(SessionToolOverrides::default()))
 }
 
 /// Returns metadata with the model-facing operator policy merged under the stable key.
