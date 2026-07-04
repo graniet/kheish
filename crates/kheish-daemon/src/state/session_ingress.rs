@@ -413,6 +413,40 @@ where
         Ok(view)
     }
 
+    pub(crate) async fn set_session_output_contract(
+        &self,
+        session_id: &str,
+        contract: Option<kheish_types::StructuredOutputContract>,
+    ) -> Result<SessionView> {
+        let normalized = contract.map(|mut contract| {
+            contract.max_repair_attempts = contract
+                .max_repair_attempts
+                .map(|attempts| attempts.min(kheish_types::MAX_OUTPUT_CONTRACT_REPAIR_ATTEMPTS));
+            contract
+        });
+        self.run_service
+            .with_session_idle_guard(session_id, || async {
+                self.agent_id_for_session(session_id).await?;
+                self.save_session_output_contract(session_id, normalized.as_ref())
+                    .await?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                if error.to_string().contains("has active or queued runs") {
+                    anyhow::anyhow!(
+                        "session {session_id} has non-terminal work or live descendants; output-contract changes are only allowed while the session is idle"
+                    )
+                } else {
+                    error
+                }
+            })?;
+        let agent_id = self.agent_id_for_session(session_id).await?;
+        let view = self.session_view(session_id, &agent_id).await?;
+        self.publish_snapshot(&view);
+        Ok(view)
+    }
+
     pub(crate) async fn set_session_capability_scope(
         &self,
         session_id: &str,

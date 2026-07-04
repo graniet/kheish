@@ -496,7 +496,10 @@ where
                 )
                 .await?;
             let reply_targets = self
-                .resolve_autonomous_run_reply_targets(&record.view.target_session_id, &request.request)
+                .resolve_autonomous_run_reply_targets(
+                    &record.view.target_session_id,
+                    &request.request,
+                )
                 .await?;
             RunRecord {
                 view: RunView {

@@ -419,6 +419,7 @@ fn read_path_allows_read_only(parts: &[&str]) -> bool {
             | ["", "v1", "sessions", _, "skills"]
             | ["", "v1", "sessions", _, "operator"]
             | ["", "v1", "sessions", _, "tool-overrides"]
+            | ["", "v1", "sessions", _, "output-contract"]
             | ["", "v1", "sessions", _, "reply-targets"]
             | ["", "v1", "sessions", _, "tasks"]
             | ["", "v1", "sessions", _, "tasks", _]

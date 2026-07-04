@@ -184,6 +184,25 @@ where
             .await
     }
 
+    pub(crate) async fn load_session_output_contract(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<kheish_types::StructuredOutputContract>> {
+        self.session_service
+            .load_session_output_contract(session_id)
+            .await
+    }
+
+    pub(crate) async fn save_session_output_contract(
+        &self,
+        session_id: &str,
+        contract: Option<&kheish_types::StructuredOutputContract>,
+    ) -> Result<()> {
+        self.session_service
+            .save_session_output_contract(session_id, contract)
+            .await
+    }
+
     pub(crate) async fn load_session_capability_scope(
         &self,
         session_id: &str,

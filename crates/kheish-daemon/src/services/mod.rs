@@ -34,7 +34,6 @@ pub(crate) use connector_ingress::ConnectorIngressService;
 pub(crate) use delivery::DeliveryService;
 pub(crate) use derivation::DerivationService;
 pub use external_action::ExternalActionAuditRecord;
-pub(crate) use mcp_overlay::McpOverlayService;
 pub(crate) use external_action::ExternalActionService;
 pub(crate) use goal::{GoalService, SessionGoalPatch};
 pub(crate) use learning::{
@@ -46,6 +45,7 @@ pub(crate) use learning_judge::LearningJudgeService;
 pub(crate) use learning_policy::{
     LearningAutomationEvaluation, LearningMutationMode, LearningPolicyService,
 };
+pub(crate) use mcp_overlay::McpOverlayService;
 pub(crate) use observation::{
     ObservationIngressRateLimitDecision, ObservationService, ObservationUploadAuthorization,
 };

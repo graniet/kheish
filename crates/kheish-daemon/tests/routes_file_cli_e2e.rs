@@ -1505,7 +1505,10 @@ async fn control_plane_pagination_contract_real_daemon() -> Result<()> {
         .await?
         .json()
         .await?;
-    assert_eq!(runs_desc.pagination.order, "submitted_at_ms_desc,run_id_desc");
+    assert_eq!(
+        runs_desc.pagination.order,
+        "submitted_at_ms_desc,run_id_desc"
+    );
     if runs_desc.pagination.total_count > 0 {
         let newest = runs_desc.items.first().context("desc first item")?;
         let oldest = runs_page.items.first().context("asc first item")?;
@@ -4833,8 +4836,7 @@ for line in sys.stdin:
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn runtime_mcp_server_hot_add_connects_persists_and_removes_on_a_real_daemon() -> Result<()>
-{
+async fn runtime_mcp_server_hot_add_connects_persists_and_removes_on_a_real_daemon() -> Result<()> {
     let bin = cli_bin()?;
     let temp = TempDir::new()?;
     let state_root = temp.path().join("state");
@@ -4967,7 +4969,9 @@ for line in sys.stdin:
     assert_eq!(duplicate.status(), reqwest::StatusCode::CONFLICT);
 
     let call: serde_json::Value = client
-        .post(format!("{base_url}/v1/runtime/mcp/tools/mcp__hot__echo/call"))
+        .post(format!(
+            "{base_url}/v1/runtime/mcp/tools/mcp__hot__echo/call"
+        ))
         .json(&serde_json::json!({ "input": {} }))
         .send()
         .await?
@@ -5008,7 +5012,11 @@ for line in sys.stdin:
         .json()
         .await?;
     assert!(
-        removed.mcp.servers.iter().all(|server| server.server != "hot"),
+        removed
+            .mcp
+            .servers
+            .iter()
+            .all(|server| server.server != "hot"),
         "removed server should leave the snapshot"
     );
     assert!(
@@ -5039,7 +5047,11 @@ for line in sys.stdin:
         .json()
         .await?;
     assert!(
-        after.mcp.servers.iter().all(|server| server.server != "hot"),
+        after
+            .mcp
+            .servers
+            .iter()
+            .all(|server| server.server != "hot"),
         "a removed overlay server must not resurrect at boot"
     );
 

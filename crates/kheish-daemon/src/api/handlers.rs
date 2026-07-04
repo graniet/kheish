@@ -64,10 +64,10 @@ use super::types::{
     SetAgentNicknameRequest, SetChannelReactionRequest, SetDebugLevelRequest, SetHooksRequest,
     SetLearningPolicyRequest, SetModelRequest, SetPermissionModeRequest, SetRunMemoryPolicyRequest,
     SetSessionCapabilityScopeRequest, SetSessionCredentialScopeRequest, SetSessionGoalRequest,
-    SetSessionOperatorConfigRequest, SetSessionPersonaRequest, SetSessionReplyTargetsRequest,
-    SetSessionRoutePolicyRequest, SetSessionToolOverridesRequest, SetSystemPromptRequest,
-    SetToolRuntimeLimitsRequest, SkillListQuery, SkillSummaryView, SkillView,
-    SpawnSidechainRequest, StackApplyRequest, StackDownRequest, StackImportRequest,
+    SetSessionOperatorConfigRequest, SetSessionOutputContractRequest, SetSessionPersonaRequest,
+    SetSessionReplyTargetsRequest, SetSessionRoutePolicyRequest, SetSessionToolOverridesRequest,
+    SetSystemPromptRequest, SetToolRuntimeLimitsRequest, SkillListQuery, SkillSummaryView,
+    SkillView, SpawnSidechainRequest, StackApplyRequest, StackDownRequest, StackImportRequest,
     StackManifestRequest, StackPlanRequest, StartProjectTaskRequest, StopTaskRequest,
     SubmitInputRequest, SubmitRunRequest, SupersedeLearningRequest, TaskListQuery, TaskOutputQuery,
     UpdateBoardRequest, UpdateChannelRequest, UpdatePersonaRequest, UpdateProjectRequest,
@@ -811,6 +811,13 @@ where
                 .post(set_session_tool_overrides::<M>)
                 .put(set_session_tool_overrides::<M>)
                 .delete(clear_session_tool_overrides::<M>),
+        )
+        .route(
+            "/v1/sessions/{session_id}/output-contract",
+            get(get_session_output_contract::<M>)
+                .post(set_session_output_contract::<M>)
+                .put(set_session_output_contract::<M>)
+                .delete(clear_session_output_contract::<M>),
         )
         .route(
             "/v1/sessions/{session_id}/capability-scope",
@@ -1964,6 +1971,10 @@ const CONTROL_PLANE_OPENAPI_ROUTES: &[OpenApiRouteSpec] = &[
     },
     OpenApiRouteSpec {
         path: "/v1/sessions/{session_id}/tool-overrides",
+        methods: &["GET", "POST", "PUT", "DELETE"],
+    },
+    OpenApiRouteSpec {
+        path: "/v1/sessions/{session_id}/output-contract",
         methods: &["GET", "POST", "PUT", "DELETE"],
     },
     OpenApiRouteSpec {
@@ -5818,6 +5829,71 @@ where
 {
     state
         .set_session_tool_overrides(&session_id, None)
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn get_session_output_contract<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Result<Json<Option<crate::StructuredOutputContractView>>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    state
+        .load_session_output_contract(&session_id)
+        .await
+        .map(|contract| {
+            Json(
+                contract
+                    .as_ref()
+                    .map(crate::StructuredOutputContractView::from),
+            )
+        })
+        .map_err(internal_error)
+}
+
+async fn set_session_output_contract<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    AxumPath(session_id): AxumPath<String>,
+    Json(request): Json<SetSessionOutputContractRequest>,
+) -> Result<Json<SessionView>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    let schema = kheish_types::StructuredFieldSchema::from_json_schema(&request.schema).map_err(
+        |error| {
+            ApiError::coded(
+                StatusCode::BAD_REQUEST,
+                "sessions",
+                "output_contract_schema_unsupported",
+                error,
+            )
+        },
+    )?;
+    state
+        .set_session_output_contract(
+            &session_id,
+            Some(kheish_types::StructuredOutputContract {
+                schema,
+                max_repair_attempts: request.max_repair_attempts,
+            }),
+        )
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn clear_session_output_contract<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Result<Json<SessionView>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    state
+        .set_session_output_contract(&session_id, None)
         .await
         .map(Json)
         .map_err(internal_error)

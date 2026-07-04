@@ -676,7 +676,10 @@ impl SessionService {
         session_id: &str,
     ) -> Result<kheish_types::SessionToolOverrides> {
         self.sessions
-            .load_metadata_value(session_id, kheish_types::SESSION_TOOL_OVERRIDES_METADATA_KEY)
+            .load_metadata_value(
+                session_id,
+                kheish_types::SESSION_TOOL_OVERRIDES_METADATA_KEY,
+            )
             .await?
             .filter(|value| !value.is_null())
             .map(serde_json::from_value)
@@ -705,6 +708,44 @@ impl SessionService {
             )
             .await?;
         Ok(overrides.clone())
+    }
+
+    /// Loads the structured output contract configured on one session.
+    pub(crate) async fn load_session_output_contract(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<kheish_types::StructuredOutputContract>> {
+        self.sessions
+            .load_metadata_value(
+                session_id,
+                kheish_types::SESSION_OUTPUT_CONTRACT_METADATA_KEY,
+            )
+            .await?
+            .filter(|value| !value.is_null())
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    /// Persists (or clears, with `None`) one session's output contract.
+    pub(crate) async fn save_session_output_contract(
+        &self,
+        session_id: &str,
+        contract: Option<&kheish_types::StructuredOutputContract>,
+    ) -> Result<()> {
+        self.sessions
+            .append(
+                session_id,
+                PersistedSessionRecord::Metadata {
+                    key: kheish_types::SESSION_OUTPUT_CONTRACT_METADATA_KEY.to_string(),
+                    value: match contract {
+                        Some(contract) => serde_json::to_value(contract)?,
+                        None => Value::Null,
+                    },
+                },
+            )
+            .await?;
+        Ok(())
     }
 
     /// Loads the stored session capability scope override for one session.

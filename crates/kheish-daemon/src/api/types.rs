@@ -1618,6 +1618,37 @@ pub struct SetSessionToolOverridesRequest {
     pub tool_overrides: kheish_types::SessionToolOverrides,
 }
 
+/// Session structured-output-contract update payload. The schema is standard
+/// JSON Schema restricted to the enforceable subset; unsupported keywords are
+/// rejected with their paths rather than silently dropped.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetSessionOutputContractRequest {
+    /// The JSON Schema the session's final answers must match.
+    pub schema: Value,
+    /// Optional corrective-turn budget (clamped by the daemon).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_repair_attempts: Option<u8>,
+}
+
+/// Structured output contract projected through the control plane.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructuredOutputContractView {
+    /// Canonical JSON Schema rendering of the enforced schema.
+    pub schema: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_repair_attempts: Option<u8>,
+}
+
+impl From<&kheish_types::StructuredOutputContract> for StructuredOutputContractView {
+    fn from(contract: &kheish_types::StructuredOutputContract) -> Self {
+        Self {
+            schema: contract.schema.to_json_schema(),
+            max_repair_attempts: contract.max_repair_attempts,
+        }
+    }
+}
+
 /// Session operator-contact policy projected through the control plane.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionOperatorConfigView {
@@ -2606,6 +2637,9 @@ pub struct SessionViewSummary {
         skip_serializing_if = "kheish_types::SessionToolOverrides::is_empty"
     )]
     pub tool_overrides: kheish_types::SessionToolOverrides,
+    /// Structured output contract enforced on the session's runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_contract: Option<StructuredOutputContractView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reply_targets: Vec<ReplyHandle>,
 }
@@ -2642,6 +2676,9 @@ pub struct SessionView {
         skip_serializing_if = "kheish_types::SessionToolOverrides::is_empty"
     )]
     pub tool_overrides: kheish_types::SessionToolOverrides,
+    /// Structured output contract enforced on the session's runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_contract: Option<StructuredOutputContractView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reply_targets: Vec<ReplyHandle>,
     pub outputs: Vec<DaemonOutputRecord>,
