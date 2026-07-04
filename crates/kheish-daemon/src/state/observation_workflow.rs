@@ -328,7 +328,7 @@ where
             .agent_id_for_session(&request.target_session_id)
             .await?;
         let reply_targets = self
-            .resolve_run_reply_targets(&request.target_session_id, &request.request)
+            .resolve_autonomous_run_reply_targets(&request.target_session_id, &request.request)
             .await?;
         if !request.request.binding_keys.is_empty() {
             self.remember_session_bindings(

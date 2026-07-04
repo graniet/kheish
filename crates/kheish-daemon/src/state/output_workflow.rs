@@ -245,11 +245,15 @@ where
             !targets.is_empty(),
             "operator notification requires at least one configured session reply target"
         );
-        let message = format_operator_notification_message(&request)?;
+        let message = operator_notification_message(&request)?;
         let output = RichOutput::text(message);
+        // Subject and urgency travel as metadata for the console and audit
+        // trail; the delivered text stays exactly what the agent wrote — a
+        // telegram operator reads a message, not a ticket header.
         let mut metadata = json!({
             "output_kind": "operator_notification",
             "run_id": run_id,
+            "subject": request.subject,
             "urgency": request.urgency,
         });
         if let Some(idempotency_key) = request.idempotency_key.as_deref()
@@ -294,7 +298,7 @@ where
     }
 }
 
-fn format_operator_notification_message(
+fn operator_notification_message(
     request: &crate::control_tools::OperatorNotificationRequest,
 ) -> Result<String> {
     let message = request.message.trim();
@@ -302,26 +306,5 @@ fn format_operator_notification_message(
         !message.is_empty(),
         "operator notification message is required"
     );
-    let mut lines = Vec::new();
-    if let Some(subject) = request
-        .subject
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        lines.push(format!("Subject: {subject}"));
-    }
-    if let Some(urgency) = request
-        .urgency
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        lines.push(format!("Urgency: {urgency}"));
-    }
-    if !lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines.push(message.to_string());
-    Ok(lines.join("\n"))
+    Ok(message.to_string())
 }

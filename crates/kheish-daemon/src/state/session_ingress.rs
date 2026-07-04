@@ -1472,6 +1472,35 @@ where
         Ok(session_targets)
     }
 
+    /// Reply targets for autonomous runs (scheduler fires, observation
+    /// materializations).
+    ///
+    /// Explicit request targets always win. The session-target fallback only
+    /// applies while the session has no operator contact: machine pipelines
+    /// (HTTP consumers of scheduled outputs) keep receiving them, but once a
+    /// session's targets serve a human operator, the run's closing summary
+    /// must not echo there on top of what the agent sends deliberately
+    /// through notify_operator.
+    pub(super) async fn resolve_autonomous_run_reply_targets(
+        &self,
+        session_id: &str,
+        request: &SubmitInputRequest,
+    ) -> Result<Vec<ReplyHandle>> {
+        let explicit = self.explicit_input_reply_targets(session_id, request);
+        if !explicit.is_empty() {
+            self.validate_session_reply_targets(session_id, &explicit)
+                .await?;
+            return Ok(explicit);
+        }
+        if self.load_session_operator_config(session_id).await?.enabled {
+            return Ok(Vec::new());
+        }
+        let session_targets = self.session_reply_targets(session_id).await;
+        self.validate_session_reply_targets(session_id, &session_targets)
+            .await?;
+        Ok(session_targets)
+    }
+
     pub(super) async fn run_reply_targets(&self, run_id: &str) -> Vec<ReplyHandle> {
         self.run_service.run_reply_targets(run_id).await
     }
