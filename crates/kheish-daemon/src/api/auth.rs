@@ -388,6 +388,7 @@ fn read_path_requires_admin(parts: &[&str]) -> bool {
         || matches!(parts, ["", "v1", "runtime", "auth", "accounts", ..])
         || matches!(parts, ["", "v1", "runtime", "hooks", ..])
         || matches!(parts, ["", "v1", "runtime", "revisions"])
+        || matches!(parts, ["", "v1", "stacks"])
         || matches!(parts, ["", "v1", "stacks", _, "ledger"])
 }
 
@@ -1193,6 +1194,10 @@ mod tests {
         );
         assert_eq!(
             required_access_for_request(&Method::GET, "/v1/runtime/revisions"),
+            ControlPlaneAccess::Admin
+        );
+        assert_eq!(
+            required_access_for_request(&Method::GET, "/v1/stacks"),
             ControlPlaneAccess::Admin
         );
         assert_eq!(

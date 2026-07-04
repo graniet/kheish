@@ -3909,9 +3909,51 @@ fn session_matches(live: &crate::SessionView, desired: &ResolvedSession) -> bool
     live_persona_id == desired.persona_id.as_deref()
         && live.capability_scope == desired.capability_scope.clone().unwrap_or_default()
         && live.credential_scope == desired.credential_scope.clone().unwrap_or_default()
-        && live.route_policy == desired.route_policy.clone().unwrap_or_default()
+        && route_policy_matches(
+            &live.route_policy,
+            &desired.route_policy.clone().unwrap_or_default(),
+        )
         && live.operator == desired.operator.clone().unwrap_or_default()
         && live.reply_targets == desired_reply_targets
+}
+
+/// Compares one desired route policy against the live one. The daemon
+/// resolves route policies at write time — filling the generation config and
+/// the route's default model — so exact equality would flag permanent drift
+/// on every stack that pins a provider. Fields the manifest set explicitly
+/// must match; fields it left unset accept the resolved value.
+fn route_policy_matches(
+    live: &kheish_types::SessionRoutePolicy,
+    desired: &kheish_types::SessionRoutePolicy,
+) -> bool {
+    if desired.provider != live.provider {
+        return false;
+    }
+    match (&desired.generation, &live.generation) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(desired_generation), Some(live_generation)) => {
+            let desired_value = serde_json::to_value(desired_generation).unwrap_or_default();
+            let live_value = serde_json::to_value(live_generation).unwrap_or_default();
+            json_is_subset(&desired_value, &live_value)
+        }
+    }
+}
+
+/// Returns true when every field present in `desired` equals the matching
+/// field in `live`, recursing through objects. Extra live fields are the
+/// write-time resolution filling defaults, not drift.
+fn json_is_subset(desired: &Value, live: &Value) -> bool {
+    match (desired, live) {
+        (Value::Object(desired_map), Value::Object(live_map)) => {
+            desired_map.iter().all(|(key, desired_value)| {
+                live_map
+                    .get(key)
+                    .is_some_and(|live_value| json_is_subset(desired_value, live_value))
+            })
+        }
+        _ => desired == live,
+    }
 }
 
 fn schedule_view_matches(
@@ -6071,6 +6113,33 @@ mod tests {
 
     fn context(raw: &str) -> StackContext {
         StackContext::from_manifest(raw, PathBuf::from("."), None, true).unwrap()
+    }
+
+    #[test]
+    fn route_policy_verification_tolerates_write_time_resolution() {
+        // The daemon fills the generation config and route default model when
+        // a route policy is saved; a manifest pinning only the provider must
+        // still verify clean.
+        let desired: kheish_types::SessionRoutePolicy =
+            serde_json::from_value(serde_json::json!({ "provider": "openai" })).unwrap();
+        let live: kheish_types::SessionRoutePolicy = serde_json::from_value(serde_json::json!({
+            "provider": "openai",
+            "generation": { "model": "gpt-5.4", "tool_choice": { "type": "auto" } },
+        }))
+        .unwrap();
+        assert!(route_policy_matches(&live, &desired));
+
+        // An explicitly pinned model must still be compared.
+        let desired_model: kheish_types::SessionRoutePolicy = serde_json::from_value(
+            serde_json::json!({ "provider": "openai", "generation": { "model": "gpt-4o" } }),
+        )
+        .unwrap();
+        assert!(!route_policy_matches(&live, &desired_model));
+
+        // Provider drift stays drift.
+        let desired_other: kheish_types::SessionRoutePolicy =
+            serde_json::from_value(serde_json::json!({ "provider": "anthropic" })).unwrap();
+        assert!(!route_policy_matches(&live, &desired_other));
     }
 
     fn errors_contain(validation: &StackValidation, needle: &str) -> bool {
