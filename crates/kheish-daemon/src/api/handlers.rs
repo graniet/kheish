@@ -711,6 +711,11 @@ where
             get(get_persona::<M>).put(update_persona::<M>),
         )
         .route("/v1/runtime/model", post(set_model::<M>))
+        .route("/v1/runtime/mcp/servers", post(add_mcp_server::<M>))
+        .route(
+            "/v1/runtime/mcp/servers/{name}",
+            delete(remove_mcp_server::<M>),
+        )
         .route(
             "/v1/runtime/revisions",
             get(list_runtime_config_revisions::<M>),
@@ -1770,6 +1775,14 @@ const CONTROL_PLANE_OPENAPI_ROUTES: &[OpenApiRouteSpec] = &[
     OpenApiRouteSpec {
         path: "/v1/runtime/model",
         methods: &["POST"],
+    },
+    OpenApiRouteSpec {
+        path: "/v1/runtime/mcp/servers",
+        methods: &["POST"],
+    },
+    OpenApiRouteSpec {
+        path: "/v1/runtime/mcp/servers/{name}",
+        methods: &["DELETE"],
     },
     OpenApiRouteSpec {
         path: "/v1/runtime/revisions",
@@ -5007,6 +5020,34 @@ where
 {
     state
         .set_model(request.provider, request.model, request.expected_revision)
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn add_mcp_server<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    Json(request): Json<crate::AddMcpServerRequest>,
+) -> Result<Json<RuntimeSettingsView>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    state
+        .add_mcp_server(&request.name, request.server)
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn remove_mcp_server<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<RuntimeSettingsView>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    state
+        .remove_mcp_server(&name)
         .await
         .map(Json)
         .map_err(internal_error)
@@ -8536,6 +8577,8 @@ mod tests {
         assert_eq!(problem.domain.as_deref(), Some("mcp"));
         assert_eq!(problem.code, "mcp_tool_input_not_object");
 
+        // The MCP manager always exists so servers can be added at runtime;
+        // a daemon without any server fails closed with an unknown tool.
         let problem = client
             .post(format!("{base}/v1/runtime/mcp/tools/mcp__demo__tool/call"))
             .json(&json!({}))
@@ -8545,9 +8588,9 @@ mod tests {
             .json::<ProblemDetails>()
             .await
             .expect("problem details");
-        assert_eq!(problem.status, 409);
+        assert_eq!(problem.status, 404);
         assert_eq!(problem.domain.as_deref(), Some("mcp"));
-        assert_eq!(problem.code, "mcp_not_configured");
+        assert_eq!(problem.code, "mcp_tool_not_found");
 
         let _ = shutdown.send(());
     }

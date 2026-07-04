@@ -43,6 +43,7 @@ mod web_search;
 mod tests;
 
 pub use api::{
+    AddMcpServerRequest,
     AckMailboxResponse, AgentAuditListQuery, AgentSummaryCountsView, AgentSummaryListPage,
     AgentSummaryListQuery, AgentSummaryView, AssetDeleteQuery, AssetDeletionFileView,
     AssetDeletionPlanView, AssetGcPlanView, AssetGcRequest, AssetListQuery, AssetReferenceView,

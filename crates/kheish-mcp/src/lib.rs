@@ -13,8 +13,9 @@ pub use catalog::{
     normalize_catalog_profile_name,
 };
 pub use config::{
-    CodexCompatOptions, LoadedMcpServerConfig, McpLoadOptions, McpLoadResult, McpServerConfig,
-    McpServerSource, McpServerTransport, default_codex_credentials_path,
-    default_codex_mcp_config_path, load_codex_mcp_servers, load_mcp_servers,
+    CodexCompatOptions, CodexServerConfig, LoadedMcpServerConfig, McpLoadOptions, McpLoadResult,
+    McpServerConfig, McpServerSource, McpServerTransport, codex_server_to_config,
+    default_codex_credentials_path, default_codex_mcp_config_path, load_codex_mcp_servers,
+    load_mcp_servers,
 };
 pub use manager::{McpManager, McpRuntimeSnapshot, McpServerInstruction, McpServerSnapshot};

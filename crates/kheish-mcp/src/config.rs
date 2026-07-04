@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use kheish_runtime::redact_text;
 use reqwest::Url;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::catalog::{McpResolvedSecrets, expand_catalog_profiles_with_secrets};
 use crate::client::load_codex_bearer_token;
@@ -244,6 +244,8 @@ pub enum McpServerSource {
         profiles: Vec<String>,
         entry_id: String,
     },
+    /// Registered through the daemon runtime API while the daemon runs.
+    RuntimeApi,
 }
 
 /// One loaded MCP server plus source metadata.
@@ -272,8 +274,12 @@ struct CodexConfigFile {
     mcp_servers: BTreeMap<String, CodexServerConfig>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
-struct CodexServerConfig {
+/// One Codex-compatible `[mcp_servers.<name>]` entry.
+///
+/// Public so the daemon runtime API can accept exactly this shape as JSON
+/// and persist accepted entries in its state-root overlay.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CodexServerConfig {
     enabled: Option<bool>,
     required: Option<bool>,
     command: Option<String>,
@@ -339,139 +345,156 @@ pub fn load_codex_mcp_servers(options: &CodexCompatOptions) -> Result<Vec<McpSer
         .or_else(default_codex_credentials_path);
     let mut servers = Vec::new();
     for (name, server) in parsed.mcp_servers {
-        if matches!(server.enabled, Some(false)) {
-            continue;
+        if let Some(config) =
+            codex_server_to_config(name, server, options, credentials_path.as_deref())?
+        {
+            servers.push(config);
         }
-        let startup_timeout_ms = server
-            .startup_timeout_sec
-            .unwrap_or(DEFAULT_STARTUP_TIMEOUT_MS / 1_000)
-            * 1_000;
-        let tool_timeout_ms = server
-            .tool_timeout_sec
-            .unwrap_or(DEFAULT_TOOL_TIMEOUT_MS / 1_000)
-            * 1_000;
-        let is_stdio = server.command.is_some();
-        let is_http = server.url.is_some();
-        validate_transport_specific_fields(&name, &server, is_stdio, is_http)?;
-        let inherit_env = if is_stdio {
-            resolve_stdio_inherit_env(
-                &name,
-                server.inherit_env,
-                !server.env_secret_refs.is_empty(),
-            )?
-        } else {
-            true
-        };
-        let mut credential_secret_refs = if is_stdio {
-            stdio_secret_refs(&server)
-        } else if is_http {
-            http_secret_refs(&server)
-        } else {
-            Vec::new()
-        };
-        if credential_secret_refs.iter().any(|secret_ref| {
-            options
-                .resolved_secrets
-                .revoked_secret_refs
-                .contains(secret_ref)
-        }) {
-            continue;
-        }
-        let transport = if let Some(command) = server.command {
-            let env = resolve_stdio_env(&server.env, &server.env_secret_refs, options)?;
-            McpServerTransport::Stdio {
-                command,
-                args: server.args,
-                env,
-                cwd: server.cwd.map(PathBuf::from),
-            }
-        } else if let Some(url) = server.url {
-            let has_authorization_header = configured_http_headers_include(
-                &server.headers,
-                &server.env_http_headers,
-                &server.http_header_secret_refs,
-                "authorization",
-            );
-            let has_bearer_source =
-                server.bearer_token_env_var.is_some() || server.bearer_token_secret_ref.is_some();
-            let has_oauth_source = server.oauth_slot_ref.is_some();
-            if has_authorization_header && (has_bearer_source || has_oauth_source) {
-                return Err(anyhow!(
-                    "MCP server `{name}` cannot configure Authorization header and managed HTTP auth"
-                ));
-            }
-            if has_bearer_source && has_oauth_source {
-                return Err(anyhow!(
-                    "MCP server `{name}` cannot configure both bearer token auth and OAuth auth"
-                ));
-            }
-            let headers = resolve_http_headers(
-                &name,
-                &server.headers,
-                &server.env_http_headers,
-                &server.http_header_secret_refs,
-                options,
-            )?;
-            let bearer_token = resolve_optional_secret_ref(
-                &options.resolved_secrets,
-                server.bearer_token_secret_ref.as_deref(),
-                &format!("MCP server `{name}` bearer token"),
-            )?
-            .or_else(|| {
-                server
-                    .bearer_token_env_var
-                    .as_deref()
-                    .and_then(env::var_os)
-                    .map(|value| value.to_string_lossy().into_owned())
-            })
-            .or_else(|| {
-                credentials_path
-                    .as_deref()
-                    .and_then(|path| load_codex_bearer_token(path, &name, &url).ok())
-            });
-            if has_authorization_header && bearer_token.is_some() {
-                return Err(anyhow!(
-                    "MCP server `{name}` cannot configure Authorization header and bearer token auth"
-                ));
-            }
-            let auth = if let Some(oauth_slot_ref) = server.oauth_slot_ref {
-                if !oauth_slot_ref.starts_with("mcp.oauth.") {
-                    return Err(anyhow!(
-                        "MCP server `{name}` OAuth slot refs must use the `mcp.oauth.` namespace"
-                    ));
-                }
-                let resource = server.oauth_resource.unwrap_or_else(|| url.clone());
-                credential_secret_refs.push(oauth_slot_ref.clone());
-                McpHttpAuth::OAuth {
-                    slot_id: oauth_slot_ref,
-                    resource,
-                    scopes: normalize_entries(&server.oauth_scopes),
-                }
-            } else if let Some(token) = bearer_token {
-                McpHttpAuth::BearerToken { token }
-            } else {
-                McpHttpAuth::None
-            };
-            McpServerTransport::StreamableHttp { url, headers, auth }
-        } else {
-            continue;
-        };
-        credential_secret_refs.sort();
-        credential_secret_refs.dedup();
-        servers.push(McpServerConfig {
-            name,
-            startup_timeout_ms,
-            tool_timeout_ms,
-            required: server.required.unwrap_or(false),
-            enabled_tools: server.enabled_tools,
-            disabled_tools: server.disabled_tools,
-            inherit_env,
-            credential_secret_refs,
-            transport,
-        });
     }
     servers.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(servers)
+}
+
+/// Converts one Codex-compatible entry into a runtime server config.
+///
+/// Returns `Ok(None)` when the entry is disabled, references a revoked
+/// secret, or declares no transport — mirroring how config-file loading
+/// skips such entries. Secret refs resolve through `options.resolved_secrets`
+/// exactly like at boot.
+pub fn codex_server_to_config(
+    name: String,
+    server: CodexServerConfig,
+    options: &CodexCompatOptions,
+    credentials_path: Option<&std::path::Path>,
+) -> Result<Option<McpServerConfig>> {
+    if matches!(server.enabled, Some(false)) {
+        return Ok(None);
+    }
+    let startup_timeout_ms = server
+        .startup_timeout_sec
+        .unwrap_or(DEFAULT_STARTUP_TIMEOUT_MS / 1_000)
+        * 1_000;
+    let tool_timeout_ms = server
+        .tool_timeout_sec
+        .unwrap_or(DEFAULT_TOOL_TIMEOUT_MS / 1_000)
+        * 1_000;
+    let is_stdio = server.command.is_some();
+    let is_http = server.url.is_some();
+    validate_transport_specific_fields(&name, &server, is_stdio, is_http)?;
+    let inherit_env = if is_stdio {
+        resolve_stdio_inherit_env(
+            &name,
+            server.inherit_env,
+            !server.env_secret_refs.is_empty(),
+        )?
+    } else {
+        true
+    };
+    let mut credential_secret_refs = if is_stdio {
+        stdio_secret_refs(&server)
+    } else if is_http {
+        http_secret_refs(&server)
+    } else {
+        Vec::new()
+    };
+    if credential_secret_refs.iter().any(|secret_ref| {
+        options
+            .resolved_secrets
+            .revoked_secret_refs
+            .contains(secret_ref)
+    }) {
+        return Ok(None);
+    }
+    let transport = if let Some(command) = server.command {
+        let env = resolve_stdio_env(&server.env, &server.env_secret_refs, options)?;
+        McpServerTransport::Stdio {
+            command,
+            args: server.args,
+            env,
+            cwd: server.cwd.map(PathBuf::from),
+        }
+    } else if let Some(url) = server.url {
+        let has_authorization_header = configured_http_headers_include(
+            &server.headers,
+            &server.env_http_headers,
+            &server.http_header_secret_refs,
+            "authorization",
+        );
+        let has_bearer_source =
+            server.bearer_token_env_var.is_some() || server.bearer_token_secret_ref.is_some();
+        let has_oauth_source = server.oauth_slot_ref.is_some();
+        if has_authorization_header && (has_bearer_source || has_oauth_source) {
+            return Err(anyhow!(
+                "MCP server `{name}` cannot configure Authorization header and managed HTTP auth"
+            ));
+        }
+        if has_bearer_source && has_oauth_source {
+            return Err(anyhow!(
+                "MCP server `{name}` cannot configure both bearer token auth and OAuth auth"
+            ));
+        }
+        let headers = resolve_http_headers(
+            &name,
+            &server.headers,
+            &server.env_http_headers,
+            &server.http_header_secret_refs,
+            options,
+        )?;
+        let bearer_token = resolve_optional_secret_ref(
+            &options.resolved_secrets,
+            server.bearer_token_secret_ref.as_deref(),
+            &format!("MCP server `{name}` bearer token"),
+        )?
+        .or_else(|| {
+            server
+                .bearer_token_env_var
+                .as_deref()
+                .and_then(env::var_os)
+                .map(|value| value.to_string_lossy().into_owned())
+        })
+        .or_else(|| {
+            credentials_path.and_then(|path| load_codex_bearer_token(path, &name, &url).ok())
+        });
+        if has_authorization_header && bearer_token.is_some() {
+            return Err(anyhow!(
+                "MCP server `{name}` cannot configure Authorization header and bearer token auth"
+            ));
+        }
+        let auth = if let Some(oauth_slot_ref) = server.oauth_slot_ref {
+            if !oauth_slot_ref.starts_with("mcp.oauth.") {
+                return Err(anyhow!(
+                    "MCP server `{name}` OAuth slot refs must use the `mcp.oauth.` namespace"
+                ));
+            }
+            let resource = server.oauth_resource.unwrap_or_else(|| url.clone());
+            credential_secret_refs.push(oauth_slot_ref.clone());
+            McpHttpAuth::OAuth {
+                slot_id: oauth_slot_ref,
+                resource,
+                scopes: normalize_entries(&server.oauth_scopes),
+            }
+        } else if let Some(token) = bearer_token {
+            McpHttpAuth::BearerToken { token }
+        } else {
+            McpHttpAuth::None
+        };
+        McpServerTransport::StreamableHttp { url, headers, auth }
+    } else {
+        return Ok(None);
+    };
+    credential_secret_refs.sort();
+    credential_secret_refs.dedup();
+    Ok(Some(McpServerConfig {
+        name,
+        startup_timeout_ms,
+        tool_timeout_ms,
+        required: server.required.unwrap_or(false),
+        enabled_tools: server.enabled_tools,
+        disabled_tools: server.disabled_tools,
+        inherit_env,
+        credential_secret_refs,
+        transport,
+    }))
 }
 
 fn validate_transport_specific_fields(

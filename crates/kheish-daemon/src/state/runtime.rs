@@ -172,6 +172,137 @@ where
         })
     }
 
+    /// Connects one MCP server while the daemon runs.
+    ///
+    /// The entry uses the exact Codex-compatible config-file shape; its
+    /// secret refs resolve against the live auth store, so a slot stored a
+    /// moment earlier through the secrets API works immediately. On success
+    /// the entry persists in the state-root overlay and reconnects at boot.
+    pub(crate) async fn add_mcp_server(
+        &self,
+        name: &str,
+        entry: kheish_mcp::CodexServerConfig,
+    ) -> Result<RuntimeSettingsView> {
+        let name = name.trim();
+        if name.is_empty()
+            || name.len() > 64
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(DaemonProblem::bad_request(
+                "mcp",
+                "mcp_server_name_invalid",
+                "MCP server names use 1-64 ascii alphanumerics, `-`, or `_`",
+            )
+            .into());
+        }
+        let Some(manager) = self.mcp_manager.as_ref() else {
+            return Err(DaemonProblem::conflict(
+                "mcp",
+                "mcp_not_configured",
+                "MCP is not configured for this daemon",
+            )
+            .into());
+        };
+        let _overlay_guard = self.mcp_overlay.lock().await;
+        if manager.has_server(name).await {
+            return Err(DaemonProblem::conflict(
+                "mcp",
+                "mcp_server_exists",
+                format!("MCP server `{name}` is already configured"),
+            )
+            .into());
+        }
+        let resolved_secrets =
+            crate::builders::mcp_resolved_secrets_from_auth_store(&self.auth_manager).await?;
+        let options = kheish_mcp::CodexCompatOptions {
+            config_path: None,
+            credentials_path: None,
+            resolved_secrets,
+        };
+        let config =
+            kheish_mcp::codex_server_to_config(name.to_string(), entry.clone(), &options, None)?
+                .ok_or_else(|| {
+                    DaemonProblem::bad_request(
+                        "mcp",
+                        "mcp_server_config_inert",
+                        "entry is disabled, declares no transport, or references a revoked secret",
+                    )
+                })?;
+        manager
+            .add_server(
+                kheish_mcp::LoadedMcpServerConfig {
+                    config,
+                    source: kheish_mcp::McpServerSource::RuntimeApi,
+                },
+                Some(self.auth_manager.clone()),
+                &self.tools,
+            )
+            .await
+            .map_err(|error| {
+                DaemonProblem::bad_gateway("mcp", "mcp_server_connect_failed", format!("{error:#}"))
+            })?;
+        let mut entries = self.mcp_overlay.entries();
+        entries.insert(name.to_string(), entry);
+        if let Err(error) = self.mcp_overlay.save(&entries) {
+            // The server must not outlive a failed persist: an unrecorded
+            // hot-add would silently vanish at the next boot.
+            let _ = manager.remove_server(name, &self.tools).await;
+            return Err(error);
+        }
+        self.refresh_mcp_runtime_snapshot().await;
+        let runtime = self.runtime_settings_unlocked();
+        self.events.publish(DaemonEvent::RuntimeUpdated {
+            runtime: runtime.clone(),
+        });
+        Ok(runtime)
+    }
+
+    /// Disconnects one runtime-added MCP server and retires its tools.
+    ///
+    /// Servers from the operator's `--mcp-config` file or catalog profiles
+    /// are startup-owned and refused here — edit the file and restart.
+    pub(crate) async fn remove_mcp_server(&self, name: &str) -> Result<RuntimeSettingsView> {
+        let Some(manager) = self.mcp_manager.as_ref() else {
+            return Err(DaemonProblem::conflict(
+                "mcp",
+                "mcp_not_configured",
+                "MCP is not configured for this daemon",
+            )
+            .into());
+        };
+        let _overlay_guard = self.mcp_overlay.lock().await;
+        let mut entries = self.mcp_overlay.entries();
+        if !entries.contains_key(name) {
+            if manager.has_server(name).await {
+                return Err(DaemonProblem::conflict(
+                    "mcp",
+                    "mcp_server_startup_owned",
+                    format!(
+                        "MCP server `{name}` comes from startup configuration; edit the config file and restart"
+                    ),
+                )
+                .into());
+            }
+            return Err(DaemonProblem::not_found(
+                "mcp",
+                "mcp_server_not_found",
+                format!("unknown MCP server `{name}`"),
+            )
+            .into());
+        }
+        manager.remove_server(name, &self.tools).await?;
+        entries.remove(name);
+        self.mcp_overlay.save(&entries)?;
+        self.refresh_mcp_runtime_snapshot().await;
+        let runtime = self.runtime_settings_unlocked();
+        self.events.publish(DaemonEvent::RuntimeUpdated {
+            runtime: runtime.clone(),
+        });
+        Ok(runtime)
+    }
+
     pub(crate) async fn runtime_config_revisions(
         &self,
     ) -> crate::RuntimeConfigRevisionListResponse {

@@ -4833,6 +4833,220 @@ for line in sys.stdin:
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_mcp_server_hot_add_connects_persists_and_removes_on_a_real_daemon() -> Result<()>
+{
+    let bin = cli_bin()?;
+    let temp = TempDir::new()?;
+    let state_root = temp.path().join("state");
+    let workspace_root = temp.path().join("workspace");
+    fs::create_dir_all(&state_root)?;
+    fs::create_dir_all(&workspace_root)?;
+    let mcp_script = temp.path().join("hot-mcp.py");
+    fs::write(
+        &mcp_script,
+        r#"import json
+import sys
+
+for line in sys.stdin:
+    try:
+        message = json.loads(line)
+    except Exception:
+        continue
+    if "id" not in message:
+        continue
+    method = message.get("method")
+    if method == "initialize":
+        result = {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "hot", "version": "1.0.0"},
+        }
+    elif method == "tools/list":
+        result = {
+            "tools": [
+                {
+                    "name": "echo",
+                    "description": "Echo back a marker.",
+                    "inputSchema": {"type": "object", "properties": {}},
+                }
+            ]
+        }
+    elif method == "tools/call":
+        result = {
+            "content": [{"type": "text", "text": "HOT_TOOL_OK"}],
+            "isError": False,
+        }
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+"#,
+    )?;
+
+    let routes_path = default_routes_path()?;
+    let master_key = "0123456789abcdef0123456789abcdef";
+    seed_default_route_auth_slots(&bin, &state_root, master_key)?;
+    let discovery_args = [
+        OsString::from("--mcp-discovery"),
+        OsString::from("disabled"),
+    ];
+    let start = |bind: &str| {
+        start_daemon_with_env_and_args(
+            &bin,
+            &temp,
+            bind,
+            &state_root,
+            &workspace_root,
+            &routes_path,
+            Some("openai"),
+            &discovery_args,
+            [(AUTH_STORE_MASTER_KEY_ENV, master_key)],
+        )
+    };
+    let bind = reserve_bind_address()?;
+    let mut daemon = start(&bind)?;
+    let base_url = format!("http://{bind}");
+    wait_for_daemon_ready(&bin, &base_url, &daemon)?;
+    let client = reqwest::Client::new();
+
+    let runtime: RuntimeSettingsView = client
+        .get(format!("{base_url}/v1/runtime"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert!(
+        runtime.mcp.servers.is_empty(),
+        "the daemon starts without any MCP server"
+    );
+
+    let python = std::env::var("PYTHON").unwrap_or_else(|_| "python3".to_string());
+    let add_body = serde_json::json!({
+        "name": "hot",
+        "command": python,
+        "args": [mcp_script.to_string_lossy()],
+        "inherit_env": true,
+    });
+
+    let bad_name = client
+        .post(format!("{base_url}/v1/runtime/mcp/servers"))
+        .json(&serde_json::json!({ "name": "bad name!", "command": "true" }))
+        .send()
+        .await?;
+    assert_eq!(bad_name.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let added: RuntimeSettingsView = client
+        .post(format!("{base_url}/v1/runtime/mcp/servers"))
+        .json(&add_body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let hot = added
+        .mcp
+        .servers
+        .iter()
+        .find(|server| server.server == "hot")
+        .context("hot server should appear in the runtime snapshot")?;
+    assert!(hot.connected, "hot-added server should be connected");
+    assert!(
+        added
+            .mcp
+            .tool_names
+            .iter()
+            .any(|tool| tool == "mcp__hot__echo"),
+        "hot-added tools should join the runtime inventory: {:?}",
+        added.mcp.tool_names
+    );
+
+    let duplicate = client
+        .post(format!("{base_url}/v1/runtime/mcp/servers"))
+        .json(&add_body)
+        .send()
+        .await?;
+    assert_eq!(duplicate.status(), reqwest::StatusCode::CONFLICT);
+
+    let call: serde_json::Value = client
+        .post(format!("{base_url}/v1/runtime/mcp/tools/mcp__hot__echo/call"))
+        .json(&serde_json::json!({ "input": {} }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(
+        serde_json::to_string(&call)?.contains("HOT_TOOL_OK"),
+        "hot-added tool should execute through the manager: {call}"
+    );
+
+    // The overlay must survive a daemon restart.
+    stop_daemon(&mut daemon)?;
+    drop(daemon);
+    let bind = reserve_bind_address()?;
+    let mut daemon = start(&bind)?;
+    let base_url = format!("http://{bind}");
+    wait_for_daemon_ready(&bin, &base_url, &daemon)?;
+    let restarted: RuntimeSettingsView = client
+        .get(format!("{base_url}/v1/runtime"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let hot = restarted
+        .mcp
+        .servers
+        .iter()
+        .find(|server| server.server == "hot")
+        .context("hot server should reconnect from the overlay at boot")?;
+    assert!(hot.connected, "overlay server should reconnect at boot");
+
+    let removed: RuntimeSettingsView = client
+        .delete(format!("{base_url}/v1/runtime/mcp/servers/hot"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(
+        removed.mcp.servers.iter().all(|server| server.server != "hot"),
+        "removed server should leave the snapshot"
+    );
+    assert!(
+        removed
+            .mcp
+            .tool_names
+            .iter()
+            .all(|tool| tool != "mcp__hot__echo"),
+        "removed server tools should leave the inventory"
+    );
+    let missing = client
+        .delete(format!("{base_url}/v1/runtime/mcp/servers/hot"))
+        .send()
+        .await?;
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // Removal must also survive a restart: the overlay entry is gone.
+    stop_daemon(&mut daemon)?;
+    drop(daemon);
+    let bind = reserve_bind_address()?;
+    let daemon = start(&bind)?;
+    let base_url = format!("http://{bind}");
+    wait_for_daemon_ready(&bin, &base_url, &daemon)?;
+    let after: RuntimeSettingsView = client
+        .get(format!("{base_url}/v1/runtime"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert!(
+        after.mcp.servers.iter().all(|server| server.server != "hot"),
+        "a removed overlay server must not resurrect at boot"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_secret_rotation_disconnects_server_snapshot_on_a_real_daemon() -> Result<()> {
     let bin = cli_bin()?;
     let captured_requests = Arc::new(Mutex::new(Vec::new()));

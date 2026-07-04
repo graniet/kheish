@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use kheish_auth::{AuthManager, AuthProvider, AuthSlotId};
 use kheish_codec::{digest_serialize, digest_text};
 use kheish_runtime::{
@@ -193,7 +193,9 @@ pub struct McpManager {
     selected_profiles: Vec<String>,
     observer: Arc<dyn RuntimeObserver>,
     servers: Arc<RwLock<BTreeMap<String, ManagedServer>>>,
-    tools: Arc<BTreeMap<String, DiscoveredMcpTool>>,
+    /// Qualified tool name → discovery record. Lockable so servers connected
+    /// at runtime can add and remove their tools after bootstrap.
+    tools: Arc<SyncRwLock<BTreeMap<String, DiscoveredMcpTool>>>,
     runtime_surface: Arc<SyncRwLock<McpRuntimeSurface>>,
 }
 
@@ -263,146 +265,14 @@ impl McpManager {
         let mut managed = BTreeMap::new();
         let mut tools = BTreeMap::new();
         for loaded in configs {
-            let config = loaded.config;
-            let source = loaded.source;
-            observer.record_external_action(external_action_trace(
-                "request",
-                "mcp",
-                format!("mcp:connect:{}", config.name),
-                None,
-                None,
-                None,
-            ))?;
-            let client =
-                match McpClient::connect(&config, &workspace_root, auth_manager.clone()).await {
-                    Ok(client) => {
-                        observer.record_external_action(external_action_trace(
-                            "response",
-                            "mcp",
-                            format!("mcp:connect:{}", config.name),
-                            None,
-                            None,
-                            Some("ok".to_string()),
-                        ))?;
-                        Arc::new(client)
-                    }
-                    Err(error) => {
-                        observer.record_external_action(external_action_trace(
-                            "response",
-                            "mcp",
-                            format!("mcp:connect:{}", config.name),
-                            None,
-                            None,
-                            Some(failed_external_action_outcome(error.to_string())),
-                        ))?;
-                        return Err(error);
-                    }
-                };
-            if config.requires_scoped_oauth() {
-                let error = scoped_oauth_startup_error(&config, auth_manager.as_ref()).await;
-                managed.insert(
-                    config.name.clone(),
-                    ManagedServer {
-                        config,
-                        source,
-                        client,
-                        instructions: None,
-                        tools: Vec::new(),
-                        error: Some(error.unwrap_or_else(|| OAUTH_LAZY_STARTUP_ERROR.to_string())),
-                        connected: false,
-                    },
-                );
-                continue;
-            }
-            observer.record_external_action(external_action_trace(
-                "request",
-                "mcp",
-                format!("mcp:initialize:{}", config.name),
-                None,
-                None,
-                None,
-            ))?;
-            let (connected, instructions, discovered_tools, error) =
-                match client.initialize(&workspace_root).await {
-                    Ok(info) => {
-                        observer.record_external_action(external_action_trace(
-                            "response",
-                            "mcp",
-                            format!("mcp:initialize:{}", config.name),
-                            None,
-                            Some(digest_serialize(&info).unwrap_or_else(|_| "unknown".to_string())),
-                            Some("ok".to_string()),
-                        ))?;
-                        observer.record_external_action(external_action_trace(
-                            "request",
-                            "mcp",
-                            format!("mcp:list_tools:{}", config.name),
-                            None,
-                            None,
-                            None,
-                        ))?;
-                        let tools_result = client.list_tools().await;
-                        match tools_result {
-                            Ok(list) => {
-                                observer.record_external_action(external_action_trace(
-                                    "response",
-                                    "mcp",
-                                    format!("mcp:list_tools:{}", config.name),
-                                    None,
-                                    Some(
-                                        digest_serialize(&list)
-                                            .unwrap_or_else(|_| "unknown".to_string()),
-                                    ),
-                                    Some("ok".to_string()),
-                                ))?;
-                                (
-                                    true,
-                                    info.instructions,
-                                    filter_discovered_tools(&config, list),
-                                    None,
-                                )
-                            }
-                            Err(error) => {
-                                observer.record_external_action(external_action_trace(
-                                    "response",
-                                    "mcp",
-                                    format!("mcp:list_tools:{}", config.name),
-                                    None,
-                                    None,
-                                    Some(failed_external_action_outcome(error.to_string())),
-                                ))?;
-                                (
-                                    true,
-                                    info.instructions,
-                                    Vec::new(),
-                                    Some(redact_text(&error.to_string())),
-                                )
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        observer.record_external_action(external_action_trace(
-                            "response",
-                            "mcp",
-                            format!("mcp:initialize:{}", config.name),
-                            None,
-                            None,
-                            Some(failed_external_action_outcome(error.to_string())),
-                        ))?;
-                        if config.required {
-                            return Err(error).with_context(|| {
-                                format!("failed to initialize required MCP server {}", config.name)
-                            });
-                        }
-                        (
-                            false,
-                            None,
-                            Vec::new(),
-                            Some(redact_text(&error.to_string())),
-                        )
-                    }
-                };
-            for tool in &discovered_tools {
+            let server = Self::connect_and_initialize_server(
+                &workspace_root,
+                auth_manager.clone(),
+                &observer,
+                loaded,
+            )
+            .await?;
+            for tool in &server.tools {
                 if tools
                     .insert(tool.qualified_name.clone(), tool.clone())
                     .is_some()
@@ -413,18 +283,7 @@ impl McpManager {
                     ));
                 }
             }
-            managed.insert(
-                config.name.clone(),
-                ManagedServer {
-                    config,
-                    source,
-                    client,
-                    instructions,
-                    tools: discovered_tools,
-                    error,
-                    connected,
-                },
-            );
+            managed.insert(server.config.name.clone(), server);
         }
         let manager = Self {
             workspace_root,
@@ -432,11 +291,168 @@ impl McpManager {
             selected_profiles,
             observer,
             servers: Arc::new(RwLock::new(managed)),
-            tools: Arc::new(tools),
+            tools: Arc::new(SyncRwLock::new(tools)),
             runtime_surface: Arc::new(SyncRwLock::new(McpRuntimeSurface::default())),
         };
         manager.refresh_runtime_surface().await;
         Ok(manager)
+    }
+
+    /// Connects and initializes one MCP server, returning its managed record.
+    ///
+    /// Shared by bootstrap and the runtime hot-add path. Connect failures and
+    /// required-server initialization failures are hard errors; optional
+    /// servers that fail to initialize come back disconnected with the error
+    /// recorded, exactly as at boot.
+    async fn connect_and_initialize_server(
+        workspace_root: &std::path::Path,
+        auth_manager: Option<Arc<AuthManager>>,
+        observer: &Arc<dyn RuntimeObserver>,
+        loaded: LoadedMcpServerConfig,
+    ) -> Result<ManagedServer> {
+        let config = loaded.config;
+        let source = loaded.source;
+        observer.record_external_action(external_action_trace(
+            "request",
+            "mcp",
+            format!("mcp:connect:{}", config.name),
+            None,
+            None,
+            None,
+        ))?;
+        let client = match McpClient::connect(&config, workspace_root, auth_manager.clone()).await {
+            Ok(client) => {
+                observer.record_external_action(external_action_trace(
+                    "response",
+                    "mcp",
+                    format!("mcp:connect:{}", config.name),
+                    None,
+                    None,
+                    Some("ok".to_string()),
+                ))?;
+                Arc::new(client)
+            }
+            Err(error) => {
+                observer.record_external_action(external_action_trace(
+                    "response",
+                    "mcp",
+                    format!("mcp:connect:{}", config.name),
+                    None,
+                    None,
+                    Some(failed_external_action_outcome(error.to_string())),
+                ))?;
+                return Err(error);
+            }
+        };
+        if config.requires_scoped_oauth() {
+            let error = scoped_oauth_startup_error(&config, auth_manager.as_ref()).await;
+            return Ok(ManagedServer {
+                config,
+                source,
+                client,
+                instructions: None,
+                tools: Vec::new(),
+                error: Some(error.unwrap_or_else(|| OAUTH_LAZY_STARTUP_ERROR.to_string())),
+                connected: false,
+            });
+        }
+        observer.record_external_action(external_action_trace(
+            "request",
+            "mcp",
+            format!("mcp:initialize:{}", config.name),
+            None,
+            None,
+            None,
+        ))?;
+        let (connected, instructions, discovered_tools, error) =
+            match client.initialize(workspace_root).await {
+                Ok(info) => {
+                    observer.record_external_action(external_action_trace(
+                        "response",
+                        "mcp",
+                        format!("mcp:initialize:{}", config.name),
+                        None,
+                        Some(digest_serialize(&info).unwrap_or_else(|_| "unknown".to_string())),
+                        Some("ok".to_string()),
+                    ))?;
+                    observer.record_external_action(external_action_trace(
+                        "request",
+                        "mcp",
+                        format!("mcp:list_tools:{}", config.name),
+                        None,
+                        None,
+                        None,
+                    ))?;
+                    let tools_result = client.list_tools().await;
+                    match tools_result {
+                        Ok(list) => {
+                            observer.record_external_action(external_action_trace(
+                                "response",
+                                "mcp",
+                                format!("mcp:list_tools:{}", config.name),
+                                None,
+                                Some(
+                                    digest_serialize(&list)
+                                        .unwrap_or_else(|_| "unknown".to_string()),
+                                ),
+                                Some("ok".to_string()),
+                            ))?;
+                            (
+                                true,
+                                info.instructions,
+                                filter_discovered_tools(&config, list),
+                                None,
+                            )
+                        }
+                        Err(error) => {
+                            observer.record_external_action(external_action_trace(
+                                "response",
+                                "mcp",
+                                format!("mcp:list_tools:{}", config.name),
+                                None,
+                                None,
+                                Some(failed_external_action_outcome(error.to_string())),
+                            ))?;
+                            (
+                                true,
+                                info.instructions,
+                                Vec::new(),
+                                Some(redact_text(&error.to_string())),
+                            )
+                        }
+                    }
+                }
+                Err(error) => {
+                    observer.record_external_action(external_action_trace(
+                        "response",
+                        "mcp",
+                        format!("mcp:initialize:{}", config.name),
+                        None,
+                        None,
+                        Some(failed_external_action_outcome(error.to_string())),
+                    ))?;
+                    if config.required {
+                        return Err(error).with_context(|| {
+                            format!("failed to initialize required MCP server {}", config.name)
+                        });
+                    }
+                    (
+                        false,
+                        None,
+                        Vec::new(),
+                        Some(redact_text(&error.to_string())),
+                    )
+                }
+            };
+        Ok(ManagedServer {
+            config,
+            source,
+            client,
+            instructions,
+            tools: discovered_tools,
+            error,
+            connected,
+        })
     }
 
     #[cfg(test)]
@@ -447,7 +463,7 @@ impl McpManager {
             selected_profiles: Vec::new(),
             observer: Arc::new(kheish_runtime::NoopObserver),
             servers: Arc::new(RwLock::new(BTreeMap::new())),
-            tools: Arc::new(BTreeMap::new()),
+            tools: Arc::new(SyncRwLock::new(BTreeMap::new())),
             runtime_surface: Arc::new(SyncRwLock::new(McpRuntimeSurface::default())),
         })
     }
@@ -568,13 +584,133 @@ impl McpManager {
         runtime.try_register_unique(McpListResourcesTool::new(Arc::new(self.clone())))?;
         runtime.try_register_unique(McpListResourceTemplatesTool::new(Arc::new(self.clone())))?;
         runtime.try_register_unique(McpReadResourceTool::new(Arc::new(self.clone())))?;
-        for tool in self.tools.values() {
+        let tools: Vec<DiscoveredMcpTool> = self.tools.read().values().cloned().collect();
+        for tool in &tools {
             runtime.try_register_unique(McpToolAdapter::new(
                 Arc::new(self.clone()),
                 discovered_tool_descriptor(tool),
             ))?;
         }
         Ok(())
+    }
+
+    /// Connects one server while the daemon runs and exposes its tools.
+    ///
+    /// The server is spawned exactly like at boot; any connect or initialize
+    /// failure is returned to the caller and nothing is registered. On
+    /// success the adapters are registered on the shared tool runtime and the
+    /// runtime surface refreshes, so the next agent turn sees the tools.
+    pub async fn add_server(
+        &self,
+        loaded: LoadedMcpServerConfig,
+        auth_manager: Option<Arc<AuthManager>>,
+        runtime: &ToolRuntime,
+    ) -> Result<()> {
+        let name = loaded.config.name.clone();
+        if self.servers.read().await.contains_key(&name) {
+            bail!("MCP server `{name}` is already configured");
+        }
+        let server = Self::connect_and_initialize_server(
+            &self.workspace_root,
+            auth_manager,
+            &self.observer,
+            loaded,
+        )
+        .await?;
+        if !server.connected {
+            let detail = server
+                .error
+                .clone()
+                .unwrap_or_else(|| "server did not connect".to_string());
+            server.client.begin_shutdown();
+            server.client.shutdown().await;
+            bail!("MCP server `{name}` failed to initialize: {detail}");
+        }
+        let collision = {
+            let tools = self.tools.read();
+            server
+                .tools
+                .iter()
+                .find(|tool| tools.contains_key(&tool.qualified_name))
+                .map(|tool| tool.qualified_name.clone())
+        };
+        if let Some(qualified) = collision {
+            server.client.begin_shutdown();
+            server.client.shutdown().await;
+            bail!("MCP tool name `{qualified}` collides with an existing tool");
+        }
+        let mut registered: Vec<String> = Vec::with_capacity(server.tools.len());
+        for tool in &server.tools {
+            let adapter =
+                McpToolAdapter::new(Arc::new(self.clone()), discovered_tool_descriptor(tool));
+            if let Err(error) = runtime.register_dynamic(Arc::new(adapter)) {
+                for name in &registered {
+                    runtime.unregister_dynamic(name);
+                }
+                server.client.begin_shutdown();
+                server.client.shutdown().await;
+                return Err(error);
+            }
+            registered.push(tool.qualified_name.clone());
+        }
+        {
+            let mut tools = self.tools.write();
+            for tool in &server.tools {
+                tools.insert(tool.qualified_name.clone(), tool.clone());
+            }
+        }
+        self.servers.write().await.insert(name, server);
+        self.refresh_runtime_surface().await;
+        Ok(())
+    }
+
+    /// Disconnects one configured server and retires its tools everywhere.
+    ///
+    /// Returns the qualified tool names that were retired.
+    pub async fn remove_server(&self, name: &str, runtime: &ToolRuntime) -> Result<Vec<String>> {
+        let server = self
+            .servers
+            .write()
+            .await
+            .remove(name)
+            .ok_or_else(|| anyhow!("unknown MCP server `{name}`"))?;
+        server.client.begin_shutdown();
+        server.client.shutdown().await;
+        let retired: Vec<String> = server
+            .tools
+            .iter()
+            .map(|tool| tool.qualified_name.clone())
+            .collect();
+        {
+            let mut tools = self.tools.write();
+            for qualified in &retired {
+                tools.remove(qualified);
+            }
+        }
+        for qualified in &retired {
+            runtime.unregister_dynamic(qualified);
+        }
+        self.refresh_runtime_surface().await;
+        Ok(retired)
+    }
+
+    /// Reports whether one server name is currently configured.
+    pub async fn has_server(&self, name: &str) -> bool {
+        self.servers.read().await.contains_key(name)
+    }
+
+    /// Creates an empty manager so a daemon started without any MCP
+    /// configuration can still accept servers through the runtime API.
+    pub fn empty(workspace_root: PathBuf, observer: Arc<dyn RuntimeObserver>) -> Self {
+        Self {
+            workspace_root,
+            config_path: None,
+            selected_profiles: Vec::new(),
+            observer,
+            servers: Arc::new(RwLock::new(BTreeMap::new())),
+            tools: Arc::new(SyncRwLock::new(BTreeMap::new())),
+            runtime_surface: Arc::new(SyncRwLock::new(McpRuntimeSurface::default())),
+        }
     }
 
     /// Returns the live model-facing MCP surface maintained by runtime state changes.
@@ -677,7 +813,9 @@ impl McpManager {
     ) -> Result<ToolExecutionOutput> {
         let tool = self
             .tools
+            .read()
             .get(qualified_name)
+            .cloned()
             .ok_or_else(|| anyhow!("unknown MCP tool {qualified_name}"))?;
         let server = self.server(&tool.server_name).await?;
         self.record_external_action(
@@ -1286,19 +1424,20 @@ impl McpServerSource {
         match self {
             Self::CodexConfig => "codex_config",
             Self::BuiltInCatalog { .. } => "built_in_catalog",
+            Self::RuntimeApi => "runtime_api",
         }
     }
 
     fn profiles(&self) -> &[String] {
         match self {
-            Self::CodexConfig => &[],
+            Self::CodexConfig | Self::RuntimeApi => &[],
             Self::BuiltInCatalog { profiles, .. } => profiles.as_slice(),
         }
     }
 
     fn catalog_entry_id(&self) -> Option<&str> {
         match self {
-            Self::CodexConfig => None,
+            Self::CodexConfig | Self::RuntimeApi => None,
             Self::BuiltInCatalog { entry_id, .. } => Some(entry_id.as_str()),
         }
     }
@@ -1505,7 +1644,7 @@ mod tests {
                     connected: false,
                 },
             )]))),
-            tools: Arc::new(BTreeMap::new()),
+            tools: Arc::new(SyncRwLock::new(BTreeMap::new())),
             runtime_surface: Arc::new(SyncRwLock::new(McpRuntimeSurface::default())),
         };
 
@@ -1559,7 +1698,7 @@ mod tests {
                     connected: true,
                 },
             )]))),
-            tools: Arc::new(BTreeMap::new()),
+            tools: Arc::new(SyncRwLock::new(BTreeMap::new())),
             runtime_surface: Arc::new(SyncRwLock::new(McpRuntimeSurface::default())),
         };
 
@@ -1662,7 +1801,7 @@ mod tests {
                     connected: true,
                 },
             )]))),
-            tools: Arc::new(BTreeMap::new()),
+            tools: Arc::new(SyncRwLock::new(BTreeMap::new())),
             runtime_surface: Arc::new(SyncRwLock::new(McpRuntimeSurface::default())),
         };
 
@@ -1731,7 +1870,7 @@ mod tests {
                     connected: false,
                 },
             )]))),
-            tools: Arc::new(BTreeMap::new()),
+            tools: Arc::new(SyncRwLock::new(BTreeMap::new())),
             runtime_surface: Arc::new(SyncRwLock::new(McpRuntimeSurface::default())),
         };
 
@@ -1888,7 +2027,7 @@ mod tests {
                     connected: false,
                 },
             )]))),
-            tools: Arc::new(BTreeMap::new()),
+            tools: Arc::new(SyncRwLock::new(BTreeMap::new())),
             runtime_surface: Arc::new(SyncRwLock::new(McpRuntimeSurface::default())),
         };
 
@@ -2006,7 +2145,7 @@ mod tests {
                     connected: true,
                 },
             )]))),
-            tools: Arc::new(BTreeMap::new()),
+            tools: Arc::new(SyncRwLock::new(BTreeMap::new())),
             runtime_surface: Arc::new(SyncRwLock::new(McpRuntimeSurface::default())),
         };
 

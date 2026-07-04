@@ -10,6 +10,7 @@ pub(crate) use auth::{digest_token, parse_bearer_token};
 pub(crate) use handlers::build_router;
 pub(crate) use headers::asset_raw_response_headers;
 pub use types::{
+    AddMcpServerRequest,
     AckMailboxResponse, AgentAuditListQuery, AgentSummaryCountsView, AgentSummaryListPage,
     AgentSummaryListQuery, AgentSummaryView, AssetDeleteQuery, AssetDeletionFileView,
     AssetDeletionPlanView, AssetGcPlanView, AssetGcRequest, AssetListQuery, AssetReferenceView,

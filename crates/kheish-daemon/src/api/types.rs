@@ -4147,6 +4147,15 @@ pub struct SetModelRequest {
     pub expected_revision: Option<u64>,
 }
 
+/// Runtime MCP server registration payload: one Codex-compatible
+/// `[mcp_servers.<name>]` entry plus its name.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AddMcpServerRequest {
+    pub name: String,
+    #[serde(flatten)]
+    pub server: kheish_mcp::CodexServerConfig,
+}
+
 /// Runtime permission mode request payload.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SetPermissionModeRequest {

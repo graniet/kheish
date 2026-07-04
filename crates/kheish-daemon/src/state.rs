@@ -316,6 +316,8 @@ pub(crate) struct DaemonState<M> {
     mcp: Mutex<McpRuntimeSnapshot>,
     mcp_surface: Arc<RwLock<McpRuntimeSurface>>,
     mcp_manager: Option<Arc<McpManager>>,
+    /// Runtime-added MCP servers, persisted in the state root.
+    mcp_overlay: crate::services::McpOverlayService,
     auth_manager: Arc<AuthManager>,
     skills: Arc<SharedSkillRegistry>,
     connectors: Arc<ConnectorRegistry>,
@@ -443,6 +445,7 @@ where
             control_plane_auth_token_files,
             control_plane_cors,
             state_root_lock_held,
+            mcp_overlay: crate::services::McpOverlayService::new(&state_root),
             state_root,
             workspace_root,
             orchestrator: Arc::new(orchestrator),

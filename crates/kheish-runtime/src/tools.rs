@@ -170,7 +170,9 @@ pub trait ToolHook: Send + Sync {
 
 /// A registry-backed tool runtime with validation, hooks, and timeouts.
 pub struct ToolRuntime {
-    registry: BTreeMap<String, Arc<dyn Tool>>,
+    /// Shared, lockable so MCP servers connected at runtime can register and
+    /// unregister their tool adapters after the runtime is frozen in an `Arc`.
+    registry: Arc<RwLock<BTreeMap<String, Arc<dyn Tool>>>>,
     hooks: Vec<Arc<dyn ToolHook>>,
     hook_dispatcher: Option<Arc<dyn HookDispatcher>>,
     observer: Arc<dyn RuntimeObserver>,
@@ -368,7 +370,7 @@ impl ToolRuntime {
     /// Creates an empty tool runtime with explicit runtime limits.
     pub fn with_limits(observer: Arc<dyn RuntimeObserver>, limits: ToolRuntimeLimits) -> Self {
         Self {
-            registry: BTreeMap::new(),
+            registry: Arc::new(RwLock::new(BTreeMap::new())),
             hooks: Vec::new(),
             hook_dispatcher: None,
             observer,
@@ -394,6 +396,7 @@ impl ToolRuntime {
         T: Tool + 'static,
     {
         self.registry
+            .write()
             .insert(tool.descriptor().name.clone(), Arc::new(tool));
     }
 
@@ -404,11 +407,37 @@ impl ToolRuntime {
     {
         let descriptor = tool.descriptor();
         let name = descriptor.name.clone();
-        if self.registry.contains_key(&name) {
+        let mut registry = self.registry.write();
+        if registry.contains_key(&name) {
             bail!("tool `{name}` is already registered");
         }
-        self.registry.insert(name, Arc::new(tool));
+        registry.insert(name, Arc::new(tool));
         Ok(())
+    }
+
+    /// Registers a tool on a shared (frozen) runtime, failing on collisions.
+    ///
+    /// This is the hot-add path: MCP servers connected while the daemon runs
+    /// register their adapters here, and every existing scoped view sees them
+    /// on its next lookup.
+    pub fn register_dynamic(&self, tool: Arc<dyn Tool>) -> Result<()> {
+        let name = tool.descriptor().name.clone();
+        let mut registry = self.registry.write();
+        if registry.contains_key(&name) {
+            bail!("tool `{name}` is already registered");
+        }
+        registry.insert(name, tool);
+        Ok(())
+    }
+
+    /// Removes a dynamically registered tool; returns whether it existed.
+    pub fn unregister_dynamic(&self, name: &str) -> bool {
+        self.registry.write().remove(name).is_some()
+    }
+
+    /// Returns one registered tool by name.
+    fn tool(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.registry.read().get(name).cloned()
     }
 
     /// Registers a hook executed around every tool invocation.
@@ -430,6 +459,8 @@ impl ToolRuntime {
     /// recursively re-triggering the daemon-level hook pipeline.
     pub fn clone_without_hook_dispatcher(&self) -> Self {
         Self {
+            // The registry Arc is shared: tools added at runtime stay visible
+            // to hook executors and isolated internal agents too.
             registry: self.registry.clone(),
             hooks: self.hooks.clone(),
             hook_dispatcher: None,
@@ -441,6 +472,7 @@ impl ToolRuntime {
     /// Returns all registered tool descriptors.
     pub fn descriptors(&self) -> Vec<ToolDescriptor> {
         self.registry
+            .read()
             .values()
             .map(|tool| tool.descriptor())
             .collect()
@@ -469,12 +501,15 @@ impl ToolRuntime {
         let limits = self.limits();
         let turn_budget = ToolTurnBudget::new(limits.clone());
 
-        let all_parallel = calls.iter().all(|call| {
-            self.registry
-                .get(&call.name)
-                .map(|tool| tool.descriptor().allows_parallel)
-                .unwrap_or(false)
-        });
+        let all_parallel = {
+            let registry = self.registry.read();
+            calls.iter().all(|call| {
+                registry
+                    .get(&call.name)
+                    .map(|tool| tool.descriptor().allows_parallel)
+                    .unwrap_or(false)
+            })
+        };
         if calls.len() == 1 || !all_parallel {
             let mut results = Vec::with_capacity(calls.len());
             for call in calls {
@@ -513,8 +548,7 @@ impl ToolRuntime {
             Vec::with_capacity(calls.len());
         for (index, call) in calls.iter().cloned().enumerate() {
             let descriptor = self
-                .registry
-                .get(&call.name)
+                .tool(&call.name)
                 .map(|tool| tool.descriptor())
                 .unwrap_or_else(|| unavailable_tool_descriptor(&call));
             if !turn_budget.try_accept_call() {
@@ -540,7 +574,7 @@ impl ToolRuntime {
                 ));
                 continue;
             }
-            let Some(tool) = self.registry.get(&call.name).cloned() else {
+            let Some(tool) = self.tool(&call.name) else {
                 tasks.push((
                     index,
                     tokio::spawn(async move {
@@ -636,8 +670,7 @@ impl ToolRuntime {
         turn_budget: ToolTurnBudget,
     ) -> Result<ToolResultRecord> {
         let descriptor = self
-            .registry
-            .get(&call.name)
+            .tool(&call.name)
             .map(|tool| tool.descriptor())
             .unwrap_or_else(|| unavailable_tool_descriptor(call));
         if !turn_budget.try_accept_call() {
@@ -655,7 +688,7 @@ impl ToolRuntime {
                 }),
             );
         }
-        let Some(tool) = self.registry.get(&call.name).cloned() else {
+        let Some(tool) = self.tool(&call.name) else {
             return Ok(build_tool_result_record(
                 call.id.clone(),
                 serde_json::json!({"error": "tool not found"}),
@@ -708,8 +741,7 @@ impl ScopedToolRuntime {
 
     fn unavailable_descriptor(&self, call: &ToolCallRecord) -> ToolDescriptor {
         self.inner
-            .registry
-            .get(&call.name)
+            .tool(&call.name)
             .map(|tool| tool.descriptor())
             .unwrap_or_else(|| ToolDescriptor {
                 name: call.name.clone(),

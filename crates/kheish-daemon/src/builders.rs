@@ -1,6 +1,5 @@
 //! Daemon service builders and provider bootstrap helpers.
 
-use parking_lot::RwLock;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -14,7 +13,7 @@ use kheish_agent::{AgentOrchestrator, AgentSupervisor};
 use kheish_auth::{AuthManager, AuthSlotId};
 use kheish_core::{HookDispatcher, LoopPolicy, ModelDriver};
 use kheish_mcp::{
-    CodexCompatOptions, McpLoadOptions, McpManager, McpResolvedSecrets, McpRuntimeSnapshot,
+    CodexCompatOptions, McpLoadOptions, McpManager, McpResolvedSecrets,
 };
 use kheish_output::OutputHost;
 use kheish_runtime::{
@@ -620,10 +619,11 @@ where
     let mut permission_rules = default_session_permission_rules();
     extend(&mut tools, &mut permission_rules)?;
     permission_rules.push(allow_all_session_permission_rule());
-    let mcp_manager = if config.mcp_config_path.is_some() || !config.mcp_catalog_profiles.is_empty()
+    let mcp_resolved_secrets =
+        mcp_resolved_secrets_from_auth_store(auth_manager.as_ref()).await?;
+    let configured_manager = if config.mcp_config_path.is_some()
+        || !config.mcp_catalog_profiles.is_empty()
     {
-        let mcp_resolved_secrets =
-            mcp_resolved_secrets_from_auth_store(auth_manager.as_ref()).await?;
         McpManager::from_load_options(
             config.workspace_root.clone(),
             McpLoadOptions {
@@ -633,7 +633,7 @@ where
                     resolved_secrets: mcp_resolved_secrets.clone(),
                 },
                 catalog_profiles: config.mcp_catalog_profiles.clone(),
-                resolved_secrets: mcp_resolved_secrets,
+                resolved_secrets: mcp_resolved_secrets.clone(),
             },
             Some(auth_manager.clone()),
             observer.clone(),
@@ -642,39 +642,66 @@ where
     } else {
         None
     };
-    let (
-        mcp_snapshot,
-        active_mcp_tools,
-        connected_mcp_servers,
-        credentialed_mcp_servers,
-        mcp_tool_servers,
-        mcp_server_instructions,
-    ) = if let Some(manager) = mcp_manager.as_ref() {
-        manager.register_into(&mut tools)?;
-        let snapshot = manager.runtime_snapshot().await;
-        let surface = snapshot.runtime_surface();
-        (
-            snapshot.clone(),
-            surface.active_tools.clone(),
-            surface.connected_servers.clone(),
-            surface.credentialed_servers.clone(),
-            surface.tool_servers.clone(),
-            surface.server_instructions.clone(),
-        )
-    } else {
-        (
-            McpRuntimeSnapshot::default(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            BTreeMap::new(),
-            Vec::new(),
-        )
-    };
-    let mcp_surface = mcp_manager
-        .as_ref()
-        .map(|manager| manager.runtime_surface_handle())
-        .unwrap_or_else(|| Arc::new(RwLock::new(mcp_snapshot.runtime_surface())));
+    // A daemon without any startup MCP configuration still gets a manager so
+    // servers can be connected through the runtime API.
+    let manager = configured_manager.unwrap_or_else(|| {
+        Arc::new(McpManager::empty(
+            config.workspace_root.clone(),
+            observer.clone(),
+        ))
+    });
+    manager.register_into(&mut tools)?;
+    // Reconnect servers added through the runtime API in earlier daemon
+    // lives. A broken overlay server logs and skips: it must never block
+    // boot the way a broken required config-file server does.
+    let overlay = crate::services::McpOverlayService::new(&config.state_root);
+    for (name, entry) in overlay.entries() {
+        let options = CodexCompatOptions {
+            config_path: None,
+            credentials_path: None,
+            resolved_secrets: mcp_resolved_secrets.clone(),
+        };
+        match kheish_mcp::codex_server_to_config(name.clone(), entry, &options, None) {
+            Ok(Some(server_config)) => {
+                if let Err(error) = manager
+                    .add_server(
+                        kheish_mcp::LoadedMcpServerConfig {
+                            config: server_config,
+                            source: kheish_mcp::McpServerSource::RuntimeApi,
+                        },
+                        Some(auth_manager.clone()),
+                        &tools,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        server = %name,
+                        error = %format!("{error:#}"),
+                        "runtime-added MCP server failed to reconnect at boot"
+                    );
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(server = %name, "runtime-added MCP server entry is inert; skipped");
+            }
+            Err(error) => {
+                tracing::warn!(
+                    server = %name,
+                    error = %format!("{error:#}"),
+                    "runtime-added MCP server entry failed to resolve; skipped"
+                );
+            }
+        }
+    }
+    let mcp_manager = Some(manager.clone());
+    let mcp_snapshot = manager.runtime_snapshot().await;
+    let boot_surface = mcp_snapshot.runtime_surface();
+    let active_mcp_tools = boot_surface.active_tools.clone();
+    let connected_mcp_servers = boot_surface.connected_servers.clone();
+    let credentialed_mcp_servers = boot_surface.credentialed_servers.clone();
+    let mcp_tool_servers = boot_surface.tool_servers.clone();
+    let mcp_server_instructions = boot_surface.server_instructions.clone();
+    let mcp_surface = manager.runtime_surface_handle();
     let hook_tools = Arc::new(tools.clone_without_hook_dispatcher());
     let system_prompt = Arc::new(SystemPromptBuilder::new(
         SystemPromptEnvironment::new(
@@ -846,7 +873,7 @@ where
     Ok((service, listener))
 }
 
-async fn mcp_resolved_secrets_from_auth_store(
+pub(crate) async fn mcp_resolved_secrets_from_auth_store(
     auth_manager: &AuthManager,
 ) -> Result<McpResolvedSecrets> {
     let mut secret_values = BTreeMap::new();

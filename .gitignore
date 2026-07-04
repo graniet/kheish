@@ -31,3 +31,4 @@ reports/
 *.log
 .aidesigner/*
 !.aidesigner/.gitkeep
+__pycache__/
