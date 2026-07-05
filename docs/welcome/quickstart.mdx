@@ -76,28 +76,20 @@ and your browser will open to that address. Leave the daemon running in this ter
 
 That single command does a surprising amount of quiet work so you do not have to. Here is what `up` sets up:
 
-```text
-   $ kheish-daemon up
-        │
-        ├─(1) ensure an encryption master key exists
-        │      • honors one you already provided (env / file), OR
-        │      • generates one and writes it to
-        │        <state_root>/auth-store-master.key  (chmod 0600)
-        │      • idempotent: re-running reuses the same key
-        │
-        ├─(2) boot the daemon in onboarding mode
-        │      • default bind: 127.0.0.1:4000  (loopback only)
-        │      • default state root: .kheish-daemon  (created if missing)
-        │      • tolerates ZERO model routes — it boots without a provider key
-        │        so you can add the key from the console instead of the CLI
-        │
-        ├─(3) serve the embedded Kheish Air console at the HTTP root "/"
-        │      • one binary hosts BOTH the control-plane API and the console
-        │      • no separate static host, no CORS to configure
-        │
-        └─(4) open your browser to the console URL (unless --no-open)
-               and print "Kheish console ready at http://127.0.0.1:4000/"
+```mermaid
+flowchart TD
+    Up["kheish-daemon up"] --> P1["1 — ensure an encryption master key exists"]
+    P1 --> P2["2 — boot the daemon in onboarding mode"]
+    P2 --> P3["3 — serve the embedded Kheish Air console at the HTTP root"]
+    P3 --> P4["4 — open your browser to the console URL and print the ready line"]
 ```
+
+What each step does, from the original:
+
+- Master key (1): honors one you already provided (env or file), or generates one and writes it to `<state_root>/auth-store-master.key` at chmod 0600; idempotent, so re-running reuses the same key.
+- Onboarding mode (2): default bind `127.0.0.1:4000` (loopback only); default state root `.kheish-daemon` (created if missing); tolerates zero model routes, booting without a provider key so you can add the key from the console instead of the CLI.
+- Serve the console (3): one binary hosts both the control-plane API and the console — no separate static host and no CORS to configure.
+- Open the browser (4): unless `--no-open`, and prints `Kheish console ready at http://127.0.0.1:4000/`.
 
 Two of those steps are worth dwelling on, because they are the reason `up` exists as a separate command from the lower-level `serve`.
 
@@ -144,19 +136,14 @@ If you see that, the fix is exactly what it says: make sure `kheish-daemon up` i
 
 The wizard is four steps. Only the first is required; the rest are optional and skippable, and you can change everything later. The whole thing is designed so that four quick choices leave you talking to an agent.
 
-```text
-   ┌────────┐    ┌────────┐    ┌────────┐    ┌──────────────┐
-   │ 1 Model│───▶│ 2 Tools│───▶│3 Secrets│──▶│ 4 First agent│
-   └────────┘    └────────┘    └────────┘    └──────────────┘
-    required      optional      optional       lands you in
-    connect a     plug in       park extra     a live chat
-    provider      MCP tools     keys, write-    from a template
-    (or pick a    (GitHub,      only store      (or the
-    default)      Linear, …)                    playground)
-
-   Every step writes to your REAL daemon as you go. "Skip the tour"
-   at any point drops you straight into the console.
+```mermaid
+flowchart LR
+    M["1 Model — required — connect a provider or pick a default"] --> T["2 Tools — optional — plug in MCP tools such as GitHub or Linear"]
+    T --> S["3 Secrets — optional — park extra keys in a write-only store"]
+    S --> A["4 First agent — lands you in a live chat from a template or the playground"]
 ```
+
+Every step writes to your real daemon as you go, and "Skip the tour" at any point drops you straight into the console.
 
 Let us walk each one.
 
@@ -234,14 +221,13 @@ This is the payoff step. You start from a ready-made agent template, and the mom
 
 Click a template and the console does several real things in sequence:
 
-```text
-   click "Personal assistant"
-        │
-        ├─ create a persona   (its character + instructions, on the daemon)
-        ├─ create a session    (the durable thread the agent lives in)
-        ├─ bind the persona to the session
-        ├─ (Daily digest only) create a 9:00 daily schedule
-        └─ navigate you into the session's chat, ready to talk
+```mermaid
+flowchart TD
+    Click["click Personal assistant"] --> Persona["create a persona — its character and instructions, on the daemon"]
+    Persona --> Session["create a session — the durable thread the agent lives in"]
+    Session --> Bind["bind the persona to the session"]
+    Bind --> Sched["Daily digest only — create a 9:00 daily schedule"]
+    Sched --> Nav["navigate you into the session chat, ready to talk"]
 ```
 
 Notice what just happened: you now have a durable **persona** and a durable **session** on your daemon, and — if you chose Daily digest — a durable **schedule** that will wake the agent every morning at 9:00 without you doing anything. These are the same first-class objects the rest of the docs talk about; the wizard just created them for you with sensible defaults. See [Agents, personas, and skills](../concepts/agents-personas-skills) for what a persona really is, and [Sessions and runs](../concepts/sessions-and-runs) for the session model underneath.
@@ -398,21 +384,22 @@ None of those five steps required touching a config file or restarting anything.
 
 You clicked through a friendly wizard, but every click was a real control-plane call. Here is the same onboarding, drawn as what the daemon actually did:
 
-```text
-   Kheish Air (browser)                    kheish-daemon
-   ────────────────────                    ─────────────
-   Step 1  "connect OpenAI" ───────────▶   create live route "openai"
-                                           store key in encrypted vault
-   Step 2  "connect GitHub MCP" ──────▶    wire MCP server into runtime
-   Step 3  "save tools.x.KEY" ────────▶    write write-only secret slot
-   Step 4  "start Personal assistant" ▶    create persona
-                                           create session
-                                           bind persona → session
-                                           (Daily digest) create schedule
-   chat    "introduce yourself" ──────▶    submit direct-input RUN
-                                           journal every step to disk
-                                    ◀──────  stream events over SSE
-                                           store the output
+```mermaid
+sequenceDiagram
+    participant Air as Kheish Air browser
+    participant Daemon as kheish-daemon
+    Air->>Daemon: Step 1 connect OpenAI
+    Note over Daemon: create live route openai, store key in encrypted vault
+    Air->>Daemon: Step 2 connect GitHub MCP
+    Note over Daemon: wire MCP server into runtime
+    Air->>Daemon: Step 3 save tools.x.KEY
+    Note over Daemon: write write-only secret slot
+    Air->>Daemon: Step 4 start Personal assistant
+    Note over Daemon: create persona, create session, bind persona to session, Daily digest creates a schedule
+    Air->>Daemon: chat introduce yourself
+    Note over Daemon: submit direct-input run, journal every step to disk
+    Daemon-->>Air: stream events over SSE
+    Note over Daemon: store the output
 ```
 
 Nothing in that diagram is special to onboarding. It is the ordinary way clients drive the daemon: create routes, store secrets, create personas and sessions, submit runs, watch the stream. The wizard is just a particularly nice client for the first five minutes. Once you understand that, the console stops being magic and becomes exactly what it is — the reference client for the control plane you will also drive from SDKs and scripts. See [Architecture](../concepts/architecture) for how those pieces fit, and [SDKs and API](../integrate/sdks-and-api) for driving the same daemon from your own code.
@@ -438,15 +425,14 @@ kheish-daemon runs list --session-id daily-digest
 
 Everything the console showed you is visible here too, because the console was never the source of truth — the daemon is. This is worth internalizing early: when a run surprises you, you do not squint at the UI and guess. You read the run from the daemon, in order, from the journal. `kheish-daemon runs get <run_id>` and `kheish-daemon sessions events <session>` give you the ground truth.
 
-```text
-   two clients, one truth
-   ──────────────────────
-   Kheish Air (browser) ─┐
-                         ├─▶  kheish-daemon  ─▶  durable journal on disk
-   kheish-daemon CLI  ───┘        (authority)      (what actually happened)
-
-   both read and write the same state; neither one owns it.
+```mermaid
+flowchart LR
+    Air["Kheish Air browser"] --> Daemon["kheish-daemon — the authority"]
+    CLI["kheish-daemon CLI"] --> Daemon
+    Daemon --> Journal["durable journal on disk — what actually happened"]
 ```
+
+Two clients, one truth: both read and write the same state, and neither one owns it.
 
 You will not need the CLI for a first agent. But knowing it is there — and that it agrees with the console because they share a daemon — is what makes Kheish feel solid rather than magical. If a run ever gets stuck, the fixed order of evidence is: the session, then its runs, then any pending approvals and questions. All of it is answerable, because all of it is durable.
 
@@ -563,18 +549,15 @@ A short list of the things that actually go wrong on a first run, and the honest
 
 In five minutes you did more than start a chatbot. Trace it back and you built a small but complete Kheish deployment, and every piece of it is a durable object the daemon owns:
 
-```text
-   one command ── kheish-daemon up
-        │
-        ▼
-   a daemon with durable state on your disk
-        │
-        ├── a model ROUTE          (added live in the Model step)
-        ├── an encrypted SECRET     (your provider key, never exposed)
-        ├── a PERSONA               (your agent's character)
-        ├── a SESSION               (its durable thread)
-        ├── maybe a SCHEDULE         (a 9:00 morning trigger)
-        └── your first RUNS          (journaled, resumable, inspectable)
+```mermaid
+flowchart TD
+    Cmd["kheish-daemon up"] --> Daemon["a daemon with durable state on your disk"]
+    Daemon --> Route["a model ROUTE — added live in the Model step"]
+    Daemon --> Secret["an encrypted SECRET — your provider key, never exposed"]
+    Daemon --> Persona["a PERSONA — your agent character"]
+    Daemon --> Session["a SESSION — its durable thread"]
+    Daemon --> Schedule["maybe a SCHEDULE — a 9:00 morning trigger"]
+    Daemon --> Runs["your first RUNS — journaled, resumable, inspectable"]
 ```
 
 Everything you touched — the console, the CLI, the wizard — was a client of that daemon. None of them held the truth. That is the one idea the whole system rests on, and now you have felt it rather than just read it: **the daemon owns state, and everything else talks to it.**

@@ -33,47 +33,21 @@ tool, checks byte and rate limits, evaluates permissions against the active
 rule set and mode, runs hooks, and — only if the decision is `allow` — actually
 executes. A decision of `ask` suspends the run until a human resolves it.
 
-```
-                        ONE TOOL CALL, END TO END
-
-  model emits          ┌─────────────────────────────────────────────┐
-  tool_call  ─────────▶│ 1. resolve tool by name                     │
-  {name,input}         │    (built-in? control tool? mcp__srv__tool?) │
-                       └───────────────┬─────────────────────────────┘
-                                       │ unknown name → hard error
-                                       ▼
-                       ┌─────────────────────────────────────────────┐
-                       │ 2. ToolRuntimeLimits gate                    │
-                       │    input bytes, calls-per-turn, batch width  │
-                       └───────────────┬─────────────────────────────┘
-                                       │ over limit → rejected, audited
-                                       ▼
-                       ┌─────────────────────────────────────────────┐
-                       │ 3. capability scope: is this tool visible?   │
-                       │    (persona / session / sidechain boundary)  │
-                       └───────────────┬─────────────────────────────┘
-                                       │ hidden → not callable at all
-                                       ▼
-                       ┌─────────────────────────────────────────────┐
-                       │ 4. permission engine                         │
-                       │    rule match → mode transform → decision    │
-                       └───────┬──────────────┬──────────────┬────────┘
-                          allow│           ask│           deny│
-                               ▼              ▼               ▼
-                       ┌───────────┐  ┌──────────────┐  ┌───────────┐
-                       │ 5a. run   │  │ 5b. persist  │  │ 5c. deny  │
-                       │ the tool  │  │ approval req,│  │ hooks,    │
-                       │           │  │ pause run,   │  │ audit,    │
-                       │           │  │ wait for a   │  │ return    │
-                       │           │  │ human, then  │  │ refusal   │
-                       │           │  │ resume       │  │           │
-                       └─────┬─────┘  └──────┬───────┘  └─────┬─────┘
-                             │               │                │
-                             └───────────────┴────────────────┘
-                                       ▼
-                             durable permission audit +
-                             (for external effects) signed
-                             external-action ledger record
+```mermaid
+flowchart TD
+    Emit["Model emits tool_call with a name and input"] --> Resolve["1. Resolve tool by name: built-in, control tool, or mcp server tool"]
+    Resolve -->|"unknown name"| HardError["Hard error"]
+    Resolve --> Limits["2. ToolRuntimeLimits gate: input bytes, calls-per-turn, batch width"]
+    Limits -->|"over limit"| Rejected["Rejected and audited"]
+    Limits --> Scope["3. Capability scope: is this tool visible to the persona, session, or sidechain?"]
+    Scope -->|"hidden"| NotCallable["Not callable at all"]
+    Scope --> Engine["4. Permission engine: rule match, then mode transform, then decision"]
+    Engine -->|"allow"| Run["5a. Run the tool"]
+    Engine -->|"ask"| Persist["5b. Persist approval request, pause run, wait for a human, then resume"]
+    Engine -->|"deny"| Deny["5c. Deny hooks, audit, return refusal"]
+    Run --> Audit["Durable permission audit, plus a signed external-action ledger record for external effects"]
+    Persist --> Audit
+    Deny --> Audit
 ```
 
 Two things are worth internalizing from this diagram. First, **capability scope
@@ -289,26 +263,24 @@ skills — is governed separately and covered in [memory](../concepts/memory).
 The exact set of built-in tools a fully-featured daemon registers, sorted, is:
 
 ```
-apply_patch            get_goal               schedule_trigger_now
-ask_operator           glob_search            set_channel_reaction
-ask_user_question      grep_search            spawn_agent
-bash                   list_agent_summaries   store_asset
-create_channel_stimulus list_agents           task_create
-create_goal            list_files             task_delete
-edit_file              list_skills            task_get
-edit_image             message_agent          task_list
-emit_output            notify_operator        task_output
-enter_plan_mode        read_channel_thread    task_stop
-exit_plan_mode         read_file              task_update
-generate_audio         request_parent_        todo_write
-generate_image           clarification        update_goal
-get_agent              schedule_cancel        use_skill
-                       schedule_create        wait_agent
-                       schedule_get           wake_after
-                       schedule_list          wake_at
-                       schedule_pause         web_fetch
-                       schedule_resume        web_search
-                       schedule_resume        write_file
+apply_patch               list_agents                   task_create
+ask_operator              list_files                    task_delete
+ask_user_question         list_skills                   task_get
+bash                      message_agent                 task_list
+create_channel_stimulus   notify_operator               task_output
+create_goal               read_channel_thread           task_stop
+edit_file                 read_file                     task_update
+edit_image                request_parent_clarification  todo_write
+emit_output               schedule_cancel               update_goal
+enter_plan_mode           schedule_create               use_skill
+exit_plan_mode            schedule_get                  wait_agent
+generate_audio            schedule_list                 wake_after
+generate_image            schedule_pause                wake_at
+get_agent                 schedule_resume               web_fetch
+get_goal                  schedule_trigger_now          web_search
+glob_search               set_channel_reaction          write_file
+grep_search               spawn_agent
+list_agent_summaries      store_asset
 ```
 
 The three channel tools — `read_channel_thread`, `set_channel_reaction`, and
@@ -405,36 +377,17 @@ operator set broad defaults while narrowing or relaxing one deployment or one
 session. When a call is evaluated, the engine resolves the winning rule
 deterministically:
 
-```
-        RULE RESOLUTION: SCOPE  →  SPECIFICITY  →  MODE
-
-   ┌──────────────────────────────────────────────────────┐
-   │ durable session hook updates merged with static       │
-   │ session rules (hook updates win same-pattern ties)    │
-   └───────────────────────┬──────────────────────────────┘
-                           ▼
-   ┌──────────────────────────────────────────────────────┐
-   │ scope order:   session  ▶  project  ▶  user           │
-   └───────────────────────┬──────────────────────────────┘
-                           ▼
-   ┌──────────────────────────────────────────────────────┐
-   │ within the winning scope, most specific pattern wins: │
-   │   exact name  ▶  longer prefix (mcp__linear__*)       │
-   │              ▶  shorter prefix (mcp__*)  ▶  *          │
-   │   ties broken by earliest-inserted rule               │
-   └───────────────────────┬──────────────────────────────┘
-                           ▼
-   ┌──────────────────────────────────────────────────────┐
-   │ apply effective mode: ask→allow, ask→deny,            │
-   │ or plan-deny a base allow for non-whitelisted tools   │
-   └───────────────────────┬──────────────────────────────┘
-              decision = allow / ask / deny
-                           ▼
-   ┌──────────────────────────────────────────────────────┐
-   │ if ask → run permission_request hooks                 │
-   │ if deny → run permission_denied hooks                 │
-   │ persist the permission audit for this call            │
-   └──────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    Merge["Durable session hook updates merged with static session rules, where hook updates win same-pattern ties"] --> ScopeOrder["Scope order: session, then project, then user"]
+    ScopeOrder --> Specific["Within the winning scope, most specific pattern wins: exact name, then longer prefix such as mcp__linear__*, then shorter prefix mcp__*, then wildcard *. Ties broken by earliest-inserted rule"]
+    Specific --> Mode["Apply effective mode: turn ask into allow, turn ask into deny, or plan-deny a base allow for non-whitelisted tools"]
+    Mode --> Decision{"Decision is allow, ask, or deny"}
+    Decision -->|"ask"| AskHooks["Run permission_request hooks"]
+    Decision -->|"deny"| DenyHooks["Run permission_denied hooks"]
+    Decision -->|"allow"| PersistAudit["Persist the permission audit for this call"]
+    AskHooks --> PersistAudit
+    DenyHooks --> PersistAudit
 ```
 
 Because specificity is well-defined, you can layer policy safely. A user-scope
@@ -485,25 +438,17 @@ Needed** widget: it names the tool, shows the input the agent wants to run, and
 offers approve / deny. Resolving it there is exactly equivalent to resolving the
 request through the API — the same persisted request, the same resume.
 
-```
-   AGENT                         KHEISH AIR CHAT                 HUMAN
-     │                                 │                           │
-     │ tool_call: bash "rm -rf build"  │                           │
-     │────────────────────────────────▶│                           │
-     │                                 │ ┌───────────────────────┐ │
-     │        run is SUSPENDED         │ │  ⚠ Approval Needed    │ │
-     │        (nothing executes)       │ │  bash                 │ │
-     │                                 │ │  $ rm -rf build       │ │
-     │                                 │ │  [ Approve ] [ Deny ] │ │
-     │                                 │ └──────────┬────────────┘ │
-     │                                 │            │  click Approve│
-     │                                 │            │◀──────────────│
-     │        request resolved:        │            │               │
-     │        decision = allow         │◀───────────┘               │
-     │◀────────────────────────────────│                            │
-     │ run RESUMES, bash executes,     │                            │
-     │ permission audit = allow        │                            │
-     ▼                                 ▼                            ▼
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant Chat as Kheish Air chat
+    participant Human
+    Agent->>Chat: tool_call bash rm -rf build
+    Note over Agent: Run is SUSPENDED, nothing executes
+    Note over Chat: Approval Needed widget shows tool bash, command rm -rf build, and buttons Approve and Deny
+    Human->>Chat: Click Approve
+    Chat->>Agent: Request resolved, decision = allow
+    Note over Agent: Run RESUMES, bash executes, permission audit = allow
 ```
 
 The important property is that the run does not lose its place. The suspension is
@@ -532,44 +477,23 @@ narrowed per-session by capability and credential scope. This is the key scaling
 property: one server process serves every session; you do not pay a process per
 agent.
 
-```
-                        MCP TOPOLOGY
-
-   ┌──────────────────────────── DAEMON ────────────────────────────┐
-   │                                                                 │
-   │   ┌───────────────┐   loads once at boot   ┌────────────────┐   │
-   │   │  MCP Manager  │◀──────────────────────▶│  Auth store    │   │
-   │   │  (global      │   resolves mcp.* slots  │  (encrypted    │   │
-   │   │   inventory)  │                         │   secrets)     │   │
-   │   └───┬───────┬───┘                         └────────────────┘   │
-   │       │       │                                                  │
-   │  stdio│       │streamable HTTP                                   │
-   │       │       │                                                  │
-   │       ▼       ▼                                                  │
-   │  ┌─────────┐ ┌────────────────────────────────┐                 │
-   │  │ child   │ │ HTTP client                     │                 │
-   │  │ process │ │  auth: None | Bearer | OAuth    │                 │
-   │  │ (stdin/ │ │  bearer/header from secret_ref  │                 │
-   │  │  stdout │ │  OAuth re-authorizes each call  │                 │
-   │  │  JSON-  │ └──────────────┬─────────────────┘                  │
-   │  │  RPC)   │                │                                    │
-   │  │ env from│                │ https                              │
-   │  │ secret_ │                ▼                                    │
-   │  │ refs,   │      ┌──────────────────────┐                       │
-   │  │ restricted     │  remote MCP server   │                       │
-   │  │ env     │      │  (Linear, Stripe,    │                       │
-   │  └────┬────┘      │   your internal MCP) │                       │
-   │       │           └──────────────────────┘                      │
-   │       ▼                                                          │
-   │  ┌──────────────────────┐                                       │
-   │  │ local MCP server      │  e.g. GitHub via Docker,              │
-   │  │ (Docker / npx / bin)  │  Playwright, Sentry                   │
-   │  └──────────────────────┘                                       │
-   │                                                                 │
-   │   surfaced into runtime as:  mcp__<server>__<tool>              │
-   │   plus helpers: list_mcp_resources, list_mcp_resource_          │
-   │                 templates, read_mcp_resource                    │
-   └─────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph Daemon["Daemon"]
+        Manager["MCP Manager, global inventory"]
+        AuthStore["Auth store, encrypted secrets"]
+        Child["Stdio child process, stdin and stdout JSON-RPC, env from secret_refs, restricted env"]
+        HTTPClient["HTTP client, auth None or Bearer or OAuth, bearer or header from secret_ref, OAuth re-authorizes each call"]
+        Local["Local MCP server via Docker, npx, or binary, such as GitHub via Docker, Playwright, or Sentry"]
+        Surface["Surfaced into runtime as mcp__server__tool, plus helpers list_mcp_resources, list_mcp_resource_templates, and read_mcp_resource"]
+        Manager <-->|"loads once at boot, resolves mcp.* slots"| AuthStore
+        Manager -->|"stdio"| Child
+        Manager -->|"streamable HTTP"| HTTPClient
+        Child --> Local
+        Local --> Surface
+    end
+    HTTPClient -->|"https"| Remote["Remote MCP server such as Linear, Stripe, or your internal MCP"]
+    Remote --> Surface
 ```
 
 ### Two transports
@@ -687,33 +611,14 @@ scopes decide what it can *see* and what it can *use*:
 
 The effective access is the intersection:
 
-```
-        WHAT AN MCP TOOL CALL MUST PASS
-
-   global daemon MCP inventory
-        │   (every loaded server + tool)
-        ▼
-   ┌─────────────────────────────┐
-   │ CapabilityScope             │   hides whole servers,
-   │  visible? ──── no ──▶ NOT   │   individual tools, and
-   │        │             CALL-  │   resource helpers
-   │       yes            ABLE   │
-   └────────┼────────────────────┘
-            ▼
-   ┌─────────────────────────────┐
-   │ Permission engine           │   mcp__* defaults to ask;
-   │  allow / ask / deny         │   deny rules still win
-   └────────┼────────────────────┘
-            ▼ (allow or approved)
-   ┌─────────────────────────────┐
-   │ CredentialScope             │   even if visible + allowed,
-   │  mcp_server_allow / deny    │   a credentialed server can
-   │  usable? ── no ──▶ DENIED   │   be denied at resolution
-   │        │          AT USE    │
-   │       yes                   │
-   └────────┼────────────────────┘
-            ▼
-        the MCP call runs
+```mermaid
+flowchart TD
+    Inventory["Global daemon MCP inventory: every loaded server and tool"] --> Capability{"CapabilityScope: is the tool visible?"}
+    Capability -->|"no"| NotCallable["Not callable. CapabilityScope hides whole servers, individual tools, and resource helpers"]
+    Capability -->|"yes"| Engine{"Permission engine: allow, ask, or deny. mcp__* defaults to ask, and deny rules still win"}
+    Engine -->|"allow or approved"| Credential{"CredentialScope: is the server usable? Checks mcp_server_allow and mcp_server_deny"}
+    Credential -->|"no"| DeniedUse["Denied at use. Even if visible and allowed, a credentialed server can be denied at resolution"]
+    Credential -->|"yes"| Runs["The MCP call runs"]
 ```
 
 This separation is what lets you say precise things. "This delegated child keeps
@@ -845,28 +750,15 @@ Each individual tool also declares its own `timeout_ms` and whether it
 means it will not be batched concurrently with others even inside a parallel
 batch. Here is how a multi-call turn is scheduled:
 
-```
-        ONE MODEL TURN → MANY TOOL CALLS
-
-   model returns a batch of N tool calls in one turn
-        │
-        ▼
-   is N ≤ max_calls_per_turn (256)? ── no ──▶ batch rejected
-        │ yes
-        ▼
-   split into chunks of max_parallel_tools (16)
-
-   chunk 1                      chunk 2
-   ┌────┬────┬────┬────┐        ┌────┬────┬────┐
-   │ t1 │ t2 │ t3 │ .. │  then  │ t17│ t18│ .. │  ...
-   └─┬──┴─┬──┴─┬──┴────┘        └────┴────┴────┘
-     │    │    │  each ≤ its own timeout_ms (≤ max_timeout_ms)
-     ▼    ▼    ▼  each ≤ max_output_bytes
-   results accumulate; if cumulative output or envelope bytes
-   exceed the batch caps, further calls in the turn are cut off
-        │
-        ▼
-   a tool with allows_parallel=false runs alone, not in a chunk
+```mermaid
+flowchart TD
+    Batch["Model returns a batch of N tool calls in one turn"] --> Check{"Is N at most max_calls_per_turn, which is 256?"}
+    Check -->|"no"| Reject["Batch rejected"]
+    Check -->|"yes"| Split["Split into chunks of max_parallel_tools, which is 16"]
+    Split --> Chunk1["Chunk 1 runs t1, t2, t3, and so on"]
+    Chunk1 -->|"then"| Chunk2["Chunk 2 runs t17, t18, and so on, then further chunks"]
+    Chunk2 --> Accumulate["Each call is bounded by its own timeout_ms, at most max_timeout_ms, and by max_output_bytes. Results accumulate, and if cumulative output or envelope bytes exceed the batch caps, further calls in the turn are cut off"]
+    Accumulate --> Alone["A tool with allows_parallel false runs alone, not in a chunk"]
 ```
 
 Operators can inspect or replace these limits with

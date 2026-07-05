@@ -17,40 +17,34 @@ This document is both the conceptual map and the detailed reference for every pl
 
 ## The three planes at a glance
 
-Here are the three planes, side by side. Read this diagram top to bottom as "how durable is it," and left to right as "three parallel stores that never merge into one another."
+Here are the three planes, side by side — three parallel stores that never merge into one another. Each plane flows down into its own storage, then into the two shared surfaces that read all three.
 
-```text
-                         KHEISH MEMORY PLANES (daemon-owned)
-
-  ┌───────────────────────────┐ ┌───────────────────────────┐ ┌───────────────────────────┐
-  │  PLANE 1                   │ │  PLANE 2                   │ │  PLANE 3                   │
-  │  SESSION JOURNAL           │ │  RECOVERED RUN MEMORY      │ │  LEARNING PLANE            │
-  │  (the transcript)          │ │  (episodic)                │ │  (durable knowledge)       │
-  ├───────────────────────────┤ ├───────────────────────────┤ ├───────────────────────────┤
-  │ append-only event log      │ │ compact record per         │ │ first-class learning       │
-  │ + checkpoints              │ │ TERMINAL run               │ │ records, scoped, reviewed  │
-  │                            │ │                            │ │                            │
-  │ canonical conversation     │ │ ≤480-char summary,         │ │ kinds:                     │
-  │ history, source of truth   │ │ request/outcome previews,  │ │  fact / preference /       │
-  │                            │ │ failure markers, artifacts │ │  decision  -> injectable   │
-  │ restored on restart        │ │                            │ │  run_summary / procedure   │
-  │                            │ │ scrubbed before storage    │ │            -> NOT injected  │
-  │                            │ │                            │ │                            │
-  │ feeds live context +       │ │ ranked, bounded injection  │ │ semantic learnings +       │
-  │ compaction                 │ │ as `recovered_memory`      │ │ promoted procedural skills │
-  └─────────────┬─────────────┘ └─────────────┬─────────────┘ └─────────────┬─────────────┘
-                │                              │                             │
-                v                              v                             v
-        lives in the session          lives in run-memories/        lives in learnings/,
-        journal + checkpoints         + a topology index            learning-candidates/,
-        (canonical history)           (derived read model)          learning-skills/
-                │                              │                             │
-                └──────────────┬───────────────┴─────────────┬───────────────┘
-                               v                             v
-                     assembled into ONE prompt        inspected together via
-                     by the runtime, each with        GET /v1/sessions/{id}/memory-context
-                     its own bounded budget            (the "what is eligible now" view)
+```mermaid
+flowchart TD
+    P1["Plane 1: Session journal<br/>the transcript"]
+    P2["Plane 2: Recovered run memory<br/>episodic"]
+    P3["Plane 3: Learning plane<br/>durable knowledge"]
+    S1["Lives in the session journal and checkpoints<br/>canonical history"]
+    S2["Lives in run-memories and a topology index<br/>derived read model"]
+    S3["Lives in learnings, learning-candidates, learning-skills"]
+    Prompt["Assembled into ONE prompt by the runtime<br/>each with its own bounded budget"]
+    Inspect["Inspected together via GET /v1/sessions/ID/memory-context<br/>the what-is-eligible-now view"]
+    P1 --> S1
+    P2 --> S2
+    P3 --> S3
+    S1 --> Prompt
+    S2 --> Prompt
+    S3 --> Prompt
+    S1 --> Inspect
+    S2 --> Inspect
+    S3 --> Inspect
 ```
+
+What each plane holds:
+
+- **Plane 1 — Session journal (the transcript):** append-only event log plus checkpoints; canonical conversation history and source of truth; restored on restart; feeds live context plus compaction.
+- **Plane 2 — Recovered run memory (episodic):** one compact record per terminal run; ≤480-char summary, request and outcome previews, failure markers, artifacts; scrubbed before storage; ranked, bounded injection as `recovered_memory`.
+- **Plane 3 — Learning plane (durable knowledge):** first-class learning records, scoped and reviewed; kinds `fact` / `preference` / `decision` are injectable, while `run_summary` / `procedure` are stored but NOT injected; semantic learnings plus promoted procedural skills.
 
 The three planes are **never collapsed into one system**. That separation is a deliberate governance decision, not an accident of implementation. If Kheish let arbitrary run output flow straight into long-term, prompt-visible memory, a single confused or adversarial run could quietly rewrite how the assistant behaves forever. Instead, each plane has its own rules for what gets in, what gets out, and what reaches a prompt.
 
@@ -145,65 +139,17 @@ Four hundred and eighty characters. That is the entire budget for one run's epis
 
 Here is the life of one episodic record, end to end:
 
-```text
-   RECOVERED RUN MEMORY: from a finished run to the next prompt
-
-   ┌──────────────────────┐
-   │  A run reaches a      │   completed / failed /
-   │  TERMINAL status      │   interrupted / cancelled
-   └──────────┬───────────┘
-              │
-              v
-   ┌──────────────────────────────────────────────┐
-   │  BUILD RECORD                                  │
-   │  - request_preview  (from durable payload)     │
-   │  - outcome_preview  (latest assistant text)    │
-   │  - failure_markers  (status + error preview)   │
-   │  - artifact_ids                                │
-   │  - summary = join(parts), then cap at 480      │
-   └──────────┬─────────────────────────────────────┘
-              │
-              v
-   ┌──────────────────────────────────────────────┐
-   │  SCRUB (before it ever touches disk)           │
-   │  - secret/token redactor                       │
-   │  - PII: email, phone, SSN, Luhn card, keys ... │
-   │  redaction_count fields are counted            │
-   └──────────┬─────────────────────────────────────┘
-              │
-              v
-   ┌──────────────────────────────────────────────┐
-   │  PERSIST + INDEX                               │
-   │  - write to run-memories/                      │
-   │  - track pointer in the topology index         │
-   │    (by_session and by_scope)                   │
-   │  - prune: TTL + per-session overflow           │
-   └──────────┬─────────────────────────────────────┘
-              │
-        (later) a NEW input arrives on the SAME session
-              │
-              v
-   ┌──────────────────────────────────────────────┐
-   │  RANK against the pending input                │
-   │  - lexical query-term scoring                  │
-   │  - recency is the fallback + tie-breaker       │
-   └──────────┬─────────────────────────────────────┘
-              │
-              v
-   ┌──────────────────────────────────────────────┐
-   │  BUDGET + PACK                                 │
-   │  - keep at most `max_prompt_entries` (default 3)│
-   │  - drop older entries first if they don't fit  │
-   │  - if nothing fits, omit the section entirely  │
-   └──────────┬─────────────────────────────────────┘
-              │
-              v
-   ┌──────────────────────────────────────────────┐
-   │  INJECT as ONE system section                  │
-   │  named `recovered_memory`                      │
-   │  (framed as historical run data, not orders;   │
-   │   code fences inside summaries are neutralized) │
-   └────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    Terminal["A run reaches a TERMINAL status<br/>completed, failed, interrupted, or cancelled"]
+    Build["BUILD RECORD<br/>request_preview from the durable payload<br/>outcome_preview, the latest assistant text<br/>failure_markers, status plus error preview<br/>artifact_ids<br/>summary is the joined parts, then capped at 480"]
+    Scrub["SCRUB, before it ever touches disk<br/>secret and token redactor<br/>PII: email, phone, SSN, Luhn card, keys<br/>redaction_count fields are counted"]
+    Persist["PERSIST and INDEX<br/>write to run-memories<br/>track a pointer in the topology index, by_session and by_scope<br/>prune on TTL plus per-session overflow"]
+    NewInput["Later, a NEW input arrives on the SAME session"]
+    Rank["RANK against the pending input<br/>lexical query-term scoring<br/>recency is the fallback and tie-breaker"]
+    Budget["BUDGET and PACK<br/>keep at most max_prompt_entries, default 3<br/>drop older entries first if they do not fit<br/>if nothing fits, omit the section entirely"]
+    Inject["INJECT as ONE system section named recovered_memory<br/>framed as historical run data, not orders<br/>code fences inside summaries are neutralized"]
+    Terminal --> Build --> Scrub --> Persist --> NewInput --> Rank --> Budget --> Inject
 ```
 
 A few things in this flow deserve emphasis because they are easy to get wrong:
@@ -338,28 +284,16 @@ Two more guardrails reinforce this:
 
 Every learning belongs to exactly one scope. When a session asks "what learnings can I see," the daemon resolves an **ordered** list of visible scopes, widest reach last:
 
-```text
-   SCOPE RESOLUTION for one session
-   (learning_scopes_for_session)
-
-   ┌────────────────────────────────────────────────────────────┐
-   │  1. SESSION            scope = session:<this session id>     │  narrowest
-   │     always present                                           │   |
-   ├────────────────────────────────────────────────────────────┤   |
-   │  2. PERSONA            scope = persona:<bound persona id>     │   |
-   │     only if a persona is bound to the session                │   |
-   ├────────────────────────────────────────────────────────────┤   |
-   │  3. PROJECT(S)         scope = project:<each linked project>  │   |
-   │     one entry per project the session is linked to           │   |
-   ├────────────────────────────────────────────────────────────┤   v
-   │  4. WORKSPACE          scope = workspace:default             │  widest
-   │     always present; id is ALWAYS `default`                   │
-   └────────────────────────────────────────────────────────────┘
-
-   A learning is visible to the session if its scope key matches
-   ANY row above. So a workspace:default fact is visible to every
-   session; a session:S fact is visible only inside session S.
+```mermaid
+flowchart TD
+    Sess["1. SESSION<br/>scope key session:ID, always present, narrowest"]
+    Pers["2. PERSONA<br/>scope key persona:ID, only if a persona is bound to the session"]
+    Proj["3. PROJECTS<br/>scope key project:ID, one entry per project the session is linked to"]
+    Work["4. WORKSPACE<br/>scope key workspace:default, always present, id is ALWAYS default, widest"]
+    Sess --> Pers --> Proj --> Work
 ```
+
+The scopes are resolved by `learning_scopes_for_session`. A learning is visible to the session if its scope key matches ANY row above: a `workspace:default` fact is visible to every session, while a `session:S` fact is visible only inside session S.
 
 Read the ladder as concentric rings of trust. A `session`-scoped preference is a private note for one conversation. A `persona`-scoped fact follows an identity across the sessions bound to it. A `project`-scoped decision is shared by everyone working that project. A `workspace`-scoped fact is daemon-wide truth. The workspace scope id is *always* `default` — the code validates this and rejects any other workspace id — so there is exactly one workspace ring, not a family of them.
 
@@ -369,68 +303,16 @@ The direction of resolution (session → persona → project → workspace) is a
 
 Now the heart of Plane 3: how a candidate becomes prompt-visible durable memory. This is a pipeline with several gates, and each gate exists to keep the daemon — not arbitrary run output — in charge of long-term behavior.
 
-```text
-   SEMANTIC LEARNING PIPELINE
-   capture -> candidate -> rules -> judge -> verification -> publish -> inject
-
-   ┌─────────────┐
-   │  CAPTURE     │  A completed run is scanned for durable memory.
-   │             │  Two paths:
-   │             │   (a) heuristic: explicit `Preference:` / `Fact:` /
-   │             │       `Decision:` labels in the request  (conf 98,
-   │             │       SHORT-CIRCUITS the model entirely)
-   │             │   (b) model-backed structured extraction (fact /
-   │             │       preference / decision only), bounded by
-   │             │       max_candidates_per_run (default 2)
-   └──────┬──────┘
-          v
-   ┌─────────────┐
-   │  CANDIDATE   │  A LearningCandidateView is persisted. It records
-   │             │  its ORIGIN (api vs daemon), scope, kind, content,
-   │             │  confidence, source, evidence_refs, sensitivity.
-   │             │  Secret-looking content is rejected before storage.
-   └──────┬──────┘
-          v
-   ┌─────────────┐
-   │  RULES       │  Ordered publication rules are evaluated; FIRST match
-   │             │  wins, else publication.default_action. Rules match on
-   │             │  scope, kind, sensitivity, min_confidence, and the
-   │             │  trusted-input gates require_evidence / require_source_run
-   │             │  / require_source_session (daemon-origin candidates only).
-   │             │  Output: an ACTION in {manual_review, reject,
-   │             │  publish_provisional, publish_active}.
-   └──────┬──────┘
-          v
-   ┌─────────────┐
-   │  JUDGE       │  OPTIONAL model-backed review, runs AFTER rules.
-   │  (optional)  │  It is CLAMPED to the policy envelope: it can only pick
-   │             │  from actions the baseline already allowed, never widen.
-   │             │  In `enabled` mode a judge FAILURE fails closed to
-   │             │  manual_review. The verdict is retained for audit.
-   └──────┬──────┘
-          v
-   ┌─────────────┐
-   │ VERIFICATION │  Only when the surviving action is publish_active.
-   │  (gate)      │  The daemon looks for DAEMON-OWNED support for the
-   │             │  content (run-memory record, or referenced debug
-   │             │  artifact). No support -> DOWNGRADE to publish_provisional.
-   │             │  Same-subject/different-value conflicts -> escalate to
-   │             │  manual_review unless an explicit supersession is named.
-   └──────┬──────┘
-          v
-   ┌─────────────┐
-   │  PUBLISH     │  A LearningView is written with status + publish_tier +
-   │             │  verification_status + policy_decision + policy_actor.
-   │             │  provisional = durable but NOT prompt-visible;
-   │             │  active = eligible for retrieval.
-   └──────┬──────┘
-          v
-   ┌─────────────┐
-   │  INJECT      │  On a later input, eligible learnings for the session's
-   │             │  visible scopes are packed into ONE `learned_context`
-   │             │  section — but ONLY fact/preference/decision, only if
-   │             │  they pass every visibility gate (see next section).
-   └─────────────┘
+```mermaid
+flowchart TD
+    Capture["CAPTURE<br/>a completed run is scanned for durable memory<br/>heuristic labels Preference, Fact, Decision short-circuit the model at confidence 98<br/>else model-backed extraction of fact, preference, decision, bounded by max_candidates_per_run, default 2"]
+    Candidate["CANDIDATE<br/>a LearningCandidateView is persisted with origin api or daemon, scope, kind, content, confidence, source, evidence_refs, sensitivity<br/>secret-looking content is rejected before storage"]
+    Rules["RULES<br/>ordered publication rules, FIRST match wins, else publication.default_action<br/>match on scope, kind, sensitivity, min_confidence, and the trusted-input gates require_evidence, require_source_run, require_source_session for daemon-origin candidates<br/>output action: manual_review, reject, publish_provisional, or publish_active"]
+    Judge["JUDGE, optional<br/>model-backed review, runs AFTER rules, CLAMPED to the policy envelope and never widens<br/>in enabled mode a failure fails closed to manual_review, and the verdict is retained for audit"]
+    Verification["VERIFICATION, gate<br/>only when the surviving action is publish_active<br/>needs DAEMON-OWNED support, a run-memory record or referenced debug artifact, else DOWNGRADE to publish_provisional<br/>same-subject different-value conflicts escalate to manual_review unless a supersession is named"]
+    Publish["PUBLISH<br/>a LearningView is written with status, publish_tier, verification_status, policy_decision, policy_actor<br/>provisional is durable but NOT prompt-visible<br/>active is eligible for retrieval"]
+    Inject["INJECT<br/>on a later input, eligible learnings for the visible scopes are packed into ONE learned_context section<br/>only fact, preference, decision, and only if they pass every visibility gate"]
+    Capture --> Candidate --> Rules --> Judge --> Verification --> Publish --> Inject
 ```
 
 Let us walk the stages, because each one has behavior that surprises people.
@@ -523,38 +405,22 @@ Session-scoped procedures are *not* promoted into the shared daemon skill catalo
 
 Once promoted, a skill has its own **rollout ladder**, which is really a small governance state machine bound to evidence:
 
-```text
-   PROCEDURAL SKILL ROLLOUT LADDER (evidence-bound)
-
-   ┌────────┐   verification run completes, output   ┌──────────┐
-   │ DRAFT  │   matches expected marker (optionally   │ VERIFIED │
-   │        │──►guarded by definition_fingerprint) ──►│          │
-   └────────┘   recorded via rollout-result           └────┬─────┘
-   stored, not                                              │ operator records
-   yet runnable                                             │ canary evidence
-                                                            v
-                              hidden from the normal   ┌──────────┐
-                              catalog while canary      │  CANARY  │
-                              evidence is gathered      │          │
-                                                        └────┬─────┘
-                                 >=1 successful canary,      │
-                                 0 canary failures for the   │
-                                 current definition          v
-                                 fingerprint             ┌──────────┐
-                                                         │  ACTIVE  │  mounted in
-                                                         │          │  /v1/skills,
-                                                         └────┬─────┘  session skills,
-                                                              │        list_skills,
-                                          revoke / source     │        use_skill
-                                          learning revoked    v
-                                                         ┌──────────┐
-                                                         │ REVOKED  │  removed from
-                                                         │          │  the catalog
-                                                         └──────────┘
-
-   rollback: restores the latest historical ACTIVE snapshot and remounts it,
-   but REFUSES if the source procedure learning is no longer active+active-tier.
+```mermaid
+stateDiagram-v2
+    [*] --> DRAFT
+    DRAFT --> VERIFIED : verification run output matches the expected marker, recorded via rollout-result
+    VERIFIED --> CANARY : operator records canary evidence
+    CANARY --> ACTIVE : at least 1 successful canary and 0 canary failures for the current fingerprint
+    ACTIVE --> REVOKED : revoke, or the source learning is revoked
 ```
+
+- **DRAFT** — stored, not yet runnable.
+- **DRAFT to VERIFIED** — a verification run completes and its output matches the expected marker, optionally guarded by `definition_fingerprint`, recorded via `rollout-result`.
+- **VERIFIED to CANARY** — the operator records canary evidence; CANARY is hidden from the normal catalog while that evidence is gathered.
+- **CANARY to ACTIVE** — requires at least one successful canary and zero canary failures for the current definition fingerprint.
+- **ACTIVE** — mounted in `/v1/skills`, session skills, `list_skills`, and `use_skill`.
+- **REVOKED** — removed from the catalog.
+- **Rollback** — restores the latest historical ACTIVE snapshot and remounts it, but REFUSES if the source procedure learning is no longer active and at the active tier.
 
 The ladder is strict about evidence and immutability:
 

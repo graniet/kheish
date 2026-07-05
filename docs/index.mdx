@@ -19,26 +19,19 @@ If you remember one thing about Kheish, remember this:
 
 That single decision is where every other property comes from. Because the daemon owns state, sessions outlive the client that created them. Because the daemon owns execution, a run keeps going when you close the tab. Because the daemon owns credentials, your keys never travel to a client or a cloud. Because there is exactly one authority, five different clients — the web console, a Python script, a Slack bot, a cron schedule, a webhook — can all touch the same agent without stepping on each other.
 
-```text
-                        ┌───────────────────────────────────────┐
-                        │            kheish-daemon               │
-                        │        (the single source of truth)    │
-                        │                                        │
-   Kheish Air ─────────▶│  • sessions (durable, journaled)       │
-   (web console)        │  • runs (execution + lifecycle)        │
-                        │  • approvals & questions (suspend/resume)
-   Python / Web SDK ───▶│  • personas, memory, learnings         │◀── model providers
-                        │  • routes + auth_ref (credential vault) │    (OpenAI, Anthropic,
-   CLI ────────────────▶│  • schedules, tasks, agents            │     Google, xAI,
-                        │  • assets, channels, projects          │     OpenRouter)
-   Webhook / Slack ────▶│  • connectors (ingress + egress)       │
-   / Telegram           │                                        │◀── MCP tool servers
-                        └───────────────────────────────────────┘
-                                        │
-                                        ▼
-                        state root on your disk (encrypted secrets,
-                        append-only journals, checkpoints, artifacts)
+```mermaid
+flowchart LR
+    Air["Kheish Air web console"] --> Daemon
+    SDK["Python / Web SDK"] --> Daemon
+    CLI["CLI"] --> Daemon
+    Ingress["Webhook / Slack / Telegram"] --> Daemon
+    Daemon["kheish-daemon — the single source of truth"]
+    Daemon --> Providers["Model providers — OpenAI, Anthropic, Google, xAI, OpenRouter"]
+    Daemon --> MCP["MCP tool servers"]
+    Daemon --> State["State root on your disk — encrypted secrets, append-only journals, checkpoints, artifacts"]
 ```
+
+Inside the daemon it owns: durable, journaled sessions; runs (execution and lifecycle); approvals and questions (suspend/resume); personas, memory, and learnings; routes and auth_ref (the credential vault); schedules, tasks, and agents; assets, channels, and projects; and connectors (ingress and egress).
 
 Every arrow into the daemon is a client. None of them holds the truth. They ask the daemon to do things and observe what happens over HTTP and Server-Sent Events. When you understand that picture, the rest of Kheish stops being a pile of features and becomes one coherent system.
 
@@ -60,33 +53,33 @@ None of these are model problems. They are **operational** problems. They are ab
 
 Here is the same support task, drawn twice. First the way a plain API-call script handles it, then the way Kheish handles it.
 
-```text
-  PLAIN API-CALL SCRIPT (stateless)
-  ─────────────────────────────────
-  request ─▶ [ your process ] ─▶ model ─▶ tokens ─▶ response ─▶ EXIT
-                   │
-                   └── all context lives in RAM. Process ends → gone.
-                       Needs a human "yes"? No mechanism. You hard-code
-                       a pause or you skip the check. Crash mid-way? The
-                       work never existed. Second client? Different process,
-                       different memory, no shared truth.
+**Plain API-call script (stateless)**
 
-
-  KHEISH (daemon owns state)
-  ──────────────────────────
-  input ─▶ [ daemon: session "acme-support" ]
-                   │
-                   ├─ run starts, journaled to disk as it goes
-                   ├─ hits a refund tool → SUSPENDS, records a pending approval
-                   │        (you can close everything here; nothing is lost)
-                   ├─ you approve from ANY client (console, CLI, API)
-                   ├─ run RESUMES from the suspension point
-                   ├─ needs a fact → asks a structured question → suspends → you answer
-                   └─ completes → output stored, optionally routed to Slack
-
-           Restart the daemon at any point above: the session, the run
-           state, the pending approval, and the answer all come back.
+```mermaid
+flowchart LR
+    Req["request"] --> Proc["your process"]
+    Proc --> Model["model"]
+    Model --> Tokens["tokens"]
+    Tokens --> Resp["response"]
+    Resp --> Exit["EXIT"]
 ```
+
+All context lives in RAM — when the process ends it is gone. Needs a human yes? There is no mechanism, so you hard-code a pause or skip the check. Crash mid-way? The work never existed. A second client? A different process with different memory and no shared truth.
+
+**Kheish (daemon owns state)**
+
+```mermaid
+stateDiagram-v2
+    [*] --> Started: input arrives in daemon session acme-support
+    Started --> Journaled: run starts, journaled to disk as it goes
+    Journaled --> ApprovalSuspend: hits a refund tool, SUSPENDS on a pending approval
+    ApprovalSuspend --> Resumed: you approve from ANY client, run RESUMES from the suspension point
+    Resumed --> QuestionSuspend: needs a fact, asks a structured question, suspends
+    QuestionSuspend --> Completed: you answer
+    Completed --> [*]: output stored, optionally routed to Slack
+```
+
+At the approval suspension you can close everything and nothing is lost; you approve from any client (console, CLI, or API). Restart the daemon at any point above and the session, the run state, the pending approval, and the answer all come back.
 
 The difference is not cosmetic. In the first model, "wait for a human" and "survive a restart" and "share across clients" are features you would have to invent, and they are genuinely hard to get right. In the second, they are the ground floor. You do not build them; you use them.
 
@@ -127,17 +120,13 @@ The indirection matters operationally. Runs select a named **route** (`route_id`
 - A leaked client, script, or log never contains a usable key, because clients only ever hold route names.
 - The web console, the SDK, and a webhook can all drive the same agent without any of them being trusted with the credential.
 
-```text
-   run  ──selects──▶  route "openai"  ──resolves──▶  auth_ref "openai.prod"
-                          │                                │
-                          │                                ▼
-                    (a name a client                encrypted secret slot
-                     is allowed to see)             (daemon-only, rotatable)
-                          │
-                          └─ change the key once here ▲, and every run,
-                             every client, every schedule follows. No client
-                             edit, no redeploy, no key in a log.
+```mermaid
+flowchart LR
+    Run["run"] -->|"selects"| Route["route openai — a name a client is allowed to see"]
+    Route -->|"resolves"| AuthRef["auth_ref openai.prod — encrypted secret slot, daemon-only and rotatable"]
 ```
+
+Change the key once in the auth_ref slot and every run, every client, and every schedule follows — no client edit, no redeploy, and no key in a log.
 
 More in [Security](./operations/security).
 
@@ -250,25 +239,23 @@ Kheish is built around a deliberate separation:
 - **The daemon owns state and truth.** Sessions, runs, approvals, routes, secrets, schedules, memory, assets — all of it lives in and is governed by the daemon.
 - **Everything else is a client or a producer.** The Kheish Air console, the Python and Web SDKs, external connector sidecars, the capture runtime — none of them hold the truth. They ask the daemon and observe.
 
-```text
-   ┌────────────────────────── clients & producers ──────────────────────────┐
-   │                                                                          │
-   │   Kheish Air        SDKs            connector          capture           │
-   │   (web console)     (Python/Web)    sidecars           runtime           │
-   │        │                │               │                 │              │
-   └────────┼────────────────┼───────────────┼─────────────────┼──────────────┘
-            │                │               │                 │
-            ▼                ▼               ▼                 ▼
-   ══════════════════ HTTP + Server-Sent Events (one contract) ═══════════════
-            │
-            ▼
-   ┌──────────────────────────── kheish-daemon ───────────────────────────────┐
-   │  control plane · runtime (prompts, tools, permissions, hooks, providers)  │
-   │  auth layer (accounts, route keys, OAuth, revocation)                     │
-   │  orchestration (agents, sidechains, mailboxes, projects, tasks)           │
-   │  persistence (journals, checkpoints, memory, assets, deliveries)          │
-   └───────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph Clients["clients and producers"]
+        Air["Kheish Air web console"]
+        SDKs["SDKs — Python and Web"]
+        Sidecars["connector sidecars"]
+        Capture["capture runtime"]
+    end
+    Air --> Contract
+    SDKs --> Contract
+    Sidecars --> Contract
+    Capture --> Contract
+    Contract["HTTP and Server-Sent Events — one contract"]
+    Contract --> Daemon["kheish-daemon"]
 ```
+
+Inside the daemon: the control plane and runtime (prompts, tools, permissions, hooks, providers); the auth layer (accounts, route keys, OAuth, revocation); orchestration (agents, sidechains, mailboxes, projects, tasks); and persistence (journals, checkpoints, memory, assets, deliveries).
 
 This is why the docs keep saying "the daemon owns X." It is not a slogan; it is the invariant that makes the whole system coherent. Once you internalize it, you always know where to look: if it is state, it is in the daemon, and you reach it through the control plane — not by poking at files or trusting a client's local copy. Read [Architecture](./concepts/architecture) for the subsystem-by-subsystem view.
 
@@ -295,23 +282,18 @@ Cross-references, so you can dive where it matters to you: [Sessions and runs](.
 
 Because approvals are the feature people most often underestimate, here is the actual shape of a gated run over time. Notice that the human step can happen much later, from a different client, and the run does not fail while it waits.
 
-```text
-  t0   input arrives ──▶ run starts in session "acme-support"
-  t1   agent drafts a reply, decides a refund is warranted
-  t2   agent calls the refund tool
-        │
-        ▼
-  t3   PERMISSION GATE: refund requires approval
-        run SUSPENDS, writes a pending approval to the journal
-        ── you may now close the console, the CLI, everything ──
-        .
-        .   (minutes or hours pass; the daemon holds the state)
-        .
-  t7   a human opens ANY client, sees the pending approval, clicks Approve
-  t8   run RESUMES exactly at the refund tool call
-  t9   refund executes, agent finishes the reply
-  t10  output stored; optionally routed to Slack via a connector
+```mermaid
+flowchart TD
+    T0["t0 — input arrives, run starts in session acme-support"] --> T1["t1 — agent drafts a reply, decides a refund is warranted"]
+    T1 --> T2["t2 — agent calls the refund tool"]
+    T2 --> T3["t3 — PERMISSION GATE, refund requires approval, run SUSPENDS and writes a pending approval to the journal"]
+    T3 -->|"minutes or hours pass, the daemon holds the state"| T7["t7 — a human opens ANY client, sees the pending approval, clicks Approve"]
+    T7 --> T8["t8 — run RESUMES exactly at the refund tool call"]
+    T8 --> T9["t9 — refund executes, agent finishes the reply"]
+    T9 --> T10["t10 — output stored, optionally routed to Slack via a connector"]
 ```
+
+At t3 you may close the console, the CLI, everything — the suspension is durable state the daemon holds while minutes or hours pass.
 
 Nothing about `t3 → t7` is fragile. The suspension is durable state, not an in-memory promise. That is the whole point: safety that survives time, restarts, and a change of operator. The same mechanism powers user questions — the run parks on "which plan is this customer on?" and resumes with your typed answer.
 
@@ -319,25 +301,19 @@ Nothing about `t3 → t7` is fragile. The suspension is durable state, not an in
 
 Local-first is not a vibe; it is a concrete boundary you can point at. Here is where a provider key lives and does not live.
 
-```text
-   your laptop / your server
-   ┌──────────────────────────────────────────────────────────┐
-   │  kheish-daemon                                            │
-   │  ┌────────────────────────────────────────────────────┐  │
-   │  │  encrypted auth store (master key generated on      │  │
-   │  │  first `up`, kept at 0600 in the state root)        │  │
-   │  │    auth_ref "openai.prod"  = ●●●●●●●● (never leaves) │  │
-   │  │    auth_ref "anthropic.prod" = ●●●●●●●●              │  │
-   │  └────────────────────────────────────────────────────┘  │
-   │        ▲ resolved only inside the daemon, per run         │
-   └────────┼──────────────────────────────────────────────────┘
-            │ clients only ever send a route NAME, never a key
-   ┌────────┴───────────────┐   ┌───────────────┐   ┌───────────┐
-   │ Kheish Air (browser)   │   │ Python SDK    │   │ webhook   │
-   │ "use route: openai"    │   │ "route: openai"│   │ "openai"  │
-   └────────────────────────┘   └───────────────┘   └───────────┘
-     no key here                 no key here          no key here
+```mermaid
+flowchart TD
+    subgraph Host["your laptop or your server — kheish-daemon"]
+        Store["encrypted auth store — master key generated on first up, kept at 0600 in the state root"]
+        Refs["auth_ref openai.prod and auth_ref anthropic.prod — masked secret values that never leave, resolved only inside the daemon per run"]
+        Store --- Refs
+    end
+    Air["Kheish Air browser — use route openai, no key here"] -->|"route NAME only"| Host
+    SDK["Python SDK — route openai, no key here"] -->|"route NAME only"| Host
+    Hook["webhook — openai, no key here"] -->|"route NAME only"| Host
 ```
+
+Clients only ever send a route name, never a key.
 
 A stolen client token, a leaked log line, a compromised script — none of them yields a working provider credential, because none of them ever held one. And when a key rotates, it rotates in one place. This is the security posture that raw API calls (keys scattered across processes) and hosted platforms (keys on someone else's cloud) structurally cannot give you.
 
@@ -412,33 +388,27 @@ Count the distinct actors that touched one session across that week: a schedule,
 
 When something asks the daemon to do work — a chat message, a webhook, a schedule firing — it travels a consistent path. Understanding it once means you always know where to look when something surprises you.
 
-```text
-   (1) INPUT ARRIVES
-       console message │ webhook event │ schedule fires │ approval answered
-                       └──────────────┬──────────────────────────────────┘
-                                      ▼
-   (2) DAEMON VALIDATES & PREPARES
-       • checks request metadata and permissions
-       • resolves the route  (route_id → auth_ref → decrypted key, in-daemon)
-       • resolves reply targets (where output should go, if anywhere)
-       • creates or queues a RUN in the target session
-                                      ▼
-   (3) RUNTIME EXECUTES THE RUN
-       • assembles the prompt from persona + durable session history + memory
-       • applies permissions, hooks, and the tool surface (built-in + MCP)
-       • drives the model over the selected provider route
-       • each step is JOURNALED to disk as it happens
-                                      ▼
-   (4) THE RUN REACHES ONE OF THREE OUTCOMES
-       ┌── completes ─────────▶ output stored
-       ├── suspends ─────────▶ pending approval OR user question (durable)
-       └── spawns work ──────▶ sidechains / background tasks
-                                      ▼
-   (5) DAEMON PERSISTS & OPTIONALLY ROUTES
-       • output saved to the session journal
-       • if reply targets exist, delivery is queued and retried
-       • clients watching the SSE stream see every event live
+```mermaid
+flowchart TD
+    S1["1 — INPUT ARRIVES — console message, webhook event, schedule fires, or approval answered"]
+    S2["2 — DAEMON VALIDATES AND PREPARES"]
+    S3["3 — RUNTIME EXECUTES THE RUN"]
+    S4["4 — THE RUN REACHES ONE OF THREE OUTCOMES"]
+    S5["5 — DAEMON PERSISTS AND OPTIONALLY ROUTES"]
+    S1 --> S2 --> S3 --> S4
+    S4 -->|"completes"| O1["output stored"]
+    S4 -->|"suspends"| O2["pending approval OR user question, durable"]
+    S4 -->|"spawns work"| O3["sidechains or background tasks"]
+    O1 --> S5
+    O2 --> S5
+    O3 --> S5
 ```
+
+Step details preserved from the original:
+
+- Validate and prepare (step 2): checks request metadata and permissions; resolves the route (route_id → auth_ref → decrypted key, in-daemon); resolves reply targets (where output should go, if anywhere); creates or queues a run in the target session.
+- Execute the run (step 3): assembles the prompt from persona plus durable session history plus memory; applies permissions, hooks, and the tool surface (built-in plus MCP); drives the model over the selected provider route; journals each step to disk as it happens.
+- Persist and route (step 5): output saved to the session journal; if reply targets exist, delivery is queued and retried; clients watching the SSE stream see every event live.
 
 Two details are worth internalizing. First, step (2) is where the credential indirection lives — the raw key is resolved *inside* the daemon, per run, and never handed to whatever triggered the input. Second, step (3) journals continuously, which is why step (4)'s "suspends" outcome is durable rather than a fragile in-memory pause: the suspension point is written down, so a restart resumes it. This same flow serves a human typing in the console and a cron schedule firing at 3am; there is no separate, less-durable path for automated triggers.
 
@@ -490,18 +460,13 @@ The important thing is that each stage builds on the same daemon and the same ob
 | You rotate a credential | Edit every client and redeploy | Rotate one secret slot; everything follows |
 | You want to know what happened | Reconstruct from scattered logs | Read the journal; the truth is one place |
 
-```text
-   TIME ───────────────────────────────────────────────────────────────▶
-
-   naive:   [start]──work──work── ✗ CRASH ─────────────────────────────
-                                    everything after the last checkpoint
-                                    you never wrote is simply gone.
-
-   kheish:  [start]──▶journal──▶journal──▶ ✗ CRASH ──▶ [restart] ──▶ resume
-                       │        │                        recovers the
-                       ▼        ▼                        session + pending
-                    on disk   on disk                    approval + run state
+```mermaid
+flowchart LR
+    N0["naive — start"] --> N1["work"] --> N2["work"] --> NC["CRASH"] --> NGone["everything after the last checkpoint you never wrote is simply gone"]
+    K0["kheish — start"] --> K1["journal to disk"] --> K2["journal to disk"] --> KC["CRASH"] --> KR["restart"] --> KResume["resume — recovers the session, the pending approval, and the run state"]
 ```
+
+Time runs left to right. The naive chain loses everything after the crash; the Kheish chain journals to disk as it goes, so a restart recovers the session, its pending approval, and the run state.
 
 Notice that none of these are exotic. Laptops close, processes crash, people step away, keys leak, providers flake. A stateless agent treats every one of them as catastrophic because it has nowhere to stand. The daemon treats them as ordinary because the truth is on disk and the truth is one place. You will not appreciate this on day one. You will appreciate it the first time a run you had forgotten about is still sitting there, exactly where it paused, waiting for you.
 
@@ -509,18 +474,21 @@ Notice that none of these are exotic. Laptops close, processes crash, people ste
 
 Most people start with a single agent and stay there a long time, which is exactly right. But some work genuinely needs division of labor — a reviewer and an implementer, a researcher feeding a writer, a fleet of sessions coordinating on a release. Kheish has durable primitives for that so you do not collapse everything into one overloaded session or wire brittle glue between separate scripts.
 
-```text
-   ┌───────────── project "release-2026-q2" (durable coordination) ─────────────┐
-   │                                                                            │
-   │   member: researcher      member: implementer      member: reviewer        │
-   │      (session)                (session)                (session)           │
-   │         │                        │                        │                │
-   │         └──────────┬─────────────┴────────────┬───────────┘                │
-   │                    ▼                          ▼                            │
-   │            linked channel "release-room"   project tasks                   │
-   │            (shared public log,             (assignment, dependencies,      │
-   │             reactions, turn-taking)         one latest run each)           │
-   └────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph Project["project release-2026-q2 — durable coordination"]
+        R["member researcher — session"]
+        Impl["member implementer — session"]
+        V["member reviewer — session"]
+        Chan["linked channel release-room — shared public log, reactions, turn-taking"]
+        Tasks["project tasks — assignment, dependencies, one latest run each"]
+        R --> Chan
+        Impl --> Chan
+        V --> Chan
+        R --> Tasks
+        Impl --> Tasks
+        V --> Tasks
+    end
 ```
 
 - **Sidechains and agents** let one run spawn focused sub-work under bounded quotas, so a big task decomposes without losing the thread.

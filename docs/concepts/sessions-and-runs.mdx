@@ -53,22 +53,19 @@ Separating sessions from runs buys several properties that a stateless request/r
 - approvals and questions resume the exact suspended run instead of blindly starting a new one;
 - a terminal run can seed a compact, daemon-owned recovered-memory layer for later runs in the same session (see [Recovered run memory](./memory)).
 
-```text
-   SESSION ⊃ RUNS  (one durable context, many executions over time)
-
-   ┌──────────────────────── session ────────────────────────────────────────┐
-   │ journal · checkpoints · metadata sidecars                                │
-   │ persona snapshot · capability scope · credential scope · route policy    │
-   │ input contract · output contract · reply-target defaults                 │
-   │                                                                          │
-   │   run-1 ▸ input          Completed                                       │
-   │   run-2 ▸ scheduled      Completed                                       │
-   │   run-3 ▸ input          WaitingForApproval  ← active (holds the slot)   │
-   │   run-4 ▸ input          Queued              ← waits behind run-3        │
-   │   run-5 ▸ mailbox        Queued                                          │
-   └──────────────────────────────────────────────────────────────────────────┘
-        one active run at a time · route/model pinned per run · policy inherited
+```mermaid
+flowchart TD
+    subgraph Session["session, one durable context, many executions over time"]
+        State["journal · checkpoints · metadata sidecars<br/>persona snapshot · capability scope · credential scope · route policy<br/>input contract · output contract · reply-target defaults"]
+        R1["run-1 · input · Completed"]
+        R2["run-2 · scheduled · Completed"]
+        R3["run-3 · input · WaitingForApproval, active, holds the slot"]
+        R4["run-4 · input · Queued, waits behind run-3"]
+        R5["run-5 · mailbox · Queued"]
+    end
 ```
+
+One active run at a time; route and model are pinned per run; policy is inherited by later runs.
 
 ### Input payloads and the envelope
 
@@ -211,29 +208,22 @@ Enforcement runs like this, for each submission to a contracted session:
 3. **Validate against the schema.** A schema mismatch is rejected with `input_contract_violated` and the JSON-path error string, so the caller learns exactly which field was wrong.
 4. **Canonicalize.** An accepted value is re-serialized canonically (minified, deterministic key order) and that canonical string replaces the submitted content. When the submission used ordered `input_items`, the text fragments collapse into one canonical JSON item where the first text item stood, and any asset or board references keep their order and position.
 
-```text
-   INPUT CONTRACT — INGRESS BOUNDARY  (fail-closed, before any run)
-
-   submit(text or input_items)  ─┐
-                                 ▼
-        extract JSON candidate (strip one code fence)
-                                 │
-                 ┌───────────────┴───────────────┐
-            valid single JSON?                    │
-                 │ no                             │ yes
-                 ▼                                ▼
-        400 input_contract_violated       validate against schema
-        "…not a single JSON value: …"           │
-        (NO RUN CREATED)          ┌─────────────┴─────────────┐
-                              matches?                          │
-                                  │ no                          │ yes
-                                  ▼                             ▼
-                     400 input_contract_violated       re-serialize canonically
-                     "$.field: expected …"             (minified, sorted keys)
-                     (NO RUN CREATED)                          │
-                                                               ▼
-                                                   canonical value on the envelope
-                                                   → run created (status Queued)
+```mermaid
+flowchart TD
+    Submit["submit: text or input_items"]
+    Extract["extract JSON candidate, strip one code fence"]
+    Valid{"valid single JSON?"}
+    Reject1["400 input_contract_violated<br/>not a single JSON value<br/>NO RUN CREATED"]
+    Validate["validate against schema"]
+    Matches{"matches schema?"}
+    Reject2["400 input_contract_violated<br/>$.field: expected …<br/>NO RUN CREATED"]
+    Canon["re-serialize canonically, minified, sorted keys"]
+    Created["canonical value on the envelope · run created, status Queued"]
+    Submit --> Extract --> Valid
+    Valid -->|"no"| Reject1
+    Valid -->|"yes"| Validate --> Matches
+    Matches -->|"no"| Reject2
+    Matches -->|"yes"| Canon --> Created
 ```
 
 Two consequences are worth stating outright. First, **the agent always reads normalized JSON.** Whatever whitespace, key order, or fencing the caller sent, the run's input is the canonical form, so the model's view is stable and the journal stores one deterministic representation. Second, **the parsed value travels on the envelope metadata**, so downstream logic that wants the structured input as real JSON — not as a string it has to re-parse — can read it directly.
@@ -252,28 +242,29 @@ Validation reuses the same extractor and validator as the input contract: extrac
 - **The answer does not conform, and the repair budget is not exhausted.** The engine appends a **repair message** to the conversation — the validation error (the JSON-path string) plus the schema rendered as JSON Schema plus an instruction to reply with *only* the corrected JSON, no prose and no fences — and takes another turn. Crucially, the repair turn is run with tools **withheld entirely** (`tool_choice: none`, parallel tool calls off), so the model cannot wander off calling tools instead of correcting its payload. Its only job on a repair turn is to answer.
 - **The answer does not conform and the repair budget is exhausted.** The run **fails closed** with an error like `structured output contract unsatisfied after N repair attempts: <last validation error>`. A contracted session never delivers a non-conforming answer; if it cannot produce one, it fails visibly instead.
 
-```text
-   OUTPUT CONTRACT — COMPLETION BOUNDARY (validate → repair loop → deliver or fail)
-
-   model produces final answer (no more tool calls)
-        │
-        ▼
-   completion requirements satisfied? ──no──▶ follow-up turn (bounded) … then fail if still unmet
-        │ yes
-        ▼
-   output contract set? ──no──▶ complete with prose answer
-        │ yes
-        ▼
-   extract JSON · parse · validate  ───conforms──▶ structured_output = value ──▶ COMPLETED
-        │ does not conform
-        ▼
-   repair_count ≥ budget? ──yes──▶ FAILED  "contract unsatisfied after N repair attempts: <error>"
-        │ no
-        ▼
-   append repair message (JSON-path error + rendered schema + "reply ONLY corrected JSON")
-   repair_count += 1 ;  next turn with tools WITHHELD (tool_choice: none)
-        │
-        └────────────▶ back to the completion boundary
+```mermaid
+flowchart TD
+    Final["model produces final answer, no more tool calls"]
+    Reqs{"completion requirements satisfied?"}
+    Followup["follow-up turn, bounded … then fail if still unmet"]
+    ContractSet{"output contract set?"}
+    Prose["complete with prose answer"]
+    Validate["extract JSON · parse · validate"]
+    Conforms{"conforms?"}
+    Completed["structured_output = value · COMPLETED"]
+    Budget{"repair_count ≥ budget?"}
+    Failed["FAILED: contract unsatisfied after N repair attempts: last error"]
+    Repair["append repair message: JSON-path error + rendered schema + reply ONLY corrected JSON<br/>repair_count += 1 · next turn with tools WITHHELD, tool_choice: none"]
+    Final --> Reqs
+    Reqs -->|"no"| Followup
+    Reqs -->|"yes"| ContractSet
+    ContractSet -->|"no"| Prose
+    ContractSet -->|"yes"| Validate --> Conforms
+    Conforms -->|"conforms"| Completed
+    Conforms -->|"does not conform"| Budget
+    Budget -->|"yes"| Failed
+    Budget -->|"no"| Repair
+    Repair -->|"back to the completion boundary"| Final
 ```
 
 ### The repair budget
@@ -287,12 +278,13 @@ Note the important sequencing: a run under an output contract can still take **a
 When an output contract is satisfied, the delivered content is the **canonical, minified JSON** — fences stripped, keys deterministically ordered — not the raw text the model typed. If the model answered with a fenced, whitespace-heavy blob (a Markdown `json` code fence wrapping `{ "status": "ok",   "count": 3 }`), the delivered `content` is the canonical string `{"count":3,"status":"ok"}`. The delivery also carries the structured payload as **real JSON** in its metadata (an `output_kind` of `structured_output` and a `structured_output` field holding the parsed value), so a webhook or downstream consumer can read typed JSON without re-parsing a string. This is what "delivered canonically to webhooks" means in practice: the wire format is normalized and machine-consumable, and it is identical regardless of how the model happened to format its answer.
 
 ```text
-   MODEL ANSWER ──▶ CANONICAL DELIVERY
+   MODEL ANSWER  -->  CANONICAL DELIVERY
 
    model typed (wrapped in a ~~~json … ~~~ markdown fence):
-                  { "status": "ok",   "count": 3 }
-        │  extract (strip fence) · parse · validate · re-serialize
-        ▼
+       { "status": "ok",   "count": 3 }
+
+   -- extract (strip fence) · parse · validate · re-serialize -->
+
    delivered content:  {"count":3,"status":"ok"}          (canonical, minified, sorted keys)
    delivery metadata:  output_kind = "structured_output"
                        structured_output = { "status": "ok", "count": 3 }   (real JSON, not a string)
@@ -345,29 +337,33 @@ Producing an answer is not the same as delivering it. When output must reach an 
 
 A delivery moves through states: it starts `pending`, becomes `retrying` after a failed attempt that is worth retrying, and — if it never succeeds within its budget — ends `dead_lettered`. The retry policy is bounded on every axis: an initial delay, a maximum delay, a cap on how long a provider-requested "retry after" can push the next attempt, and a maximum number of attempts. Consecutive retryable failures against one target can **open a circuit** for that target, so a downstream that is hard-down does not get hammered — its deliveries wait for the circuit rather than retrying into a wall, and other targets keep flowing.
 
-```text
-   DELIVERY LIFECYCLE  (retry with bounds → dead-letter → operator replay)
-
-   output ready ──▶ enqueue delivery ──▶ PENDING
-                                          │  attempt
-                        ┌─────────────────┴──────────────────┐
-                    success                                failure
-                        │                              retryable?
-                        ▼                        ┌─────────┴─────────┐
-                   delivered (done)           yes                    no
-                                                │                     │
-                                     backoff (initial→max,            │
-                                     honoring capped retry-after)     │
-                                     attempts < max?                  │
-                                     ┌────────┴────────┐              │
-                                    yes               no             │
-                                     │                 ▼             ▼
-                                     └──▶ RETRYING   DEAD_LETTERED ◀──┘
-                                     (circuit may open after                │
-                                      consecutive retryable failures)       │  operator
-                                                                            ▼
-                                                        replay (single / bulk / force) → back to PENDING
-                                                        resolve (mark handled, with reason)
+```mermaid
+flowchart TD
+    Ready["output ready"]
+    Enqueue["enqueue delivery"]
+    Pending["PENDING"]
+    Attempt{"attempt: success or failure?"}
+    Delivered["delivered, done"]
+    Retryable{"retryable?"}
+    Backoff["backoff: initial to max, honoring capped retry-after"]
+    Attempts{"attempts below max?"}
+    Retrying["RETRYING<br/>circuit may open after consecutive retryable failures"]
+    DeadLetter["DEAD_LETTERED"]
+    Operator["operator action"]
+    Replay["replay: single / bulk / force"]
+    Resolve["resolve: mark handled, with reason"]
+    Ready --> Enqueue --> Pending --> Attempt
+    Attempt -->|"success"| Delivered
+    Attempt -->|"failure"| Retryable
+    Retryable -->|"yes"| Backoff --> Attempts
+    Retryable -->|"no"| DeadLetter
+    Attempts -->|"yes"| Retrying
+    Attempts -->|"no"| DeadLetter
+    Retrying -->|"retry"| Attempt
+    DeadLetter --> Operator
+    Operator --> Replay
+    Operator --> Resolve
+    Replay -->|"back to PENDING"| Pending
 ```
 
 Dead letters are not a graveyard; they are a queue for a human. An operator can **replay** a single dead letter, **bulk-replay** a filtered set (with a dry-run to preview what would be replayed), optionally **force** a replay past a guard, or **resolve** a dead letter as handled with a recorded reason (when the right fix was to do something out of band rather than resend). Both the dead-letter ledger and the resolved-dead-letter ledger are durable and survive restarts, and the daemon exposes counts — retrying, dead-lettered, unresolved-dead-lettered, targets blocked behind an earlier retry, open circuits — as metrics so the backlog is observable rather than discovered by a user who never got their message.

@@ -27,36 +27,22 @@ Start with the shape of the whole system, because most security reasoning is
 really "which side of which boundary is this thing on?" Kheish has a small number
 of trust boundaries, and almost every control on this page is about one of them.
 
-```
-                       KHEISH TRUST BOUNDARIES
-
-   ┌───────────────────────── operator / host ─────────────────────────┐
-   │  You, the shell, the state_root on disk, the master key.           │
-   │  Highest trust. Can read/write everything the daemon can.          │
-   │                                                                    │
-   │   ┌──────────────────── control plane (HTTP) ───────────────────┐  │
-   │   │  auth modes: loopback-auto | bearer(admin/read-only) | none │  │
-   │   │  CORS: loopback origins or an exact allowlist                │  │
-   │   │                                                              │  │
-   │   │   ┌──────────────────── daemon core ────────────────────┐   │  │
-   │   │   │  AuthManager (root of trust for secrets)             │   │  │
-   │   │   │  Broker (subjects → grants → short-lived leases)     │   │  │
-   │   │   │  encrypted secret store  |  signed audit ledger      │   │  │
-   │   │   │  learning plane (governed durable memory)            │   │  │
-   │   │   │                                                      │   │  │
-   │   │   │   ┌──────────── execution (per session) ────────┐    │   │  │
-   │   │   │   │  agents run models + tools here.             │    │   │  │
-   │   │   │   │  LOWEST trust. Never sees a root credential. │    │   │  │
-   │   │   │   │  Bounded by CapabilityScope ∩ CredentialScope│    │   │  │
-   │   │   │   └──────┬───────────────────────────────┬──────┘    │   │  │
-   │   │   │          │ route lease                    │ conn lease │  │  │
-   │   │   └──────────┼────────────────────────────────┼──────────┘   │  │
-   │   └──────────────┼────────────────────────────────┼──────────────┘  │
-   └──────────────────┼────────────────────────────────┼─────────────────┘
-                      ▼                                 ▼
-              model providers                   connectors / MCP servers
-             (OpenAI, Anthropic, ...)          (Slack, HTTP, stdio, ...)
-              — external, untrusted             — external, untrusted
+```mermaid
+flowchart TD
+    subgraph Host["Operator and host - highest trust"]
+        HostDesc["You, the shell, the state_root on disk, and the master key. Can read and write everything the daemon can"]
+        subgraph Control["Control plane over HTTP"]
+            ControlDesc["Auth modes: loopback-auto, bearer with admin or read-only, or none. CORS: loopback origins or an exact allowlist"]
+            subgraph Core["Daemon core"]
+                CoreDesc["AuthManager is the root of trust for secrets. Broker maps subjects to grants to short-lived leases. Encrypted secret store and signed audit ledger. Learning plane holds governed durable memory"]
+                subgraph Exec["Execution, per session - lowest trust"]
+                    ExecDesc["Agents run models and tools here. Never sees a root credential. Bounded by CapabilityScope intersected with CredentialScope"]
+                end
+            end
+        end
+    end
+    ExecDesc -->|"route lease"| Providers["Model providers such as OpenAI or Anthropic - external, untrusted"]
+    ExecDesc -->|"connector lease"| Connectors["Connectors and MCP servers such as Slack, HTTP, or stdio - external, untrusted"]
 ```
 
 The single most load-bearing line on this diagram is the innermost one:
@@ -115,37 +101,20 @@ requires admin. And among the read methods, the daemon maintains an explicit
 allowlist of genuinely-read-only paths; anything sensitive, or anything not on
 the allowlist, requires admin.
 
-```
-        REQUEST → REQUIRED ACCESS → TOKEN CHECK
-
-   incoming request (method, path)
-        │
-        ▼
-   is method GET / HEAD / OPTIONS? ── no ──▶ required = ADMIN
-        │ yes
-        ▼
-   does path match a "requires admin" read pattern?
-   (assets/*/raw, runs/*/debug/*, runtime/secrets,
-    runtime/auth/{subjects,leases,accounts}, runtime/hooks,
-    runtime/revisions, logs, stacks, stacks/*/ledger)
-        │ yes ─────────────────────────────▶ required = ADMIN
-        │ no
-        ▼
-   does path match the explicit read-only allowlist?
-   (status, sessions, runs, agents, assets metadata,
-    schedules, learnings, personas, ... )
-        │ yes ─────────────────────────────▶ required = READ_ONLY
-        │ no (unknown path)
-        ▼
-   required = ADMIN  (fail safe: unknown read paths need admin)
-        │
-        ▼
-   ┌──────────────────────────────────────────────┐
-   │ token digest (SHA-256, constant-time compare) │
-   │  matches admin?    ─▶ allow                    │
-   │  matches readonly? ─▶ allow iff required==RO   │
-   │  else              ─▶ 401 / 403, audited       │
-   └──────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    Req["Incoming request with a method and a path"] --> Method{"Is the method GET, HEAD, or OPTIONS?"}
+    Method -->|"no"| Admin1["Required access = ADMIN"]
+    Method -->|"yes"| AdminPattern{"Does the path match a requires-admin read pattern, such as assets/*/raw, runs/*/debug/*, runtime/secrets, runtime/auth subjects leases accounts, runtime/hooks, runtime/revisions, logs, stacks, or stacks/*/ledger?"}
+    AdminPattern -->|"yes"| Admin2["Required access = ADMIN"]
+    AdminPattern -->|"no"| ReadAllow{"Does the path match the explicit read-only allowlist, such as status, sessions, runs, agents, assets metadata, schedules, learnings, or personas?"}
+    ReadAllow -->|"yes"| ReadOnly["Required access = READ_ONLY"]
+    ReadAllow -->|"no, unknown path"| AdminFail["Required access = ADMIN. Fail safe: unknown read paths need admin"]
+    Admin1 --> Token
+    Admin2 --> Token
+    ReadOnly --> Token
+    AdminFail --> Token
+    Token["Token digest with SHA-256, compared in constant time. A match on admin is allowed. A match on read-only is allowed only if the required access is READ_ONLY. Otherwise 401 or 403, and the failure is audited"]
 ```
 
 The "unknown read paths require admin" rule is the important safety property: a
@@ -238,36 +207,13 @@ managed by the `AuthManager`. Its defining property is that it is
 can rotate it, but nothing — not the CLI, not the HTTP API, not a running agent —
 can read the raw value back out.
 
-```
-             SECRET STORE DATA FLOW  (write-only)
-
-   operator                          daemon                       consumers
-   ────────                          ──────                       ─────────
-
-   secrets set openai.prod           ┌───────────────────┐
-   --from-env OPENAI_API_KEY  ──────▶│ encrypt with       │
-                                     │ master key         │
-                                     │ (AEAD envelope)    │
-                                     └─────────┬──────────┘
-                                               ▼
-                                     ┌───────────────────┐
-                                     │ state_root/auth/   │   encrypted at rest
-                                     │ global-slots.json  │   owner-only file
-                                     └─────────┬──────────┘
-                                               │
-             ┌─────────────────────────────────┼──────────────────────────┐
-             │ READ PATH (metadata only)        │ USE PATH (never exposed) │
-             ▼                                   ▼                          
-   secrets list / get                  broker mints a short-lived lease;    
-   returns:                            the raw value is injected only where 
-     slot_id, provider, mode,          it is consumed:                      
-     summary, updated_at_ms              • provider route request           
-   NEVER the secret value                • connector child-process env      
-                                         • MCP stdio child env / HTTP header
-                                               │
-                                               ▼
-                                     external system (provider, connector,
-                                     MCP server) — value used, then gone
+```mermaid
+flowchart TD
+    Op["Operator runs secrets set openai.prod --from-env OPENAI_API_KEY"] --> Encrypt["Daemon encrypts with the master key using an AEAD envelope"]
+    Encrypt --> Store["Stored at state_root/auth/global-slots.json, encrypted at rest, owner-only file"]
+    Store --> Read["Read path, metadata only: secrets list or get returns slot_id, provider, mode, summary, and updated_at_ms. Never the secret value"]
+    Store --> Use["Use path, never exposed: broker mints a short-lived lease, and the raw value is injected only where it is consumed - a provider route request, a connector child-process env, or an MCP stdio child env or HTTP header"]
+    Use --> External["External system such as a provider, connector, or MCP server. Value used, then gone"]
 ```
 
 Concretely, `kheish-daemon secrets list` and `secrets get <ref>` return only
@@ -396,31 +342,16 @@ brokered objects instead:
 - **`CredentialLease`** — the short-lived opaque lease actually used for one
   route resolution or one connector/MCP credential request.
 
-```
-        BROKERED CREDENTIAL FLOW
-
-   agent needs to call model route "openai"
-        │
-        ▼
-   AuthSubject = session:demo / agent:agent-7
-        │
-        ▼
-   CredentialScope check: is "openai" route allowed?
-        │ no ─────────────▶ DENIED (route selection may have
-        │                   succeeded; resolution is denied here)
-        │ yes
-        ▼
-   CredentialGrant issued (audience = openai route)
-        │
-        ▼
-   CredentialLease minted  ── short-lived, opaque, revocable ──┐
-        │                                                       │
-        ▼                                                       │
-   provider request runs using the lease, not the API key      │
-        │                                                       │
-        ▼                                                       │
-   revoke-subject / revoke-lease / revoke-slot ────────────────┘
-   invalidates future resolutions AND active leases immediately
+```mermaid
+flowchart TD
+    Need["Agent needs to call model route openai"] --> Subject["AuthSubject = session:demo or agent:agent-7"]
+    Subject --> ScopeCheck{"CredentialScope check: is the openai route allowed?"}
+    ScopeCheck -->|"no"| Denied["Denied. Route selection may have succeeded, and resolution is denied here"]
+    ScopeCheck -->|"yes"| Grant["CredentialGrant issued, audience is the openai route"]
+    Grant --> Lease["CredentialLease minted - short-lived, opaque, revocable"]
+    Lease --> Request["Provider request runs using the lease, not the API key"]
+    Request --> Revoke["revoke-subject, revoke-lease, or revoke-slot"]
+    Revoke -->|"invalidates future resolutions and active leases immediately"| Lease
 ```
 
 The payoff is revocation and audit without secret exposure. Revoking a subject,
@@ -469,22 +400,21 @@ That default-deny is the least-privilege principle made concrete: access to a
 resource and access to its *credentials* are separate grants, and the safe
 default is to withhold the credential.
 
+```mermaid
+flowchart TD
+    Cap["CapabilityScope says you can SEE the slack connector's tools"] --> Eff["Effective authority = CapabilityScope intersected with CredentialScope. A child can only ever narrow this, never widen it"]
+    Cred["CredentialScope says you may NOT resolve slack-prod:BOT_TOKEN"] --> Eff
 ```
-   VISIBILITY  vs  USABILITY  (why two scopes)
 
-   CapabilityScope says:  "you can SEE the slack connector's tools"
-   CredentialScope says:  "...but you may NOT resolve slack-prod:BOT_TOKEN"
+A concrete scope illustrating the two axes:
 
-   {
-     "route_allow": ["openai", "anthropic"],
-     "connector_allow": ["slack-prod"],
-     "connector_credential_allow": ["slack-prod:BOT_TOKEN"],
-     "mcp_server_deny": ["github"]
-   }
-                    │
-                    ▼
-   effective authority = CapabilityScope  ∩  CredentialScope
-   (a child can only ever narrow this; never widen it)
+```json
+{
+  "route_allow": ["openai", "anthropic"],
+  "connector_allow": ["slack-prod"],
+  "connector_credential_allow": ["slack-prod:BOT_TOKEN"],
+  "mcp_server_deny": ["github"]
+}
 ```
 
 Sessions persist a credential scope directly, and sidechains can request a
@@ -504,41 +434,14 @@ memory, it could poison every future run. So the learning plane is *governed* �
 nothing mutates durable memory ungoverned. Treat this as a security control, not
 just a quality feature.
 
-```
-        LEARNING GOVERNANCE PIPELINE
-
-   run produces a candidate learning
-        │
-        ▼
-   ┌─────────────────────────────────────────────┐
-   │ 1. secret-shaped rejection                   │
-   │    content that redacts non-trivially, or     │
-   │    contains "<redacted", or looks like a      │
-   │    secret assignment → REJECTED               │
-   └───────────────────┬─────────────────────────┘
-                       │ passes
-                       ▼
-   ┌─────────────────────────────────────────────┐
-   │ 2. policy evaluation                         │
-   │    scope rules, dedup, same-subject conflict  │
-   └───────────────────┬─────────────────────────┘
-                       │
-                       ▼
-   ┌─────────────────────────────────────────────┐
-   │ 3. model-backed judge (when enabled)         │
-   │    confirms or downgrades the action; can     │
-   │    only reject or narrow, never widen         │
-   └───────────────────┬─────────────────────────┘
-                       │
-                       ▼
-   ┌─────────────────────────────────────────────┐
-   │ 4. promotion gate (for procedural skills)     │
-   │    workspace-scoped procedure only; must run   │
-   │    via fork + verification profile; evidence-  │
-   │    bound rollout: draft→verified→canary→active │
-   └───────────────────┬─────────────────────────┘
-                       ▼
-              durable memory / active skill
+```mermaid
+flowchart TD
+    Candidate["Run produces a candidate learning"] --> Secret{"1. Secret-shaped rejection: does the content redact non-trivially, contain a redacted marker, or look like a secret assignment?"}
+    Secret -->|"yes"| Rejected["Rejected"]
+    Secret -->|"passes"| Policy["2. Policy evaluation: scope rules, dedup, and same-subject conflict"]
+    Policy --> Judge["3. Model-backed judge, when enabled: confirms or downgrades the action. Can only reject or narrow, never widen"]
+    Judge --> Promotion["4. Promotion gate for procedural skills: workspace-scoped procedure only, must run via fork plus the verification profile, evidence-bound rollout from draft to verified to canary to active"]
+    Promotion --> Durable["Durable memory or active skill"]
 ```
 
 Each stage is a real defense:
@@ -633,32 +536,19 @@ an internal service and you have a pivot. Kheish's outbound HTTP surfaces —
 `remote_http` reply targets and external connector base URLs — reject private and
 otherwise-non-public network destinations by default.
 
-```
-        OUTBOUND HTTP GUARD  (SSRF defense)
-
-   connector / reply target base_url
-        │
-        ▼
-   userinfo in URL? ─── yes ──▶ REJECT ("must not include userinfo")
-        │ no
-        ▼
-   host is "localhost" / "*.localhost"? ─ yes ─▶ REJECT
-        │ no
-        ▼
-   host is a literal IP?
-        │ yes ─▶ ensure_public_ip:
-        │         reject private, loopback, link-local, broadcast,
-        │         documentation, 0.0.0.0/8, ≥224.0.0.0 (multicast/
-        │         reserved), 100.64.0.0/10 CGNAT, IPv6 ULA/link-local
-        │ no (hostname)
-        ▼
-   resolve host → for EVERY resolved address, ensure_public_ip
-        │
-        ▼
-   all public? ── no ──▶ REJECT ("resolved to a private network address")
-        │ yes
-        ▼
-   request proceeds, pinned to the checked addresses
+```mermaid
+flowchart TD
+    Start["Connector or reply target base_url"] --> Userinfo{"Does the URL contain userinfo?"}
+    Userinfo -->|"yes"| RejectUser["Reject: must not include userinfo"]
+    Userinfo -->|"no"| Localhost{"Is the host localhost or *.localhost?"}
+    Localhost -->|"yes"| RejectLocal["Reject"]
+    Localhost -->|"no"| LiteralIP{"Is the host a literal IP?"}
+    LiteralIP -->|"yes"| EnsureIP["ensure_public_ip rejects private, loopback, link-local, broadcast, documentation, 0.0.0.0/8, addresses at or above 224.0.0.0 which are multicast or reserved, 100.64.0.0/10 CGNAT, and IPv6 ULA or link-local"]
+    LiteralIP -->|"no, hostname"| Resolve["Resolve host, then run ensure_public_ip for every resolved address"]
+    EnsureIP --> AllPublic{"Are all checked addresses public?"}
+    Resolve --> AllPublic
+    AllPublic -->|"no"| RejectPrivate["Reject: resolved to a private network address"]
+    AllPublic -->|"yes"| Proceed["Request proceeds, pinned to the checked addresses"]
 ```
 
 The guard checks *every* resolved address, not just the first, so a hostname that
@@ -782,7 +672,7 @@ Everything above composes into a short checklist for the moment you move off
 loopback. Each item re-imposes a control that local-first gave you for free.
 
 ```
-        LOOPBACK-DEFAULT  ──▶  HARDENED EXPOSURE
+        LOOPBACK-DEFAULT  -->  HARDENED EXPOSURE
 
    [ ] --http-auth-mode bearer            (never rely on auto off-loopback)
    [ ] distinct admin + read-only tokens  (files, not inline; 0600)

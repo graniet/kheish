@@ -28,28 +28,15 @@ The single most important idea on this page is a separation Kheish makes on purp
 - A **connector** is a daemon-managed *transport resource*. One Telegram bot. One Slack app. One HTTP webhook definition. One external sidecar bridge. It owns transport-specific configuration and secrets: bot tokens, signing secrets, polling versus webhook mode, rate limits, allow-lists.
 - A **reply target** is a normalized *output destination* — a `ReplyHandle` of `{ plugin, address }` — attached to a session, a run, or a connector. It says "put the answer *here*."
 
-```text
-   CONNECTOR  vs  REPLY TARGET
-   ===========================
-
-   ┌───────────────────────────┐        ┌──────────────────────────┐
-   │        CONNECTOR           │        │       REPLY TARGET       │
-   │  (transport definition)    │        │  (routing destination)   │
-   ├───────────────────────────┤        ├──────────────────────────┤
-   │ - bot token / signing key  │        │ - plugin   ("telegram")  │
-   │ - webhook vs polling       │        │ - address  (opaque route)│
-   │ - rate limits, allow-lists │        │                          │
-   │ - stable connector name    │        │ lives on: session / run /│
-   │ owned by: the DAEMON       │        │           connector      │
-   └───────────────────────────┘        └──────────────────────────┘
-             │                                      ▲
-             │ derives a natural reply target       │
-             └──────────────────────────────────────┘
-              (e.g. "reply in the same chat/thread")
-
-   Change the BOT TOKEN or polling mode  -> mutate the CONNECTOR.
-   Change WHERE a session answers         -> mutate the REPLY TARGETS.
+```mermaid
+flowchart LR
+    C["CONNECTOR, a transport definition<br/>bot token or signing key<br/>webhook vs polling<br/>rate limits and allow-lists<br/>stable connector name<br/>owned by the DAEMON"]
+    RT["REPLY TARGET, a routing destination<br/>plugin such as telegram<br/>address, an opaque route<br/>lives on a session, run, or connector"]
+    C -->|"derives a natural reply target, e.g. reply in the same chat or thread"| RT
 ```
+
+- Change the bot token or polling mode → mutate the connector.
+- Change where a session answers → mutate the reply targets.
 
 Why the split matters in practice: a connector's secrets (a Slack signing secret, a Telegram bot token) are configured once, at the daemon level, and never copied into individual sessions or runs. A reply target is just a route — no secret material rides inside it. That means you can inspect, log, and move reply targets freely, while the sensitive transport credentials stay in one place under the secret store. It also means a session can answer on a completely different Slack thread than the one it was created from, just by editing its reply targets — no connector change required.
 
@@ -85,18 +72,18 @@ The Telegram connector handles both ingress (inbound updates) and egress (Bot AP
 
 Two modes, two tradeoffs:
 
-```text
-   TELEGRAM INGRESS MODES
-   ======================
-
-   WEBHOOK (default)                POLLING
-   ─────────────────                ───────
-   Telegram  ──HTTPS──► daemon      daemon ──getUpdates──► Telegram
-   route, verified by               long-poll, timeout =
-   secret_token header              polling_timeout_seconds
-   needs a public URL               works behind NAT / locally
-   lowest latency                   simplest to run in dev
+```mermaid
+flowchart LR
+    subgraph WH["WEBHOOK, the default"]
+        TG1["Telegram"] -->|"HTTPS route, verified by secret_token header"| D1["daemon"]
+    end
+    subgraph PO["POLLING"]
+        D2["daemon"] -->|"getUpdates long-poll, timeout is polling_timeout_seconds"| TG2["Telegram"]
+    end
 ```
+
+- Webhook needs a public URL and has the lowest latency.
+- Polling works behind NAT or locally and is the simplest to run in dev.
 
 Guardrails the daemon enforces at config time: a polling connector *requires* a bot token (you can't poll without one). Self-output *requires* a bot token even for webhook connectors (you can't reply without one). A webhook connector with neither a `secret_token` nor `allow_unauthenticated_ingress=true` is rejected — webhook ingress must be authenticated unless you explicitly opt out. Empty tokens are rejected outright, and an overridden `api_base_url` must be a clean `http(s)` URL with no userinfo, query, or fragment (so secrets can't hide in the URL).
 
@@ -154,24 +141,13 @@ On top of self-output, a connector can carry `additional_reply_targets` — a fi
 
 When a run produces output, Kheish resolves *where it goes* in a strict order. This ordering is the whole reason session reply-target edits are "prospective, not retroactive."
 
-```text
-   REPLY TARGET RESOLUTION (highest priority first)
-   ================================================
-
-   1. EXPLICIT output override    (this specific emit says "go here")
-            │  none?
-            ▼
-   2. RUN SNAPSHOT                (targets captured when the run
-            │                      was created — immutable)
-            │  none?
-            ▼
-   3. SESSION DEFAULTS            (durable session reply-target
-                                   preferences, editable)
-
-   A run captures its reply targets at creation time. Editing
-   the SESSION defaults afterward does NOT rewrite that run's
-   snapshot. It only affects FUTURE work and future fallback.
+```mermaid
+flowchart TD
+    E["1. EXPLICIT output override, this specific emit says go here"] -->|"none"| RS["2. RUN SNAPSHOT, targets captured when the run was created, immutable"]
+    RS -->|"none"| SD["3. SESSION DEFAULTS, durable session reply-target preferences, editable"]
 ```
+
+A run captures its reply targets at creation time. Editing the SESSION defaults afterward does NOT rewrite that run's snapshot. It only affects FUTURE work and future fallback.
 
 Run reply targets are **immutable snapshots** taken when the concrete work is created. This applies to normal input runs, scheduled input materialized into runs, and parent clarification flows. Because the snapshot is frozen, restart and retry are deterministic — a delivery that retries after a crash routes to the same place it was always going to, not to wherever the session defaults happen to point *now*.
 
@@ -181,28 +157,17 @@ Here is the one connector behavior most likely to catch you out, and it deserves
 
 When a connector supplies explicit reply targets on an inbound event, those targets do not stay purely run-local. After the daemon schedules a non-daemon, non-scheduler **input** run, the connector's explicit reply targets are also **written back** into the session's stored reply-target *defaults* for future work in that session.
 
-```text
-   EXPLICIT REPLY TARGET WRITE-BACK
-   ================================
-
-   inbound event (connector A, reply target = X)
-            │
-            ▼
-   run created  ── snapshot reply targets = X ──►  delivered to X
-            │
-            └──► session DEFAULT reply targets := X   (written back!)
-
-   Later, a different connector B sends an event with target Y:
-            │
-            ▼
-   run created  ── snapshot = Y ──►  delivered to Y
-            │
-            └──► session DEFAULT reply targets := Y   (overwrites X)
-
-   Net effect: whichever connector arrived LAST sets the
-   session's default output route. Daemon-owned output that
-   falls back to session defaults follows the last arrival.
+```mermaid
+flowchart TD
+    A["Inbound event, connector A, reply target X"] --> RA["Run created, snapshot reply targets X"]
+    RA --> DA["Delivered to X"]
+    RA --> SA["Session default reply targets set to X, written back"]
+    B["Later, connector B sends an event with target Y"] --> RB["Run created, snapshot Y"]
+    RB --> DB["Delivered to Y"]
+    RB --> SB["Session default reply targets set to Y, overwrites X"]
 ```
+
+Net effect: whichever connector arrived LAST sets the session's default output route. Daemon-owned output that falls back to session defaults follows the last arrival.
 
 The consequence: in a session fed by several connectors, "whoever spoke last" quietly becomes the session's default output route. The *current* run always uses its own snapshot, so no in-flight work is misrouted. But daemon-owned output that falls back to session defaults — and future work without explicit routing — follows the most recent arrival.
 
@@ -222,24 +187,11 @@ There are two run modes.
 
 ### `remote_http` vs `child_process`
 
-```text
-   EXTERNAL CONNECTOR RUN MODES
-   ============================
-
-   remote_http                       child_process
-   ───────────                       ─────────────
-   sidecar runs SOMEWHERE ELSE       daemon LAUNCHES & supervises
-   (you operate it)                  the sidecar as a subprocess
-                                     
-   base_url: public/private          base_url: LOOPBACK ONLY
-   (private nets need explicit       (127.0.0.1 / ::1 / localhost,
-    allow_private_network=true)       no path/query/fragment)
-                                     
-   you manage lifecycle, restarts    daemon manages lifecycle,
-   and secrets yourself              restarts, secret leasing
-                                     
-   good for: shared infra, a         good for: single-host deploys,
-   sidecar behind your own LB        turnkey "just run it" setups
+```mermaid
+flowchart TD
+    CH{"Choose external connector run mode"}
+    CH -->|"you operate it elsewhere"| RH["remote_http<br/>sidecar runs somewhere else, you operate it<br/>base_url public or private<br/>private nets need allow_private_network true<br/>you manage lifecycle, restarts, and secrets<br/>good for shared infra or a sidecar behind your own load balancer"]
+    CH -->|"turnkey single host"| CP["child_process<br/>daemon launches and supervises the sidecar as a subprocess<br/>base_url loopback only, such as 127.0.0.1 or localhost, no path, query, or fragment<br/>daemon manages lifecycle, restarts, and secret leasing<br/>good for single-host deploys and turnkey setups"]
 ```
 
 **`remote_http`** connectors point at a sidecar you operate elsewhere. Because SSRF is a real risk when the daemon makes outbound calls to a configurable URL, `remote_http` base URLs are hardened: they must be `http`/`https` with no userinfo, and they **reject loopback, private, link-local, and metadata-network targets by default**. You must set `allow_private_network=true` explicitly to point one at a trusted local sidecar. The daemon re-resolves hostnames at manifest-fetch and delivery time, rejects any private/special address in the answer set, pins the validated addresses for the request, and never follows redirects. Manifests are cached briefly then revalidated, so a sidecar at a stable URL cannot pin an old capability contract forever.
@@ -316,46 +268,37 @@ When a delivery includes attachments, each asset descriptor carries a `download_
 
 Here is the whole life of a `child_process` sidecar, from spawn to first delivery, including how it gets its platform secrets without them ever sitting in its startup environment.
 
-```text
-   EXTERNAL SIDECAR HANDSHAKE (child_process mode)
-   ===============================================
-
-   DAEMON                                   SIDECAR
-   ──────                                   ───────
-   spawn process with reserved env:
-     KHEISH_EXTERNAL_CONNECTOR_NAME
-     KHEISH_EXTERNAL_CONNECTOR_BASE_URL
-     KHEISH_EXTERNAL_CONNECTOR_DAEMON_BASE_URL
-     KHEISH_EXTERNAL_CONNECTOR_SHARED_TOKEN
-     KHEISH_EXTERNAL_CONNECTOR_CREDENTIAL_TOKEN   (short-lived lease)
-     KHEISH_EXTERNAL_CONNECTOR_CREDENTIAL_KEYS_JSON (which keys it may fetch)
-        │
-        │  ──────────────────────────────────►  process starts
-        │
-        │   GET /manifest  ◄───────────────────  (daemon polls readiness)
-        │   -> protocol_version 1, instance_id
-        │
-        │   GET /health    ◄───────────────────
-        │   -> SAME instance_id  (readiness gate)
-        │
-        │                        sidecar needs DISCORD_BOT_TOKEN:
-        │   GET /v1/connectors/external/{name}/credentials/DISCORD_BOT_TOKEN
-        │   Authorization: Bearer $CREDENTIAL_TOKEN
-        │        ◄──────────────────────────────
-        │   -> { value, lease_id, grant_id, expires_at_ms }
-        │
-        │                        sidecar connects to Discord, marks ready
-        │
-   inbound event arrives on the platform  ───►  sidecar builds Kheish event
-        │   POST /v1/connectors/external/{name}/events
-        │        ◄──────────────────────────────  (ingress protocol 2)
-        │   -> { status, session_id, run_id }
-        │
-   run produces output  ─────────────────────►  POST /deliver (protocol 1)
-        │   Idempotency-Key: kheish:<delivery_id>
-        │   ──────────────────────────────────►  sidecar sends to platform
-        │        ◄── 2xx "committed" ───────────
+```mermaid
+sequenceDiagram
+    participant D as DAEMON
+    participant S as SIDECAR
+    participant P as PLATFORM
+    D->>S: spawn process with reserved env vars, listed below
+    Note over S: process starts
+    D->>S: GET /manifest, daemon polls readiness
+    S-->>D: protocol_version 1 and instance_id
+    D->>S: GET /health
+    S-->>D: SAME instance_id, readiness gate passes
+    S->>D: GET /v1/connectors/external/NAME/credentials/DISCORD_BOT_TOKEN, Bearer credential token
+    D-->>S: value, lease_id, grant_id, expires_at_ms
+    S->>P: sidecar connects to Discord and marks ready
+    P->>S: inbound event arrives, sidecar builds a Kheish event
+    S->>D: POST /v1/connectors/external/NAME/events, ingress protocol 2
+    D-->>S: status, session_id, run_id
+    Note over D: run produces output
+    D->>S: POST /deliver protocol 1, Idempotency-Key kheish delivery_id
+    S->>P: sidecar sends to the platform
+    S-->>D: 2xx committed
 ```
+
+Reserved environment variables the daemon sets on spawn:
+
+- `KHEISH_EXTERNAL_CONNECTOR_NAME`
+- `KHEISH_EXTERNAL_CONNECTOR_BASE_URL`
+- `KHEISH_EXTERNAL_CONNECTOR_DAEMON_BASE_URL`
+- `KHEISH_EXTERNAL_CONNECTOR_SHARED_TOKEN`
+- `KHEISH_EXTERNAL_CONNECTOR_CREDENTIAL_TOKEN` — a short-lived lease.
+- `KHEISH_EXTERNAL_CONNECTOR_CREDENTIAL_KEYS_JSON` — which keys the sidecar may fetch.
 
 Two credential concepts are in play, and confusing them is a classic mistake:
 
@@ -379,53 +322,33 @@ The daemon runs child-process sidecars with real operational hygiene:
 - spawn, readiness, and exit failures are retried with bounded backoff;
 - on Unix the sidecar starts in its own process group, so shutdown can signal the whole descendant tree rather than orphaning grandchildren.
 
-```text
-   CHILD-PROCESS SUPERVISION LIFECYCLE
-   ===================================
-
-   configure ──► validate secret slots ──► spawn (own process group)
-        │                                        │
-        │                                  poll /manifest + /health
-        │                                        │ same instance_id?
-        │                                   ┌─────┴─────┐
-        │                                  yes          no / timeout
-        │                                   │            │
-        │                                READY      retry w/ backoff
-        │                                   │            │
-        │                            serve ingress/      │
-        │                            delivery            │
-        │                                   │            │
-   daemon shutdown ──► signal process ──────┴────────────┘
-   group ──► child exits ──► credential lease revoked
+```mermaid
+flowchart TD
+    CFG["configure"] --> VAL["validate secret slots"]
+    VAL --> SPAWN["spawn in its own process group"]
+    SPAWN --> POLL["poll /manifest and /health"]
+    POLL --> CHK{"same instance_id?"}
+    CHK -->|"yes"| READY["READY, serve ingress and delivery"]
+    CHK -->|"no or timeout"| RETRY["retry with backoff"]
+    RETRY --> POLL
+    READY --> SHUT["daemon shutdown, signal the process group"]
+    SHUT --> EXIT["child exits"]
+    EXIT --> REVOKE["credential lease revoked"]
 ```
 
 ### Ingress semantics: session resolution
 
 When a sidecar posts an event, the daemon must decide *which session* it belongs to. The resolution order is fixed and worth memorizing, because it determines whether two messages continue one conversation or fork into two.
 
-```text
-   EXTERNAL SESSION RESOLUTION (first match wins)
-   ==============================================
-
-   1. connector fixed_session_id          ── "everything into ONE session"
-            │  not set?
-            ▼
-   2. session already bound to the event's ── sticky binding keys
-      derived binding keys
-            │  none?
-            ▼
-   3. natural session id from thread.path  ── hierarchical conversation
-            │  thread.path empty?           identity (guild/channel/thread)
-            ▼
-   4. natural session id from routing_key  ── threadless domain events
-            │  none of the above?
-            ▼
-        REJECTED
-
-   Rule: if thread.path is present, it drives identity.
-   routing_key is only used for identity when thread.path
-   is empty — but routing_key is always PERSISTED to metadata.
+```mermaid
+flowchart TD
+    S1["1. connector fixed_session_id, everything into ONE session"] -->|"not set"| S2["2. a session already bound to the event's derived binding keys, sticky binding keys"]
+    S2 -->|"none"| S3["3. natural session id from thread.path, hierarchical conversation identity of guild, channel, thread"]
+    S3 -->|"thread.path empty"| S4["4. natural session id from routing_key, threadless domain events"]
+    S4 -->|"none of the above"| REJ["REJECTED"]
 ```
+
+Rule: if thread.path is present, it drives identity. routing_key is only used for identity when thread.path is empty, but routing_key is always PERSISTED to metadata.
 
 Choosing among these is a design decision:
 
@@ -493,17 +416,12 @@ These two are marked **experimental** in their manifests, and the label is not d
 
 Use Signal and WhatsApp for evaluation and internal experiments. Do not put a customer-facing SLA behind them yet. If you deploy them, pin the media host allow-lists, watch the degraded-health signals the sidecars emit, and expect to babysit the external services they depend on.
 
-```text
-   PLATFORM READINESS LADDER
-   =========================
+Tiers from most to least production-ready:
 
-   production      discord · email · sms · webhook   (native: telegram,
-                                                       slack, http)
-        ▲
-   best-effort     matrix   (unencrypted rooms only, no E2E crypto)
-        ▲
-   experimental    signal · whatsapp   (depend on external services
-                                        you run; not SLA-ready)
+```mermaid
+flowchart TD
+    PROD["production: discord, email, sms, webhook<br/>native transports are telegram, slack, http"] --> BE["best-effort: matrix<br/>unencrypted rooms only, no E2E crypto"]
+    BE --> EXP["experimental: signal, whatsapp<br/>depend on external services you run, not SLA-ready"]
 ```
 
 ---

@@ -23,20 +23,17 @@ submit a run, lose the process, reconnect from a different process or a differen
 language entirely, and pick the same session and run back up by id. The daemon is
 the source of truth; the SDK is a typed window onto it.
 
-```text
-        your code                         the durable engine
-   ┌──────────────────┐   HTTPS / HTTP   ┌───────────────────────────┐
-   │  Kheish SDK       │  Bearer token   │      kheish-daemon         │
-   │  (py/ts/go/rust)  │ ───────────────►│   /v1/* control plane      │
-   │                   │                 │                            │
-   │  from_env()       │  snake_case     │   sessions · runs ·        │
-   │  responses.create │  JSON wire      │   schedules · learnings ·  │
-   │  run.wait()       │◄─────────────── │   runtime · connectors ·   │
-   │  sessions.create  │  JSON / SSE     │   assets · docs · logs     │
-   └──────────────────┘                 └────────────┬──────────────┘
-                                                      │
-                                        durable state (see production.mdx):
-                                        sessions/, runs, deliveries, learnings
+```mermaid
+flowchart LR
+    subgraph Code["your code"]
+        SDK["Kheish SDK, py ts go rust<br/>from_env<br/>responses.create<br/>run.wait<br/>sessions.create"]
+    end
+    subgraph Engine["the durable engine"]
+        Daemon["kheish-daemon<br/>/v1/* control plane<br/>sessions, runs, schedules, learnings<br/>runtime, connectors, assets, docs, logs"]
+        Durable["durable state, see production<br/>sessions/, runs, deliveries, learnings"]
+        Daemon --> Durable
+    end
+    SDK <-->|"HTTPS or HTTP, Bearer token, snake_case JSON, JSON or SSE"| Daemon
 ```
 
 ---
@@ -316,19 +313,22 @@ what `responses.create(...)` plus `run.wait(...)` is for. Under the hood,
 polls (or streams) the run until it reaches a terminal status and then returns
 the result.
 
-```text
-   your code                    SDK                         daemon
-      │  responses.create(...)   │                            │
-      │ ───────────────────────► │  POST session input / run  │
-      │                          │ ─────────────────────────► │  run: queued
-      │                          │ ◄───────────────────────── │  202 + run handle
-      │  run.wait(...)           │                            │
-      │ ───────────────────────► │  poll GET /v1/runs/{id}    │
-      │                          │ ─────────────────────────► │  queued → running
-      │                          │ ◄───────────────────────── │  running
-      │                          │ ─────────────────────────► │  (repeat)
-      │                          │ ◄───────────────────────── │  completed + outputs
-      │ ◄─────────────────────── │  result.output_text        │
+```mermaid
+sequenceDiagram
+    participant You as your code
+    participant SDK
+    participant Daemon as daemon
+    You->>SDK: responses.create
+    SDK->>Daemon: POST session input then run
+    Note over Daemon: run queued
+    Daemon-->>SDK: 202 and run handle
+    You->>SDK: run.wait
+    SDK->>Daemon: poll GET /v1/runs/id
+    Daemon-->>SDK: queued then running
+    SDK->>Daemon: repeat poll
+    Daemon-->>SDK: running
+    Daemon-->>SDK: completed and outputs
+    SDK-->>You: result.output_text
 ```
 
 Python:
@@ -423,22 +423,16 @@ that "hang" — they are not hung, they are **waiting for you**. The SDKs expose
 explicit human-loop control plane so you can detect the wait, resolve it, and let
 the run continue.
 
-```text
-   run.wait_until_blocked(timeout)
-        │
-        ▼
-   ┌──────────────────────────────────────────────┐
-   │ blocked.requires_approval ?                    │
-   │    yes → blocked.approve_all("ok, operator")   │──┐
-   │ blocked.requires_question ?                    │  │
-   │    yes → gather answers → blocked.answer(...)  │──┤
-   └──────────────────────────────────────────────┘  │
-        │                                              │
-        ▼                                              ▼
-   run resumes ───────────────► run.wait(raise_on_failure=True)
-                                     │
-                                     ▼
-                                output_text
+```mermaid
+flowchart TD
+    Start["run.wait_until_blocked with timeout"]
+    Start --> Check["blocked, requires approval or question?"]
+    Check -->|"requires_approval yes"| Approve["blocked.approve_all with operator note"]
+    Check -->|"requires_question yes"| Answer["gather answers, then blocked.answer"]
+    Approve --> Resume["run resumes"]
+    Answer --> Resume
+    Resume --> Wait["run.wait with raise_on_failure true"]
+    Wait --> Out["output_text"]
 ```
 
 ```python
@@ -496,28 +490,22 @@ the daemon enforces. `run.wait(...)` and `wait_until_blocked(...)` are convenien
 wrappers over this; if you poll `GET /v1/runs/{run_id}` yourself, this is what you
 are watching.
 
-```text
-                         ┌──────────┐
-        submit ─────────►│  queued  │
-                         └────┬─────┘
-                              │ scheduler picks it up
-                              ▼
-                         ┌──────────┐
-                    ┌───►│ running  │◄────── resume ──────┐
-                    │    └────┬─────┘                      │
-                    │         │                            │
-      resume        │         ├───────────────┬───────────┤
-    (approval/       │         ▼               ▼           │
-     question)      │  ┌───────────────┐ ┌──────────────────┐
-                    └──┤ waiting_for_  │ │ waiting_for_user_ │
-                       │ approval      │ │ question          │
-                       └───────────────┘ └──────────────────┘
-                              │
-        terminal states (run.wait returns / raises here):
-                              ▼
-       ┌───────────┬──────────┬─────────────┬────────────┐
-       │ completed │  failed  │ interrupted │ cancelled  │
-       └───────────┴──────────┴─────────────┴────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> queued: submit
+    queued --> running: scheduler picks it up
+    running --> waiting_for_approval
+    running --> waiting_for_user_question
+    waiting_for_approval --> running: resume
+    waiting_for_user_question --> running: resume
+    running --> completed
+    running --> failed
+    running --> interrupted
+    running --> cancelled
+    completed --> [*]
+    failed --> [*]
+    interrupted --> [*]
+    cancelled --> [*]
 ```
 
 The statuses, verbatim from the run model:
@@ -598,20 +586,23 @@ The contract is set once per session as a JSON Schema (a strict daemon-supported
 subset), and then every run through that session is validated (input) or coerced
 (output) against it.
 
+Set the contract once per session with a schema PUT:
+
 ```text
-   SET THE CONTRACT (schema PUT, once per session):
+PUT /v1/sessions/{id}/input-contract    { "schema": { …JSON Schema… } }
+PUT /v1/sessions/{id}/output-contract   { "schema": { …JSON Schema… },
+                                          "max_repair_attempts": N }
+```
 
-   PUT /v1/sessions/{id}/input-contract    { "schema": { …JSON Schema… } }
-   PUT /v1/sessions/{id}/output-contract    { "schema": { …JSON Schema… },
-                                              "max_repair_attempts": N }
+Then, per run, canonical JSON flows both ways:
 
-   THEN, PER RUN — canonical JSON both ways:
-
-   ┌────────────┐   input JSON that      ┌──────────┐   output JSON that
-   │ integrator │   MUST match the ─────►│  daemon  │──► MUST match the ───► integrator
-   │            │   input schema         │          │   output schema
-   └────────────┘   (else 400)          └──────────┘   (daemon repairs up to
-                                                        max_repair_attempts)
+```mermaid
+flowchart LR
+    Integrator["integrator"]
+    Daemon["daemon"]
+    Receiver["integrator receives output"]
+    Integrator -->|"input JSON that MUST match the input schema, else 400"| Daemon
+    Daemon -->|"output JSON that MUST match the output schema, daemon repairs up to max_repair_attempts"| Receiver
 ```
 
 ### Setting a contract
@@ -666,21 +657,21 @@ polling. Reply targets are how: attach an HTTP reply target to a session (or a
 run, or a connector), and the daemon `POST`s the assistant output there as real
 JSON when the run produces output.
 
-```text
-   session has reply_target { http, https://your-app/webhook }
-        │
-        ▼
-   run completes / emits output
-        │
-        ▼
-   daemon delivery worker  ──POST──►  https://your-app/webhook
-        │   JSON body:                       │
-        │   { session_id, thread_id,         │  200 → delivered
-        │     content, parts,                │  429 → retry with backoff
-        │     resolved_parts, artifacts,     │  fail after retries →
-        │     artifact_attachments, metadata}│    dead-letter (replayable)
-        ▼
-   delivery is durable + retried; DLQ + replay if the target keeps failing
+```mermaid
+flowchart TD
+    S["session has reply_target http, https://your-app/webhook"]
+    R["run completes or emits output"]
+    W["daemon delivery worker"]
+    Target["POST to https://your-app/webhook"]
+    Done["200 delivered"]
+    Retry["429 retry with backoff"]
+    DLQ["fail after retries, dead-letter and replayable"]
+    S --> R --> W
+    W -->|"JSON body: session_id, thread_id, content, parts, resolved_parts, artifacts, artifact_attachments, metadata"| Target
+    Target --> Done
+    Target --> Retry
+    Target --> DLQ
+    Target -.-> Summary["delivery is durable and retried, DLQ plus replay if the target keeps failing"]
 ```
 
 The JSON body the daemon delivers to an HTTP reply target contains real,
@@ -746,7 +737,7 @@ There are two ways to get a file into a run:
 
 ```text
    UPLOAD ONCE:
-   POST /v1/assets  { file_name, media_type, content_base64 }  ──►  { asset_id }
+   POST /v1/assets  { file_name, media_type, content_base64 }  ->  { asset_id }
 
    REFERENCE FROM A RUN (preferred, provider-neutral input_items):
    input_items: [
@@ -759,7 +750,7 @@ There are two ways to get a file into a run:
    ]
 
    READ OUTPUT ARTIFACTS BACK:
-   run output → parts / artifacts (asset ids) → GET /v1/assets/{id}/raw (admin)
+   run output -> parts / artifacts (asset ids) -> GET /v1/assets/{id}/raw (admin)
 ```
 
 `input_items` is the preferred input surface precisely because it is
@@ -827,13 +818,12 @@ retry after a timeout, a redelivered message, a double-click. The daemon gives
 you a clean at-most-once story through **idempotency keys**, and every SDK's
 submit path takes one.
 
-```text
-   submit run  (idempotency_key = "order-8842")
-        │
-        ▼
-   daemon: have I seen "order-8842" for this session?
-        ├─ no  → create a new run, remember the key
-        └─ yes → return the EXISTING run, do not run again
+```mermaid
+flowchart TD
+    Submit["submit run with idempotency_key order-8842"]
+    Submit --> Q["daemon: have I seen order-8842 for this session?"]
+    Q -->|"no"| New["create a new run, remember the key"]
+    Q -->|"yes"| Existing["return the EXISTING run, do not run again"]
 ```
 
 - Python/TypeScript `responses.create` accepts an idempotency key; Go's
@@ -895,18 +885,15 @@ message, a domain event) into daemon sessions and runs. That is the external
 connector ingress contract, and the Python SDK ships `ExternalDaemonClient` for
 exactly this.
 
-```text
-   external platform            your sidecar (ExternalDaemonClient)      daemon
-        │  event                       │                                   │
-        │ ────────────────────────────►│  POST /v1/connectors/external/    │
-        │                              │       {name}/events               │
-        │                              │  (ingress protocol_version 2,     │
-        │                              │   falls back to 1 for old daemons)│
-        │                              │ ─────────────────────────────────►│
-        │                              │            materializes a session │
-        │                              │            + a run, replies via   │
-        │                              │            the connector's        │
-        │                              │            reply targets          │
+```mermaid
+sequenceDiagram
+    participant Platform as external platform
+    participant Sidecar as your sidecar ExternalDaemonClient
+    participant Daemon as daemon
+    Platform->>Sidecar: event
+    Sidecar->>Daemon: POST /v1/connectors/external/name/events
+    Note over Sidecar,Daemon: ingress protocol_version 2, falls back to 1 for old daemons
+    Note over Daemon: materializes a session and a run, replies via the connector reply targets
 ```
 
 Key facts for building one:
@@ -943,46 +930,38 @@ you know where to look (or which `raw` path to call). Everything under `/v1/` is
 control plane and sits behind the auth middleware; connector ingress and
 observation upload ingress are mounted separately, on purpose.
 
-```text
-   /v1  control plane (behind auth middleware)
-    │
-    ├── sessions ─── durable containers: create, input, route policy,
-    │                capability/credential scope, reply targets, persona
-    │                binding, input/output contracts, memory context/search
-    ├── runs ─────── execution attempts: list, get (source of truth for
-    │                route+model used), cancel, debug bundles, external actions
-    ├── questions & approvals ── the human-loop control plane
-    ├── tasks ─────── background daemon tasks: list, output, stop
-    ├── schedules ─── durable schedules + wakeups: create, trigger, pause,
-    │                resume, cancel
-    ├── learnings ─── learning-candidates, learnings, revoke-matching,
-    │  & memory       learning-skills (promoted procedural skills)
-    ├── runtime ───── /v1/status, /v1/capabilities, /v1/runtime,
-    │                learning-policy, secrets, auth subjects/leases, hooks,
-    │                debug-level, connectors/external/metrics, routes overlay
-    ├── connectors ── runtime connectors + ingress definitions (http/slack/
-    │                telegram/external)
-    ├── assets ────── daemon-owned assets and documents (upload/download/raw)
-    ├── boards ────── immutable visual revisions
-    ├── personas ──── persona records + session persona binding
-    ├── channels ──── public conversations, members, messages, leases,
-    │                stimuli, thread-work
-    ├── projects ──── projects, members, linked channels, project tasks
-    ├── playbooks &── playbook lifecycle + Flow execution/streaming
-    │  flows
-    ├── observations ── observation sources, observations, materializations
-    │  & derivations   and durable derivations
-    ├── docs ──────── GET /v1/docs — the daemon's own documentation manifest
-    ├── logs ──────── GET /v1/logs — bounded ring of daemon tracing events
-    └── streams ───── SSE: events, sessions/{id}, runs/{id}, flows/{id}
-
-   separately mounted (NOT control-plane auth):
-    ├── connector ingress ── /v1/connectors/{http,slack,telegram}/{name},
-    │                        /v1/connectors/external/{name}/events[/batch],
-    │                        /v1/connectors/external/{name}/credentials/{key}
-    └── observation upload ── /v1/observation-sources/{id}/observations
-                              (source-scoped bearer token, not the admin token)
+```mermaid
+flowchart TD
+    Root["Daemon HTTP surface"]
+    Root --> CP["/v1 control plane<br/>behind auth middleware"]
+    Root --> Sep["Separately mounted<br/>NOT control-plane auth"]
 ```
+
+Control plane `/v1` (behind auth middleware):
+
+- `sessions` — durable containers: create, input, route policy, capability/credential scope, reply targets, persona binding, input/output contracts, memory context/search
+- `runs` — execution attempts: list, get (source of truth for route+model used), cancel, debug bundles, external actions
+- `questions & approvals` — the human-loop control plane
+- `tasks` — background daemon tasks: list, output, stop
+- `schedules` — durable schedules + wakeups: create, trigger, pause, resume, cancel
+- `learnings & memory` — learning-candidates, learnings, revoke-matching, learning-skills (promoted procedural skills)
+- `runtime` — `/v1/status`, `/v1/capabilities`, `/v1/runtime`, learning-policy, secrets, auth subjects/leases, hooks, debug-level, connectors/external/metrics, routes overlay
+- `connectors` — runtime connectors + ingress definitions (http/slack/telegram/external)
+- `assets` — daemon-owned assets and documents (upload/download/raw)
+- `boards` — immutable visual revisions
+- `personas` — persona records + session persona binding
+- `channels` — public conversations, members, messages, leases, stimuli, thread-work
+- `projects` — projects, members, linked channels, project tasks
+- `playbooks & flows` — playbook lifecycle + Flow execution/streaming
+- `observations & derivations` — observation sources, observations, materializations and durable derivations
+- `docs` — `GET /v1/docs` — the daemon's own documentation manifest
+- `logs` — `GET /v1/logs` — bounded ring of daemon tracing events
+- `streams` — SSE: events, sessions/{id}, runs/{id}, flows/{id}
+
+Separately mounted (NOT control-plane auth):
+
+- connector ingress — `/v1/connectors/{http,slack,telegram}/{name}`, `/v1/connectors/external/{name}/events[/batch]`, `/v1/connectors/external/{name}/credentials/{key}`
+- observation upload — `/v1/observation-sources/{id}/observations` (source-scoped bearer token, not the admin token)
 
 A few domain-specific pointers integrators reach for most:
 
@@ -1040,19 +1019,17 @@ and on the playground bench. It answers the question every integrator asks —
 "how do I talk to *this* agent from my code?" — by generating a ready-to-paste
 snippet.
 
-```text
-   [ Use via SDK ]  on session "orders"
-        │
-        ▼
-   pick a language:  ● Python   ○ TypeScript   ○ Go   ○ Rust
-        │
-        ├─ reads your connection settings → fills KHEISH_BASE_URL
-        ├─ fetches GET /v1/sessions/orders/input-contract
-        │     └─ if a contract exists: builds a payload skeleton from the
-        │        JSON Schema so the snippet passes validation
-        └─ emits the snippet, mirrored from the official kheish-sdks quickstarts
-        ▼
-   copy → paste → run.  target = this exact session.
+```mermaid
+flowchart TD
+    Btn["Use via SDK on session orders"]
+    Btn --> Pick["pick a language: Python, TypeScript, Go, Rust"]
+    Pick --> Base["reads your connection settings, fills KHEISH_BASE_URL"]
+    Pick --> Fetch["fetches GET /v1/sessions/orders/input-contract"]
+    Fetch --> Skel["if a contract exists, builds a payload skeleton from the JSON Schema so the snippet passes validation"]
+    Pick --> Emit["emits the snippet, mirrored from the official kheish-sdks quickstarts"]
+    Base --> Done["copy, paste, run. target is this exact session"]
+    Skel --> Done
+    Emit --> Done
 ```
 
 What the generated snippet gives you:

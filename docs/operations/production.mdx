@@ -39,21 +39,11 @@ A production daemon is defined by two filesystem roots and one network bind:
   state-root snapshot and is not part of the daemon's recovery guarantee.
 - `--bind` — the control-plane listen address, `127.0.0.1:4000` by default.
 
-```text
-                 ┌────────────────────────────────────────────┐
-                 │              kheish-daemon                   │
-                 │  (control plane + agent loop + workers)      │
-                 └───────────────┬──────────────────┬───────────┘
-                                 │                  │
-                    writes durable state     runs shell / file tools
-                                 │                  │
-                                 ▼                  ▼
-                    ┌───────────────────┐  ┌───────────────────┐
-                    │    STATE ROOT     │  │  WORKSPACE ROOT   │
-                    │  back this up.    │  │  blast radius.    │
-                    │  it is the memory │  │  ephemeral by     │
-                    │  of the daemon.   │  │  design.          │
-                    └───────────────────┘  └───────────────────┘
+```mermaid
+flowchart TD
+    Daemon["kheish-daemon<br/>control plane, agent loop, workers"]
+    Daemon -->|"writes durable state"| State["STATE ROOT<br/>back this up<br/>it is the memory of the daemon"]
+    Daemon -->|"runs shell and file tools"| Workspace["WORKSPACE ROOT<br/>blast radius<br/>ephemeral by design"]
 ```
 
 Three rules follow directly and are enforced by the official container
@@ -230,57 +220,15 @@ what is deliberately settled fail-closed. The daemon does not "resume the world
 exactly as it was" — it restores durable, replayable state and settles anything
 that cannot be safely replayed.
 
-```text
-   kheish-daemon serve/up  --state-root R
-            │
-            ▼
-   ┌─────────────────────────────────────────────────────────────┐
-   │ 1. Acquire the state-root lock (flock on daemon.lock).        │
-   │    If another daemon holds it → refuse. Same mechanism as     │
-   │    sessions vacuum. This is what makes vacuum-while-serving   │
-   │    fail politely.                                             │
-   └─────────────────────────────────────────────────────────────┘
-            │
-            ▼
-   ┌─────────────────────────────────────────────────────────────┐
-   │ 2. Load runtime-config.json → restore the LAST revision       │
-   │    (route/model, permission mode, hooks, debug level, tool    │
-   │    limits, learning + run-memory policy) BEFORE accepting work.│
-   └─────────────────────────────────────────────────────────────┘
-            │
-            ▼
-   ┌─────────────────────────────────────────────────────────────┐
-   │ 3. Rebuild the route registry:                                │
-   │      routes file (path+SHA from route-inventory.json)         │
-   │    + routes-overlay.json (insertion-ordered; first stays      │
-   │      default if the file inventory was empty)                 │
-   │    + resolve auth_ref slots from the encrypted auth store.    │
-   └─────────────────────────────────────────────────────────────┘
-            │
-            ▼
-   ┌─────────────────────────────────────────────────────────────┐
-   │ 4. Replay durable stores: sessions (journal + sidecars),      │
-   │    schedules, channels (records/leases/stimuli/thread-work),  │
-   │    projects, personas, connectors, deliveries, learnings.     │
-   └─────────────────────────────────────────────────────────────┘
-            │
-            ▼
-   ┌─────────────────────────────────────────────────────────────┐
-   │ 5. Repair run lifecycle:                                      │
-   │    - one wait-capable run per session keeps the active slot   │
-   │    - extra daemon-owned replayable runs (scheduled, mailbox,  │
-   │      observation, parent-clarification) are requeued          │
-   │    - extra normal input runs are INTERRUPTED, not replayed    │
-   │    - active shell tasks are SETTLED FAIL-CLOSED:              │
-   │        status=failed, terminal_reason=daemon_restarted,       │
-   │        recovered_on_boot=true                                 │
-   └─────────────────────────────────────────────────────────────┘
-            │
-            ▼
-   ┌─────────────────────────────────────────────────────────────┐
-   │ 6. Start workers (scheduler, delivery, learning), open the    │
-   │    HTTP listener, /readyz flips to 200.                       │
-   └─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    Start["kheish-daemon serve or up, --state-root R"]
+    Start --> S1["1. Acquire the state-root lock, flock on daemon.lock.<br/>If another daemon holds it, refuse.<br/>Same mechanism as sessions vacuum, so vacuum-while-serving fails politely."]
+    S1 --> S2["2. Load runtime-config.json, restore the LAST revision.<br/>route or model, permission mode, hooks, debug level, tool limits, learning and run-memory policy.<br/>BEFORE accepting work."]
+    S2 --> S3["3. Rebuild the route registry.<br/>routes file, path and SHA from route-inventory.json.<br/>plus routes-overlay.json, insertion-ordered, first stays default if the file inventory was empty.<br/>plus resolve auth_ref slots from the encrypted auth store."]
+    S3 --> S4["4. Replay durable stores: sessions journal and sidecars, schedules, channels records leases stimuli thread-work, projects, personas, connectors, deliveries, learnings."]
+    S4 --> S5["5. Repair run lifecycle.<br/>one wait-capable run per session keeps the active slot.<br/>extra daemon-owned replayable runs, scheduled, mailbox, observation, parent-clarification, are requeued.<br/>extra normal input runs are INTERRUPTED, not replayed.<br/>active shell tasks are SETTLED FAIL-CLOSED: status=failed, terminal_reason=daemon_restarted, recovered_on_boot=true."]
+    S5 --> S6["6. Start workers, scheduler, delivery, learning, open the HTTP listener, /readyz flips to 200."]
 ```
 
 What Kheish **does** restore across a restart: pending approvals, pending
@@ -407,28 +355,15 @@ to executing normally after restart.
 
 ### Vacuum runbook
 
-```text
-   1. SLO warning fires: oversized_session_count > 0
-            │
-            ▼
-   2. Confirm the target from /v1/status .storage.session_storage
-      (largest_session_id, oversized_session_ids)
-            │
-            ▼
-   3. Drain and STOP the daemon for that state root (see Upgrades).
-            │
-            ▼
-   4. kheish-daemon sessions vacuum <id> --state-root R
-            │
-            ▼
-   5. Verify the JSON report: bytes_after << bytes_before,
-      metadata_records_dropped > 0, torn_tail_dropped as expected.
-            │
-            ▼
-   6. Restart the daemon. Confirm /readyz=200 and runs start normally.
-            │
-            ▼
-   7. Remove <name>.jsonl.vacuum-bak once you trust the compaction.
+```mermaid
+flowchart TD
+    V1["1. SLO warning fires: oversized_session_count above 0"]
+    V1 --> V2["2. Confirm the target from /v1/status .storage.session_storage using largest_session_id and oversized_session_ids"]
+    V2 --> V3["3. Drain and STOP the daemon for that state root, see Upgrades"]
+    V3 --> V4["4. kheish-daemon sessions vacuum the session id --state-root R"]
+    V4 --> V5["5. Verify the JSON report: bytes_after much less than bytes_before, metadata_records_dropped above 0, torn_tail_dropped as expected"]
+    V5 --> V6["6. Restart the daemon. Confirm /readyz=200 and runs start normally"]
+    V6 --> V7["7. Remove the .jsonl.vacuum-bak backup once you trust the compaction"]
 ```
 
 ### The downgrade non-guarantee
@@ -453,16 +388,17 @@ The default and the safest. The daemon binds loopback, nothing external reaches
 it, and operators use the CLI or SDK from the same host (or through an SSH
 tunnel). No TLS, no CORS surface, minimal attack surface.
 
-```text
-   ┌──────────────────────── host ────────────────────────┐
-   │                                                        │
-   │   operator CLI / SDK ──► 127.0.0.1:4000                │
-   │                              │                          │
-   │                       kheish-daemon                     │
-   │                          │        │                     │
-   │                    state_root   workspace_root          │
-   │                                                        │
-   └────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph Host["host"]
+        CLI["operator CLI or SDK"]
+        Daemon["kheish-daemon"]
+        State["state_root"]
+        Workspace["workspace_root"]
+        CLI -->|"127.0.0.1:4000"| Daemon
+        Daemon --> State
+        Daemon --> Workspace
+    end
 ```
 
 Use this for automation hosts, CI runners, and any daemon that only ever talks
@@ -475,19 +411,15 @@ proxy or ingress controller terminates TLS and forwards to it. Bearer auth stays
 enabled behind the proxy. This is the standard shape for exposing a daemon to a
 team or an application backend.
 
-```text
-   Internet / VPN
-        │  https://kheish.example.com
-        ▼
-   ┌───────────────┐   plain HTTP, loopback    ┌────────────────┐
-   │  Nginx / Caddy │ ───────────────────────► │  kheish-daemon  │
-   │  TLS terminate │   Authorization forwarded │  127.0.0.1:4000 │
-   │  SSE buffering │   X-Forwarded-* set       │  bearer enabled │
-   │  OFF           │                           └────────────────┘
-   └───────────────┘
-        ▲
-        │  /healthz /readyz reachable by orchestrator
-        │  SSE streams NOT buffered
+```mermaid
+flowchart LR
+    Net["Internet or VPN"]
+    Proxy["Nginx or Caddy<br/>TLS terminate<br/>SSE buffering OFF"]
+    Daemon["kheish-daemon<br/>127.0.0.1:4000<br/>bearer enabled"]
+    Orch["orchestrator"]
+    Net -->|"https to kheish.example.com"| Proxy
+    Proxy -->|"plain HTTP loopback, Authorization forwarded, X-Forwarded headers set"| Daemon
+    Orch -->|"/healthz and /readyz reachable, SSE streams NOT buffered"| Proxy
 ```
 
 Non-negotiables for the proxy layer, all validated by the shipped Nginx fixture
@@ -525,22 +457,19 @@ The recommended container shape is **one daemon container** plus **separate
 connector services** talking to it over `remote_http`. The official daemon image
 is deliberately not the home for every platform-specific sidecar runtime.
 
-```text
-   ┌──────────────────────── orchestrator ─────────────────────────┐
-   │                                                                 │
-   │  ┌───────────────────┐        remote_http        ┌───────────┐  │
-   │  │  kheish-daemon     │◄─────────────────────────►│ connector │  │
-   │  │  0.0.0.0:4000      │   /v1/connectors/external  │ service   │  │
-   │  │  bearer auth       │                            │ (webhook, │  │
-   │  │  MCP discovery OFF │                            │  slack,   │  │
-   │  └─────────┬──────────┘                            │  telegram)│  │
-   │            │                                       └───────────┘  │
-   │   named volumes:                                                  │
-   │   state → /var/lib/kheish/state                                   │
-   │   workspace → /workspace                                          │
-   │   secrets → /run/secrets/... (Docker-managed, 0600 on host)       │
-   │                                                                   │
-   └───────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph Orch["orchestrator"]
+        Daemon["kheish-daemon<br/>0.0.0.0:4000<br/>bearer auth<br/>MCP discovery OFF"]
+        Connector["connector service<br/>webhook, slack, telegram"]
+        State["state volume<br/>/var/lib/kheish/state"]
+        Work["workspace volume<br/>/workspace"]
+        Secrets["secrets<br/>/run/secrets/... Docker-managed, 0600 on host"]
+        Daemon <-->|"remote_http /v1/connectors/external"| Connector
+        Daemon --> State
+        Daemon --> Work
+        Daemon --> Secrets
+    end
 ```
 
 Container defaults baked into the official image:
@@ -580,44 +509,23 @@ The daemon exposes several distinct observability surfaces. Knowing which is
 which keeps you from, for example, using an authenticated endpoint for a
 liveness probe.
 
-```text
-   ┌────────────────────────── observability map ──────────────────────────┐
-   │                                                                         │
-   │  UNAUTHENTICATED probes (outside auth middleware):                      │
-   │    GET /healthz   → liveness                                            │
-   │    GET /readyz    → readiness; 503 while draining on shutdown           │
-   │        └─ use these for Docker/K8s probes. NEVER reuse /v1/* for probes.│
-   │                                                                         │
-   │  AUTHENTICATED operator snapshot:                                       │
-   │    GET /v1/status → health.ok, storage.ok + probes[],                   │
-   │                     storage.session_storage (sizes, oversized),         │
-   │                     provider_readiness, runs.{queued,running,waiting_*},│
-   │                     delivery.unresolved_dead_lettered,                  │
-   │                     runtime.debug_level, health.warnings[]              │
-   │                                                                         │
-   │  DAEMON LOG RING BUFFER:                                                │
-   │    GET /v1/logs?limit=N → last N of a bounded 5000-entry in-memory ring │
-   │                     of the daemon's own tracing events (scheduler,      │
-   │                     deliveries, MCP, errors) — no shell access needed.  │
-   │                                                                         │
-   │  DELIVERY / DLQ:                                                        │
-   │    GET /v1/deliveries[?status=dead_lettered]                            │
-   │    GET /v1/deliveries/dead-letter                                       │
-   │    POST /v1/deliveries/{id}/replay                                      │
-   │    GET /v1/runtime/connectors/external/metrics                          │
-   │                                                                         │
-   │  LIVE STREAMS (SSE):                                                    │
-   │    GET /v1/events/stream        (global, filterable by session_id/run_id)│
-   │    GET /v1/sessions/{id}/stream                                         │
-   │    GET /v1/runs/{id}/stream                                             │
-   │    GET /v1/flows/{id}/stream    (proxy over the root run stream)        │
-   │                                                                         │
-   │  SECURITY AUDIT (on disk):                                             │
-   │    <state_root>/control-plane-auth/audit.jsonl                          │
-   │    <state_root>/external-actions/  (signed per-run external audit)      │
-   │                                                                         │
-   └─────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    Map["Observability surfaces"]
+    Map --> Unauth["Unauthenticated probes<br/>outside auth middleware"]
+    Map --> Snapshot["Authenticated operator snapshot"]
+    Map --> Ring["Daemon log ring buffer"]
+    Map --> Delivery["Delivery and DLQ"]
+    Map --> Streams["Live streams SSE"]
+    Map --> Audit["Security audit on disk"]
 ```
+
+- **Unauthenticated probes** (outside auth middleware): `GET /healthz` liveness; `GET /readyz` readiness, 503 while draining on shutdown. Use these for Docker/K8s probes. NEVER reuse `/v1/*` for probes.
+- **Authenticated operator snapshot**: `GET /v1/status` returns `health.ok`, `storage.ok` + `probes[]`, `storage.session_storage` (sizes, oversized), `provider_readiness`, `runs.{queued,running,waiting_*}`, `delivery.unresolved_dead_lettered`, `runtime.debug_level`, `health.warnings[]`.
+- **Daemon log ring buffer**: `GET /v1/logs?limit=N` returns the last N of a bounded 5000-entry in-memory ring of the daemon's own tracing events (scheduler, deliveries, MCP, errors) — no shell access needed.
+- **Delivery / DLQ**: `GET /v1/deliveries[?status=dead_lettered]`, `GET /v1/deliveries/dead-letter`, `POST /v1/deliveries/{id}/replay`, `GET /v1/runtime/connectors/external/metrics`.
+- **Live streams (SSE)**: `GET /v1/events/stream` (global, filterable by session_id/run_id), `GET /v1/sessions/{id}/stream`, `GET /v1/runs/{id}/stream`, `GET /v1/flows/{id}/stream` (proxy over the root run stream).
+- **Security audit (on disk)**: `<state_root>/control-plane-auth/audit.jsonl`, `<state_root>/external-actions/` (signed per-run external audit).
 
 ### `/v1/status` is the operator snapshot
 
@@ -755,13 +663,17 @@ The failure mode: your orchestrator sees the port close, immediately starts the
 replacement daemon, and the new daemon fails to acquire the lock because the old
 one has not let go yet. This looks like a flaky restart.
 
-```text
-   t0  SIGTERM sent
-   t0  drain begins, /readyz → 503
-   ...  ingress tasks + MCP shutdown run
-   t+  listening PORT released  ◄── orchestrator may (wrongly) start new daemon here
-   t++ process exits, flock on daemon.lock RELEASED  ◄── only now is start safe
-       └─ gap ≈ up to ~2s. Do NOT race into it.
+```mermaid
+flowchart TD
+    T1["t0 SIGTERM sent"]
+    T2["t0 drain begins, /readyz returns 503"]
+    T3["ingress tasks and MCP shutdown run"]
+    T4["t+ listening PORT released<br/>orchestrator may wrongly start a new daemon here"]
+    T5["t++ process exits, flock on daemon.lock RELEASED<br/>only now is start safe"]
+    Gap["gap up to about 2s between port release and lock release<br/>do NOT race into it"]
+    T1 --> T2 --> T3 --> T4 --> T5
+    T4 -.-> Gap
+    T5 -.-> Gap
 ```
 
 Mitigations:
@@ -774,29 +686,15 @@ Mitigations:
 
 ### Standard upgrade runbook
 
-```text
-   1. Build/pull the new binary or image. Record the version/digest.
-            │
-            ▼
-   2. Snapshot or archive the state root (see Backup). Optionally the workspace.
-            │
-            ▼
-   3. Drain: stop accepting new external ingress if you can. Let active runs
-      settle, or accept that active shell tasks will be settled fail-closed.
-            │
-            ▼
-   4. Stop the old daemon. CONFIRM the process exited (flock released).
-            │
-            ▼
-   5. Start the new daemon on the SAME state root, same routes file, same
-      auth-store master key.
-            │
-            ▼
-   6. Validate: /readyz=200, status.health.ok, runtime get, doctor,
-      doctor routes --check-auth, doctor routes --check-references.
-            │
-            ▼
-   7. Watch /v1/status warnings + /v1/logs for the first few minutes.
+```mermaid
+flowchart TD
+    U1["1. Build or pull the new binary or image. Record the version or digest."]
+    U1 --> U2["2. Snapshot or archive the state root, see Backup. Optionally the workspace."]
+    U2 --> U3["3. Drain: stop accepting new external ingress if you can. Let active runs settle, or accept that active shell tasks will be settled fail-closed."]
+    U3 --> U4["4. Stop the old daemon. CONFIRM the process exited and the flock released."]
+    U4 --> U5["5. Start the new daemon on the SAME state root, same routes file, same auth-store master key."]
+    U5 --> U6["6. Validate: /readyz=200, status.health.ok, runtime get, doctor, doctor routes --check-auth, doctor routes --check-references."]
+    U6 --> U7["7. Watch /v1/status warnings and /v1/logs for the first few minutes."]
 ```
 
 Because the runtime-config revision stream restores the last revision on boot,
@@ -973,45 +871,45 @@ prompt.
 
 ### Drill: daemon will not become ready
 
-```text
-   /readyz stuck on 503 (not draining)?
-     ├─ Another daemon holds the state-root lock (flock)?
-     │    → check for a lingering old process; wait out the ~2s flock gap.
-     ├─ runtime-config.json unreadable / route rebuild failing?
-     │    → doctor routes --check-auth ; confirm auth-store master key present.
-     ├─ Storage write-probe failing?
-     │    → status.storage.probes[] ; check disk full / permissions / inode.
-     └─ Provider route not ready?
-          → status.provider_readiness ; doctor routes --check-references.
+```mermaid
+flowchart TD
+    Q["/readyz stuck on 503, not draining?"]
+    Q --> C1["Another daemon holds the state-root lock, flock?"]
+    C1 --> R1["Check for a lingering old process, wait out the about 2s flock gap"]
+    Q --> C2["runtime-config.json unreadable or route rebuild failing?"]
+    C2 --> R2["doctor routes --check-auth, confirm auth-store master key present"]
+    Q --> C3["Storage write-probe failing?"]
+    C3 --> R3["status.storage.probes, check disk full, permissions, inode"]
+    Q --> C4["Provider route not ready?"]
+    C4 --> R4["status.provider_readiness, doctor routes --check-references"]
 ```
 
 ### Drill: runs are queuing and not starting
 
-```text
-   status.runs.queued climbing, oldest_queued_run_age_ms large?
-     ├─ Active run stuck waiting for approval/question?
-     │    → status.runs.waiting_for_* ; approvals list ; questions list.
-     ├─ Oversized session slowing run start (old build symptom)?
-     │    → status.storage.session_storage ; plan a vacuum window.
-     ├─ Provider route degraded?
-     │    → status.provider_readiness ; doctor routes --canary.
-     └─ A stale non-terminal run holding the slot?
-          → status.runs.oldest_non_terminal_run_idle_ms ; runs get <id> ;
-            runs cancel <id> if genuinely stuck.
+```mermaid
+flowchart TD
+    Q["status.runs.queued climbing, oldest_queued_run_age_ms large?"]
+    Q --> C1["Active run stuck waiting for approval or question?"]
+    C1 --> R1["status.runs.waiting_for_*, approvals list, questions list"]
+    Q --> C2["Oversized session slowing run start, old build symptom?"]
+    C2 --> R2["status.storage.session_storage, plan a vacuum window"]
+    Q --> C3["Provider route degraded?"]
+    C3 --> R3["status.provider_readiness, doctor routes --canary"]
+    Q --> C4["A stale non-terminal run holding the slot?"]
+    C4 --> R4["status.runs.oldest_non_terminal_run_idle_ms, runs get the run id, runs cancel it if genuinely stuck"]
 ```
 
 ### Drill: output is not being delivered
 
-```text
-   Replies not arriving?
-     ├─ status.delivery.unresolved_dead_lettered > 0?
-     │    → deliveries dead-letter ; inspect safe error codes ; fix target ;
-     │      deliveries replay <id>.
-     ├─ Wrong reply target on the run?
-     │    → runs get <run_id> (reply targets snapshot at run/task creation);
-     │      a session reply-target edit is prospective, not retroactive.
-     └─ Connector broken?
-          → connectors get <kind> <name> ; runtime/connectors/external/metrics.
+```mermaid
+flowchart TD
+    Q["Replies not arriving?"]
+    Q --> C1["status.delivery.unresolved_dead_lettered above 0?"]
+    C1 --> R1["deliveries dead-letter, inspect safe error codes, fix target, deliveries replay the id"]
+    Q --> C2["Wrong reply target on the run?"]
+    C2 --> R2["runs get the run_id, reply targets snapshot at run or task creation<br/>a session reply-target edit is prospective, not retroactive"]
+    Q --> C3["Connector broken?"]
+    C3 --> R3["connectors get kind and name, runtime connectors external metrics"]
 ```
 
 ### Incident containment quick reference

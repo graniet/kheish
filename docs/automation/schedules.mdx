@@ -67,27 +67,14 @@ The `timezone` field defaults to `"UTC"` when omitted. Cron is the only cadence 
 
 Cron cadences are validated at creation time by computing the first two fire instants and asserting the gap between them is at least 5 seconds. A cron expression that never fires, fires only once, or fires faster than the floor is rejected before the record is ever stored.
 
-```text
-                 CADENCE SELECTION
-                 =================
-
-   "run this at   ->  once      { fire_at_ms }
-    a specific
-    moment"
-
-   "run this      ->  interval  { every_seconds >= 5 }
-    every N
-    seconds"
-
-   "run this on   ->  cron      { expression, timezone }
-    a calendar
-    pattern"
-
-   Exactly ONE cadence per schedule. There is no
-   hybrid. If you need "every weekday at 9 AND on the
-   1st of the month", that is TWO cron schedules, not
-   one clever expression.
+```mermaid
+flowchart LR
+    A["Run this at a specific moment"] --> ONCE["once, needs fire_at_ms"]
+    B["Run this every N seconds"] --> INT["interval, needs every_seconds at least 5"]
+    C["Run this on a calendar pattern"] --> CRON["cron, needs expression and timezone"]
 ```
+
+Exactly ONE cadence per schedule. There is no hybrid. If you need "every weekday at 9 AND on the 1st of the month," that is TWO cron schedules, not one clever expression.
 
 ---
 
@@ -182,14 +169,19 @@ Cron cadences are evaluated in the IANA timezone you name (`Europe/Paris`, `Amer
 - **Spring forward (a wall-clock time that does not exist).** If your expression names 02:30 and the clocks jump from 02:00 to 03:00 on that date, that instant simply does not occur. Kheish skips the non-existent local time and lands on the next valid occurrence.
 - **Fall back (a wall-clock time that occurs twice).** When the clocks repeat an hour, a `02:30` daily job could theoretically fire twice. Kheish coalesces the ambiguous hour to a **single** due fire rather than double-firing.
 
-```text
-   DST BEHAVIOR (Europe/Paris, expression "0 30 2 * * *")
-   ======================================================
+Example: timezone Europe/Paris, cron `0 30 2 * * *`.
 
-   Spring forward (March):        Fall back (October):
-   01:59  02:00 ──jump──> 03:00   01:59  02:30(#1)  02:00-again  02:30(#2)
-          └ 02:30 never exists           └────── coalesced to ONE fire ─┘
-          -> fires next valid day        -> fires exactly once
+```mermaid
+flowchart TD
+    subgraph SF["Spring forward in March"]
+        A1["Clocks jump from 02:00 to 03:00"] --> A2["Local time 02:30 never exists"]
+        A2 --> A3["Fires the next valid day"]
+    end
+    subgraph FB["Fall back in October"]
+        B1["The 02:00 to 03:00 hour repeats"] --> B2["02:30 would occur twice, first and second"]
+        B2 --> B3["Coalesced to ONE fire"]
+        B3 --> B4["Fires exactly once"]
+    end
 ```
 
 If precise wall-clock behavior across DST matters to your workload (billing cutoffs, SLA windows), prefer `UTC` cron or an `interval` cadence, which never negotiate with a timezone at all.
@@ -214,30 +206,17 @@ If an execution is already in flight, remember **one** pending fire. When the cu
 
 Dispatch the new fire immediately regardless of what is already running. Multiple executions from the same schedule can be in flight at once. Use this only when the scheduled work is genuinely independent per fire and your downstream (and your provider budget) can absorb concurrency. Remember that runs in the same *session* still serialize; `parallel` is most meaningful when each fire targets independent work or the session tolerates queued runs stacking up.
 
-```text
-   FIRE PIPELINE:  due  ->  overlap check  ->  outcome
-   ===================================================
-
-                    a fire becomes DUE
-                           │
-                           ▼
-                 is a prior execution
-                    still in flight?
-                     /           \
-                   NO             YES
-                    │              │
-              DISPATCH        ┌────┴─────────────┐
-                              │ overlap_policy?  │
-                              ├──────────────────┤
-                   skip  ───► drop this fire, advance next_fire
-                   queue_one► remember ONE fire, run it on settle
-                   parallel ► dispatch now, run alongside
-                              └──────────────────┘
-
-   max_executions is checked BEFORE dispatch. If the
-   schedule has no remaining execution slots, even a
-   queued fire is skipped with a recorded reason.
+```mermaid
+flowchart TD
+    DUE["A fire becomes DUE"] --> Q{"Is a prior execution still in flight?"}
+    Q -->|"NO"| DISP["DISPATCH"]
+    Q -->|"YES"| POL{"overlap_policy?"}
+    POL -->|"skip"| SK["Drop this fire, advance next_fire"]
+    POL -->|"queue_one"| QO["Remember ONE fire, run it on settle"]
+    POL -->|"parallel"| PA["Dispatch now, run alongside"]
 ```
+
+max_executions is checked BEFORE dispatch. If the schedule has no remaining execution slots, even a queued fire is skipped with a recorded reason.
 
 The scheduler tracks in-flight state on the schedule record itself (`in_flight_fire_at_ms`, `in_flight_run_id`) and the single pending fire in `queued_fire_at_ms`. Those fields are visible on the schedule view, so an operator can always see "is this thing currently running, and is something waiting behind it?"
 
@@ -257,19 +236,17 @@ However many fires were missed during the outage, run the work **once** to repre
 
 Do **not** run anything for the missed window. Just advance the next fire to the correct future time and carry on as if the missed occurrences never existed. This is right for time-sensitive work where a late run is worse than a skipped one — a "good morning summary" at 9am is pointless at 2pm; skip it and wait for tomorrow.
 
-```text
-   MISFIRE RECONCILIATION (per-minute interval, 50 min outage)
-   ===========================================================
-
-   fires that SHOULD have happened while daemon was down:
-   09:01 09:02 09:03 ... 09:49 09:50   (50 missed)
-
-   coalesce_once ─► [ one catch-up run ] ─► resume at 09:51, 09:52 ...
-   skip_missed   ─► ( nothing )          ─► resume at 09:51, 09:52 ...
-
-   Both converge on the same FUTURE schedule. They differ
-   only in whether the gap produces one run or zero runs.
+```mermaid
+flowchart TD
+    M["50 fires missed while the daemon was down, 09:01 through 09:50"] --> CO["coalesce_once"]
+    M --> SM["skip_missed"]
+    CO --> COR["One catch-up run"]
+    SM --> SMR["Nothing runs"]
+    COR --> R["Resume at 09:51, 09:52 and onward"]
+    SMR --> R
 ```
+
+Both converge on the same future schedule. They differ only in whether the gap produces one run or zero runs.
 
 The catch-up scan is bounded. A schedule that has been asleep for months does not attempt to compute every missed cron instant since the dawn of time; the planner computes the *latest* missed fire (for `coalesce_once`) or simply the next future fire (for `skip_missed`) without walking an unbounded history. This keeps a long outage from producing a pathological startup scan.
 
@@ -281,34 +258,24 @@ Overlap and misfire compose. After an outage, `coalesce_once` produces one catch
 
 A schedule is a durable record with a status, not a fire-and-forget timer. Its lifecycle is small and explicit.
 
-```text
-   SCHEDULE STATE MACHINE
-   ======================
-
-                    create
-                      │
-                      ▼
-                 ┌─────────┐   pause    ┌────────┐
-                 │ ACTIVE  │ ─────────► │ PAUSED │
-                 │         │ ◄───────── │        │
-                 └─────────┘   resume   └────────┘
-                   │     │                   │
-        max_execs  │     │ cancel            │ cancel
-        reached /  │     │                   │
-        once fired │     ▼                   ▼
-            │   ┌──────────┐            ┌──────────┐
-            └─► │ COMPLETED│            │ CANCELED │
-                └──────────┘            └──────────┘
-                  (terminal)             (terminal)
-
-   ACTIVE     the scheduler drives it; fires dispatch runs
-   PAUSED     no fires; remaining time is preserved
-   COMPLETED  reached max_executions, or a `once` fired
-   CANCELED   operator/agent stopped it permanently
-
-   COMPLETED and CANCELED are TERMINAL. You do not
-   resume them; you create a new schedule.
+```mermaid
+stateDiagram-v2
+    [*] --> ACTIVE: create
+    ACTIVE --> PAUSED: pause
+    PAUSED --> ACTIVE: resume
+    ACTIVE --> COMPLETED: max_executions reached or once fired
+    ACTIVE --> CANCELED: cancel
+    PAUSED --> CANCELED: cancel
+    COMPLETED --> [*]
+    CANCELED --> [*]
 ```
+
+- **ACTIVE** — the scheduler drives it; fires dispatch runs.
+- **PAUSED** — no fires; remaining time is preserved.
+- **COMPLETED** — reached max_executions, or a `once` fired. Terminal.
+- **CANCELED** — operator or agent stopped it permanently. Terminal.
+
+COMPLETED and CANCELED are terminal. You do not resume them; you create a new schedule.
 
 The daemon exposes five mutations against a schedule:
 
@@ -325,19 +292,16 @@ Pausing does not throw away where you were in the cadence. When you pause, the d
 - For `once` and `interval`, the next fire is set to `now + paused_remaining_ms`. If a per-hour interval had 12 minutes left when you paused, it has 12 minutes left when you resume, no matter how long the pause lasted.
 - For `cron`, resume recomputes the next fire from the calendar pattern relative to *now*. A cron schedule does not "owe" you a fire for the paused window; it simply rejoins its pattern.
 
-```text
-   PAUSE / RESUME  (interval, 12 min remaining at pause)
-   =====================================================
-
-   ...──fire──[ 48 min elapsed ]──PAUSE  (remaining = 12m)
-                                    :
-                          (paused for any duration)
-                                    :
-                                  RESUME ──[ 12 min ]──► next fire
-
-   Cron is different: resume rejoins the calendar pattern
-   from "now"; it does not replay the paused window.
+```mermaid
+flowchart LR
+    F["fire"] --> E["48 min elapsed"]
+    E --> P["PAUSE, remaining 12 min"]
+    P --> D["Paused for any duration"]
+    D --> RES["RESUME"]
+    RES --> N["12 min later, next fire"]
 ```
+
+Cron is different: resume rejoins the calendar pattern from "now"; it does not replay the paused window.
 
 This is the difference between "snooze" (interval/once: the clock stops and restarts where it left off) and "rejoin" (cron: catch the next scheduled slot). Choose your cadence accordingly if pause semantics matter to you.
 
@@ -587,33 +551,21 @@ The split between `version` and `definition_version` is subtle and important. Ev
 
 ### Goal lifecycle
 
-```text
-   SESSION GOAL LIFECYCLE
-   ======================
-
-              create (active)
-                    │
-                    ▼
-              ┌───────────┐   pause     ┌────────┐
-              │  ACTIVE   │ ──────────► │ PAUSED │
-              │           │ ◄────────── │        │
-              └───────────┘   resume    └────────┘
-                 │      │
-     budget hit  │      │  mark complete
-                 ▼      ▼
-        ┌──────────────┐   ┌──────────┐
-        │ BUDGET_LIMITED│   │ COMPLETE │
-        └──────────────┘   └──────────┘
-              │
-              │ ONE budget wrap-up continuation, then stop
-              ▼
-        (no further auto-continuation)
-
-   ACTIVE          daemon drives it when the session is idle
-   PAUSED          user/system halted auto-continuation
-   BUDGET_LIMITED  hit the token ceiling; allowed ONE wrap-up
-   COMPLETE        explicitly marked achieved
+```mermaid
+stateDiagram-v2
+    [*] --> ACTIVE: create
+    ACTIVE --> PAUSED: pause
+    PAUSED --> ACTIVE: resume
+    ACTIVE --> BUDGET_LIMITED: budget hit
+    ACTIVE --> COMPLETE: mark complete
+    BUDGET_LIMITED --> [*]: one wrap-up continuation then stop
+    COMPLETE --> [*]
 ```
+
+- **ACTIVE** — daemon drives it when the session is idle.
+- **PAUSED** — user or system halted auto-continuation.
+- **BUDGET_LIMITED** — hit the token ceiling; allowed ONE wrap-up, then no further auto-continuation.
+- **COMPLETE** — explicitly marked achieved.
 
 Only an `active` goal is auto-continued by the daemon. `paused` and `complete` do not auto-continue. `budget_limited` is special: it is a terminal-ish state that still permits exactly **one** wrap-up continuation, so the agent can gracefully summarize and stop rather than being cut off mid-thought.
 

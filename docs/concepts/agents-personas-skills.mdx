@@ -20,47 +20,20 @@ This page is the map of that machinery — identity, scopes, skills, and the exe
 
 Here is the whole apparatus in one diagram. Read it top-down as "how an agent is assembled," and note that the two scope boxes are **parallel, independent gates** — one governs visibility, the other governs authorization.
 
-```text
-                    HOW ONE AGENT IS ASSEMBLED
-
-   ┌──────────────────────────────────────────────────────────────┐
-   │  PERSONA RECORD (mutable, daemon-owned)                        │
-   │  soul + display_name + version + capability baseline + defaults│
-   └───────────────┬──────────────────────────────────────────────┘
-                   │  bind at session create (or later)
-                   v   -> IMMUTABLE snapshot copied into the session
-   ┌──────────────────────────────────────────────────────────────┐
-   │  SESSION                                                       │
-   │  persona snapshot + session capability_scope + credential_scope│
-   │  + tool_overrides + permission mode                            │
-   └───────┬───────────────────────────────────┬──────────────────┘
-           │                                   │
-           v                                   v
-   ┌───────────────────────┐         ┌───────────────────────────┐
-   │ CAPABILITY SCOPE       │         │ CREDENTIAL SCOPE           │
-   │ = persona ∩ session    │         │ = persona/parent ∩ session │
-   │ (VISIBILITY)           │         │ (AUTHORIZATION)            │
-   │  skill_allow/deny      │         │  route_allow/deny (families)│
-   │  mcp_server_allow/deny │         │  connector_allow/deny      │
-   │  mcp_tool_allow/deny   │         │  connector_credential_*    │
-   │                        │         │  mcp_server_allow/deny     │
-   │ decides WHAT IS SEEN   │         │ decides WHAT RESOLVES      │
-   └──────────┬─────────────┘         └───────────┬───────────────┘
-              │                                   │
-              v                                   v
-   ┌──────────────────────────────────────────────────────────────┐
-   │  EFFECTIVE TOOL SURFACE (per run)                              │
-   │  profile tools -> narrowed by capability scope -> session      │
-   │  tool_overrides -> operator-contact gating (last word)         │
-   └───────────────┬──────────────────────────────────────────────┘
-                   │  spawn_agent
-                   v
-   ┌──────────────────────────────────────────────────────────────┐
-   │  CHILD AGENT (sidechain)                                       │
-   │  inherits persona snapshot + capability + credential + mode    │
-   │  then INTERSECTS with any requested child scope (never wider)  │
-   │  optional dedicated git worktree; retain / close_on_settle     │
-   └──────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    Persona["PERSONA RECORD, mutable, daemon-owned<br/>soul, display_name, version, capability baseline, defaults"]
+    Session["SESSION<br/>persona snapshot, session capability_scope, credential_scope, tool_overrides, permission mode"]
+    Cap["CAPABILITY SCOPE, persona intersect session, VISIBILITY<br/>skill_allow and deny, mcp_server_allow and deny, mcp_tool_allow and deny<br/>decides WHAT IS SEEN"]
+    Cred["CREDENTIAL SCOPE, persona or parent intersect session, AUTHORIZATION<br/>route_allow and deny families, connector_allow and deny, connector_credential lists, mcp_server_allow and deny<br/>decides WHAT RESOLVES"]
+    Tools["EFFECTIVE TOOL SURFACE, per run<br/>profile tools narrowed by capability scope, then session tool_overrides, then operator-contact gating as the last word"]
+    Child["CHILD AGENT, sidechain<br/>inherits persona snapshot, capability, credential, mode<br/>then INTERSECTS with any requested child scope, never wider<br/>optional dedicated git worktree, retain or close_on_settle"]
+    Persona -->|"bind at session create or later, an IMMUTABLE snapshot is copied into the session"| Session
+    Session --> Cap
+    Session --> Cred
+    Cap --> Tools
+    Cred --> Tools
+    Tools -->|"spawn_agent"| Child
 ```
 
 Everything below is an expansion of one box in that diagram. We start at the top — identity — and work down to the leaves — child agents.
@@ -136,27 +109,18 @@ The critical design rule:
 - persona records are **mutable**,
 - session bindings are **immutable snapshots**.
 
-```text
-   PERSONA: MUTABLE RECORD vs IMMUTABLE BINDING
-
-   PERSONA RECORD  "reviewer"  (daemon state root)
-   ┌───────────────────────────────────────┐
-   │ version 1  soul="...v1..."             │
-   │ version 2  soul="...v2..."  <- current │
-   │ capability baseline, default_skills    │
-   └───────────────┬───────────────────────┘
-                   │
-       bind time copies the CURRENT state into the session
-                   │
-     ┌─────────────┼──────────────────────────────┐
-     v             v                              v
-  session A     session B                     session C
-  bound v1      bound v1                       bound v2
-  (frozen)      (frozen)                       (frozen)
-     │             │                              │
-     └─ updating the record to v3 does NOT rewrite A, B, or C ─┘
-        A and B keep v1; C keeps v2; only NEW sessions get v3
+```mermaid
+flowchart TD
+    Record["PERSONA RECORD reviewer, daemon state root<br/>version 1, soul v1<br/>version 2, soul v2, current<br/>capability baseline, default_skills"]
+    A["session A, bound v1, frozen"]
+    B["session B, bound v1, frozen"]
+    C["session C, bound v2, frozen"]
+    Record -->|"bind time copies the CURRENT state into the session"| A
+    Record -->|"bind time copies the CURRENT state into the session"| B
+    Record -->|"bind time copies the CURRENT state into the session"| C
 ```
+
+Updating the record to v3 does NOT rewrite A, B, or C: A and B keep v1, C keeps v2, and only NEW sessions get v3.
 
 When a session binds a persona, Kheish copies the *current* persona state into session metadata: `persona_id`, `persona_version`, `display_name`, the captured `soul`, the captured `capability_scope`, the resolved `default_inline_skills` snapshot, an instruction digest, and the bind timestamp. Consequences:
 
@@ -214,7 +178,7 @@ When a persona baseline meets a session override, Kheish computes the **intersec
    EFFECTIVE CAPABILITY SCOPE = persona baseline ∩ session override
 
    PERSONA baseline           SESSION override            EFFECTIVE
-   ─────────────────          ────────────────            ─────────
+   -----------------          ----------------            ---------
    skill_allow                skill_allow                 skill_allow
    [review, plan]      ∩      [review, ship]      =       [review]      (intersection)
 
@@ -266,29 +230,19 @@ One rule here is easy to trip over and important to understand. If a scope const
 
 This is the single most important consequence of keeping visibility and authorization separate:
 
-```text
-   CAPABILITY vs CREDENTIAL: two independent gates
-
-                 ┌──────────────────────────────┐
-   a tool /      │  CAPABILITY SCOPE (visibility)│  passes?
-   MCP call ───► │  is it in the allowed surface?│ ──yes──┐
-                 └──────────────────────────────┘        │
-                                                          v
-                 ┌──────────────────────────────┐   ┌──────────┐
-                 │  CREDENTIAL SCOPE (authz)     │   │ VISIBLE  │
-                 │  does the route/connector/    │   │ but can  │
-                 │  secret actually resolve?     │   │ it RUN?  │
-                 └───────────┬──────────────────┘   └────┬─────┘
-                             │                            │
-                    ┌────────┴────────┐                   │
-                    v                 v                   │
-              resolves?          blocked/                 │
-                 │               no secret                │
-                 v                  │                     │
-            RUNS for real           v                     │
-                              tool is VISIBLE but         │
-                              the call cannot resolve  ◄──┘
-                              its credential -> fails
+```mermaid
+flowchart TD
+    Call["a tool or MCP call"]
+    Cap["CAPABILITY SCOPE, visibility<br/>is it in the allowed surface?"]
+    Visible["VISIBLE, but can it run?"]
+    Cred["CREDENTIAL SCOPE, authorization<br/>does the route, connector, or secret actually resolve?"]
+    Runs["RUNS for real"]
+    Fails["tool is VISIBLE but the call cannot resolve its credential, so it fails"]
+    Call --> Cap
+    Cap -->|"passes"| Visible
+    Visible --> Cred
+    Cred -->|"resolves"| Runs
+    Cred -->|"blocked or no secret"| Fails
 ```
 
 An agent can therefore *see* fewer tools than its nominal profile exposes (capability scope hid them) **and** be unable to resolve some credentials even when a tool remains visible (credential scope blocked the route/connector). When you debug "the agent has the tool but it keeps failing," you are almost always looking at a credential-scope block, not a visibility problem. Inspect both `credential_scope` and `effective_credential_scope`, not just the capability side.
@@ -306,29 +260,20 @@ Credential scope inheritance mirrors capability scope (`restrict_with`: allow in
 
 They meet in the same runtime catalog, but they are born very differently.
 
-```text
-   WHERE A VISIBLE SKILL COMES FROM
-
-   CATALOG SKILLS                        PROMOTED PROCEDURAL SKILLS
-   ──────────────                        ──────────────────────────
-   author writes SKILL.md                a `procedure` learning is
-   in a skills/ root                     reviewed and published (active,
-        │                                workspace scope, active tier)
-        v                                       │
-   discovered by the registry                   v  promote (explicit step)
-   (Explicit / Repo / User roots,         a draft promoted skill (fork-only,
-    scope precedence, digest)             verification profile)
-        │                                       │  rollout ladder:
-        │                                       v  draft->verified->canary->active
-        └──────────────┬──────────────── only ACTIVE promoted skills mount
-                        v
-             GET /v1/skills  (the runtime catalog)
-                        │
-                        v
-             filtered by the session's EFFECTIVE CAPABILITY SCOPE
-                        │
-                        v
-                visible_skills for the session
+```mermaid
+flowchart TD
+    Author["CATALOG SKILLS<br/>author writes SKILL.md in a skills root"]
+    Registry["discovered by the registry<br/>Explicit, Repo, and User roots, with scope precedence and a digest"]
+    Learning["PROMOTED PROCEDURAL SKILLS<br/>a procedure learning is reviewed and published<br/>active, workspace scope, active tier"]
+    Draft["a draft promoted skill, fork-only, verification profile<br/>rollout ladder draft to verified to canary to active"]
+    Catalog["GET /v1/skills, the runtime catalog"]
+    Filter["filtered by the session EFFECTIVE CAPABILITY SCOPE"]
+    Visible["visible_skills for the session"]
+    Author --> Registry
+    Learning -->|"promote, an explicit step"| Draft
+    Registry --> Catalog
+    Draft -->|"only ACTIVE promoted skills mount"| Catalog
+    Catalog --> Filter --> Visible
 ```
 
 ### Catalog skills: SKILL.md and the registry
@@ -392,26 +337,15 @@ The rules:
 
 Where do overrides sit in the pipeline? Here is the full order the runtime uses to compute the **effective tool surface** for a run:
 
-```text
-   EFFECTIVE TOOL SURFACE (per run)
-
-   1. AGENT PROFILE          default / planning / coordination / verification
-      base allow/deny        (the daemon-enforced role surface)
-            │
-            v
-   2. MCP-DERIVED FILTER      MCP servers/tools contribute to the surface
-            │
-            v
-   3. CAPABILITY SCOPE        narrow to what the session may SEE
-            │
-            v
-   4. SESSION TOOL OVERRIDES  enable: un-deny + add to allow
-            │                 disable: append to deny
-            v
-   5. OPERATOR-CONTACT GATING operator tools gated LAST -> overrides here
-            │                 cannot bypass operator policy
-            v
-      final tool surface handed to the model
+```mermaid
+flowchart TD
+    Profile["1. AGENT PROFILE<br/>default, planning, coordination, verification<br/>base allow and deny, the daemon-enforced role surface"]
+    Mcp["2. MCP-DERIVED FILTER<br/>MCP servers and tools contribute to the surface"]
+    CapScope["3. CAPABILITY SCOPE<br/>narrow to what the session may SEE"]
+    Overrides["4. SESSION TOOL OVERRIDES<br/>enable un-denies and adds to allow<br/>disable appends to deny"]
+    Operator["5. OPERATOR-CONTACT GATING<br/>operator tools gated LAST, so overrides here cannot bypass operator policy"]
+    Final["final tool surface handed to the model"]
+    Profile --> Mcp --> CapScope --> Overrides --> Operator --> Final
 ```
 
 Read step 4 carefully: an `enable` removes a tool from the denylist and adds it to the allowlist (when the allowlist is non-empty), while a `disable` appends to the denylist. Because operator gating runs at step 5, you cannot use an `enable` to smuggle an operator-contact tool past operator policy — the gate simply re-applies afterward.
@@ -441,19 +375,17 @@ Use the richer multimodal `input_items` shape when the child must review or tran
 
 The child does not get a blank slate and it cannot escalate. At spawn, the daemon computes the child scope as **inherited parent scope, intersected with the requested child scope**, and validates that the request is a subset of the parent before applying it:
 
-```text
-   CHILD SCOPE AT SPAWN
-
-   parent effective scope ──┐
-                            ├─►  validate: requested ⊆ parent ?
-   requested child scope ───┘        │
-                                     ├─ no  -> REJECT (cannot widen)
-                                     └─ yes -> child = parent.restrict_with(requested)
-                                                │
-                                                v
-                                   allow-lists intersect, deny-lists union
-                                   credential defaults-to-none preserved
-                                   persisted as the child session scope
+```mermaid
+flowchart TD
+    Parent["parent effective scope"]
+    Requested["requested child scope"]
+    Validate{"validate: is requested a subset of parent?"}
+    Reject["REJECT, cannot widen"]
+    Restrict["child = parent restrict_with requested<br/>allow-lists intersect, deny-lists union<br/>credential defaults-to-none preserved<br/>persisted as the child session scope"]
+    Parent --> Validate
+    Requested --> Validate
+    Validate -->|"no"| Reject
+    Validate -->|"yes"| Restrict
 ```
 
 So a child can ask to be *narrower* than its parent, never wider. `validate_requested_capability_scope` and `validate_requested_credential_scope` enforce the subset rule; the connector-credential default-denied and delegated-deny rules from earlier still apply. The child's tool surface is intersected the same way. This is the mechanism behind "least privilege by delegation": you spawn a focused child with exactly the routes/skills/tools it needs and nothing more, and the daemon guarantees the child cannot climb back up.

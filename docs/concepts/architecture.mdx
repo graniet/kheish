@@ -26,35 +26,29 @@ The daemon is split into layers so that each layer can be reasoned about — and
 
 The layering is not just tidiness. It is what lets the daemon restart: the control plane and engine are reconstructed in memory from what the service layer persisted, and the provider layer is re-resolved against the current secret store so rotated credentials take effect without touching run payloads.
 
-```text
-                          KHEISH DAEMON — CONTROL, SERVICE, ENGINE, PROVIDER
-
-   external world                     the daemon process                         on disk (state root)
-  ┌───────────────┐   ┌──────────────────────────────────────────────────┐   ┌────────────────────────┐
-  │ HTTP / SSE    │   │  CONTROL PLANE                                     │   │ sessions/              │
-  │ CLI           │──▶│  · request metadata validation                    │   │  __safe/<id>.jsonl      │  journal
-  │ ingress       │   │  · route + auth_ref resolution                     │   │  __safe/<id>.meta/*.json │ sidecars
-  │ connectors    │   │  · reply-target resolution                         │   │  __safe/<id>.tasks-      │ task
-  └───────────────┘   │  · create run  |  queue run  |  resume run         │   │        archive.jsonl      │ archive
-                      └───────────────────────┬──────────────────────────┘   ├────────────────────────┤
-                                              │ submit / resume               │ runs/__safe/<id>.json   │ run record
-                      ┌───────────────────────▼──────────────────────────┐   │ run-events/__safe/*.jsonl│ run events
-                      │  SERVICE LAYER                                     │──▶│ run-memories/           │
-                      │  run store · session store · scheduler            │   ├────────────────────────┤
-                      │  delivery queue · persona/secret stores           │   │ deliveries + dead-letter │
-                      │  idempotency ledgers · reply-target index         │   │   ledgers                │
-                      └───────────────────────┬──────────────────────────┘   ├────────────────────────┤
-                                              │ launch_run(run_id)            │ personas / secrets /     │
-                      ┌───────────────────────▼──────────────────────────┐   │   connectors / auth      │
-                      │  ENGINE (kheish-core agent loop)                  │   └────────────────────────┘
-                      │  prompt build · permissions · tools · compaction  │
-                      │  completion boundary · output contract            │
-                      └───────────────────────┬──────────────────────────┘
-                                              │ ModelRequest
-                      ┌───────────────────────▼──────────────────────────┐
-                      │  PROVIDER LAYER (model driver + routing)          │
-                      │  provider-agnostic · returns answer or typed error│
-                      └──────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    Ext["external world<br/>HTTP / SSE · CLI · ingress connectors"]
+    subgraph Daemon["the daemon process"]
+        Control["CONTROL PLANE<br/>request metadata validation<br/>route + auth_ref resolution<br/>reply-target resolution<br/>create run / queue run / resume run"]
+        Service["SERVICE LAYER<br/>run store · session store · scheduler<br/>delivery queue · persona/secret stores<br/>idempotency ledgers · reply-target index"]
+        Engine["ENGINE, kheish-core agent loop<br/>prompt build · permissions · tools · compaction<br/>completion boundary · output contract"]
+        Provider["PROVIDER LAYER, model driver + routing<br/>provider-agnostic · returns answer or typed error"]
+    end
+    subgraph Disk["on disk, state root"]
+        Sessions["sessions/<br/>__safe/id.jsonl journal · __safe/id.meta/*.json sidecars · __safe/id.tasks-archive.jsonl"]
+        Runs["runs/__safe/id.json run record · run-events/__safe/*.jsonl run events · run-memories/"]
+        Deliveries["deliveries + dead-letter ledgers"]
+        Config["personas / secrets / connectors / auth"]
+    end
+    Ext --> Control
+    Control -->|"submit / resume"| Service
+    Service -->|"launch_run run_id"| Engine
+    Engine -->|"ModelRequest"| Provider
+    Service --> Sessions
+    Service --> Runs
+    Service --> Deliveries
+    Service --> Config
 ```
 
 Read the boxes top to bottom for a request and bottom to top for durability: the service layer is the only layer that touches disk, and every other layer is either upstream of it (control plane) or downstream of it (engine, providers) but reconstructed *from* it after a restart.
@@ -71,22 +65,20 @@ Before the state machine makes sense, it helps to see the whole path an ordinary
 6. The engine loops: build prompt → call model → evaluate permissions → execute tools → repeat, flushing journal entries to disk at each turn boundary. It exits when it produces a final answer (`Completed`), needs a human decision (`WaitingForApproval` / `WaitingForUserQuestion`), or hits an unrecoverable error (`Failed`).
 7. On completion the daemon captures output records locally, then routes them through reply targets and output plugins. Outbound messages that must reach an external system go through the **delivery queue**, which retries and, if it exhausts its budget, **dead-letters** them for an operator to replay.
 
-```text
-   INPUT → ENVELOPE → ENGINE → DELIVERY
-
-   caller input                    ingress boundary                     run + engine                       output
-  ┌──────────────┐   ┌────────────────────────────────┐   ┌──────────────────────────────┐   ┌────────────────────────┐
-  │ content /    │   │ · has-payload check             │   │ status: Queued → Running     │   │ output records captured │
-  │ input_items  │──▶│ · input-contract validation ────┼──▶│ engine turn loop:            │──▶│ reply targets resolved   │
-  │ attachments  │   │   (fail-closed, JSON-path error) │   │  build→model→perms→tools     │   │ output plugins invoked   │
-  │ route/model  │   │ · normalize + canonical JSON     │   │ flush journal each boundary  │   │ delivery queue (retry)   │
-  │ metadata     │   │ · pin route (override>policy>def)│   │ completion boundary:         │   │  └─ dead-letter on        │
-  │ reply targets│   │ · build InputEnvelope           │   │  requirements + out-contract │   │     exhausted budget      │
-  └──────────────┘   │ · write run record + events     │   │ → Completed / Waiting / Fail │   └────────────────────────┘
-                     └────────────────────────────────┘   └──────────────────────────────┘
-        (rejected here                                        (suspends here for                    (canonical JSON to
-         never creates a run)                                  approvals / questions)                webhooks; see below)
+```mermaid
+flowchart LR
+    Input["caller input<br/>content / input_items<br/>attachments<br/>route/model · metadata<br/>reply targets"]
+    Ingress["ingress boundary<br/>has-payload check<br/>input-contract validation, fail-closed, JSON-path error<br/>normalize + canonical JSON<br/>pin route: override beats policy beats default<br/>build InputEnvelope<br/>write run record + events"]
+    EngineRun["run + engine<br/>status: Queued then Running<br/>engine turn loop: build then model then perms then tools<br/>flush journal each boundary<br/>completion boundary: requirements + out-contract<br/>then Completed / Waiting / Failed"]
+    Output["output<br/>output records captured<br/>reply targets resolved<br/>output plugins invoked<br/>delivery queue with retry<br/>dead-letter on exhausted budget"]
+    Input --> Ingress --> EngineRun --> Output
 ```
+
+Where each stage fails or pauses:
+
+- Rejected at the ingress boundary never creates a run.
+- The run suspends at the engine for approvals or questions.
+- Canonical JSON is delivered to webhooks (see below).
 
 The important property of this pipeline is where it *fails closed*. A payload that violates the input contract is rejected at the ingress boundary and **no run is ever created** — you cannot end up with a half-formed run whose input was invalid. A final answer that violates the output contract does not get delivered as-is; the engine repairs it or fails the run. Delivery that cannot reach its destination is retried and then parked in a dead-letter ledger, never silently dropped. Each of these is a deliberate seam so that a problem shows up as an explicit, inspectable state rather than as a lost message.
 
@@ -109,38 +101,40 @@ Every run has exactly one status at any moment, drawn from eight values. Four ar
 
 The transitions between these statuses are **explicitly enumerated** in the daemon, not implied. A run may always "transition" to its own status (an idempotent no-op), and beyond that only the following moves are legal:
 
-```text
-   THE RUN STATE MACHINE  (arrows = legal transitions; terminal states absorb)
-
-                         submit / promote
-        ┌─────────┐  ────────────────────────▶  ┌──────────┐
-        │ QUEUED  │                              │ RUNNING  │◀───────────────┐
-        └────┬────┘                              └────┬─────┘                │
-             │  (reject before start)                 │                      │  resume
-             │  ├──────────────▶ FAILED               │                      │  (approval
-             │  └──────────────▶ CANCELLED            │                      │   resolved)
-             │                                        │                      │
-             │        ┌───────────────────────────────┼──────────────┐      │
-             │        │            │            │      │       │       │      │
-             ▼        ▼            ▼            ▼      ▼       ▼       ▼      │
-        (queued  WAITING_FOR   WAITING_FOR  COMPLETED FAILED INTERR. CANCEL  │
-         cannot   APPROVAL      USER_QUESTION   ▲       ▲      ▲       ▲      │
-         reach    │  │  │  │     │  │  │  │  │   │       │      │       │      │
-         waiting  │  │  │  │     │  │  │  │  └───┘       │      │       │      │
-         states)  │  │  │  └──▶ RUNNING ───────┐        │      │       │      │
-                  │  │  │        ▲             │  resume │      │       │      │
-                  │  │  └──▶ CANCELLED         │ (answer │      │       │      │
-                  │  └─────▶ INTERRUPTED       │  posted)│      │       │      │
-                  └────────▶ FAILED            └─────────┘──────┘──────┘──────┘
-
-   Legal transitions, exhaustively:
-     QUEUED                 → RUNNING · FAILED · CANCELLED
-     RUNNING                → WAITING_FOR_APPROVAL · WAITING_FOR_USER_QUESTION
-                              · COMPLETED · FAILED · INTERRUPTED · CANCELLED
-     WAITING_FOR_APPROVAL   → RUNNING · FAILED · INTERRUPTED · CANCELLED
-     WAITING_FOR_USER_QUESTION → RUNNING · COMPLETED · FAILED · INTERRUPTED · CANCELLED
-     COMPLETED / FAILED / INTERRUPTED / CANCELLED → (nothing; terminal)
+```mermaid
+stateDiagram-v2
+    [*] --> queued : submit
+    queued --> running : promote
+    queued --> failed : reject before start
+    queued --> cancelled : reject before start
+    running --> waiting_for_approval
+    running --> waiting_for_user_question
+    running --> completed
+    running --> failed
+    running --> interrupted
+    running --> cancelled
+    waiting_for_approval --> running : approval resolved
+    waiting_for_approval --> failed
+    waiting_for_approval --> interrupted
+    waiting_for_approval --> cancelled
+    waiting_for_user_question --> running : answer posted
+    waiting_for_user_question --> completed : parent clarification, answer posted directly
+    waiting_for_user_question --> failed
+    waiting_for_user_question --> interrupted
+    waiting_for_user_question --> cancelled
+    completed --> [*]
+    failed --> [*]
+    interrupted --> [*]
+    cancelled --> [*]
 ```
+
+The diagram is the exhaustive set of legal transitions; terminal states absorb (no outgoing edges). A run may also always "transition" to its own status as an idempotent no-op. Written out:
+
+- `queued` → `running`, `failed`, `cancelled`
+- `running` → `waiting_for_approval`, `waiting_for_user_question`, `completed`, `failed`, `interrupted`, `cancelled`
+- `waiting_for_approval` → `running`, `failed`, `interrupted`, `cancelled`
+- `waiting_for_user_question` → `running`, `completed`, `failed`, `interrupted`, `cancelled`
+- `completed` / `failed` / `interrupted` / `cancelled` → terminal, nothing
 
 Three details in that table are easy to miss and worth calling out, because they are where clients tend to make wrong assumptions.
 
@@ -162,20 +156,16 @@ This is not an arbitrary bottleneck; it is what keeps a session's conversation c
 
 The queue is itself rebuilt from persisted runs on restart. The rebuild is deterministic: for each session it scans the persisted run records, treats the first `running`/`waiting_for_approval`/`waiting_for_user_question` run it finds (ordered by persisted queue position, then submission time, then run id) as the active one, and pushes the rest into the queue in the same stable order. Persisted queue positions win over submission timestamps, so a queue order established before a crash survives it.
 
-```text
-   SESSION QUEUE  (one active run; the rest wait)
-
-   session S ─┬─ active_run_id ──▶ [ run-42  RUNNING ]
-              │
-              └─ queued_run_ids ──▶ [ run-43 QUEUED ] [ run-44 QUEUED ] [ run-45 QUEUED ]
-
-   run-42 reaches a terminal status
-        │
-        ▼
-   promote head of queue
-              ┌─ active_run_id ──▶ [ run-43  RUNNING ]
-   session S ─┤
-              └─ queued_run_ids ──▶ [ run-44 QUEUED ] [ run-45 QUEUED ]
+```mermaid
+flowchart TD
+    SA["session S"]
+    A1["active_run_id: run-42 RUNNING"]
+    Q1["queued_run_ids: run-43, run-44, run-45, all QUEUED"]
+    SA --> A1
+    SA --> Q1
+    A1 -->|"run-42 reaches a terminal status"| Promote["promote head of queue"]
+    Promote --> A2["active_run_id: run-43 RUNNING"]
+    Promote --> Q2["queued_run_ids: run-44, run-45, all QUEUED"]
 ```
 
 ### Run kinds
@@ -203,20 +193,25 @@ The mechanism is careful about a subtle failure: a retry that reuses a key but *
 - If a submission for this key is currently in flight, the caller briefly waits (polling for up to two seconds) for it to land, then returns that run.
 - If the key was reused with a *different* fingerprint, the daemon rejects the request with an idempotency conflict rather than guessing which payload the caller meant.
 
-```text
-   IDEMPOTENT SUBMIT  (key + fingerprint)
-
-   submit(key K, payload P)
-        │
-        ▼
-   receipt for K exists? ──yes──▶ fingerprint(P) == stored? ──yes──▶ return existing run
-        │ no                                   │ no
-        ▼                                      ▼
-   acquire in-flight lock for K          409 idempotency_conflict
-        │                                (key reused with a different payload)
-        ├─ held by another submit ─▶ wait ≤ 2s, poll, then return the run it created
-        ▼
-   reserve run id · create run · remember receipt(K → run, fingerprint) · release lock
+```mermaid
+flowchart TD
+    Submit["submit: key K, payload P"]
+    Exists{"receipt for K exists?"}
+    FP{"fingerprint of P == stored?"}
+    ReturnExisting["return existing run"]
+    Conflict["409 idempotency_conflict<br/>key reused with a different payload"]
+    Lock["acquire in-flight lock for K"]
+    Held{"held by another submit?"}
+    Wait["wait up to 2s, poll, then return the run it created"]
+    Reserve["reserve run id · create run · remember receipt K to run + fingerprint · release lock"]
+    Submit --> Exists
+    Exists -->|"yes"| FP
+    Exists -->|"no"| Lock
+    FP -->|"yes"| ReturnExisting
+    FP -->|"no"| Conflict
+    Lock --> Held
+    Held -->|"yes"| Wait
+    Held -->|"no"| Reserve
 ```
 
 The same receipt-and-fingerprint pattern guards approval and question resolutions, so re-posting the same approval (because the first response was lost) resolves the run once and then returns the already-resolved run instead of erroring or double-resuming.
@@ -249,24 +244,19 @@ A run does not execute in a vacuum; it executes as an **agent** inside a **sessi
 - Agents have **mailboxes**. Messages posted to an agent are delivered in the background as `mailbox_delivery` runs, with per-agent slotting so one delivery is in flight at a time and expired messages are dead-lettered rather than delivered stale.
 - A child that needs a decision from its parent raises a **parent clarification**, which the daemon materializes as a `parent_clarification` run on the *parent's* session. That is why questions can appear on a session that never "asked" anything directly — a descendant asked, and the daemon routed it up the tree.
 
-```text
-   SESSION / AGENT TOPOLOGY
-
-   ┌───────────────────────────── session: root ─────────────────────────────┐
-   │  agent: root  (persona snapshot · capability scope · credential scope)   │
-   │     journal · checkpoints · metadata sidecars · control state            │
-   └───────┬─────────────────────────────────────────────────┬───────────────┘
-           │ spawns sidechain                                 │ mailbox
-           ▼                                                  ▼
-   ┌─────────────── session: child-A ───────────┐     [ msg ][ msg ][ msg ]
-   │  agent: child-A   parent = root            │            │
-   │  inherits persona + capability + credential │           ▼  delivered as
-   │  boundaries, may only narrow them           │      mailbox_delivery run
-   │                                             │
-   │  needs a decision from its parent           │
-   │        │                                    │
-   │        └── raises parent clarification ──────┼────────────▶ parent_clarification
-   └─────────────────────────────────────────────┘              run on session: root
+```mermaid
+flowchart TD
+    subgraph Root["session: root"]
+        RootAgent["agent: root<br/>persona snapshot · capability scope · credential scope<br/>journal · checkpoints · metadata sidecars · control state"]
+    end
+    subgraph ChildA["session: child-A"]
+        ChildAgent["agent: child-A · parent = root<br/>inherits persona + capability + credential boundaries<br/>may only narrow them<br/>needs a decision from its parent"]
+    end
+    Mailbox["mailbox messages: msg · msg · msg<br/>each delivered as a mailbox_delivery run"]
+    RootAgent -->|"spawns sidechain"| ChildAgent
+    RootAgent -->|"mailbox"| Mailbox
+    ChildAgent -->|"raises parent clarification"| ParentClar["parent_clarification run on session: root"]
+    ParentClar --> RootAgent
 ```
 
 The topology is persisted, not held only in memory. After a restart the daemon rebuilds the agent mapping, re-queues claimed work that still needs attention, and keeps existing persona bindings valid because the authoritative binding lives in session metadata rather than only in a compact in-memory index. For the full model of agents, personas, capability scopes, and how sidechains inherit them, see [Agents, personas, and skills](./agents-personas-skills).
@@ -327,29 +317,21 @@ The engine flushes to its journal sink at three points inside every turn:
 
 The sink tracks how much of the journal it has already flushed and only sends the new suffix each time, so a flush costs one durable write proportional to what that turn produced, not the whole transcript. At the end of the run a batched persist re-sends the run's entries; that persist **dedups against what is already on disk** by matching the incoming batch's prefix against the file's tail, appending only the genuinely new suffix. Reading just the tail keeps the end-of-run persist O(batch) rather than O(transcript), and duplicate event offsets are skipped on load because offsets are unique and monotonic per session. The net effect: incremental flushes make the run durable as it goes, and the final batch reconciles without duplicating anything.
 
-```text
-   TURN-BOUNDARY TIMELINE  (durability boundaries marked ▣)
-
-   run starts
-     │
-     ├─▣ flush: accepted input becomes durable
-     │
-     ├─ TURN n ─────────────────────────────────────────────┐
-     │    build prompt · (maybe compact) · call model        │
-     │    append assistant message + ToolCallStarted entries │
-     │  ▣ flush: assistant + tool-calls durable BEFORE tools │
-     │    execute tools                                       │
-     │    append ToolCallFinished entries                    │
-     │  ▣ flush: tool results durable BEFORE next model call │
-     │                                                        │
-     ├─ TURN n+1 ──────────────────────────────────────────┐ │
-     │  ▣ flush (top of turn) · … repeats …                 │ │
-     │                                                       ─┘
-     │
-     └─ completion boundary reached
-          │
-          └─ end-of-run batched persist (dedup against tail → append new suffix only)
+```mermaid
+flowchart TD
+    Start["run starts"]
+    F0["flush: accepted input becomes durable"]
+    TurnN["TURN n<br/>build prompt · maybe compact · call model<br/>append assistant message + ToolCallStarted entries"]
+    F1["flush: assistant + tool-calls durable BEFORE tools execute"]
+    Exec["execute tools<br/>append ToolCallFinished entries"]
+    F2["flush: tool results durable BEFORE next model call"]
+    TurnN1["TURN n+1<br/>flush at top of turn · … repeats …"]
+    Boundary["completion boundary reached"]
+    Persist["end-of-run batched persist<br/>dedup against tail, append new suffix only"]
+    Start --> F0 --> TurnN --> F1 --> Exec --> F2 --> TurnN1 --> Boundary --> Persist
 ```
+
+Each `flush` node is a durability boundary (marked ▣ in the original): three fire per turn, at the top of the turn, after the assistant message and its `ToolCallStarted` entries, and after tool results.
 
 ### Why a chat client should echo optimistically
 
@@ -368,28 +350,20 @@ Vacuum is offline on purpose. The caller owns exclusivity — the CLI acquires t
 - **It refuses to clobber an existing backup.** If a `.vacuum-bak` already exists (a previous vacuum that was not cleaned up), the operation aborts rather than overwrite it. You remove the stale backup deliberately before vacuuming again.
 - **It tolerates a torn tail and rejects mid-file corruption**, exactly like the online readers: a partial final line is dropped, but corruption before valid records aborts the vacuum with the file untouched.
 
-```text
-   VACUUM SAFETY CONTRACT
-
-   preconditions:  state-root lock held  ·  no existing <name>.jsonl.vacuum-bak
-        │
-        ▼
-   pass 1: index the last line holding each metadata key
-challenge   pass 2: stream rewrite → temp file
-        │            keep every non-metadata record in original order
-        │            re-emit only the surviving metadata records (last per key)
-        ▼
-   verify: stream_summary(original) == stream_summary(temp) ?
-        │                                   │
-        │ no ─────────────────────────────▶ abort · remove temp · ORIGINAL UNTOUCHED
-        │ yes
-        ▼
-   hard-link original → <name>.jsonl.vacuum-bak     (backup preserved first)
-   atomic rename temp → <name>.jsonl                (swap only after backup + verify)
-   fsync parent dir
-        │
-        ▼
-   report: bytes_before / bytes_after · metadata_records_dropped · torn_tail_dropped
+```mermaid
+flowchart TD
+    Pre["preconditions<br/>state-root lock held · no existing name.jsonl.vacuum-bak"]
+    Pass1["pass 1: index the last line holding each metadata key"]
+    Pass2["pass 2: stream rewrite to temp file<br/>keep every non-metadata record in original order<br/>re-emit only the surviving metadata records, last per key"]
+    Verify{"verify: stream summary of original == stream summary of temp?"}
+    Abort["abort · remove temp · ORIGINAL UNTOUCHED"]
+    Backup["hard-link original to name.jsonl.vacuum-bak, backup preserved first"]
+    Rename["atomic rename temp to name.jsonl, swap only after backup + verify"]
+    Fsync["fsync parent dir"]
+    Report["report: bytes_before / bytes_after · metadata_records_dropped · torn_tail_dropped"]
+    Pre --> Pass1 --> Pass2 --> Verify
+    Verify -->|"no"| Abort
+    Verify -->|"yes"| Backup --> Rename --> Fsync --> Report
 ```
 
 The reason the ordering is *backup, then verify, then swap* — and not any other order — is that at no point should the live journal be the only copy of correct data. Before the swap, the original is intact and the temp file is a candidate. The swap only happens after the candidate has been proven equivalent and the original has been preserved under a second name. If the machine loses power in the middle, you either have the original (rename not yet done) or the original-as-backup plus the vacuumed file (rename done). There is no window where the only copy is a half-written file.
