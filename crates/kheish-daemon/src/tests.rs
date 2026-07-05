@@ -8405,6 +8405,157 @@ async fn project_agent_tools_claim_advance_and_create_subtasks() -> Result<()> {
 }
 
 #[tokio::test]
+async fn board_draw_tool_appends_authored_revisions_with_rendered_png() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-board-draw");
+    let tool_call = |id: &str, input: serde_json::Value| ModelStreamEvent::ToolCall {
+        call: kheish_types::ToolCallRecord {
+            id: id.to_string(),
+            name: "board_draw".to_string(),
+            input,
+            assistant_message_id: None,
+            assistant_provider_response_id: None,
+        },
+    };
+    let (address, shutdown) = scripted_daemon(
+        &state_root,
+        vec![
+            Ok(vec![
+                ModelStreamEvent::MessageId {
+                    value: "assistant-board-1".to_string(),
+                },
+                tool_call(
+                    "call-board-draw-1",
+                    json!({
+                        "board_id": "board-shared",
+                        "elements": [
+                            {"kind": "rect", "x": 40.0, "y": 40.0, "w": 200.0, "h": 120.0},
+                            {"kind": "text", "x": 60.0, "y": 80.0, "text": "ingress", "font_size": 20.0},
+                        ],
+                        "note": "sketch the ingress box",
+                    }),
+                ),
+                ModelStreamEvent::Stop {
+                    reason: kheish_types::ModelFinishReason::ToolCalls,
+                },
+            ]),
+            Ok(vec![
+                ModelStreamEvent::MessageId {
+                    value: "assistant-board-2".to_string(),
+                },
+                tool_call(
+                    "call-board-draw-2",
+                    json!({
+                        "board_id": "board-shared",
+                        "elements": [
+                            {"kind": "arrow", "from": [240.0, 100.0], "to": [400.0, 100.0]},
+                        ],
+                    }),
+                ),
+                ModelStreamEvent::Stop {
+                    reason: kheish_types::ModelFinishReason::ToolCalls,
+                },
+            ]),
+            Ok(scripted_events(
+                "assistant-board-3",
+                "sketched the flow",
+                kheish_types::ModelFinishReason::Completed,
+            )),
+        ],
+    )
+    .await?;
+    let base = format!("http://{address}");
+    let client = Client::new();
+
+    create_test_session(&client, &base, "board-artist").await?;
+    client
+        .post(format!("{base}/v1/boards"))
+        .json(&json!({
+            "board_id": "board-shared",
+            "display_name": "Shared sketch",
+        }))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let submitted = client
+        .post(format!("{base}/v1/sessions/board-artist/runs"))
+        .json(&test_submit_input_request("sketch the ingress flow"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<RunView>()
+        .await?;
+    wait_for_run_status(
+        &client,
+        &base,
+        &submitted.run_id,
+        &[DaemonRunStatus::Completed],
+    )
+    .await?;
+
+    let revisions = client
+        .get(format!("{base}/v1/boards/board-shared/revisions"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<crate::BoardRevisionView>>()
+        .await?;
+    assert_eq!(revisions.len(), 2, "one revision per draw call");
+    let tip = &revisions[0];
+    let first = &revisions[1];
+    assert_eq!(
+        tip.previous_revision_id.as_deref(),
+        Some(first.revision_id.as_str())
+    );
+    assert_eq!(tip.source_session_id.as_deref(), Some("board-artist"));
+    assert_eq!(tip.metadata["tool"], json!("board_draw"));
+    assert!(
+        tip.metadata["author_color"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with('#')
+    );
+
+    let render = client
+        .get(format!("{base}/v1/assets/{}/raw", tip.render_asset_id))
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    assert!(
+        image::load_from_memory(&render).is_ok(),
+        "tip render decodes as an image"
+    );
+
+    let state_asset_id = tip.state_asset_id.clone().expect("state asset recorded");
+    let state = client
+        .get(format!("{base}/v1/assets/{state_asset_id}/raw"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    let elements = state["elements"].as_array().expect("elements array");
+    assert_eq!(elements.len(), 3, "state accumulates both batches");
+    assert_eq!(elements[2]["kind"], json!("arrow"));
+    assert_eq!(elements[2]["author"]["kind"], json!("agent"));
+    assert_eq!(
+        elements[2]["author"]["session_id"],
+        json!("board-artist")
+    );
+    assert!(
+        elements[2]["author"]["name"]
+            .as_str()
+            .is_some_and(|name| !name.is_empty())
+    );
+
+    let _ = shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
 async fn project_guards_channel_deletion_and_active_session_end() -> Result<()> {
     let temp = tempdir()?;
     let state_root = temp.path().join("daemon-project-guards");

@@ -3,6 +3,7 @@
 mod api;
 mod assets;
 mod audio_generation;
+mod board_render;
 mod boards;
 mod builders;
 mod capture_provision;

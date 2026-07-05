@@ -246,6 +246,19 @@ where
             .await
     }
 
+    async fn agent_draw_on_board(
+        &self,
+        session_id: &str,
+        run_id: Option<&str>,
+        board_id: &str,
+        elements: Vec<crate::board_render::BoardElement>,
+        note: Option<String>,
+    ) -> Result<crate::BoardRevisionView> {
+        self.0
+            .agent_draw_on_board(session_id, run_id, board_id, elements, note)
+            .await
+    }
+
     async fn agent_list_project_tasks(
         &self,
         session_id: &str,

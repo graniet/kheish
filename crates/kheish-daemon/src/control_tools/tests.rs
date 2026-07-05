@@ -620,6 +620,33 @@ impl DaemonToolControl for FakeControl {
         })
     }
 
+    async fn agent_draw_on_board(
+        &self,
+        session_id: &str,
+        _run_id: Option<&str>,
+        board_id: &str,
+        elements: Vec<crate::board_render::BoardElement>,
+        note: Option<String>,
+    ) -> Result<crate::BoardRevisionView> {
+        self.state
+            .lock()
+            .project_task_calls
+            .push(format!("draw:{session_id}:{board_id}:{}:{:?}", elements.len(), note));
+        Ok(crate::BoardRevisionView {
+            revision_id: "board-revision-1".to_string(),
+            board_id: board_id.to_string(),
+            previous_revision_id: None,
+            client_revision_id: None,
+            render_asset_id: "asset-1".to_string(),
+            state_asset_id: Some("asset-2".to_string()),
+            note,
+            source_session_id: Some(session_id.to_string()),
+            source_run_id: None,
+            created_at_ms: 1,
+            metadata: serde_json::Value::Null,
+        })
+    }
+
     async fn agent_list_project_tasks(
         &self,
         _session_id: &str,

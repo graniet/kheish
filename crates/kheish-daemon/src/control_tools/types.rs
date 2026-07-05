@@ -660,6 +660,16 @@ pub trait DaemonToolControl: Send + Sync {
         request: crate::CreateChannelStimulusRequest,
     ) -> Result<crate::ChannelStimulusView>;
 
+    /// Draws one batch of vector elements on a board as a new revision.
+    async fn agent_draw_on_board(
+        &self,
+        session_id: &str,
+        run_id: Option<&str>,
+        board_id: &str,
+        elements: Vec<crate::board_render::BoardElement>,
+        note: Option<String>,
+    ) -> Result<crate::BoardRevisionView>;
+
     /// Lists the project tasks visible to the current member session.
     async fn agent_list_project_tasks(
         &self,

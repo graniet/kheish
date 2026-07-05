@@ -1,6 +1,7 @@
 //! Daemon-backed orchestration tools exposed to Kheish agents.
 
 mod bash;
+mod boards;
 mod channels;
 mod goal;
 mod helpers;
@@ -29,6 +30,7 @@ use kheish_runtime::{
 use serde_json::{Value, json};
 
 use bash::DaemonBashTool;
+use boards::BoardDrawTool;
 use channels::{CreateChannelStimulusTool, ReadChannelThreadTool, SetChannelReactionTool};
 use goal::{CreateGoalTool, GetGoalTool, UpdateGoalTool};
 pub(crate) use helpers::parse_permission_mode;
@@ -96,6 +98,7 @@ pub fn register_daemon_control_tools(
     runtime.register(ProjectClaimTaskTool::new(control.clone()));
     runtime.register(ProjectUpdateTaskTool::new(control.clone()));
     runtime.register(ProjectCreateTaskTool::new(control.clone()));
+    runtime.register(BoardDrawTool::new(control.clone()));
     runtime.register(ListSkillsTool::new(control.clone()));
     runtime.register(UseSkillTool::new(control.clone()));
     runtime.register(SpawnAgentTool::new(control.clone()));

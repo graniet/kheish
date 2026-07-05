@@ -236,6 +236,163 @@ where
         };
         self.board_service.create_revision(board_id, revision).await
     }
+
+    /// Draws one batch of vector elements on a board on behalf of an agent:
+    /// the batch is stamped with the agent's name and stable color, appended
+    /// to the latest state, rasterized over the previous render, and stored
+    /// as a new CAS-guarded revision. Concurrent writers retry against the
+    /// fresh tip a bounded number of times.
+    pub(crate) async fn agent_draw_on_board(
+        &self,
+        session_id: &str,
+        run_id: Option<&str>,
+        board_id: &str,
+        mut elements: Vec<crate::board_render::BoardElement>,
+        note: Option<String>,
+    ) -> Result<crate::boards::BoardRevisionView> {
+        use crate::board_render;
+
+        board_render::validate_elements(&elements)?;
+        board_render::ensure_reasonable_text(&elements)?;
+
+        let agent_id = self.agent_id_for_session(session_id).await?;
+        let snapshot = self.live_snapshot(&agent_id).await?;
+        let author_name = snapshot
+            .agent
+            .nickname
+            .clone()
+            .or(snapshot.agent.name.clone())
+            .unwrap_or_else(|| session_id.to_string());
+        let author_color = board_render::agent_color_for_session(session_id).to_string();
+        for element in &mut elements {
+            element.color.get_or_insert_with(|| author_color.clone());
+            element.author = Some(crate::board_render::BoardElementAuthor {
+                kind: "agent".to_string(),
+                name: author_name.clone(),
+                color: Some(author_color.clone()),
+                session_id: Some(session_id.to_string()),
+            });
+        }
+
+        const MAX_CAS_ATTEMPTS: usize = 3;
+        let mut last_error = None;
+        for _attempt in 0..MAX_CAS_ATTEMPTS {
+            let board = self.board_service.get_board(board_id).await?;
+            if let Some(owner) = board.summary.owner_session_id.as_deref() {
+                anyhow::ensure!(
+                    owner == session_id,
+                    "board {board_id} is owned by session {owner}; only that session may draw on it"
+                );
+            }
+            let latest_revision_id = board.summary.latest_revision_id.clone();
+            let (previous_elements, canvas, previous_render) = match latest_revision_id.as_deref()
+            {
+                Some(revision_id) => {
+                    let revision = self
+                        .board_service
+                        .get_revision(board_id, revision_id)
+                        .await?;
+                    let previous_state = revision
+                        .state_asset_id
+                        .as_deref()
+                        .and_then(|asset_id| self.assets.read_raw(asset_id).ok())
+                        .and_then(|(_, bytes)| serde_json::from_slice::<Value>(&bytes).ok());
+                    let elements = previous_state
+                        .as_ref()
+                        .map(board_render::elements_from_state)
+                        .unwrap_or_default();
+                    let canvas = previous_state
+                        .as_ref()
+                        .and_then(board_render::canvas_from_state);
+                    let render = self
+                        .assets
+                        .read_raw(&revision.render_asset_id)
+                        .map(|(_, bytes)| bytes)
+                        .ok();
+                    (elements, canvas, render)
+                }
+                None => (Vec::new(), None, None),
+            };
+            let canvas = canvas
+                .map(|(width, height)| board_render::clamp_canvas(width, height))
+                .unwrap_or((1600, 1000));
+
+            let png = board_render::render_board_png(
+                canvas,
+                previous_render.as_deref(),
+                &elements,
+                Some((author_name.as_str(), author_color.as_str())),
+            )?;
+            let stamp = now_ms();
+            let provenance = crate::assets::AssetProvenanceRecord {
+                kind: "board_draw".to_string(),
+                tool_name: "board_draw".to_string(),
+                session_id: Some(session_id.to_string()),
+                run_id: run_id.map(ToOwned::to_owned),
+                tool_call_id: None,
+                route_id: None,
+                provider: "daemon".to_string(),
+                model: "board_render".to_string(),
+                prompt_sha256: String::new(),
+                source_assets: Vec::new(),
+                output_index: 1,
+                output_count: 1,
+            };
+            let render_asset = self.assets.import_bytes_with_provenance(
+                &format!("board-{board_id}-{stamp}.png"),
+                Some("image/png"),
+                &png,
+                Some(provenance.clone()),
+            )?;
+            let mut all_elements = previous_elements;
+            all_elements.extend(elements.iter().cloned());
+            let state_envelope = serde_json::json!({
+                "schema_version": "kheish.board_state.v1",
+                "board_id": board_id,
+                "previous_revision_id": latest_revision_id,
+                "canvas": {"width": canvas.0, "height": canvas.1},
+                "elements": all_elements,
+            });
+            let state_asset = self.assets.import_bytes_with_provenance(
+                &format!("board-{board_id}-{stamp}.json"),
+                Some("application/json"),
+                &serde_json::to_vec_pretty(&state_envelope)?,
+                Some(provenance),
+            )?;
+
+            match self
+                .create_board_revision(
+                    board_id,
+                    crate::CreateBoardRevisionRequest {
+                        previous_revision_id: latest_revision_id,
+                        client_revision_id: None,
+                        render_asset_id: render_asset.id.clone(),
+                        state_asset_id: Some(state_asset.id.clone()),
+                        note: note.clone(),
+                        source_session_id: Some(session_id.to_string()),
+                        source_run_id: None,
+                        metadata: serde_json::json!({
+                            "tool": "board_draw",
+                            "run_id": run_id,
+                            "author_name": author_name,
+                            "author_color": author_color,
+                            "element_count": elements.len(),
+                        }),
+                    },
+                )
+                .await
+            {
+                Ok(revision) => return Ok(revision),
+                Err(error) if error.to_string().contains("expects previous revision") => {
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            anyhow!("board {board_id} kept changing while the draw was being prepared")
+        }))
+    }
 }
 
 fn normalize_board_client_revision_id(value: Option<String>) -> Result<Option<String>> {

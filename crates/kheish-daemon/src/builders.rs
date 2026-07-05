@@ -1123,6 +1123,7 @@ mod tests {
                 "ask_operator",
                 "ask_user_question",
                 "bash",
+                "board_draw",
                 "create_channel_stimulus",
                 "create_goal",
                 "edit_file",
