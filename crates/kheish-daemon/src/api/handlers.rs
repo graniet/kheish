@@ -377,6 +377,7 @@ where
         .route("/v1/status", get(status::<M>))
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/openapi.json", get(openapi))
+        .route("/v1/logs", get(get_daemon_logs))
         .route("/v1/docs", get(get_docs_manifest))
         .route("/v1/docs/{*path}", get(get_docs_page))
         .route("/v1/runtime", get(get_runtime::<M>))
@@ -2034,6 +2035,10 @@ const CONTROL_PLANE_OPENAPI_ROUTES: &[OpenApiRouteSpec] = &[
         methods: &["GET", "POST", "PUT", "DELETE"],
     },
     OpenApiRouteSpec {
+        path: "/v1/logs",
+        methods: &["GET"],
+    },
+    OpenApiRouteSpec {
         path: "/v1/docs",
         methods: &["GET"],
     },
@@ -2620,6 +2625,20 @@ where
     M: ModelDriver + Send + Sync + 'static,
 {
     Json(state.status_snapshot(daemon_capabilities()).await)
+}
+
+#[derive(serde::Deserialize)]
+struct DaemonLogQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+async fn get_daemon_logs(
+    Query(query): Query<DaemonLogQuery>,
+) -> Json<Vec<crate::log_buffer::DaemonLogEntry>> {
+    Json(crate::log_buffer::recent_daemon_logs(
+        query.limit.unwrap_or(1_000),
+    ))
 }
 
 async fn get_docs_manifest() -> Json<&'static crate::docs::DocsManifestView> {

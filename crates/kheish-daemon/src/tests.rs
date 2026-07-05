@@ -58194,3 +58194,44 @@ async fn runtime_model_routes_hot_add_persists_and_deletes() -> Result<()> {
     wait_for_daemon_shutdown(&client, &restart_base).await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn daemon_logs_endpoint_serves_the_ring_buffer() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-logs-api");
+    let (address, shutdown) = scripted_daemon(&state_root, Vec::new()).await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+
+    // Tests run without the tracing layer installed: seed the buffer the
+    // way the layer would and assert the endpoint serves it.
+    crate::log_buffer::recent_daemon_logs(1); // touch to keep the module linked
+    {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(crate::log_buffer::DaemonLogBufferLayer),
+            || {
+                tracing::warn!(component = "e2e", "ring buffer smoke entry");
+            },
+        );
+    }
+
+    let logs = client
+        .get(format!("{base}/v1/logs?limit=50"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<Value>>()
+        .await?;
+    assert!(
+        logs.iter()
+            .any(|entry| entry["message"] == json!("ring buffer smoke entry")
+                && entry["level"] == json!("warn")
+                && entry["fields"]["component"] == json!("e2e")),
+        "the seeded event must be served: {logs:?}"
+    );
+
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+    Ok(())
+}

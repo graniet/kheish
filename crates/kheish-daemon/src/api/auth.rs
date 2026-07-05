@@ -388,6 +388,7 @@ fn read_path_requires_admin(parts: &[&str]) -> bool {
         || matches!(parts, ["", "v1", "runtime", "auth", "accounts", ..])
         || matches!(parts, ["", "v1", "runtime", "hooks", ..])
         || matches!(parts, ["", "v1", "runtime", "revisions"])
+        || matches!(parts, ["", "v1", "logs"])
         || matches!(parts, ["", "v1", "stacks"])
         || matches!(parts, ["", "v1", "stacks", _, "ledger"])
 }

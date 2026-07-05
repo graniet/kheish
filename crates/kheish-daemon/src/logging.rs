@@ -56,7 +56,9 @@ pub(crate) fn init_logging(config: LoggingConfig) -> Result<()> {
     })?;
     let timer = UtcTime::rfc_3339();
 
-    let registry = tracing_subscriber::registry().with(filter);
+    let registry = tracing_subscriber::registry()
+        .with(filter)
+        .with(kheish_daemon::log_buffer::DaemonLogBufferLayer);
     let init_result = match config.format {
         LogFormat::Pretty => registry
             .with(

@@ -19,6 +19,7 @@ mod events;
 mod hooks;
 mod image_generation;
 mod learning;
+pub mod log_buffer;
 mod memory;
 mod model_routing;
 mod observation_ingress;
