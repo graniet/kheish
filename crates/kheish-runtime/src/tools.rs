@@ -1680,6 +1680,13 @@ impl ToolSchema {
     }
 }
 
+/// The schema for "any JSON value" spelled out as an explicit type union.
+/// Provider validators (OpenAI at least) reject a bare `{}` property schema,
+/// so untyped fields must still carry a `type` key.
+fn any_json_schema() -> Value {
+    json!({ "type": ["object", "array", "string", "number", "boolean", "null"] })
+}
+
 fn field_json_schema(field: &ToolSchemaField) -> serde_json::Map<String, Value> {
     if let Some(schema) = &field.structured_schema {
         let Value::Object(object) = structured_tool_schema_json(schema) else {
@@ -1694,33 +1701,35 @@ fn field_json_schema(field: &ToolSchemaField) -> serde_json::Map<String, Value> 
     }
     match field.kind {
         ToolInputKind::Array => {
-            if let Some(item_type) = field
+            // Arrays must always carry `items`: providers such as OpenAI
+            // reject function parameters with a bare `{"type":"array"}`.
+            // An unknown or `Any` item kind serializes as the explicit
+            // any-value union.
+            let items = field
                 .item_kind
                 .as_ref()
                 .and_then(ToolInputKind::json_schema_type)
-            {
-                field_schema.insert(
-                    "items".to_string(),
-                    json!({
-                        "type": item_type,
-                    }),
-                );
-            }
+                .map(|item_type| json!({ "type": item_type }))
+                .unwrap_or_else(any_json_schema);
+            field_schema.insert("items".to_string(), items);
         }
         ToolInputKind::Object => {
             field_schema.insert("additionalProperties".to_string(), Value::Bool(true));
         }
-        ToolInputKind::Any
-        | ToolInputKind::String
-        | ToolInputKind::Number
-        | ToolInputKind::Boolean => {}
+        ToolInputKind::Any => {
+            let Value::Object(any_schema) = any_json_schema() else {
+                unreachable!("any_json_schema is an object");
+            };
+            field_schema.extend(any_schema);
+        }
+        ToolInputKind::String | ToolInputKind::Number | ToolInputKind::Boolean => {}
     }
     field_schema
 }
 
 fn structured_tool_schema_json(schema: &StructuredFieldSchema) -> Value {
     match schema.kind {
-        StructuredValueKind::Any => json!({}),
+        StructuredValueKind::Any => any_json_schema(),
         StructuredValueKind::String => json!({"type": "string"}),
         StructuredValueKind::Number => json!({"type": "number"}),
         StructuredValueKind::Boolean => json!({"type": "boolean"}),
@@ -1880,7 +1889,7 @@ mod tests {
 
     use super::{
         SandboxProfile, Tool, ToolDescriptor, ToolExecutionOutput, ToolHook, ToolInputKind,
-        ToolRuntime, ToolRuntimeLimits, ToolSchema, ToolSchemaField,
+        ToolRuntime, ToolRuntimeLimits, ToolSchema, ToolSchemaField, any_json_schema,
     };
     use crate::{
         ExecutionScope, is_interrupted_error, observability::InMemoryObserver, scope_execution,
@@ -3577,6 +3586,41 @@ mod tests {
             json["properties"]["allowed_tools"]["items"],
             json!({"type": "string"})
         );
+    }
+
+    #[test]
+    fn array_fields_without_item_kind_still_emit_items() {
+        let schema = ToolSchema {
+            fields: vec![ToolSchemaField {
+                name: "entries".to_string(),
+                kind: ToolInputKind::Array,
+                item_kind: None,
+                structured_schema: None,
+                required: true,
+                description: None,
+            }],
+        };
+
+        let json = schema.json_schema();
+        assert_eq!(json["properties"]["entries"]["type"], json!("array"));
+        assert_eq!(json["properties"]["entries"]["items"], any_json_schema());
+    }
+
+    #[test]
+    fn any_fields_emit_an_explicit_type_union_instead_of_an_empty_schema() {
+        let schema = ToolSchema {
+            fields: vec![ToolSchemaField {
+                name: "parent".to_string(),
+                kind: ToolInputKind::Any,
+                item_kind: None,
+                structured_schema: None,
+                required: true,
+                description: None,
+            }],
+        };
+
+        let json = schema.json_schema();
+        assert_eq!(json["properties"]["parent"], any_json_schema());
     }
 
     #[test]
