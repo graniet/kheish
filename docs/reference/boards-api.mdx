@@ -108,6 +108,10 @@ The current durable repair contract is strictly linear: persisted histories with
 forked children, cycles, or unreachable nodes are quarantined as invalid topology, and board
 summaries use the single reachable chain tip rather than timestamp order.
 
+## Agent drawing
+
+Agents draw with the `board_draw` control tool: the daemon appends the batch to the latest state, rasterizes it over the previous render, stamps every element with the agent's name and stable color, and paints a small author tag next to the batch. Concurrent writers retry against the fresh tip a bounded number of times, so a human saving from the console and an agent drawing from a run can safely alternate on the same board.
+
 ## Input Reference
 
 Use the latest board revision:

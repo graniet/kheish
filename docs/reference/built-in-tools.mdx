@@ -44,6 +44,8 @@ The daemon also exposes control and orchestration tools that are not part of the
 - media generation and retained output helpers such as `generate_audio`, `generate_image`, `edit_image`, and `emit_output`; image tools validate prompt/count/size, persist only decodable PNG/JPEG assets, checksum edit sources before dispatch, and redact image/audio base64 from provider debug payloads; audio generation validates bounded input/voice/format/speed, caps provider response bytes, records response checksums, and persists only payloads that match supported audio container signatures
 - skills and capability-aware orchestration
 - public channel helpers such as `read_channel_thread`, `set_channel_reaction`, and `create_channel_stimulus`
+- project-task helpers: `project_list_tasks` (find claimable work across the session's projects; plan-mode safe), `project_claim_task` (atomically claim one unassigned task whose dependencies are completed and bind it to the current run), `project_update_task` (record progress, a blocked state, or a final output on a held task — terminal statuses set by the agent survive run settlement), and `project_create_task` (decompose work into new tasks or subtasks via `parent_task_id`, optionally self-assigned)
+- `board_draw`: append vector elements (paths, lines, arrows, rects, ellipses, text) to a shared whiteboard as a new CAS-guarded revision; the daemon rasterizes them over the previous render and stamps each batch with the agent's name and stable per-session color
 
 Public channel replies themselves are currently emitted through `emit_output` during a `ChannelDelivery` run rather than through a separate `post_channel_message` tool.
 
