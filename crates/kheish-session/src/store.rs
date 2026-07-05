@@ -1,8 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow};
@@ -206,6 +206,15 @@ pub trait SessionMigration: Send + Sync {
 pub struct FileSessionStore {
     root: PathBuf,
     migrations: Vec<Arc<dyn SessionMigration>>,
+    /// Metadata keys proven absent by a completed legacy-journal scan.
+    ///
+    /// Metadata writes always land in per-key sidecars, so a key that a full
+    /// backward scan failed to find can only appear again through a sidecar
+    /// write — which [`Self::load_metadata_value`] checks first. Remembering
+    /// the miss therefore never masks a write, and it turns the pathological
+    /// case (an absent key re-scanning a multi-megabyte legacy journal on
+    /// every load) into an O(1) lookup after the first scan.
+    metadata_scan_misses: Mutex<HashSet<(String, String)>>,
 }
 
 impl FileSessionStore {
@@ -214,6 +223,7 @@ impl FileSessionStore {
         Self {
             root: root.into(),
             migrations: Vec::new(),
+            metadata_scan_misses: Mutex::new(HashSet::new()),
         }
     }
 
@@ -323,6 +333,10 @@ impl FileSessionStore {
         }
         atomic_write(&path, &bytes)
             .with_context(|| format!("failed to write metadata sidecar {}", path.display()))?;
+        self.metadata_scan_misses
+            .lock()
+            .expect("metadata scan-miss cache poisoned")
+            .remove(&(session_id.to_string(), key.to_string()));
         Ok(true)
     }
 
@@ -737,24 +751,43 @@ impl FileSessionStore {
         if let Some(value) = self.read_metadata_sidecar(session_id, key)? {
             return Ok(Some(value));
         }
+        // A previous full scan proved the key absent: without this, every
+        // load of an absent key would re-parse the whole legacy journal.
+        let cache_key = (session_id.to_string(), key.to_string());
+        if self
+            .metadata_scan_misses
+            .lock()
+            .expect("metadata scan-miss cache poisoned")
+            .contains(&cache_key)
+        {
+            return Ok(None);
+        }
         // Legacy fallback: metadata is last-wins per key, so scanning
         // backwards the first match is the latest value and a multi-gigabyte
         // journal costs only a tail read instead of a full parse.
-        self.scan_tail_windows(session_id, 32, |records, reached_start| {
-            for envelope in records.into_iter().rev() {
-                if let PersistedSessionRecord::Metadata {
-                    key: record_key,
-                    value,
-                } = envelope.record
-                    && record_key == key
-                {
-                    return Ok(Some(Some(value)));
+        let found = self
+            .scan_tail_windows(session_id, 32, |records, reached_start| {
+                for envelope in records.into_iter().rev() {
+                    if let PersistedSessionRecord::Metadata {
+                        key: record_key,
+                        value,
+                    } = envelope.record
+                        && record_key == key
+                    {
+                        return Ok(Some(Some(value)));
+                    }
                 }
-            }
-            Ok(reached_start.then_some(None))
-        })
-        .await
-        .map(Option::flatten)
+                Ok(reached_start.then_some(None))
+            })
+            .await
+            .map(Option::flatten)?;
+        if found.is_none() {
+            self.metadata_scan_misses
+                .lock()
+                .expect("metadata scan-miss cache poisoned")
+                .insert(cache_key);
+        }
+        Ok(found)
     }
 
     /// Parses every session line, tolerating exactly one torn line at the tail.
@@ -1466,6 +1499,59 @@ mod tests {
         assert_eq!(
             store.load_record_sequence(session_id).await?,
             vec![first, second, third]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn absent_metadata_key_scans_once_and_a_write_revives_it() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = FileSessionStore::new(root.path());
+        let session_id = "session-metadata-miss";
+
+        // A legacy journal without the key: the first load scans to the file
+        // start and proves the absence.
+        store.append_inline_for_tests(
+            session_id,
+            PersistedSessionRecord::Metadata {
+                key: "other_key".to_string(),
+                value: json!("present"),
+            },
+        )?;
+        assert_eq!(store.load_metadata_value(session_id, "wanted").await?, None);
+        assert!(
+            store
+                .metadata_scan_misses
+                .lock()
+                .expect("cache lock")
+                .contains(&(session_id.to_string(), "wanted".to_string())),
+            "the definitive miss must be remembered"
+        );
+
+        // The cached miss answers without touching the journal.
+        assert_eq!(store.load_metadata_value(session_id, "wanted").await?, None);
+
+        // Writing the key goes to its sidecar and must win immediately.
+        store
+            .append(
+                session_id,
+                PersistedSessionRecord::Metadata {
+                    key: "wanted".to_string(),
+                    value: json!({ "now": "here" }),
+                },
+            )
+            .await?;
+        assert_eq!(
+            store.load_metadata_value(session_id, "wanted").await?,
+            Some(json!({ "now": "here" }))
+        );
+        assert!(
+            !store
+                .metadata_scan_misses
+                .lock()
+                .expect("cache lock")
+                .contains(&(session_id.to_string(), "wanted".to_string())),
+            "the write must drop the remembered miss"
         );
         Ok(())
     }

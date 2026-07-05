@@ -57994,10 +57994,13 @@ async fn console_is_served_at_root_with_spa_fallback() -> Result<()> {
             .is_some_and(|value| value.starts_with("text/html")),
         "console root should be served as HTML"
     );
+    // The embedded bundle is either the committed placeholder or a real
+    // console build (scripts/bundle-console.sh): assert the shell shape,
+    // not its content.
     let root_body = root.text().await?;
     assert!(
-        root_body.contains("Console bundle missing"),
-        "root should serve the committed placeholder shell"
+        root_body.contains("<html") || root_body.contains("<!doctype"),
+        "root should serve an HTML shell"
     );
 
     // A client-side route with no file extension falls back to the same shell.
