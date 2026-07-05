@@ -11,7 +11,7 @@ use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header};
 use axum::middleware;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 
 use anyhow::{Context as _, anyhow, bail};
@@ -65,8 +65,9 @@ use super::types::{
     SetLearningPolicyRequest, SetModelRequest, SetPermissionModeRequest, SetRunMemoryPolicyRequest,
     SetSessionCapabilityScopeRequest, SetSessionCredentialScopeRequest, SetSessionGoalRequest,
     SetSessionInputContractRequest, SetSessionOperatorConfigRequest,
-    SetSessionOutputContractRequest, SetSessionPersonaRequest, SetSessionReplyTargetsRequest,
-    SetSessionRoutePolicyRequest, SetSessionToolOverridesRequest, SetSystemPromptRequest,
+    SetSessionOutputContractRequest, SetSessionPermissionModeRequest, SetSessionPersonaRequest,
+    SetSessionReplyTargetsRequest, SetSessionRoutePolicyRequest, SetSessionToolOverridesRequest,
+    SetSystemPromptRequest,
     SetToolRuntimeLimitsRequest, SkillListQuery, SkillSummaryView, SkillView,
     SpawnSidechainRequest, StackApplyRequest, StackDownRequest, StackImportRequest,
     StackManifestRequest, StackPlanRequest, StartProjectTaskRequest, StopTaskRequest,
@@ -820,6 +821,10 @@ where
                 .post(set_session_tool_overrides::<M>)
                 .put(set_session_tool_overrides::<M>)
                 .delete(clear_session_tool_overrides::<M>),
+        )
+        .route(
+            "/v1/sessions/{session_id}/permission-mode",
+            put(set_session_permission_mode::<M>),
         )
         .route(
             "/v1/sessions/{session_id}/output-contract",
@@ -2025,6 +2030,10 @@ const CONTROL_PLANE_OPENAPI_ROUTES: &[OpenApiRouteSpec] = &[
     OpenApiRouteSpec {
         path: "/v1/sessions/{session_id}/tool-overrides",
         methods: &["GET", "POST", "PUT", "DELETE"],
+    },
+    OpenApiRouteSpec {
+        path: "/v1/sessions/{session_id}/permission-mode",
+        methods: &["PUT"],
     },
     OpenApiRouteSpec {
         path: "/v1/sessions/{session_id}/output-contract",
@@ -5959,6 +5968,34 @@ where
 {
     state
         .set_session_tool_overrides(&session_id, None)
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn set_session_permission_mode<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    AxumPath(session_id): AxumPath<String>,
+    Json(request): Json<SetSessionPermissionModeRequest>,
+) -> Result<Json<SessionView>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    // A `null`/omitted mode clears the session override; a present mode must
+    // parse to one of the canonical permission-mode names.
+    let mode = match request.mode.as_deref() {
+        Some(raw) => Some(crate::control_tools::parse_permission_mode(raw).ok_or_else(|| {
+            ApiError::coded(
+                StatusCode::BAD_REQUEST,
+                "sessions",
+                "permission_mode_unsupported",
+                format!("unknown permission_mode {raw}"),
+            )
+        })?),
+        None => None,
+    };
+    state
+        .set_session_permission_mode(&session_id, mode)
         .await
         .map(Json)
         .map_err(internal_error)

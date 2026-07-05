@@ -31563,6 +31563,102 @@ async fn daemon_restores_session_permission_mode_after_restart() -> Result<()> {
 }
 
 #[tokio::test]
+async fn daemon_session_permission_mode_route_sets_and_clears_override() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-session-permission-mode-route");
+    let (address, shutdown) = scripted_daemon(&state_root, vec![]).await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+
+    let session = create_test_session(&client, &base, "permission-mode-route-session").await?;
+    assert_eq!(session.permission_mode, None);
+
+    // Setting a concrete mode is reflected on the returned session view.
+    let updated = client
+        .put(format!(
+            "{base}/v1/sessions/{}/permission-mode",
+            session.session_id
+        ))
+        .json(&SetSessionPermissionModeRequest {
+            mode: Some("dontAsk".to_string()),
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionView>()
+        .await?;
+    assert_eq!(updated.permission_mode.as_deref(), Some("dontAsk"));
+
+    // A fresh detail read persists the override, and the list summary carries it too.
+    let detail = client
+        .get(format!("{base}/v1/sessions/{}", session.session_id))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionView>()
+        .await?;
+    assert_eq!(detail.permission_mode.as_deref(), Some("dontAsk"));
+    let summaries = client
+        .get(format!("{base}/v1/sessions"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<SessionViewSummary>>()
+        .await?;
+    let summary = summaries
+        .iter()
+        .find(|summary| summary.session_id == session.session_id)
+        .context("session missing from list view")?;
+    assert_eq!(summary.permission_mode.as_deref(), Some("dontAsk"));
+
+    // Requesting plan mode enters plan mode and surfaces as the `plan` override.
+    let planned = client
+        .put(format!(
+            "{base}/v1/sessions/{}/permission-mode",
+            session.session_id
+        ))
+        .json(&SetSessionPermissionModeRequest {
+            mode: Some("plan".to_string()),
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionView>()
+        .await?;
+    assert_eq!(planned.permission_mode.as_deref(), Some("plan"));
+
+    // A null mode clears the override so the session inherits global behavior.
+    let cleared = client
+        .put(format!(
+            "{base}/v1/sessions/{}/permission-mode",
+            session.session_id
+        ))
+        .json(&SetSessionPermissionModeRequest { mode: None })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionView>()
+        .await?;
+    assert_eq!(cleared.permission_mode, None);
+
+    // An unknown mode name is rejected before any state changes.
+    let rejected = client
+        .put(format!(
+            "{base}/v1/sessions/{}/permission-mode",
+            session.session_id
+        ))
+        .json(&SetSessionPermissionModeRequest {
+            mode: Some("nonsense".to_string()),
+        })
+        .send()
+        .await?;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+    let _ = shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
 async fn daemon_repairs_stale_plan_mode_snapshots_after_restart() -> Result<()> {
     let temp = tempdir()?;
     let state_root = temp.path().join("daemon-plan-repair");

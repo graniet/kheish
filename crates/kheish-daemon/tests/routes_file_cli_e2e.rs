@@ -1302,6 +1302,7 @@ async fn cli_encodes_nested_project_task_path_segments() -> Result<()> {
                     latest_run_id: None,
                     discussion: None,
                     blocked_by: Vec::new(),
+                    parent_task_id: None,
                     output: None,
                     created_at_ms: 1,
                     updated_at_ms: 1,

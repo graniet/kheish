@@ -1627,6 +1627,17 @@ pub struct SetSessionToolOverridesRequest {
     pub tool_overrides: kheish_types::SessionToolOverrides,
 }
 
+/// Session permission-mode override update payload. A `null` or omitted `mode`
+/// clears the session override so the session falls back to the configured
+/// rules and the global permission mode. When present, `mode` must be one of the
+/// canonical permission-mode names (`default`, `acceptEdits`, `bypassPermissions`,
+/// `plan`, `dontAsk`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetSessionPermissionModeRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+}
+
 /// Session structured-output-contract update payload. The schema is standard
 /// JSON Schema restricted to the enforceable subset; unsupported keywords are
 /// rejected with their paths rather than silently dropped.
@@ -2677,6 +2688,10 @@ pub struct SessionViewSummary {
     pub output_contract: Option<StructuredOutputContractView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reply_targets: Vec<ReplyHandle>,
+    /// Session-scoped permission-mode override, when one is active. `None` means
+    /// the session inherits the configured rules and the global permission mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
 }
 
 /// Full session view returned by detail endpoints.
@@ -2719,6 +2734,10 @@ pub struct SessionView {
     pub output_contract: Option<StructuredOutputContractView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reply_targets: Vec<ReplyHandle>,
+    /// Session-scoped permission-mode override, when one is active. `None` means
+    /// the session inherits the configured rules and the global permission mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
     pub outputs: Vec<DaemonOutputRecord>,
 }
 

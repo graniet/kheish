@@ -430,6 +430,10 @@ where
             .as_ref()
             .map(crate::StructuredOutputContractView::from);
         let reply_targets = self.session_reply_targets(session_id).await;
+        let permission_mode = self
+            .load_session_control_state(session_id)
+            .await?
+            .session_permission_mode;
         let effective_capability_scope =
             effective_session_capability_scope(persona_binding.as_ref(), &capability_scope);
         let effective_credential_scope = effective_session_credential_scope(&credential_scope);
@@ -450,6 +454,7 @@ where
             input_contract,
             output_contract,
             reply_targets,
+            permission_mode,
             outputs: self.delivery_service.session_outputs(session_id).await?,
         })
     }
@@ -509,6 +514,10 @@ where
                 .as_ref()
                 .map(crate::StructuredOutputContractView::from);
             let reply_targets = self.session_reply_targets(&session_id).await;
+            let permission_mode = self
+                .load_session_control_state(&session_id)
+                .await?
+                .session_permission_mode;
             let effective_capability_scope =
                 effective_session_capability_scope(persona_binding.as_ref(), &capability_scope);
             let effective_credential_scope = effective_session_credential_scope(&credential_scope);
@@ -530,6 +539,7 @@ where
                 input_contract,
                 output_contract,
                 reply_targets,
+                permission_mode,
             });
         }
         Ok(sessions)

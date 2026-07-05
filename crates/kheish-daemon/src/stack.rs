@@ -6360,6 +6360,7 @@ mod tests {
             input_contract: None,
             output_contract: None,
             reply_targets: Vec::new(),
+            permission_mode: None,
             outputs: Vec::new(),
         }
     }
@@ -6576,6 +6577,7 @@ mod tests {
                 input_contract: None,
                 output_contract: None,
                 reply_targets: Vec::new(),
+                permission_mode: None,
                 outputs: Vec::new(),
             })
         }

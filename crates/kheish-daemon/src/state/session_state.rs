@@ -544,6 +544,22 @@ where
         Ok(())
     }
 
+    /// Applies (or clears with `None`) the session-scoped permission-mode override
+    /// requested over HTTP, then returns the refreshed session view. Clearing the
+    /// override lets the session fall back to the configured rules and the global
+    /// permission mode; requesting [`PermissionMode::Plan`] enters plan mode while
+    /// any other mode leaves it, matching the plan-mode enter/exit machinery.
+    pub(crate) async fn set_session_permission_mode(
+        &self,
+        session_id: &str,
+        mode: Option<PermissionMode>,
+    ) -> Result<SessionView> {
+        let agent_id = self.agent_id_for_session(session_id).await?;
+        self.apply_requested_session_permission_mode(session_id, Some(mode))
+            .await?;
+        self.session_view(session_id, &agent_id).await
+    }
+
     pub(crate) async fn persist_session_permission_updates(
         &self,
         session_id: &str,
