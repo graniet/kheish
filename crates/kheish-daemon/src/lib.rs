@@ -13,6 +13,7 @@ mod control_tools;
 mod debug;
 mod delivery;
 mod derivations;
+mod docs;
 mod events;
 mod hooks;
 mod image_generation;

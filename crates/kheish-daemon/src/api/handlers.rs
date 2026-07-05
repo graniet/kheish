@@ -377,6 +377,8 @@ where
         .route("/v1/status", get(status::<M>))
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/openapi.json", get(openapi))
+        .route("/v1/docs", get(get_docs_manifest))
+        .route("/v1/docs/{*path}", get(get_docs_page))
         .route("/v1/runtime", get(get_runtime::<M>))
         .route(
             "/v1/runtime/mcp/tools/{tool_name}/call",
@@ -1990,6 +1992,14 @@ const CONTROL_PLANE_OPENAPI_ROUTES: &[OpenApiRouteSpec] = &[
         methods: &["GET", "POST", "PUT", "DELETE"],
     },
     OpenApiRouteSpec {
+        path: "/v1/docs",
+        methods: &["GET"],
+    },
+    OpenApiRouteSpec {
+        path: "/v1/docs/{*path}",
+        methods: &["GET"],
+    },
+    OpenApiRouteSpec {
         path: "/v1/sessions/{session_id}/operator",
         methods: &["GET", "POST", "PUT", "DELETE"],
     },
@@ -2568,6 +2578,23 @@ where
     M: ModelDriver + Send + Sync + 'static,
 {
     Json(state.status_snapshot(daemon_capabilities()).await)
+}
+
+async fn get_docs_manifest() -> Json<&'static crate::docs::DocsManifestView> {
+    Json(crate::docs::docs_manifest())
+}
+
+async fn get_docs_page(
+    AxumPath(path): AxumPath<String>,
+) -> Result<Json<crate::docs::DocsPageView>, ApiError> {
+    crate::docs::docs_page(&path).map(Json).ok_or_else(|| {
+        ApiError::coded(
+            StatusCode::NOT_FOUND,
+            "docs",
+            "docs_page_not_found",
+            format!("unknown documentation page `{path}`"),
+        )
+    })
 }
 
 async fn get_runtime<M>(State(state): State<Arc<DaemonState<M>>>) -> Json<RuntimeSettingsView>

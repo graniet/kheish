@@ -57921,3 +57921,57 @@ async fn structured_input_contract_canonicalizes_accepted_payloads() -> Result<(
     wait_for_daemon_shutdown(&client, &base).await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn docs_routes_serve_embedded_documentation() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-docs");
+    let (address, shutdown) = scripted_daemon(&state_root, Vec::new()).await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+
+    let manifest = client
+        .get(format!("{base}/v1/docs"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    let groups = manifest["groups"].as_array().expect("groups array");
+    assert!(!groups.is_empty());
+    let first_paths = groups
+        .iter()
+        .flat_map(|group| group["pages"].as_array().cloned().unwrap_or_default())
+        .map(|page| page["path"].as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        first_paths
+            .iter()
+            .any(|path| path == "introduction/start-here")
+    );
+
+    let page = client
+        .get(format!("{base}/v1/docs/introduction/start-here"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    assert_eq!(page["title"], json!("Start Here"));
+    assert!(
+        page["content"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("# Start Here")
+    );
+
+    let missing = client
+        .get(format!("{base}/v1/docs/does/not-exist"))
+        .send()
+        .await?;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+    Ok(())
+}
