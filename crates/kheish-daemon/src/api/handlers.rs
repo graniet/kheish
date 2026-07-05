@@ -1039,11 +1039,27 @@ async fn console_or_api_not_found(OriginalUri(uri): OriginalUri) -> Response {
             .into_response();
     }
     match crate::console_assets::lookup(path) {
-        Some((bytes, content_type)) => (
-            [(header::CONTENT_TYPE, HeaderValue::from_static(content_type))],
-            bytes,
-        )
-            .into_response(),
+        Some((bytes, content_type)) => {
+            // Hashed bundle assets are immutable by construction; the HTML
+            // shell must always revalidate so a reload after a daemon upgrade
+            // picks up the new asset names instead of 404ing on stale chunks.
+            let cache_control = if path.starts_with("/assets/") {
+                "public, max-age=31536000, immutable"
+            } else {
+                "no-cache"
+            };
+            (
+                [
+                    (header::CONTENT_TYPE, HeaderValue::from_static(content_type)),
+                    (
+                        header::CACHE_CONTROL,
+                        HeaderValue::from_static(cache_control),
+                    ),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
         None => ApiError::coded(
             StatusCode::NOT_FOUND,
             "console",
