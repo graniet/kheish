@@ -660,6 +660,13 @@ pub trait DaemonToolControl: Send + Sync {
         request: crate::CreateChannelStimulusRequest,
     ) -> Result<crate::ChannelStimulusView>;
 
+    /// Builds a compact, model-facing scene summary of one board.
+    async fn agent_view_board(
+        &self,
+        session_id: &str,
+        board_id: &str,
+    ) -> Result<serde_json::Value>;
+
     /// Draws one batch of vector elements on a board as a new revision.
     async fn agent_draw_on_board(
         &self,

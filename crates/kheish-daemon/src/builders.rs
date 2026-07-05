@@ -1124,6 +1124,7 @@ mod tests {
                 "ask_user_question",
                 "bash",
                 "board_draw",
+                "board_view",
                 "create_channel_stimulus",
                 "create_goal",
                 "edit_file",
@@ -1422,6 +1423,7 @@ mod tests {
             tool_name,
             "ask_operator"
                 | "ask_user_question"
+                | "board_view"
                 | "enter_plan_mode"
                 | "exit_plan_mode"
                 | "get_agent"

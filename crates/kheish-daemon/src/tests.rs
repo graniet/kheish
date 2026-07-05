@@ -8556,6 +8556,164 @@ async fn board_draw_tool_appends_authored_revisions_with_rendered_png() -> Resul
 }
 
 #[tokio::test]
+async fn board_view_tool_reports_scene_and_agents_continue_drawing() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-board-view");
+    let tool_call = |id: &str, name: &str, input: serde_json::Value| ModelStreamEvent::ToolCall {
+        call: kheish_types::ToolCallRecord {
+            id: id.to_string(),
+            name: name.to_string(),
+            input,
+            assistant_message_id: None,
+            assistant_provider_response_id: None,
+        },
+    };
+    let stop = || ModelStreamEvent::Stop {
+        reason: kheish_types::ModelFinishReason::ToolCalls,
+    };
+    let (address, shutdown) = scripted_daemon(
+        &state_root,
+        vec![
+            // Seed the shared board with a first revision.
+            Ok(vec![
+                ModelStreamEvent::MessageId {
+                    value: "assistant-view-1".to_string(),
+                },
+                tool_call(
+                    "call-seed",
+                    "board_draw",
+                    json!({
+                        "board_id": "board-shared",
+                        "elements": [
+                            {"kind": "rect", "x": 40.0, "y": 40.0, "w": 200.0, "h": 120.0},
+                        ],
+                        "note": "seed the ingress box",
+                    }),
+                ),
+                stop(),
+            ]),
+            // View the seeded board before drawing again.
+            Ok(vec![
+                ModelStreamEvent::MessageId {
+                    value: "assistant-view-2".to_string(),
+                },
+                tool_call(
+                    "call-view-seeded",
+                    "board_view",
+                    json!({"board_id": "board-shared"}),
+                ),
+                stop(),
+            ]),
+            // View an empty board: this must not derail the run.
+            Ok(vec![
+                ModelStreamEvent::MessageId {
+                    value: "assistant-view-3".to_string(),
+                },
+                tool_call(
+                    "call-view-empty",
+                    "board_view",
+                    json!({"board_id": "board-empty"}),
+                ),
+                stop(),
+            ]),
+            // Continue the shared drawing in a second batch.
+            Ok(vec![
+                ModelStreamEvent::MessageId {
+                    value: "assistant-view-4".to_string(),
+                },
+                tool_call(
+                    "call-continue",
+                    "board_draw",
+                    json!({
+                        "board_id": "board-shared",
+                        "elements": [
+                            {"kind": "arrow", "from": [240.0, 100.0], "to": [400.0, 100.0]},
+                        ],
+                    }),
+                ),
+                stop(),
+            ]),
+            Ok(scripted_events(
+                "assistant-view-5",
+                "continued the sketch",
+                kheish_types::ModelFinishReason::Completed,
+            )),
+        ],
+    )
+    .await?;
+    let base = format!("http://{address}");
+    let client = Client::new();
+
+    create_test_session(&client, &base, "board-viewer").await?;
+    for board_id in ["board-shared", "board-empty"] {
+        client
+            .post(format!("{base}/v1/boards"))
+            .json(&json!({
+                "board_id": board_id,
+                "display_name": board_id,
+            }))
+            .send()
+            .await?
+            .error_for_status()?;
+    }
+
+    let submitted = client
+        .post(format!("{base}/v1/sessions/board-viewer/runs"))
+        .json(&test_submit_input_request("continue the shared sketch"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<RunView>()
+        .await?;
+    wait_for_run_status(
+        &client,
+        &base,
+        &submitted.run_id,
+        &[DaemonRunStatus::Completed],
+    )
+    .await?;
+
+    // The shared board accumulated both draws across the view calls.
+    let revisions = client
+        .get(format!("{base}/v1/boards/board-shared/revisions"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<crate::BoardRevisionView>>()
+        .await?;
+    assert_eq!(revisions.len(), 2, "seed plus continuation revision");
+    let tip = &revisions[0];
+    let state_asset_id = tip.state_asset_id.clone().expect("state asset recorded");
+    let state = client
+        .get(format!("{base}/v1/assets/{state_asset_id}/raw"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    let elements = state["elements"].as_array().expect("elements array");
+    assert_eq!(elements.len(), 2, "the tip carries the seeded and new element");
+    assert_eq!(elements[0]["kind"], json!("rect"));
+    assert_eq!(elements[1]["kind"], json!("arrow"));
+
+    // The empty board was viewable without error and never gained a revision.
+    let empty_revisions = client
+        .get(format!("{base}/v1/boards/board-empty/revisions"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<crate::BoardRevisionView>>()
+        .await?;
+    assert!(
+        empty_revisions.is_empty(),
+        "viewing an empty board must not create revisions"
+    );
+
+    let _ = shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
 async fn project_guards_channel_deletion_and_active_session_end() -> Result<()> {
     let temp = tempdir()?;
     let state_root = temp.path().join("daemon-project-guards");

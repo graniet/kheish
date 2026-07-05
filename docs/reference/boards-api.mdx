@@ -110,7 +110,9 @@ summaries use the single reachable chain tip rather than timestamp order.
 
 ## Agent drawing
 
-Agents draw with the `board_draw` control tool: the daemon appends the batch to the latest state, rasterizes it over the previous render, stamps every element with the agent's name and stable color, and paints a small author tag next to the batch. Concurrent writers retry against the fresh tip a bounded number of times, so a human saving from the console and an agent drawing from a run can safely alternate on the same board.
+Agents work a board with a view-then-draw-in-batches loop. Because tool outputs are JSON only, a model can never see the rendered PNG, so `board_view` gives it a structured substitute: the board metadata, the tip revision's author, a compact list of placed elements with their coordinates, an ASCII occupancy map (16×10 cells) showing which author owns each region of the canvas, and a one-line hint naming the largest free area. An agent calls `board_view` first whenever a board may already have content, then continues the existing drawing instead of restarting.
+
+Agents draw with the `board_draw` control tool: the daemon appends the batch to the latest state, rasterizes it over the previous render, stamps every element with the agent's name and stable color, and paints a small author tag next to the batch. Draw in small batches of a few elements and call `board_draw` several times — each call becomes a revision the console shows live — placing new elements in the free cells of the occupancy map and aligning coordinates with what was seen. Every `board_draw` response carries the same post-draw scene summary, so an agent can keep drawing in place without a separate `board_view` call. Concurrent writers retry against the fresh tip a bounded number of times, so a human saving from the console and an agent drawing from a run can safely alternate on the same board. `board_view` is read-only and owner-or-unowned access checked (no run required); `board_draw` requires the owner session when the board is owned.
 
 ## Input Reference
 

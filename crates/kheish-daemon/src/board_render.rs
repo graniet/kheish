@@ -6,6 +6,8 @@
 //! alike. Agent-authored batches are stamped with a small name tag in the
 //! author's color, which is how viewers tell who drew what.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use anyhow::{Context, Result, bail};
 use image::{Rgba, RgbaImage};
 use imageproc::drawing::{
@@ -407,6 +409,356 @@ pub(crate) fn canvas_from_state(state: &serde_json::Value) -> Option<(u32, u32)>
     Some((width, height))
 }
 
+/// The occupancy map column count exposed by [`scene_summary`].
+const OCCUPANCY_COLS: usize = 16;
+/// The occupancy map row count exposed by [`scene_summary`].
+const OCCUPANCY_ROWS: usize = 10;
+/// The maximum number of elements listed before [`scene_summary`] truncates.
+const SCENE_ELEMENT_CAP: usize = 120;
+/// The maximum character count kept for a text element in a scene summary.
+const SCENE_TEXT_CHARS: usize = 48;
+/// The render fallback color used when an element carries no explicit color.
+const SCENE_FALLBACK_COLOR: &str = "#1E212B";
+
+/// Builds a compact, model-facing summary of one board scene.
+///
+/// Tool outputs are JSON only, so a model can never see the rasterized PNG.
+/// This produces the structured substitute an agent reads before drawing: a
+/// capped list of placed elements, an ASCII occupancy map showing which author
+/// owns each region of the canvas, and a one-line hint pointing at the largest
+/// open area. It is pure so it can back both `board_view` and the post-draw
+/// payload of `board_draw`. The returned object carries `canvas`, `elements`,
+/// `occupancy`, and `free_hint`, plus a `note` when the board is empty.
+pub(crate) fn scene_summary(canvas: (u32, u32), elements: &[BoardElement]) -> serde_json::Value {
+    let (width, height) = clamp_canvas(canvas.0, canvas.1);
+    let (occupancy, free_hint) = occupancy_map(elements, (width, height));
+    let mut summary = serde_json::json!({
+        "canvas": {"width": width, "height": height},
+        "elements": compact_elements(elements),
+        "occupancy": occupancy,
+        "free_hint": free_hint,
+    });
+    if elements.is_empty()
+        && let serde_json::Value::Object(map) = &mut summary
+    {
+        map.insert(
+            "note".to_string(),
+            serde_json::Value::String("the board is empty".to_string()),
+        );
+    }
+    summary
+}
+
+/// Renders the capped, per-element summary rows used by [`scene_summary`].
+fn compact_elements(elements: &[BoardElement]) -> Vec<serde_json::Value> {
+    let mut rows = Vec::new();
+    for (index, element) in elements.iter().take(SCENE_ELEMENT_CAP).enumerate() {
+        let mut row = serde_json::Map::new();
+        row.insert("n".to_string(), serde_json::json!(index + 1));
+        row.insert(
+            "kind".to_string(),
+            serde_json::json!(element_kind_name(element.kind)),
+        );
+        row.insert("at".to_string(), serde_json::json!(element_anchor_text(element)));
+        if let Some(size) = element_size_text(element) {
+            row.insert("size".to_string(), serde_json::json!(size));
+        }
+        if matches!(element.kind, BoardElementKind::Text)
+            && let Some(text) = element.text.as_deref()
+        {
+            row.insert("text".to_string(), serde_json::json!(truncate_scene_text(text)));
+        }
+        row.insert("color".to_string(), serde_json::json!(element_color_hex(element)));
+        row.insert(
+            "author".to_string(),
+            serde_json::json!(element_author_label(element)),
+        );
+        rows.push(serde_json::Value::Object(row));
+    }
+    if elements.len() > SCENE_ELEMENT_CAP {
+        rows.push(serde_json::json!({"truncated": elements.len() - SCENE_ELEMENT_CAP}));
+    }
+    rows
+}
+
+/// Returns the wire name of one element kind.
+fn element_kind_name(kind: BoardElementKind) -> &'static str {
+    match kind {
+        BoardElementKind::Path => "path",
+        BoardElementKind::Line => "line",
+        BoardElementKind::Arrow => "arrow",
+        BoardElementKind::Rect => "rect",
+        BoardElementKind::Ellipse => "ellipse",
+        BoardElementKind::Text => "text",
+    }
+}
+
+/// Formats the anchor coordinate string for one element.
+fn element_anchor_text(element: &BoardElement) -> String {
+    match element.kind {
+        BoardElementKind::Path => element
+            .points
+            .first()
+            .map(|point| format!("{},{}", round_coord(point[0]), round_coord(point[1])))
+            .unwrap_or_else(|| "0,0".to_string()),
+        BoardElementKind::Line | BoardElementKind::Arrow => {
+            let from = element.from.unwrap_or([0.0, 0.0]);
+            let to = element.to.unwrap_or([0.0, 0.0]);
+            format!(
+                "{},{}\u{2192}{},{}",
+                round_coord(from[0]),
+                round_coord(from[1]),
+                round_coord(to[0]),
+                round_coord(to[1])
+            )
+        }
+        BoardElementKind::Rect | BoardElementKind::Ellipse | BoardElementKind::Text => format!(
+            "{},{}",
+            round_coord(element.x.unwrap_or(0.0)),
+            round_coord(element.y.unwrap_or(0.0))
+        ),
+    }
+}
+
+/// Formats the `w×h` size string for the sized element kinds.
+fn element_size_text(element: &BoardElement) -> Option<String> {
+    match element.kind {
+        BoardElementKind::Rect | BoardElementKind::Ellipse => match (element.w, element.h) {
+            (Some(w), Some(h)) => Some(format!("{}\u{00D7}{}", round_coord(w), round_coord(h))),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Returns the effective `#RRGGBB` color reported for one element.
+fn element_color_hex(element: &BoardElement) -> String {
+    element
+        .color
+        .clone()
+        .or_else(|| {
+            element
+                .author
+                .as_ref()
+                .and_then(|author| author.color.clone())
+        })
+        .unwrap_or_else(|| SCENE_FALLBACK_COLOR.to_string())
+}
+
+/// Returns the display author label for one element: the author name when
+/// known, otherwise `human` for human authors or `unknown`.
+fn element_author_label(element: &BoardElement) -> String {
+    match element.author.as_ref() {
+        Some(author) if !author.name.trim().is_empty() => author.name.trim().to_string(),
+        Some(author) if author.kind == "human" => "human".to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
+/// Rounds one canvas coordinate to the nearest integer for display.
+fn round_coord(value: f32) -> i64 {
+    if value.is_finite() {
+        value.round() as i64
+    } else {
+        0
+    }
+}
+
+/// Shortens a text element down to a bounded preview for the summary.
+fn truncate_scene_text(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= SCENE_TEXT_CHARS {
+        return trimmed.to_string();
+    }
+    let mut preview = trimmed
+        .chars()
+        .take(SCENE_TEXT_CHARS - 1)
+        .collect::<String>();
+    preview.push('\u{2026}');
+    preview
+}
+
+/// Builds the ASCII occupancy grid string (with a trailing legend line) and
+/// the free-space hint for one board scene.
+fn occupancy_map(elements: &[BoardElement], canvas: (u32, u32)) -> (String, String) {
+    let mut grid = vec![None::<char>; OCCUPANCY_COLS * OCCUPANCY_ROWS];
+    let mut letter_labels: BTreeMap<char, String> = BTreeMap::new();
+    for element in elements {
+        let label = element_author_label(element);
+        let Some(letter) = label.chars().next().map(|value| value.to_ascii_uppercase()) else {
+            continue;
+        };
+        let cells = element_cells(element, canvas);
+        if cells.is_empty() {
+            continue;
+        }
+        letter_labels.entry(letter).or_insert(label);
+        for (col, row) in cells {
+            grid[row * OCCUPANCY_COLS + col] = Some(letter);
+        }
+    }
+
+    let mut lines = Vec::with_capacity(OCCUPANCY_ROWS + 1);
+    for row in 0..OCCUPANCY_ROWS {
+        let mut line = String::with_capacity(OCCUPANCY_COLS);
+        for col in 0..OCCUPANCY_COLS {
+            line.push(grid[row * OCCUPANCY_COLS + col].unwrap_or('.'));
+        }
+        lines.push(line);
+    }
+    let present = grid.iter().flatten().copied().collect::<BTreeSet<char>>();
+    let legend = if present.is_empty() {
+        "legend: (empty)".to_string()
+    } else {
+        let entries = present
+            .iter()
+            .filter_map(|letter| {
+                letter_labels
+                    .get(letter)
+                    .map(|name| format!("{letter}={name}"))
+            })
+            .collect::<Vec<_>>();
+        format!("legend: {}", entries.join(", "))
+    };
+    let mut occupancy = lines.join("\n");
+    occupancy.push('\n');
+    occupancy.push_str(&legend);
+    (occupancy, free_hint(&grid, canvas))
+}
+
+/// Returns the occupancy cells covered by one element, in draw order.
+fn element_cells(element: &BoardElement, canvas: (u32, u32)) -> Vec<(usize, usize)> {
+    let mut cells = Vec::new();
+    match element.kind {
+        BoardElementKind::Rect | BoardElementKind::Ellipse => {
+            if let (Some(x), Some(y), Some(w), Some(h)) =
+                (element.x, element.y, element.w, element.h)
+            {
+                let (col0, row0) = cell_of(x.min(x + w), y.min(y + h), canvas);
+                let (col1, row1) = cell_of(x.max(x + w), y.max(y + h), canvas);
+                for row in row0..=row1 {
+                    for col in col0..=col1 {
+                        cells.push((col, row));
+                    }
+                }
+            }
+        }
+        BoardElementKind::Line | BoardElementKind::Arrow => {
+            if let (Some(from), Some(to)) = (element.from, element.to) {
+                push_segment_cells(from, to, canvas, &mut cells);
+            }
+        }
+        BoardElementKind::Path => {
+            for pair in element.points.windows(2) {
+                push_segment_cells(pair[0], pair[1], canvas, &mut cells);
+            }
+            if let Some(first) = element.points.first() {
+                cells.push(cell_of(first[0], first[1], canvas));
+            }
+        }
+        BoardElementKind::Text => {
+            if let (Some(x), Some(y)) = (element.x, element.y) {
+                cells.push(cell_of(x, y, canvas));
+            }
+        }
+    }
+    cells
+}
+
+/// Samples the occupancy cells a straight segment passes through.
+fn push_segment_cells(
+    from: [f32; 2],
+    to: [f32; 2],
+    canvas: (u32, u32),
+    cells: &mut Vec<(usize, usize)>,
+) {
+    let cell_w = canvas.0 as f32 / OCCUPANCY_COLS as f32;
+    let cell_h = canvas.1 as f32 / OCCUPANCY_ROWS as f32;
+    let distance = ((to[0] - from[0]).powi(2) + (to[1] - from[1]).powi(2)).sqrt();
+    let step = (cell_w.min(cell_h) / 2.0).max(1.0);
+    let steps = (distance / step).ceil().max(1.0) as usize;
+    for step_index in 0..=steps {
+        let t = step_index as f32 / steps as f32;
+        let px = from[0] + (to[0] - from[0]) * t;
+        let py = from[1] + (to[1] - from[1]) * t;
+        cells.push(cell_of(px, py, canvas));
+    }
+}
+
+/// Maps one canvas pixel to its clamped occupancy cell.
+fn cell_of(px: f32, py: f32, canvas: (u32, u32)) -> (usize, usize) {
+    let width = canvas.0.max(1) as f32;
+    let height = canvas.1.max(1) as f32;
+    let cx = if px.is_finite() { px } else { 0.0 }.clamp(0.0, width - 1.0);
+    let cy = if py.is_finite() { py } else { 0.0 }.clamp(0.0, height - 1.0);
+    let col = ((cx / width) * OCCUPANCY_COLS as f32).floor() as usize;
+    let row = ((cy / height) * OCCUPANCY_ROWS as f32).floor() as usize;
+    (col.min(OCCUPANCY_COLS - 1), row.min(OCCUPANCY_ROWS - 1))
+}
+
+/// Names the largest broadly-empty region of the occupancy grid.
+fn free_hint(grid: &[Option<char>], canvas: (u32, u32)) -> String {
+    let total = OCCUPANCY_COLS * OCCUPANCY_ROWS;
+    let empty = grid.iter().filter(|cell| cell.is_none()).count();
+    if empty == total {
+        return "the whole board is free".to_string();
+    }
+    if empty == 0 {
+        return "the board is full; extend or reuse existing elements instead of adding new ones"
+            .to_string();
+    }
+    let (width, height) = canvas;
+    let region_fraction = |cols: std::ops::Range<usize>, rows: std::ops::Range<usize>| -> f32 {
+        let mut empty = 0usize;
+        let mut count = 0usize;
+        for row in rows.clone() {
+            for col in cols.clone() {
+                count += 1;
+                if grid[row * OCCUPANCY_COLS + col].is_none() {
+                    empty += 1;
+                }
+            }
+        }
+        if count == 0 {
+            0.0
+        } else {
+            empty as f32 / count as f32
+        }
+    };
+    let candidates = [
+        (
+            region_fraction(0..OCCUPANCY_COLS, OCCUPANCY_ROWS / 2..OCCUPANCY_ROWS),
+            format!("the bottom half below y\u{2248}{} is mostly free", height / 2),
+        ),
+        (
+            region_fraction(0..OCCUPANCY_COLS, 0..OCCUPANCY_ROWS / 2),
+            format!("the top half above y\u{2248}{} is mostly free", height / 2),
+        ),
+        (
+            region_fraction(OCCUPANCY_COLS / 2..OCCUPANCY_COLS, 0..OCCUPANCY_ROWS),
+            format!("the right half right of x\u{2248}{} is mostly free", width / 2),
+        ),
+        (
+            region_fraction(0..OCCUPANCY_COLS / 2, 0..OCCUPANCY_ROWS),
+            format!("the left half left of x\u{2248}{} is mostly free", width / 2),
+        ),
+    ];
+    let best = candidates
+        .iter()
+        .max_by(|left, right| {
+            left.0
+                .partial_cmp(&right.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .expect("candidate regions are non-empty");
+    if best.0 >= 0.6 {
+        best.1.clone()
+    } else {
+        "free space is scattered; place new elements in the '.' cells of the occupancy map"
+            .to_string()
+    }
+}
+
 /// Rejects clearly malformed draw payloads before touching any state.
 pub(crate) fn ensure_reasonable_text(elements: &[BoardElement]) -> Result<()> {
     for element in elements {
@@ -488,5 +840,155 @@ mod tests {
     #[test]
     fn canvas_dimensions_are_clamped() {
         assert_eq!(clamp_canvas(10, 90000), (MIN_CANVAS_DIM, MAX_CANVAS_DIM));
+    }
+
+    fn authored(name: &str, mut element: BoardElement) -> BoardElement {
+        element.color = Some("#7C3AED".to_string());
+        element.author = Some(BoardElementAuthor {
+            kind: "agent".to_string(),
+            name: name.to_string(),
+            color: Some("#7C3AED".to_string()),
+            session_id: Some("session-1".to_string()),
+        });
+        element
+    }
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> BoardElement {
+        BoardElement {
+            kind: BoardElementKind::Rect,
+            points: Vec::new(),
+            from: None,
+            to: None,
+            x: Some(x),
+            y: Some(y),
+            w: Some(w),
+            h: Some(h),
+            text: None,
+            font_size: None,
+            color: None,
+            stroke_width: None,
+            author: None,
+        }
+    }
+
+    fn occupancy_rows(summary: &serde_json::Value) -> Vec<String> {
+        summary["occupancy"]
+            .as_str()
+            .expect("occupancy string")
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn scene_summary_marks_rect_area_and_legend() {
+        // On a 1600x1000 canvas each cell is 100px wide (1600/16) and 100px
+        // tall (1000/10). A rect at x 0..310, y 0..190 stays inside columns
+        // 0..=3 and rows 0..=1 without touching the next cell boundary.
+        let summary = scene_summary((1600, 1000), &[authored("Atlas", rect(0.0, 0.0, 310.0, 190.0))]);
+        let rows = occupancy_rows(&summary);
+        assert_eq!(rows[0], "AAAA............");
+        assert_eq!(rows[1], "AAAA............");
+        assert_eq!(rows[2], "................");
+        assert!(
+            rows.last().expect("legend line").contains("A=Atlas"),
+            "legend should map A to Atlas: {:?}",
+            rows.last()
+        );
+        assert_eq!(summary["elements"][0]["kind"], "rect");
+        assert_eq!(summary["elements"][0]["at"], "0,0");
+        assert_eq!(summary["elements"][0]["size"], "310\u{00D7}190");
+        assert_eq!(summary["elements"][0]["author"], "Atlas");
+        assert!(summary.get("note").is_none(), "populated board has no note");
+        assert!(
+            summary["free_hint"]
+                .as_str()
+                .expect("free hint")
+                .contains("free"),
+            "free hint should describe open space: {}",
+            summary["free_hint"]
+        );
+    }
+
+    #[test]
+    fn scene_summary_empty_board_is_all_dots_with_note() {
+        let summary = scene_summary((1600, 1000), &[]);
+        let rows = occupancy_rows(&summary);
+        assert_eq!(rows.len(), 11, "ten grid rows plus one legend line");
+        for row in &rows[..10] {
+            assert_eq!(row, "................");
+        }
+        assert_eq!(rows[10], "legend: (empty)");
+        assert_eq!(summary["note"], "the board is empty");
+        assert_eq!(summary["free_hint"], "the whole board is free");
+        assert_eq!(
+            summary["elements"].as_array().expect("elements array").len(),
+            0
+        );
+        assert_eq!(summary["canvas"]["width"], 1600);
+        assert_eq!(summary["canvas"]["height"], 1000);
+    }
+
+    #[test]
+    fn scene_summary_truncates_beyond_element_cap() {
+        let elements = (0..SCENE_ELEMENT_CAP + 5)
+            .map(|index| authored("Nova", rect(index as f32, 0.0, 4.0, 4.0)))
+            .collect::<Vec<_>>();
+        let summary = scene_summary((1600, 1000), &elements);
+        let listed = summary["elements"].as_array().expect("elements array");
+        assert_eq!(listed.len(), SCENE_ELEMENT_CAP + 1, "cap plus truncation row");
+        assert_eq!(listed[SCENE_ELEMENT_CAP]["truncated"], 5);
+        assert_eq!(listed[SCENE_ELEMENT_CAP - 1]["n"], SCENE_ELEMENT_CAP);
+    }
+
+    #[test]
+    fn scene_summary_covers_line_text_and_topmost_author() {
+        let mut line = BoardElement {
+            kind: BoardElementKind::Line,
+            points: Vec::new(),
+            from: Some([0.0, 0.0]),
+            to: Some([1599.0, 999.0]),
+            x: None,
+            y: None,
+            w: None,
+            h: None,
+            text: None,
+            font_size: None,
+            color: None,
+            stroke_width: None,
+            author: None,
+        };
+        line = authored("Nova", line);
+        let mut text = BoardElement {
+            kind: BoardElementKind::Text,
+            points: Vec::new(),
+            from: None,
+            to: None,
+            x: Some(800.0),
+            y: Some(500.0),
+            w: None,
+            h: None,
+            text: Some("hello world".to_string()),
+            font_size: Some(18.0),
+            color: None,
+            stroke_width: None,
+            author: None,
+        };
+        text = authored("Atlas", text);
+        // The diagonal line passes through the center cell; the text drawn
+        // afterwards is topmost there, so that cell shows Atlas' letter.
+        let summary = scene_summary((1600, 1000), &[line, text]);
+        let rows = occupancy_rows(&summary);
+        assert_eq!(rows[0].chars().next(), Some('N'), "line starts top-left");
+        assert_eq!(
+            rows[5].chars().nth(8),
+            Some('A'),
+            "text cell is topmost at the center: {:?}",
+            rows[5]
+        );
+        assert_eq!(summary["elements"][1]["text"], "hello world");
+        let legend = rows.last().expect("legend");
+        assert!(legend.contains("A=Atlas"), "legend has Atlas: {legend}");
+        assert!(legend.contains("N=Nova"), "legend has Nova: {legend}");
     }
 }

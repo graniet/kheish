@@ -237,6 +237,76 @@ where
         self.board_service.create_revision(board_id, revision).await
     }
 
+    /// Builds a compact, model-facing summary of one board for an agent.
+    ///
+    /// This enforces the same owner-or-unowned access rule as drawing but
+    /// requires no run: an agent calls it to see the board's current contents
+    /// before drawing, so it can continue an existing sketch instead of
+    /// restarting from scratch. The summary carries the board metadata, the
+    /// tip revision's author, a capped element list, an ASCII occupancy map,
+    /// and a free-space hint. A board with no revisions yields an empty scene
+    /// on the default 1600x1000 canvas with a friendly note.
+    pub(crate) async fn agent_view_board(
+        &self,
+        session_id: &str,
+        board_id: &str,
+    ) -> Result<Value> {
+        use crate::board_render;
+
+        let _ = self.agent_id_for_session(session_id).await?;
+        let board = self.board_service.get_board(board_id).await?;
+        if let Some(owner) = board.summary.owner_session_id.as_deref() {
+            anyhow::ensure!(
+                owner == session_id,
+                "board {board_id} is owned by session {owner}; only that session may view it"
+            );
+        }
+
+        let (elements, canvas, last_author) = match board.summary.latest_revision_id.as_deref() {
+            Some(revision_id) => {
+                let revision = self
+                    .board_service
+                    .get_revision(board_id, revision_id)
+                    .await?;
+                let state = revision
+                    .state_asset_id
+                    .as_deref()
+                    .and_then(|asset_id| self.assets.read_raw(asset_id).ok())
+                    .and_then(|(_, bytes)| serde_json::from_slice::<Value>(&bytes).ok());
+                let elements = state
+                    .as_ref()
+                    .map(board_render::elements_from_state)
+                    .unwrap_or_default();
+                let canvas = state
+                    .as_ref()
+                    .and_then(board_render::canvas_from_state)
+                    .map(|(width, height)| board_render::clamp_canvas(width, height))
+                    .unwrap_or((1600, 1000));
+                (elements, canvas, board_view_last_author(&revision.metadata))
+            }
+            None => (Vec::new(), (1600u32, 1000u32), None),
+        };
+
+        let mut summary = board_render::scene_summary(canvas, &elements);
+        if let Value::Object(map) = &mut summary {
+            map.insert(
+                "board".to_string(),
+                serde_json::json!({
+                    "board_id": board.summary.board_id,
+                    "display_name": board.summary.display_name,
+                    "revision_count": board.summary.revision_count,
+                    "tip_revision_id": board.summary.latest_revision_id,
+                    "canvas": {"width": canvas.0, "height": canvas.1},
+                }),
+            );
+            map.insert(
+                "last_author".to_string(),
+                last_author.unwrap_or(Value::Null),
+            );
+        }
+        Ok(summary)
+    }
+
     /// Draws one batch of vector elements on a board on behalf of an agent:
     /// the batch is stamped with the agent's name and stable color, appended
     /// to the latest state, rasterized over the previous render, and stored
@@ -392,6 +462,17 @@ where
         Err(last_error.unwrap_or_else(|| {
             anyhow!("board {board_id} kept changing while the draw was being prepared")
         }))
+    }
+}
+
+/// Extracts the tip revision's author name and color from its metadata, when
+/// the drawing tool recorded them.
+fn board_view_last_author(metadata: &Value) -> Option<Value> {
+    let name = metadata.get("author_name").and_then(Value::as_str);
+    let color = metadata.get("author_color").and_then(Value::as_str);
+    match (name, color) {
+        (None, None) => None,
+        _ => Some(serde_json::json!({ "name": name, "color": color })),
     }
 }
 

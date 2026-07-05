@@ -620,6 +620,30 @@ impl DaemonToolControl for FakeControl {
         })
     }
 
+    async fn agent_view_board(
+        &self,
+        session_id: &str,
+        board_id: &str,
+    ) -> Result<serde_json::Value> {
+        self.state
+            .lock()
+            .project_task_calls
+            .push(format!("view:{session_id}:{board_id}"));
+        Ok(json!({
+            "board": {
+                "board_id": board_id,
+                "display_name": "Fake board",
+                "revision_count": 1,
+                "tip_revision_id": "board-revision-1",
+                "canvas": {"width": 1600, "height": 1000},
+            },
+            "last_author": {"name": "Atlas", "color": "#7C3AED"},
+            "elements": [],
+            "occupancy": "................\n................\n................\n................\n................\n................\n................\n................\n................\n................\nlegend: (empty)",
+            "free_hint": "the whole board is free",
+        }))
+    }
+
     async fn agent_draw_on_board(
         &self,
         session_id: &str,

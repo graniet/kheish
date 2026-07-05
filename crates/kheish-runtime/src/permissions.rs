@@ -874,6 +874,7 @@ fn is_plan_mode_allowed_tool(tool_name: &str) -> bool {
             | "read_mcp_resource"
             | "list_skills"
             | "read_channel_thread"
+            | "board_view"
             | "project_list_tasks"
             | "ask_operator"
             | "ask_user_question"

@@ -246,6 +246,14 @@ where
             .await
     }
 
+    async fn agent_view_board(
+        &self,
+        session_id: &str,
+        board_id: &str,
+    ) -> Result<serde_json::Value> {
+        self.0.agent_view_board(session_id, board_id).await
+    }
+
     async fn agent_draw_on_board(
         &self,
         session_id: &str,
