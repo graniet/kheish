@@ -1,0 +1,694 @@
+---
+title: How Kheish remembers: the memory planes
+description: A beginner-friendly, code-grounded tour of Kheish's three memory planes — the session journal, recovered run memory, and the durable learning plane — including why run_summary candidates exist even though they are never injected into prompts.
+---
+
+# How Kheish remembers: the memory planes
+
+A language model, on its own, remembers nothing. Every request starts from a blank slate. Whatever the model "knew" a moment ago only survives because something outside the model wrote it down and handed it back on the next call. That "something outside the model" is what this page is about.
+
+Kheish does not have one memory. It has **three separate memory planes**, each owned by the daemon, each with a different job, a different lifetime, a different privacy posture, and a different answer to the single most important question you can ask about any piece of remembered text:
+
+> *Will this be injected back into a future prompt, or not?*
+
+Beginners usually assume that "memory" means "everything the assistant said gets remembered and replayed." That is not how Kheish works, and understanding *why* it does not work that way is the fastest path to actually understanding the system. Some memory is replayed verbatim into the next prompt. Some memory is deliberately **stored but never injected** — it exists for review, verification, and audit, and it is treated as sensitive by default. If you can hold that distinction in your head, everything else on this page will click.
+
+This document is both the conceptual map and the detailed reference for every plane. For where memory sits in the larger system, read [Architecture](./architecture). For how a single conversation and its runs are structured, read [Sessions and runs](./sessions-and-runs).
+
+## The three planes at a glance
+
+Here are the three planes, side by side. Read this diagram top to bottom as "how durable is it," and left to right as "three parallel stores that never merge into one another."
+
+```text
+                         KHEISH MEMORY PLANES (daemon-owned)
+
+  ┌───────────────────────────┐ ┌───────────────────────────┐ ┌───────────────────────────┐
+  │  PLANE 1                   │ │  PLANE 2                   │ │  PLANE 3                   │
+  │  SESSION JOURNAL           │ │  RECOVERED RUN MEMORY      │ │  LEARNING PLANE            │
+  │  (the transcript)          │ │  (episodic)                │ │  (durable knowledge)       │
+  ├───────────────────────────┤ ├───────────────────────────┤ ├───────────────────────────┤
+  │ append-only event log      │ │ compact record per         │ │ first-class learning       │
+  │ + checkpoints              │ │ TERMINAL run               │ │ records, scoped, reviewed  │
+  │                            │ │                            │ │                            │
+  │ canonical conversation     │ │ ≤480-char summary,         │ │ kinds:                     │
+  │ history, source of truth   │ │ request/outcome previews,  │ │  fact / preference /       │
+  │                            │ │ failure markers, artifacts │ │  decision  -> injectable   │
+  │ restored on restart        │ │                            │ │  run_summary / procedure   │
+  │                            │ │ scrubbed before storage    │ │            -> NOT injected  │
+  │                            │ │                            │ │                            │
+  │ feeds live context +       │ │ ranked, bounded injection  │ │ semantic learnings +       │
+  │ compaction                 │ │ as `recovered_memory`      │ │ promoted procedural skills │
+  └─────────────┬─────────────┘ └─────────────┬─────────────┘ └─────────────┬─────────────┘
+                │                              │                             │
+                v                              v                             v
+        lives in the session          lives in run-memories/        lives in learnings/,
+        journal + checkpoints         + a topology index            learning-candidates/,
+        (canonical history)           (derived read model)          learning-skills/
+                │                              │                             │
+                └──────────────┬───────────────┴─────────────┬───────────────┘
+                               v                             v
+                     assembled into ONE prompt        inspected together via
+                     by the runtime, each with        GET /v1/sessions/{id}/memory-context
+                     its own bounded budget            (the "what is eligible now" view)
+```
+
+The three planes are **never collapsed into one system**. That separation is a deliberate governance decision, not an accident of implementation. If Kheish let arbitrary run output flow straight into long-term, prompt-visible memory, a single confused or adversarial run could quietly rewrite how the assistant behaves forever. Instead, each plane has its own rules for what gets in, what gets out, and what reaches a prompt.
+
+### Comparison table
+
+| Property | Plane 1: Session journal | Plane 2: Recovered run memory | Plane 3: Learning plane |
+| --- | --- | --- | --- |
+| What it stores | Full conversation events + checkpoints | Compact per-run episodic summaries | Scoped facts, preferences, decisions, run summaries, procedures |
+| Granularity | Every turn, tool call, output | One record per terminal run | One record per learned item |
+| Derived or canonical? | **Canonical** (source of truth) | Derived read model | First-class durable records |
+| Injected into prompts? | Yes (live context + compaction) | Yes, but **bounded and ranked** | Only `fact`/`preference`/`decision`, and only when eligible |
+| Never injected | — | — | `run_summary` and `procedure` are stored but excluded |
+| Scope | One session | One session (search can widen) | `session` / `persona` / `project` / `workspace` |
+| Survives restart | Yes | Yes (index rebuilt on boot) | Yes (daemon-owned state) |
+| Governance | Journal integrity + compaction | Runtime run-memory policy | Capture + rules + judge + verification + review |
+| Privacy default | Raw transcript (per debug policy) | PII-scrubbed before storage, `session_only` search | `sensitive` kept out of prompts and search |
+| Retention default | Kept as history | 30 days, 32 tracked/session, 3 in prompt | Until revoked/superseded/expired |
+| Inspection | Session views, transcript | `/v1/status.run_memory`, memory search | `/v1/learnings`, memory-context, memory-search |
+| Runtime policy | Compaction policy | `GET/POST /v1/runtime/run-memory-policy` | `GET/POST /v1/runtime/learning-policy` |
+
+Keep this table nearby. Almost every "wait, why did the assistant remember X but not Y?" question is answered by reading across one of these rows.
+
+## Plane 1: the session journal (the canonical transcript)
+
+The first plane is the one people already have a mental model for: the conversation itself.
+
+Every session keeps an **append-only journal** of events — inputs, assistant messages, tool calls, outputs, approvals, and so on — plus periodic checkpoints. This journal is the **canonical** history. It is the source of truth. When the daemon restarts, sessions are restored from this journal and their checkpoints, which is why a long-running session survives a crash without losing the thread of the conversation. The mechanics of that restore path live in [Architecture](./architecture).
+
+The journal feeds prompts in the obvious way: recent turns are visible context, and when a conversation grows past the model's context window, Kheish's compaction policy summarizes older history so the live thread keeps fitting. That compaction is a property of the transcript plane, not of the other two planes.
+
+Two things about the journal matter for the rest of this page:
+
+- The journal is **conversation history**, not *knowledge*. It knows that a message was sent; it does not, by itself, distill "the user prefers metric units" into a reusable fact. Distillation is the learning plane's job.
+- The journal is deliberately kept **separate** from the other two planes. Recovered run memory and learnings are derived or first-class stores that live *outside* the journal. This is important for privacy: when Plane 2 scrubs a phone number out of a run summary, that scrubbing does **not** retroactively edit the canonical transcript. The transcript is what actually happened; the derived planes are cleaned-up projections of it.
+
+That last point trips people up, so it is worth stating plainly: **run-memory redaction is not a global transcript scrubber.** If a user pasted a secret into the chat, that raw text can still live in the canonical journal (and in full debug artifacts, subject to the active debug policy). The scrubbing described below protects the *derived* stores and the text that gets *re-injected*, not the original record of the conversation.
+
+## Plane 2: recovered run memory (the episodic plane)
+
+The second plane exists to solve a very specific, very practical problem:
+
+> When a run finishes and the next input arrives, how do we give the assistant a little bit of "what just happened recently" — *without* replaying entire transcripts back into the prompt?
+
+Replaying whole transcripts is expensive, noisy, and blows up the context budget. So Kheish keeps a **compact, episodic** memory: one small record per **terminal run**, and it injects only a tiny, ranked, bounded slice of those records into the next prompt. This is **recovered run memory**.
+
+It is:
+
+- **daemon-owned** (not model-provider-owned),
+- **derived** from persisted run state,
+- **compact and episodic** rather than semantic or procedural,
+- **prompt-bounded** and best-effort,
+- **restart-safe**,
+- **sanitized** before it is durably stored,
+- and controlled by a single **runtime policy**.
+
+### What counts as a "terminal run"
+
+Kheish only builds a recovered-run-memory record when a run reaches a terminal status. In the code (`crates/kheish-daemon/src/memory.rs`), the terminal statuses are:
+
+- `completed`
+- `failed`
+- `interrupted`
+- `cancelled`
+
+A run that is still `queued`, `running`, `waiting_for_approval`, or `waiting_for_user_question` produces **no** record. Memory is about finished episodes, not work in flight.
+
+### The shape of one record
+
+Each durable run-memory record (`RunMemoryRecord`) carries:
+
+- the owning `session_id`,
+- the originating `run_id`,
+- the capture timestamp (`recorded_at_ms`),
+- the terminal `status` label,
+- one compact `summary`,
+- an optional `request_preview` (what was asked),
+- an optional `outcome_preview` (the latest recorded assistant text),
+- optional daemon-owned `artifact_ids`,
+- optional compact `failure_markers`,
+- the visible `scope_keys` retained for later search,
+- and a durable **semantic-capture receipt** (more on that below).
+
+The `summary` is not a transcript excerpt. It is assembled daemon-side from durable state — request preview, latest assistant text, an error preview for failures, or a bare terminal-status note when nothing better exists — and then **capped**. The cap is a hard constant:
+
+```text
+MAX_MEMORY_SUMMARY_CHARS = 480
+```
+
+Four hundred and eighty characters. That is the entire budget for one run's episodic footprint. Recovered run memory is intentionally a postcard, not a diary.
+
+### The record-and-inject flow
+
+Here is the life of one episodic record, end to end:
+
+```text
+   RECOVERED RUN MEMORY: from a finished run to the next prompt
+
+   ┌──────────────────────┐
+   │  A run reaches a      │   completed / failed /
+   │  TERMINAL status      │   interrupted / cancelled
+   └──────────┬───────────┘
+              │
+              v
+   ┌──────────────────────────────────────────────┐
+   │  BUILD RECORD                                  │
+   │  - request_preview  (from durable payload)     │
+   │  - outcome_preview  (latest assistant text)    │
+   │  - failure_markers  (status + error preview)   │
+   │  - artifact_ids                                │
+   │  - summary = join(parts), then cap at 480      │
+   └──────────┬─────────────────────────────────────┘
+              │
+              v
+   ┌──────────────────────────────────────────────┐
+   │  SCRUB (before it ever touches disk)           │
+   │  - secret/token redactor                       │
+   │  - PII: email, phone, SSN, Luhn card, keys ... │
+   │  redaction_count fields are counted            │
+   └──────────┬─────────────────────────────────────┘
+              │
+              v
+   ┌──────────────────────────────────────────────┐
+   │  PERSIST + INDEX                               │
+   │  - write to run-memories/                      │
+   │  - track pointer in the topology index         │
+   │    (by_session and by_scope)                   │
+   │  - prune: TTL + per-session overflow           │
+   └──────────┬─────────────────────────────────────┘
+              │
+        (later) a NEW input arrives on the SAME session
+              │
+              v
+   ┌──────────────────────────────────────────────┐
+   │  RANK against the pending input                │
+   │  - lexical query-term scoring                  │
+   │  - recency is the fallback + tie-breaker       │
+   └──────────┬─────────────────────────────────────┘
+              │
+              v
+   ┌──────────────────────────────────────────────┐
+   │  BUDGET + PACK                                 │
+   │  - keep at most `max_prompt_entries` (default 3)│
+   │  - drop older entries first if they don't fit  │
+   │  - if nothing fits, omit the section entirely  │
+   └──────────┬─────────────────────────────────────┘
+              │
+              v
+   ┌──────────────────────────────────────────────┐
+   │  INJECT as ONE system section                  │
+   │  named `recovered_memory`                      │
+   │  (framed as historical run data, not orders;   │
+   │   code fences inside summaries are neutralized) │
+   └────────────────────────────────────────────────┘
+```
+
+A few things in this flow deserve emphasis because they are easy to get wrong:
+
+- **Scrubbing happens before storage, not before injection.** By the time a record is on disk, the secrets and PII are already gone. That protects the store itself, memory-search results, the recovered prompt section, and any debug artifacts that echo the recovered context.
+- **Only the current session gets a recovered-memory prompt section.** Recovered memory does not silently bleed one session's recent episodes into another session's prompt. (Search can be widened; injection cannot — see below.)
+- **The injected entries are framed as historical run data, not as fresh instructions.** And Markdown code fences inside a summary are neutralized before rendering, so a recovered summary cannot smuggle a fake instruction block into the prompt.
+- **The core engine strips the derived `recovered_memory` payload before persisting the canonical input event**, so the session journal (Plane 1) does not end up duplicating recovered memory back into itself. The planes stay separate even at the moment of injection.
+
+### The runtime run-memory policy
+
+Every bound in the flow above comes from one policy object, `RunMemoryPolicyConfig`. Its fields and **current defaults** are:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Whether terminal runs produce records at all |
+| `retention_ms` | `2592000000` (30 days) | How long one record lives before TTL pruning |
+| `max_tracked_per_session` | `32` | How many records are retained per session |
+| `max_prompt_entries` | `3` | How many records may reach one prompt |
+| `redact_pii` | `true` | Whether common PII shapes are scrubbed before storage |
+| `search_visibility` | `session_only` | Whether search can cross into learning scopes |
+
+Read those numbers as a sentence: *"Keep up to 32 recent finished episodes per session for 30 days, scrub them, but only ever show the model the 3 most relevant ones, and by default only let a session search its own episodes."*
+
+The policy is validated (`retention_ms`, `max_tracked_per_session`, and `max_prompt_entries` must all be non-zero when enabled, and `max_prompt_entries` cannot exceed `max_tracked_per_session`). Operators inspect and replace it through:
+
+- `GET /v1/runtime/run-memory-policy`
+- `POST /v1/runtime/run-memory-policy`
+
+Changing the policy immediately re-applies pruning; enforcement errors are returned to the caller rather than being swallowed as a "successful" update.
+
+### PII scrubbing, in concrete terms
+
+Because recovered memory is the plane most likely to accidentally carry sensitive operational text back into a prompt, its scrubber is worth spelling out. When `redact_pii` is on, `redact_run_memory_text` first runs the daemon's secret/token redactor, then redacts common PII shapes, replacing each with a typed marker:
+
+- provider-style tokens (OpenAI/Anthropic/GitHub/Slack/AWS shapes), bearer tokens, JWT-like compact tokens, and sensitive URL query parameters (`token`, `api_key`, `signature`, `secret`),
+- PEM private-key blocks (including truncated captured blocks),
+- email addresses → `<redacted:email>`,
+- SSN-like values → `<redacted:ssn>`,
+- Luhn-valid card-like values → `<redacted:card>`,
+- phone-like values → `<redacted:phone>`.
+
+Every redaction increments a counter surfaced in `/v1/status.run_memory.metrics.redacted_fields_total`, so operators can see redaction actually happening rather than trusting that it does.
+
+### Budgeting: why the model sometimes sees fewer than three
+
+`max_prompt_entries = 3` is a *ceiling*, not a promise. Before submission, the runtime estimates the current prompt cost from the system sections, visible messages, active tool state, restored compacted history, and the incoming payload, then applies a recovered-memory budget derived from the compaction policy and (when the model family is known) model-aware context-window reservations. If the three best entries do not fit, Kheish drops the oldest first; if none fit, it omits the section entirely rather than risk overflow.
+
+This produces two distinct "why was it omitted" counters, and the distinction matters when you are debugging:
+
+- `run_memory.metrics.prompt_limit_omitted_total` counts entries dropped because of `max_prompt_entries` **and** by the final runtime prompt-budget packing.
+- `run_memory.metrics.injected_total` counts entries **only after** final packing kept them in the rendered provider prompt.
+
+So "stored" is not "injected," and "eligible" is not "packed." A record can exist, be perfectly relevant, and still never reach a prompt on a given turn because the budget was full.
+
+### Retention, pruning, and boot repair
+
+Recovered run memory prunes itself on three triggers: read-time expiry (a long-running daemon does not keep injecting stale memory until restart), policy changes (which re-apply pruning immediately), and boot. On boot the daemon rebuilds the run-memory index from persisted runs plus persisted files, repairs stale pointers, and deletes store files that no longer belong to a terminal run — orphans, invalid safe-storage names, unknown run ids, non-terminal leftovers, and duplicate legacy files where a canonical `__safe` file exists. A broken store scan **fails** the boot repair instead of silently skipping orphan cleanup, and the last bounded maintenance report is exposed at `/v1/status.run_memory.maintenance` (with `/v1/status.health` and `kheish-daemon doctor` surfacing warnings for failures and info for successful repairs).
+
+### Session memory search vs. prompt injection
+
+This is the one place recovered run memory has a *wider* surface than the prompt path, and it is a deliberate, policy-gated widening.
+
+- **Prompt injection** always uses only the current session's bounded, ranked recovered-memory bundle.
+- **Memory search** (`GET /v1/sessions/{session_id}/memory-search`) returns, by default, only recovered runs that originated in the requested session (`search_visibility=session_only`).
+- If an operator sets `search_visibility=learning_scopes`, a session can *search* more recovered runs than it will ever *inject* — specifically the runs visible through its learning scopes.
+
+Keep the default. Recovered-run summaries can reveal cross-session operational context, and the safe posture is: a session can browse its own past, but crossing scope boundaries is an explicit opt-in.
+
+## Plane 3: the learning plane (durable, governed knowledge)
+
+The third plane is where Kheish stops *summarizing episodes* and starts *keeping knowledge*. This is the plane most people mean when they say "I want the assistant to remember this."
+
+Unlike recovered run memory, a learning is a **first-class record**, not a derived read model. It is:
+
+- stored as its own durable record,
+- **scoped** to `session`, `persona`, `project`, or `workspace`,
+- surviving restart as daemon-owned state,
+- and subject to a lifecycle — publish, reject, revoke, supersede — with review and automation gates in front of every transition.
+
+The learning plane is itself split into two products that share machinery but serve different ends: **durable semantic learnings** (things to know) and **reviewed procedural learnings that can be promoted into reusable skills** (things to do). We will take them in turn, but first: the five kinds, and the single most important rule on this page.
+
+### The five learning kinds — and the injection boundary
+
+Kheish stores five kinds of learning (`LearningKind`):
+
+- `run_summary`
+- `fact`
+- `preference`
+- `decision`
+- `procedure`
+
+They split cleanly into two groups by that one question — *does this reach a prompt?*
+
+**Prompt-eligible kinds** (injectable into later prompts when active, in scope, and prompt-visible):
+
+- `fact`
+- `preference`
+- `decision`
+
+**Stored but never auto-injected** (excluded from the `learned_context` prompt section):
+
+- `run_summary`
+- `procedure`
+
+This boundary is enforced in the type system itself — `LearningKind::is_prompt_eligible()` returns false for exactly `run_summary` and `procedure`. It is not a soft convention; it is a hard gate.
+
+### Why `run_summary` exists even though it is never injected
+
+This is the question that unlocks the whole design, so it gets its own section.
+
+A newcomer looks at the list above and asks a completely reasonable question: *"If `run_summary` is never put into a prompt, why store it as a learning at all? Isn't that just dead weight?"*
+
+It is not dead weight. `run_summary` learnings do three real jobs, none of which require — or want — prompt injection:
+
+1. **Review material.** A `run_summary` is the daemon saying "here is a compact, reviewable account of what a finished run did." Operators (and automation in shadow mode) look at these to decide whether anything *durable* should be learned. It is the raw feedstock of review, not a conclusion.
+
+2. **Verification evidence.** When the daemon considers auto-publishing a semantic `fact`/`preference`/`decision` at the `active` tier, it must *verify* that the claim is actually supported by what happened. For daemon-origin candidates, that verification can consult the persisted run-memory record of the source run and check for exact containment or a conservative normalized-term match (`run_memory_supports_candidate_content`). The run's own recorded summary is the ground truth the daemon checks a claim against. If that evidence were injected into prompts, it would stop being independent evidence and start being just more model input.
+
+3. **Audit trail.** `run_summary` records give you a durable, queryable "what did runs actually produce" history that is separate from both the raw transcript and the polished semantic memory. When you need to answer "where did this belief come from," the run summary is a link in that chain.
+
+And there is a fourth, cross-cutting reason: `run_summary` content is **treated as sensitive by default**. A run summary can carry operational context that is perfectly fine to review deliberately but that you would never want silently pasted into an unrelated future prompt. So the design keeps it out of `learned_context`, keeps recovered-run search `session_only` by default, and requires an explicit opt-in to widen visibility. "Store it, make it reviewable and auditable, but do not let it steer the model on its own" is the entire point.
+
+Two more guardrails reinforce this:
+
+- **The public API cannot create `run_summary` candidates.** `run_summary` is daemon-owned; a call that tries to create one is rejected (`run_summary candidates are daemon-owned`). Only a daemon-owned workflow materializes them.
+- **Even after publication, a `run_summary` stays review material.** Publishing it does not promote it into prompt-visible standing memory. It just becomes a durably published, still-not-injected record.
+
+> **The mental model:** `recovered_memory` (Plane 2) is the small, ranked, injected postcard of "what happened recently." A `run_summary` learning (Plane 3) is the durable, never-injected, sensitive-by-default *dossier* of "what a run did," kept for review, verification, and audit. They both summarize runs. Only one of them ever reaches a prompt.
+
+### Scopes and how they resolve
+
+Every learning belongs to exactly one scope. When a session asks "what learnings can I see," the daemon resolves an **ordered** list of visible scopes, widest reach last:
+
+```text
+   SCOPE RESOLUTION for one session
+   (learning_scopes_for_session)
+
+   ┌────────────────────────────────────────────────────────────┐
+   │  1. SESSION            scope = session:<this session id>     │  narrowest
+   │     always present                                           │   |
+   ├────────────────────────────────────────────────────────────┤   |
+   │  2. PERSONA            scope = persona:<bound persona id>     │   |
+   │     only if a persona is bound to the session                │   |
+   ├────────────────────────────────────────────────────────────┤   |
+   │  3. PROJECT(S)         scope = project:<each linked project>  │   |
+   │     one entry per project the session is linked to           │   |
+   ├────────────────────────────────────────────────────────────┤   v
+   │  4. WORKSPACE          scope = workspace:default             │  widest
+   │     always present; id is ALWAYS `default`                   │
+   └────────────────────────────────────────────────────────────┘
+
+   A learning is visible to the session if its scope key matches
+   ANY row above. So a workspace:default fact is visible to every
+   session; a session:S fact is visible only inside session S.
+```
+
+Read the ladder as concentric rings of trust. A `session`-scoped preference is a private note for one conversation. A `persona`-scoped fact follows an identity across the sessions bound to it. A `project`-scoped decision is shared by everyone working that project. A `workspace`-scoped fact is daemon-wide truth. The workspace scope id is *always* `default` — the code validates this and rejects any other workspace id — so there is exactly one workspace ring, not a family of them.
+
+The direction of resolution (session → persona → project → workspace) is also the direction of increasing blast radius. That is why, as we will see, `workspace` scope is the *only* scope from which a procedure may be promoted into a shared skill: promotion is the highest-trust operation, so it demands the widest, most deliberately-managed scope.
+
+### The semantic learning pipeline
+
+Now the heart of Plane 3: how a candidate becomes prompt-visible durable memory. This is a pipeline with several gates, and each gate exists to keep the daemon — not arbitrary run output — in charge of long-term behavior.
+
+```text
+   SEMANTIC LEARNING PIPELINE
+   capture -> candidate -> rules -> judge -> verification -> publish -> inject
+
+   ┌─────────────┐
+   │  CAPTURE     │  A completed run is scanned for durable memory.
+   │             │  Two paths:
+   │             │   (a) heuristic: explicit `Preference:` / `Fact:` /
+   │             │       `Decision:` labels in the request  (conf 98,
+   │             │       SHORT-CIRCUITS the model entirely)
+   │             │   (b) model-backed structured extraction (fact /
+   │             │       preference / decision only), bounded by
+   │             │       max_candidates_per_run (default 2)
+   └──────┬──────┘
+          v
+   ┌─────────────┐
+   │  CANDIDATE   │  A LearningCandidateView is persisted. It records
+   │             │  its ORIGIN (api vs daemon), scope, kind, content,
+   │             │  confidence, source, evidence_refs, sensitivity.
+   │             │  Secret-looking content is rejected before storage.
+   └──────┬──────┘
+          v
+   ┌─────────────┐
+   │  RULES       │  Ordered publication rules are evaluated; FIRST match
+   │             │  wins, else publication.default_action. Rules match on
+   │             │  scope, kind, sensitivity, min_confidence, and the
+   │             │  trusted-input gates require_evidence / require_source_run
+   │             │  / require_source_session (daemon-origin candidates only).
+   │             │  Output: an ACTION in {manual_review, reject,
+   │             │  publish_provisional, publish_active}.
+   └──────┬──────┘
+          v
+   ┌─────────────┐
+   │  JUDGE       │  OPTIONAL model-backed review, runs AFTER rules.
+   │  (optional)  │  It is CLAMPED to the policy envelope: it can only pick
+   │             │  from actions the baseline already allowed, never widen.
+   │             │  In `enabled` mode a judge FAILURE fails closed to
+   │             │  manual_review. The verdict is retained for audit.
+   └──────┬──────┘
+          v
+   ┌─────────────┐
+   │ VERIFICATION │  Only when the surviving action is publish_active.
+   │  (gate)      │  The daemon looks for DAEMON-OWNED support for the
+   │             │  content (run-memory record, or referenced debug
+   │             │  artifact). No support -> DOWNGRADE to publish_provisional.
+   │             │  Same-subject/different-value conflicts -> escalate to
+   │             │  manual_review unless an explicit supersession is named.
+   └──────┬──────┘
+          v
+   ┌─────────────┐
+   │  PUBLISH     │  A LearningView is written with status + publish_tier +
+   │             │  verification_status + policy_decision + policy_actor.
+   │             │  provisional = durable but NOT prompt-visible;
+   │             │  active = eligible for retrieval.
+   └──────┬──────┘
+          v
+   ┌─────────────┐
+   │  INJECT      │  On a later input, eligible learnings for the session's
+   │             │  visible scopes are packed into ONE `learned_context`
+   │             │  section — but ONLY fact/preference/decision, only if
+   │             │  they pass every visibility gate (see next section).
+   └─────────────┘
+```
+
+Let us walk the stages, because each one has behavior that surprises people.
+
+### Capture: the heuristic short-circuit
+
+Capture has two automatic paths (both daemon-owned, both restart-safe). The interesting one is the **heuristic short-circuit**. Before any model is called, the extractor scans the run's request preview for explicit labels — `Preference:`, `Fact:`, `Decision:` — and if it finds them, it lifts the labeled text directly into candidates at confidence `98` and **returns immediately without calling the LLM at all** (`heuristic_candidates` runs before `build_extraction_prompt`).
+
+Why short-circuit? Because when a user literally writes `Preference: use metric units`, there is nothing for a model to infer — the user already declared the memory. Spending a model call (and its latency and cost and non-determinism) to "extract" what was stated verbatim would be wasteful and less reliable. The heuristic also trims trailing `reply exactly` / `respond exactly` / `answer exactly` instructions off the captured content, so a labeled memory does not accidentally absorb an unrelated formatting order. Only when there are no explicit labels does the daemon fall back to the model-backed structured extractor, which proposes at most `max_candidates_per_run` (default `2`) conservative `fact`/`preference`/`decision` candidates and drops anything secret-looking or duplicated.
+
+The model-backed extractor is deliberately conservative by prompt design: prefer the user's explicit statements over the assistant's wording, do not extract one-off task instructions or ephemeral outputs or procedures or secrets, and return an empty object when nothing should be remembered.
+
+### Candidate origin: `api` vs `daemon`
+
+Every candidate remembers where it came from (`LearningCandidateOrigin`): `api` (created through the public API or CLI) or `daemon` (materialized by a daemon-owned workflow). This is not cosmetic. Daemon automation only treats **provenance and evidence as trusted policy inputs for daemon-origin candidates.** An API caller can attach a `source` and `evidence_refs`, but the strict rule gates (`require_evidence`, `require_source_run`, `require_source_session`) will not *match* on those fields for an API-origin candidate. In other words: you cannot forge trust by hand-supplying evidence through the public API.
+
+### Rules: ordered, first-match-wins, fail-safe defaults
+
+Publication rules are an ordered list; the first rule that matches decides the action, and if nothing matches the daemon falls back to `publication.default_action` (which defaults to `manual_review`). Rules can filter on `scope_kind`, `scope_id`, `kind`, `sensitivity`, `min_confidence`, and the three trusted-input gates. Two controls keep automation safe by default:
+
+- `allow_api_origin_active_publication` defaults to `false`, so an API-origin candidate that a rule would auto-`publish_active` is **downgraded to `publish_provisional`** unless the operator opts in.
+- `quarantined_rule_names` lets an operator disable specific named rules without deleting them from the policy — a kill switch you can flip without losing configuration.
+
+### The judge: advisory, clamped, fail-closed
+
+The optional model-backed **judge** runs *after* deterministic rules, and it is the most misunderstood part of the pipeline, so be precise about what it can and cannot do:
+
+- It runs **only after** rules produce a non-`manual_review` action (there is nothing to second-guess about a `manual_review`).
+- It can **only choose from the actions the baseline already allowed** — `clamp_judge_action` collapses any over-reach back down. A judge that "wants" `publish_active` on top of a `publish_provisional` baseline gets clamped to `publish_provisional`. A judge that tries to escalate a `reject` baseline into a publish gets clamped to `manual_review`.
+- It **never writes learnings directly.**
+- In `enabled` mode, a judge **failure fails closed to `manual_review`** — an error never becomes a publish.
+- Its verdict (action + reason + timestamp) is retained in `automation_review.judge` for audit.
+
+The judge is an advisor inside a bounded daemon workflow, not an authority that can invent new capabilities. It can only ever make automation *more* conservative than the rules already permit.
+
+### Automation modes: `manual_only`, `shadow`, `enabled`
+
+The whole pipeline runs under one of three modes (`LearningAutomationMode`), and the default is the cautious middle one:
+
+- `manual_only` — the worker does not review candidates automatically at all.
+- `shadow` — **the default.** The worker computes and records its review (including the judge verdict) but leaves the candidate **pending**. Nothing is published, nothing is rejected; you get the daemon's opinion without the daemon acting on it. This is how you build confidence in a rule set before you let it act.
+- `enabled` — the worker may reject, escalate to manual review, or publish automatically, subject to every gate above.
+
+Shadow mode is the feature that lets operators run automation "with the safety on." You watch what it *would have done* across real traffic, tune the rules, and only flip to `enabled` when the shadow decisions look right.
+
+### Verification and the active/provisional split
+
+When rules-plus-judge still land on `publish_active`, one more gate fires. Active publication is guarded because `active` is the tier that actually reaches prompts. The constraints:
+
+- `publication.default_action` cannot be `publish_active` (you must write an explicit rule).
+- A `publish_active` rule must declare an explicit `kind`.
+- `procedure` learnings can never be auto-published at the active tier.
+- Semantic content that looks like secret material is rejected before persistence (redaction markers, provider-style secret patterns, and assignment shapes like `api-key:`, `x-api-key:`, `clientSecret:`, `secret_token=`, `personal access token=`).
+- Same-subject/different-value conflicts (e.g. "Project codename is Atlas" vs "Project codename is Borealis" in the same scope and kind) do not silently overwrite. Automatic active publication **escalates to manual review**, and manual publication returns a conflict unless the request explicitly names the record it `supersedes`.
+
+Then the **verification** itself: the daemon looks for daemon-owned support for the candidate content. For daemon-origin `fact`/`preference`/`decision` candidates it can use the persisted run-memory record of the source run (exact containment or normalized-term match); otherwise it checks the source-run debug artifacts referenced by the candidate's evidence. If verification fails, the result is **downgraded to `publish_provisional`** — durable, but not prompt-visible. That downgrade is the safety valve: an unverifiable claim can still be kept, but it is not allowed to steer the model.
+
+This is exactly where `run_summary` and recovered run memory pay off as *verification evidence*. The daemon does not take the model's word that a fact is true; it checks the fact against the durable record of what the run actually did.
+
+### The prompt-visibility gates (why an active learning still might not show up)
+
+Being `active` is necessary but not sufficient for a learning to appear in `learned_context`. Retrieval applies a full stack of gates. A learning is injected only if **all** of these hold:
+
+- kind is `fact`, `preference`, or `decision` (never `run_summary` or `procedure`);
+- `sensitivity` is not `sensitive` (sensitive learnings stay out of both prompts and memory-search);
+- it is not revoked and not superseded;
+- it is not expired;
+- `publish_tier` is `active` (not `provisional`);
+- `verification_status` is not `failed`;
+- if `policy_decision=automatic`, then `verification_status` must be `verified`;
+- `policy_decision=escalated` is excluded;
+- manually-published active records remain prompt-visible without the automatic-only `verified` gate.
+
+There is one more nuance in *how* retrieval scores. On input, the daemon builds one `learned_context` bundle from the session's visible scopes. It scores learning content against the pending input. When at least one prompt-eligible learning scores above zero, zero-score learnings are omitted (you get the relevant ones, not a memory dump). When *nothing* scores, an ordinary unrelated input receives **no** `learned_context` at all — but an explicit request like "use durable memory" keeps the recency-and-scope fallback so an operator can still ask to browse remembered context. Learnings omitted by final prompt-budget packing are counted in `/v1/status.session_memory.metrics.prompt_limit_omitted_total`.
+
+The separation of concerns here is the whole point: **durability, automation, and prompt visibility are three independent switches.** A record can be durable but provisional; active but sensitive (so search-hidden and prompt-hidden); automatic but unverified (so held back). Kheish keeps these orthogonal on purpose.
+
+### Procedures and the promotion to skills
+
+The fifth kind, `procedure`, is durable "how to do something" state. It is never injected as prompt memory. Instead, a reviewed `procedure` learning can — as a **separate, explicit step** — be promoted into a daemon-owned **reusable skill**. A stored procedure does not become a skill automatically; promotion is its own operation.
+
+The production promotion path is intentionally narrow:
+
+- only `procedure` learnings can be promoted;
+- the source learning must be `active`, at `publish_tier=active`, and at `workspace` scope;
+- promoted procedure skills must use the `fork` execution context;
+- promoted procedure skills must use the `verification` child-agent profile.
+
+Session-scoped procedures are *not* promoted into the shared daemon skill catalog. Only workspace-scoped, deliberately-managed procedures earn a place in the global catalog — the same "highest trust demands the widest, most-governed scope" principle from scope resolution.
+
+Once promoted, a skill has its own **rollout ladder**, which is really a small governance state machine bound to evidence:
+
+```text
+   PROCEDURAL SKILL ROLLOUT LADDER (evidence-bound)
+
+   ┌────────┐   verification run completes, output   ┌──────────┐
+   │ DRAFT  │   matches expected marker (optionally   │ VERIFIED │
+   │        │──►guarded by definition_fingerprint) ──►│          │
+   └────────┘   recorded via rollout-result           └────┬─────┘
+   stored, not                                              │ operator records
+   yet runnable                                             │ canary evidence
+                                                            v
+                              hidden from the normal   ┌──────────┐
+                              catalog while canary      │  CANARY  │
+                              evidence is gathered      │          │
+                                                        └────┬─────┘
+                                 >=1 successful canary,      │
+                                 0 canary failures for the   │
+                                 current definition          v
+                                 fingerprint             ┌──────────┐
+                                                         │  ACTIVE  │  mounted in
+                                                         │          │  /v1/skills,
+                                                         └────┬─────┘  session skills,
+                                                              │        list_skills,
+                                          revoke / source     │        use_skill
+                                          learning revoked    v
+                                                         ┌──────────┐
+                                                         │ REVOKED  │  removed from
+                                                         │          │  the catalog
+                                                         └──────────┘
+
+   rollback: restores the latest historical ACTIVE snapshot and remounts it,
+   but REFUSES if the source procedure learning is no longer active+active-tier.
+```
+
+The ladder is strict about evidence and immutability:
+
+- **Only `active` promoted skills are mounted** into `/v1/skills`, `/v1/sessions/{id}/skills`, runtime `list_skills`, and `use_skill` discovery. Draft, verified, canary, and revoked skills are invisible to normal skill discovery.
+- `verified` requires a completed daemon run recorded through `rollout-result` whose output contains the expected marker. The caller can pin the current `definition_fingerprint` as a guard, and the accepted evidence retains that fingerprint in its audit note.
+- `active` requires at least one successful canary rollout and **zero** canary failures for the current definition fingerprint.
+- **Active skills are immutable.** Prompt-visible definition or runtime changes on an active skill are rejected; to change one you revoke and re-promote (creating a fresh draft) or use a future versioned rollout channel.
+- Operator-supplied revoke/rollback reasons are rejected if they look like secret material — the same secret classifier that guards learning content.
+- The durable promoted-skill record is the authority. On boot, startup repair and `use_skill` reject or rewrite a loaded catalog definition that no longer matches the active record, even if the file still lives under the daemon-owned skill root. Kheish refuses to silently rebind a promoted record to a foreign skill root.
+
+And the lifecycle is linked back to the learning plane: **revoking or superseding a promoted source learning also revokes the linked promoted skill** (with rollback safeguards so a failed revoke restores the prior active skill). The promoted-skill record stays durable for audit even after revocation; only `active` skills stay mounted.
+
+## Runtime policies: the two dials operators actually turn
+
+Two of the three planes are governed by runtime policies you can read and replace live. It is worth putting them side by side because operators confuse them constantly.
+
+| Policy | Governs | Read / write | Key knobs |
+| --- | --- | --- | --- |
+| Run-memory policy | Plane 2 (recovered run memory) | `GET`/`POST /v1/runtime/run-memory-policy` | `enabled`, `retention_ms`, `max_tracked_per_session`, `max_prompt_entries`, `redact_pii`, `search_visibility` |
+| Learning policy | Plane 3 (semantic + procedural) | `GET`/`POST /v1/runtime/learning-policy` | `mode` (manual_only/shadow/enabled), `capture` (run_summary + semantic), `publication` (rules, default_action, quarantine, api-origin gate), `judge` (enabled, model, timeout) |
+
+A useful way to remember the split: the **run-memory policy** is about *how much recent episodic context to recover and how aggressively to scrub and prune it.* The **learning policy** is about *how eager the daemon is to turn runs into durable, governed knowledge, and how much it trusts itself to publish without a human.* The first is a recovery dial; the second is an autonomy dial.
+
+Neither policy can be edited by a run. Both are operator surfaces, which is the whole point — memory governance lives with the operator, not with the model.
+
+## The Kheish Air Memory page
+
+Everything above is inspectable from the API, but most operators live in the **Kheish Air** console, whose **Memory** page (subtitle: *"What your agents learn, remember, and are allowed to keep."*) is a single pane over the learning plane plus a live governance dial. It opens with four stat cards — **Awaiting review**, **Active learnings**, **Facts**, **Preferences & decisions** — and a header status line showing the current automation posture (a colored dot plus `automation {mode} · capture on/off · judge on`). A **Policy** button opens the learning-policy editor.
+
+The page itself is four tabs — **Review**, **Learnings**, **Skills**, **Search** — and a fifth surface, the per-session memory card, lives one click away on each session's detail page. Together they cover all three planes.
+
+### 1. Review (candidates + judge reasoning)
+
+The **Review** tab is the candidate queue (`GET /v1/learning-candidates`), showing only candidates in `pending` or `escalated` state. Each row carries a kind chip (Fact / Preference / Decision / Procedure / Run summary), a status badge, a scope chip, `confidence` and relative time, and a link to the source run. Crucially, it renders the recorded **automation review**: when a judge ran, an amber `Judge: {reason}` callout shows the clamped judge action and its rationale; otherwise it falls back to the rule-level reason. Operators **Publish** (`POST /v1/learning-candidates/{id}/publish` with the chosen `publish_tier`) or **Reject** (`.../reject`) inline. Filter pills (All / fact / preference / decision / run summary) and a search box narrow the queue.
+
+The judge reasoning is exactly what makes `shadow` mode worth running: instead of trusting a policy in the abstract, you read, candidate by candidate, *why* the daemon leaned toward publish, provisional, reject, or escalate — and you tune the rules until those reasons look right before you flip to `enabled`.
+
+### 2. Learnings (governance)
+
+The **Learnings** tab lists **published learnings** (`GET /v1/learnings`) with status filter pills (active / provisional / revoked / superseded / all). Each row shows a kind chip, the lifecycle status badge, an extra `provisional` badge when `publish_tier=provisional`, a verification badge (verified / verification failed), a scope chip, and whether it was `auto-published` or `published manually` (from `policy_decision`). From here operators **Revoke** (two-step confirm → `POST /v1/learnings/{id}/revoke`) and, for an eligible procedure, **Promote to skill** — which is enabled only for a `procedure` that is `active`, at `publish_tier=active`, and at `workspace` scope (the promotion dialog posts to `/v1/learnings/{id}/promote-skill`). Because revoke and supersede cascade into any linked promoted skill, this tab is the single control point for "make the system stop believing this," across both semantic memory and any procedural skill that grew out of it.
+
+### 3. Skills (rollout checks)
+
+The **Skills** tab surfaces promoted procedural skills (`GET /v1/learning-skills`) and renders each one's position on a **draft → verified → canary → active** stepper (a revoked skill shows a single red badge instead). Each card shows the `skill_name`, the stepper, a verification badge, the source learning id, the successful-run and distinct-session counts, the version, and the last few `lifecycle_events`. The rollout controls are evidence-bound: **Record verification/canary check** opens a dialog asking for a completed **Run id** and an **Expected output marker** the run's output must contain (referencing the current `definition_fingerprint`), then posts to `/v1/learning-skills/{name}/rollout-result`; **Revoke** and, for a revoked skill, **Rollback** are also here. Only `active` promoted skills appear in the general runtime catalog (`GET /v1/skills`, which the session capability picker and Library consume) — the Skills tab is where the *not-yet-active* promoted ones are visible and where you drive them up (or roll them back down) the ladder.
+
+> Note the two distinct skill surfaces: **`/v1/learning-skills`** is the promoted-procedural-skill governance surface shown on this tab; **`/v1/skills`** is the general runtime skill catalog (catalog skills plus any *active* promoted skills). Keep them separate in your head — the Skills tab governs promotion, not the whole catalog.
+
+### 4. Search (hits across planes)
+
+The **Search** tab picks a session and queries `GET /v1/sessions/{session_id}/memory-search` (an empty query returns a recent browse). Results are ranked **hits** tagged by a colored kind pill — **learning** (blue), **recovered run** (purple), **skill** (green) — each with a title, a scope chip, an optional green **prompt-eligible** badge, a `score · time`, and an excerpt. It respects every visibility boundary: sensitive learnings stay out, and recovered-run hits obey `search_visibility` (`session_only` by default, `learning_scopes` only if the operator opted in). Search is browse-and-audit, not a second injection path — what you can find here is not automatically what the model gets, which is exactly why a `prompt-eligible` badge is worth showing.
+
+### 5. The session memory card (on the session page)
+
+On each session's detail page, a **Memory** card renders the effective, per-session projection from `GET /v1/sessions/{session_id}/memory-context`, summarized as *"N learnings · M recovered runs eligible for the next prompt."* It shows two columns — **Durable learnings** (from `learned_context`, the injectable `fact`/`preference`/`decision` entries) and **Recovered runs** (from `recovered_memory`, the ranked episodic slice with a status dot and a preview) — and links back to the Memory page. This is the single best answer to *"what is this session actually eligible to receive before the runtime packs one specific prompt?"* A sibling **Capabilities** card on the same page shows the session's `capability_scope` and `effective_capability_scope` (persona ∩ session) — the visibility boundary that decides which skills the session can even see. When someone asks "why did the assistant remember X" or "why didn't it," these two cards are where you look first.
+
+### What the console does and does not govern
+
+One honest gap worth calling out: the Air **Policy** dialog edits the **learning policy** (`GET`/`POST /v1/runtime/learning-policy`) — automation mode, semantic capture (with a max-candidates-per-run selector), run-summary capture, and the model judge, with a footer noting how many publication rules are active and the default action (rules themselves are managed through the API). The **run-memory policy** (`GET`/`POST /v1/runtime/run-memory-policy`) that governs Plane 2 is a **daemon API surface**, not currently exposed in the Air Memory dialog. So if you need to change recovered-memory retention, prompt entries, redaction, or search visibility, reach for the daemon endpoint directly.
+
+## Operator playbooks
+
+A few concrete recipes tie the surfaces together.
+
+### "I want the assistant to remember a stable fact"
+
+The clean path is a scoped learning, not a note in the transcript. Create a candidate (or state it in a run with an explicit `Fact:`/`Preference:`/`Decision:` label so the heuristic capture picks it up), review it in the queue, and publish it `active` at the scope that matches its blast radius: `session` for a one-conversation note, `persona` to follow an identity, `project` to share it with a team's work, `workspace` for daemon-wide truth. Confirm it shows up by opening the session memory card and looking at `learned_context`.
+
+### "The assistant keeps recalling something wrong"
+
+Open learnings governance, find the record, and either **revoke** it (it is simply wrong) or **supersede** it with the corrected value (naming the old record in `supersedes`). Remember that same-subject/different-value automatic publication already escalates rather than overwriting, so a wrong belief that came from automation was, at minimum, surfaced for review. If the wrong belief is a promoted skill's behavior, revoking the source learning cascades to the skill.
+
+### "I want automation to help, but I do not trust it yet"
+
+Run the learning policy in `shadow`. Let real traffic flow, then read the review queue: for each candidate, look at the matched rule and the judge reason. Tune the rules (tighten `min_confidence`, add `require_source_run`/`require_evidence` gates, quarantine a noisy rule by name) until the shadow decisions look right. Only then set `mode=enabled`. Keep `allow_api_origin_active_publication=false` unless you have a specific, audited reason to trust API-origin active publication.
+
+### "A recovered summary is leaking cross-session context"
+
+Check `search_visibility` in the run-memory policy. If it is `learning_scopes`, a session can search recovered runs beyond its own; set it back to `session_only`. Remember that injection is *already* session-only regardless of this setting — this dial only affects the *search* surface. If specific PII is showing up, verify `redact_pii=true` and check `run_memory.metrics.redacted_fields_total` to confirm scrubbing is firing.
+
+### "My prompts feel bloated / memory is crowding out the task"
+
+Recovered memory is bounded by `max_prompt_entries` (default 3) and by the runtime budget; learnings are scored and only relevant ones are injected. If you still want less, lower `max_prompt_entries`, tighten learning scopes, or mark noisy learnings `sensitive` (which removes them from both prompts and search). Watch the two omission counters (`run_memory.metrics.prompt_limit_omitted_total` and `session_memory.metrics.prompt_limit_omitted_total`) to see the budget actually shedding entries.
+
+### "I promoted a procedure into a skill and it is not showing up"
+
+Only `active` promoted skills mount into the catalog. Open the skills tab and check the rollout state. A skill sitting in `draft`/`verified`/`canary` needs evidence: a verification `rollout-result` whose output contains the expected marker to reach `verified`, then a successful canary (and zero canary failures for the current fingerprint) to reach `active`. If you changed the definition of an active skill and it was rejected, that is by design — revoke and re-promote to get a fresh draft.
+
+## Worked scenario: a preference from statement to recall
+
+To make the planes concrete, follow one small preference through all three.
+
+1. **A user states a preference.** In a session, the user writes: `Preference: always report sizes in gigabytes, not gibibytes.` The run completes.
+2. **Plane 1 (journal)** records the input, the assistant's reply, and the outcome as canonical events. It knows the message happened; it has not distilled a preference.
+3. **Plane 2 (recovered run memory)** builds a ≤480-char record for this terminal run — a scrubbed `request_preview`, `outcome_preview`, status, capped `summary` — and tracks it in the session's index. On the *next* input in this session, if relevant, a ranked slice including this episode may be injected as `recovered_memory`, framed as "here is what happened recently."
+4. **Plane 3 capture** scans the completed run, hits the explicit `Preference:` label, and short-circuits the model to produce a `preference` candidate at confidence 98, daemon-origin, session-scoped, with evidence pointing at this run.
+5. **Rules + judge + verification.** Under the learning policy, the candidate is evaluated. In `shadow` you would see the proposed action and judge reason in the review queue and publish by hand; in `enabled`, if a rule permits `publish_active` for `kind=preference`, the daemon verifies the content against the run-memory record (the label text is contained in the request preview → supported) and publishes it `active`, `verified`, `policy_decision=automatic`.
+6. **Plane 3 injection.** On a later input in this session (or any session sharing the scope), retrieval scores learnings against the new input. When the user asks about disk usage, the `preference` scores, passes every visibility gate, and lands in `learned_context`: the assistant reports gigabytes.
+7. **Governance.** Months later the team standardizes on gibibytes. An operator opens learnings governance and **supersedes** the old preference with the new value. Future prompts see the new one; the old one is retained, superseded, for audit.
+
+Notice what each plane contributed: the journal proved the conversation happened; recovered run memory carried the recent episode across the very next turn; the learning plane turned a one-time statement into durable, governed, scoped, verifiable recall — and let an operator correct it later without editing history.
+
+## Frequently asked questions
+
+**Is recovered run memory the same as a `run_summary` learning?**
+No, and this is the most common confusion. Both summarize runs, but recovered run memory (Plane 2) is a bounded, ranked, **injected** episodic postcard, while a `run_summary` learning (Plane 3) is a durable, **never-injected**, sensitive-by-default dossier kept for review, verification, and audit. Different stores, different lifetimes, different privacy posture, opposite answers to "does it reach a prompt."
+
+**If `run_summary` and `procedure` are never injected, are they useless?**
+No. `run_summary` is review material, verification evidence, and audit trail. `procedure` is durable "how to do it" state that can be *promoted* into a governed, executable skill. Neither belongs in free-form prompt memory, which is exactly why they are excluded from it.
+
+**Why does the assistant sometimes not recall something I know is stored?**
+Stored is not injected. Check the visibility gates: is the learning `active` and `active`-tier, non-sensitive, non-revoked, non-superseded, non-expired, verified-if-automatic? Is the kind prompt-eligible at all? Did it *score* against the input, or was it a zero-score omission? Did the prompt budget drop it? The session memory card (`memory-context`) shows eligibility; the omission counters show budget drops.
+
+**Can a run write to long-term memory on its own?**
+Not directly. A run can *produce* candidates (via capture) and *record* episodes (recovered memory), but publishing durable, prompt-visible learnings goes through rules, an optional clamped judge, verification, and — outside `enabled` mode — an operator. The daemon, not the run, owns long-term behavior.
+
+**What does "sensitive by default" mean for run summaries?**
+It means the design assumes a run summary may carry operational context you would not want silently reused. So `run_summary` stays out of `learned_context`, recovered-run search defaults to `session_only`, and widening visibility is an explicit operator opt-in. You review and audit them deliberately; the model does not get them for free.
+
+**Does redacting a phone number from run memory also remove it from the transcript?**
+No. Redaction protects the *derived* recovered-memory store and anything re-injected or searched. The canonical journal (and full debug artifacts, per debug policy) can still contain the original text. Run-memory redaction is not a global transcript scrubber.
+
+**What is the difference between `provisional` and `active`?**
+`active` learnings (at `publish_tier=active`) are eligible for prompt retrieval; `provisional` learnings are durable but deliberately kept out of prompts. Failed or unverifiable active candidates are *downgraded* to provisional — kept, but not allowed to steer the model.
+
+**Which policy do I change to make memory more/less aggressive?**
+Recovery aggressiveness (how much recent episodic context, how much scrubbing/pruning): run-memory policy. Learning aggressiveness (how eagerly runs become durable knowledge, and how much the daemon may publish without a human): learning policy, mainly its `mode` and `publication` rules.
+
+**Where do I look first when memory behaves unexpectedly?**
+`GET /v1/sessions/{session_id}/memory-context` (the session memory card in Air). It shows the effective capability scope, visible learning scopes, `learned_context`, `recovered_memory`, and `visible_skills` for that one session — eligibility across all three planes in one view.
+
+## Where to go next
+
+- [Agents, personas, scopes, and skills](./agents-personas-skills) — who is allowed to *see* which learnings and skills, via personas and capability/credential scopes.
+- [Sessions and runs](./sessions-and-runs) — how one conversation and its runs are structured, which is the substrate all three planes derive from.
+- [Tools and MCP](../automation/tools-and-mcp) — how skills and tools reach a running agent.
+- [The security model](../operations/security) — the operator posture that memory governance sits inside.
+- [Architecture](./architecture) — how the journal plane is restored on restart.

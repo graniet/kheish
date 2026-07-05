@@ -1,78 +1,569 @@
 ---
-title: "Kheish daemon"
+title: Why Kheish
+description: Kheish runs your AI agents as a durable local daemon that owns state, gates risky actions behind human approval, and keeps your keys on your machine. Here is what that changes, and how it compares to the alternatives.
 ---
 
-Kheish runs AI agents as a daemon rather than embedding them inside a single process. It is designed for persistent sessions, detached runs, approval-gated actions, tool execution, and multi-agent workflows over a stable HTTP/SSE control plane.
+# Why Kheish
 
-The daemon is the center of the ecosystem:
+Most agent tools treat the model call as the product. You send a prompt, you get tokens back, and everything around that — memory, tools, approvals, retries, scheduling — is left for you to bolt on. It works for a demo. It falls apart the first time an agent needs to remember something from yesterday, wait for a human to say yes, or keep running after you close your laptop.
 
-- the daemon owns the runtime and durable state
-- the daemon includes built-in connector support for HTTP, Slack, and Telegram ingress
-- the Python SDK talks to the daemon from a separate package
-- the separate `kheish-connectors` repo adds external sidecar connectors around the same daemon
-- capture pushes observations into daemon-owned sources from a separate host-local repo
+Kheish takes the opposite stance. It runs your agents as a **daemon**: a long-lived local process that owns the state, executes the runs, holds the credentials, and exposes one stable control plane that everything else talks to. The model is just one component the daemon drives. The durable part — the part that actually makes an agent useful past the demo — lives in the daemon and survives everything: client disconnects, restarts, crashes, and you walking away.
 
-## Start in this order
+This page explains what that buys you, why it is genuinely different from the alternatives, and where Kheish is the right tool versus where it is not. If you just want to get an agent running, jump straight to the [Quickstart](./welcome/quickstart) — you will have one talking to you in about five minutes. Come back here when you want to understand the shape of what you built.
 
-1. Read [Start Here](introduction/start-here) to understand what runs where and which path to take first.
-2. Run [Quickstart](introduction/quickstart) for one working daemon, one session, and one completed run.
-3. Then choose what you need next:
-   - [Running the daemon](operators/running-the-daemon), [Docker and containers](operators/docker-and-containers), and [Security and auth](operators/security-and-auth) for real operator guidance
-   - [Use Kheish from Python](introduction/python-sdk-quickstart) for application code
-   - [Send one webhook event into Kheish](integrations/webhook-quickstart) for the first external ingress path
-   - [Capture one observation](integrations/capture-quickstart) later, when you want host-local observation ingestion
+## The one idea
 
-## What Kheish gives you
+If you remember one thing about Kheish, remember this:
 
-- Persistent sessions with journaled state, checkpoints, and restart recovery
-- Detached runs that can pause on approvals or structured user questions and resume later
-- Daemon-owned assets and multimodal inputs for text, documents, images, and retained audio
-- Daemon-owned observation sources and materialized capture flows for screenshots, webcam frames, microphone segments, and other external producers
-- Daemon-managed personas that bind immutable persona snapshots into sessions
-- Immutable Playbooks and Flow projections for evidence-backed procedures over normal runs
-- Durable public channels with shared message logs, reactions, and autonomous thread turns over member sessions
-- Daemon-owned projects with durable membership, linked channels, and project-task execution over assigned sessions
-- Multi-agent execution with sidechains, tasks, schedules, mailboxes, and background shell tasks
-- Extensible runtime primitives for providers, tools, hooks, skills, MCP, connectors, and output delivery
-- Operator controls for runtime reconfiguration, debug capture, and control-plane authentication
+**The daemon owns state. Everything else talks to it.**
 
-## Learn the model
+That single decision is where every other property comes from. Because the daemon owns state, sessions outlive the client that created them. Because the daemon owns execution, a run keeps going when you close the tab. Because the daemon owns credentials, your keys never travel to a client or a cloud. Because there is exactly one authority, five different clients — the web console, a Python script, a Slack bot, a cron schedule, a webhook — can all touch the same agent without stepping on each other.
 
-After the first successful run, continue with:
+```text
+                        ┌───────────────────────────────────────┐
+                        │            kheish-daemon               │
+                        │        (the single source of truth)    │
+                        │                                        │
+   Kheish Air ─────────▶│  • sessions (durable, journaled)       │
+   (web console)        │  • runs (execution + lifecycle)        │
+                        │  • approvals & questions (suspend/resume)
+   Python / Web SDK ───▶│  • personas, memory, learnings         │◀── model providers
+                        │  • routes + auth_ref (credential vault) │    (OpenAI, Anthropic,
+   CLI ────────────────▶│  • schedules, tasks, agents            │     Google, xAI,
+                        │  • assets, channels, projects          │     OpenRouter)
+   Webhook / Slack ────▶│  • connectors (ingress + egress)       │
+   / Telegram           │                                        │◀── MCP tool servers
+                        └───────────────────────────────────────┘
+                                        │
+                                        ▼
+                        state root on your disk (encrypted secrets,
+                        append-only journals, checkpoints, artifacts)
+```
 
-1. [Overview](introduction/overview) for the product model.
-2. [Sessions and runs](concepts/sessions-and-runs) for the execution backbone.
-3. [Playbooks and flows](concepts/playbooks-and-flows) before adding evidence-backed procedures over runs.
-4. [Approvals and questions](concepts/approvals-and-questions) for blocked and resumable work.
-5. [Providers and routing](runtime/providers-and-routing) for `route_id`, `auth_ref`, selector grammar, and route pinning.
-6. [Assets and multimodal input](concepts/assets-and-multimodal-input) before integrating documents or images.
-7. [Capture and observations](concepts/capture-and-observations) before integrating host-local capture or durable external media ingestion.
-8. [Channels and public conversations](concepts/channels-and-public-conversations) before modeling shared discussion among humans and agent-backed sessions.
-9. [Projects and project tasks](concepts/projects-and-project-tasks) before modeling durable coordination across multiple sessions and channels.
-10. [Connectors and reply targets](concepts/connectors-and-reply-targets) before wiring Telegram, Slack, HTTP, or durable session reply defaults.
-11. [Personas](concepts/personas) before binding long-lived identity instructions into sessions.
-12. [Security and auth](operators/security-and-auth) before exposing the control plane beyond localhost.
-13. [Running the daemon](operators/running-the-daemon) before operating a real instance.
+Every arrow into the daemon is a client. None of them holds the truth. They ask the daemon to do things and observe what happens over HTTP and Server-Sent Events. When you understand that picture, the rest of Kheish stops being a pile of features and becomes one coherent system.
 
-## Minimal first-run CLI surface
+## The problem Kheish is actually solving
 
-For the first daemon success, the smallest useful CLI set is:
+Let us be concrete about the gap, because it is easy to miss until it bites you.
 
-- `serve`
-- `runtime get`
-- `sessions create`
-- `sessions input --wait`
+You want an agent that answers support tickets for a small SaaS called `acme-support`. On day one you write a script: read the ticket, call the model, post a reply. Beautiful. Then reality arrives:
 
-If a run pauses instead of completing, then inspect:
+- A ticket needs a refund. You do **not** want the model issuing refunds on its own. You need a human to approve that one specific action — but only that one — and then let the agent continue.
+- Halfway through drafting a reply the model needs a fact it does not have: which plan is this customer on? It should be able to **pause, ask you, and resume** where it left off, not start over.
+- Your script crashed at 2am because the provider hiccuped. The half-finished work is gone. Tomorrow the agent has no idea it ever saw that ticket.
+- You want the same agent reachable from a Slack command, from a nightly digest job, and from a teammate's browser — all sharing the same context, not three disconnected copies.
+- Your provider API key is sitting in an environment variable on a laptop, a CI runner, and a Docker container. Rotating it means editing all three.
 
-- `approvals list`
-- `tasks list`
-- `runs get`
+None of these are model problems. They are **operational** problems. They are about state, governance, resumability, sharing, and secrets. A better prompt does not fix any of them. This is the exact territory Kheish is built for: it is not trying to be a smarter model, it is trying to be the durable, governable, secure *runtime* around whatever model you choose.
 
-## Audience
+## Before and after: what "durable" means in practice
 
-This documentation is written for:
+Here is the same support task, drawn twice. First the way a plain API-call script handles it, then the way Kheish handles it.
 
-- platform and infrastructure teams operating Kheish as a daemonized service
-- application teams integrating sessions, runs, approvals, or connectors into other systems
-- contributors working on the runtime, daemon, or surrounding integrations
+```text
+  PLAIN API-CALL SCRIPT (stateless)
+  ─────────────────────────────────
+  request ─▶ [ your process ] ─▶ model ─▶ tokens ─▶ response ─▶ EXIT
+                   │
+                   └── all context lives in RAM. Process ends → gone.
+                       Needs a human "yes"? No mechanism. You hard-code
+                       a pause or you skip the check. Crash mid-way? The
+                       work never existed. Second client? Different process,
+                       different memory, no shared truth.
+
+
+  KHEISH (daemon owns state)
+  ──────────────────────────
+  input ─▶ [ daemon: session "acme-support" ]
+                   │
+                   ├─ run starts, journaled to disk as it goes
+                   ├─ hits a refund tool → SUSPENDS, records a pending approval
+                   │        (you can close everything here; nothing is lost)
+                   ├─ you approve from ANY client (console, CLI, API)
+                   ├─ run RESUMES from the suspension point
+                   ├─ needs a fact → asks a structured question → suspends → you answer
+                   └─ completes → output stored, optionally routed to Slack
+
+           Restart the daemon at any point above: the session, the run
+           state, the pending approval, and the answer all come back.
+```
+
+The difference is not cosmetic. In the first model, "wait for a human" and "survive a restart" and "share across clients" are features you would have to invent, and they are genuinely hard to get right. In the second, they are the ground floor. You do not build them; you use them.
+
+## The four things that actually make Kheish different
+
+Plenty of tools can call a model. What distinguishes Kheish is a small set of properties that are hard to add after the fact and easy to take for granted once you have them.
+
+### 1. Durable state that outlives everything
+
+A Kheish **session** is a durable unit of work backed by an append-only journal and optional checkpoints. Messages, tool activity, approvals, permission audits, and outputs are written as they happen. A **run** is one concrete execution inside a session. Sessions and runs are daemon-owned objects with real lifecycles — not variables in your process.
+
+That means:
+
+- You can start a run, close your laptop, and read the result from your phone.
+- A daemon restart recovers in-flight sessions and their pending approvals instead of losing them.
+- Two clients looking at the same session see the same history, because there is only one history.
+
+Read [Sessions and runs](./concepts/sessions-and-runs) for the execution model and [Memory](./concepts/memory) for how durable knowledge accumulates across runs.
+
+### 2. Human-in-the-loop governance that is built in, not bolted on
+
+Kheish has two first-class ways for a run to stop and wait for a human without losing its place:
+
+- **Approvals** — the runtime is about to do something that a policy says needs a human yes/no (run this shell command, call this tool, take this external action). It suspends, records a pending approval, and waits.
+- **User questions** — the agent needs structured information from a person to continue. It suspends, records the question, and waits for a typed answer.
+
+The key property is *resumability*. The run does not fail and restart; it parks at the exact suspension point and picks up when the human responds — possibly a different human, possibly hours later, possibly through a different client than the one that started it. This is what makes it safe to give an agent real capabilities: you decide which actions are gated, and the gate is a durable, auditable stop rather than a fragile in-memory callback.
+
+See [Agents, personas, and skills](./concepts/agents-personas-skills) for how identity and capability shape what an agent is even allowed to attempt.
+
+### 3. Local-first security: your keys stay on your machine
+
+This one is easy to undervalue until you think about it. With Kheish, the daemon runs on your machine (or your server), and **your provider keys live in the daemon's encrypted store, indexed by a stable reference**. Clients never see raw credentials. When you run `kheish-daemon up`, the daemon even generates and persists its own encryption master key on first launch — you never had to think about it.
+
+The indirection matters operationally. Runs select a named **route** (`route_id`), not a raw key. Routes resolve credentials through stable **auth_ref** slots owned by the daemon. So:
+
+- You rotate one secret slot, and every route and every client that uses it is updated at once — nothing to redeploy.
+- A leaked client, script, or log never contains a usable key, because clients only ever hold route names.
+- The web console, the SDK, and a webhook can all drive the same agent without any of them being trusted with the credential.
+
+```text
+   run  ──selects──▶  route "openai"  ──resolves──▶  auth_ref "openai.prod"
+                          │                                │
+                          │                                ▼
+                    (a name a client                encrypted secret slot
+                     is allowed to see)             (daemon-only, rotatable)
+                          │
+                          └─ change the key once here ▲, and every run,
+                             every client, every schedule follows. No client
+                             edit, no redeploy, no key in a log.
+```
+
+More in [Security](./operations/security).
+
+### 4. One control plane, many clients
+
+Because the daemon is the authority, the surface you integrate against is one stable HTTP + SSE contract. A CLI, the Kheish Air web console, a Python script, a webhook receiver, a Slack bot, and a nightly schedule can all target the same daemon and the same long-lived session. None of them is special; none of them owns the state. You can start something in the console and finish it from a script, or let a schedule kick off work that a human later approves in a browser.
+
+This is the difference between "an agent library I imported" and "an agent service my whole system talks to." The library dies with your process. The service is always there.
+
+## How Kheish compares to the alternatives
+
+No tool is right for everything, and Kheish is genuinely the wrong choice for some jobs. Here is an honest walk through the four categories of thing people reach for, what each is good at, and where Kheish fits differently. The goal is to help you choose correctly, not to win an argument.
+
+### Versus raw LLM API calls
+
+Calling a provider API directly (OpenAI, Anthropic, Google, and so on) from your own code is the simplest possible thing, and for a lot of tasks it is exactly right. If you need to classify a batch of text, summarize a document, or answer a one-shot question with no memory and no tools, do not reach for a runtime — just call the API.
+
+The moment you need *any* of durable memory, tool execution with permissions, human approval, resumable pauses, scheduling, or multi-client sharing, you are no longer writing "an API call." You are writing a runtime — you just have not admitted it yet. And a runtime is a large, subtle thing to get right: journaling, crash recovery, suspension and resume, credential indirection, audit trails, backpressure.
+
+| Concern | Raw API calls | Kheish |
+| --- | --- | --- |
+| One-shot completion | Perfect fit, zero overhead | Overkill |
+| Memory across runs | You build it | Durable sessions + memory, built in |
+| Tool calls with permissions | You build the loop and the gates | Runtime tools + permission modes |
+| Human approval mid-run | No mechanism | First-class approvals, resumable |
+| Survives process exit / crash | No | Yes, journaled state |
+| Shared across clients | No | Yes, one control plane |
+| Credential handling | Keys in your process/env | Encrypted store + route/auth_ref |
+| Time to first token | Fastest | Slower to set up, then durable |
+
+The honest summary: raw API calls win on simplicity for stateless work. Kheish wins the instant "stateless" stops being true. If you find yourself adding a database to remember conversations, a queue to survive restarts, and a hand-rolled "pause for human" flag, you are rebuilding the daemon badly. Use the daemon.
+
+### Versus agent framework libraries (LangChain-style)
+
+Framework libraries give you composable building blocks — chains, agents, tool wrappers, memory adapters — that you import into *your* process. They are excellent for prototyping and for teams that want maximum control over the orchestration logic in code.
+
+The structural difference is where the state and the process live. A framework agent runs **inside your application process**. Its memory is your process's memory. When your process ends, the agent ends. If you want durability, you wire in an external store yourself; if you want to share an agent across services, you build the service yourself; if you want a human to approve an action, you invent the pause-and-resume yourself. The library gives you the pieces; you are still the one assembling and operating the runtime.
+
+Kheish is not a library you import. It is a **daemon you run**. The orchestration, the durability, the approvals, the credential vault, and the multi-client control plane are the product, not an exercise left to you. You talk to it over the SDK or HTTP; you do not host the agent loop inside your own code.
+
+| Concern | Framework library | Kheish |
+| --- | --- | --- |
+| Where the agent runs | Inside your process | In the daemon |
+| Composition in code | Its whole point; very flexible | Configured, not hand-wired |
+| Durability / recovery | You add a store | Built in, journaled |
+| Human approvals | You build pause/resume | First-class, resumable |
+| Multi-client sharing | You build a service | The control plane is the service |
+| Credential vault | Your responsibility | Encrypted routes/auth_ref |
+| Operate in production | You own all of it | Daemon owns lifecycle + auth |
+
+The honest summary: if your goal is to hand-craft novel orchestration logic and you are happy owning the operational surface, a library gives you more raw flexibility. If your goal is a durable, governable agent that other systems can rely on, Kheish gives you the operational substance so you can spend your effort on the agent's behavior instead of on rebuilding a runtime. Many teams use both: prototype the logic in a library, then run the durable version on a daemon.
+
+### Versus workflow automation tools (Zapier / n8n-style)
+
+Workflow tools are graphs of triggers and steps: "when a form is submitted, call this API, then send this email." They are fantastic for deterministic glue between SaaS products, and if your problem really is "connect A to B when C happens," they are often the fastest path and you should use them.
+
+Two things make agents different from workflows, and they matter:
+
+1. **Workflows are pre-drawn; agents decide.** A workflow author lays out every branch in advance. An agent is handed a goal and figures out the steps at runtime — which tool to call, whether to ask a clarifying question, when it is done. You cannot fully pre-draw that graph, which is exactly why you wanted an agent.
+2. **Agents need memory and judgment gates.** A workflow step is stateless and fires blindly. An agent accumulates context across a long session and needs points where a human can intervene before something irreversible happens.
+
+Kheish is comfortable being *driven by* workflow-style triggers — a webhook or a connector event can be the input that starts a run — but the thing it starts is a stateful, reasoning, resumable agent, not a fixed step. And Kheish has its own scheduling and connector layer so you often do not need a separate automation tool at all.
+
+| Concern | Workflow tool | Kheish |
+| --- | --- | --- |
+| Deterministic A→B glue | Ideal | Possible but heavier |
+| Agent decides steps at runtime | Not the model | The whole point |
+| Long-lived stateful context | Per-step, stateless | Durable sessions |
+| Human approval inside a step | Limited / add-on | First-class, resumable |
+| Triggers & scheduling | Core strength | Built-in schedules + connectors |
+| Reasoning over ambiguity | Not designed for it | Designed for it |
+
+The honest summary: if the work is a fixed pipeline of deterministic steps, a workflow tool is simpler and you should reach for it. If the work needs an agent to reason, remember, use tools, and occasionally stop for a human, Kheish is the right shape — and it can consume the same kinds of triggers a workflow tool would.
+
+### Versus hosted agent platforms
+
+Hosted platforms run the agent for you in someone else's cloud. You get a managed runtime and a UI without operating anything, which is a real convenience. The tradeoffs are the usual ones for anything hosted, and they are worth naming plainly:
+
+- **Where your data and keys live.** A hosted platform holds your conversation history and, usually, your provider credentials on its infrastructure. With Kheish, the daemon runs where you put it, and secrets stay in its local encrypted store. For sensitive workloads this is often the deciding factor.
+- **Control and inspectability.** With Kheish you can read the journal, inspect the state root, run the CLI against your own daemon, and see exactly what happened. There is no vendor between you and the truth.
+- **Portability.** A daemon you run is a daemon you can move — laptop, server, container, another cloud — without a migration project. Hosted state is stickier.
+- **Convenience the other way.** A hosted platform means zero ops. Kheish means you run a process (though `kheish-daemon up` makes that a one-liner, and Docker makes it a container).
+
+| Concern | Hosted platform | Kheish |
+| --- | --- | --- |
+| Ops burden | None (vendor runs it) | You run a daemon (one command) |
+| Where keys live | Vendor infra | Your daemon, encrypted, local |
+| Where history lives | Vendor infra | Your state root, on your disk |
+| Inspect raw state | Whatever the UI shows | Full journal + CLI + files |
+| Portability | Vendor-bound | Move the daemon anywhere |
+| Best when | You want zero ops | You want control + local security |
+
+The honest summary: if you want someone else to run everything and you are comfortable with your data and keys living on their infrastructure, a hosted platform is less work. If you want your agents, your history, and your credentials to stay on hardware you control — while still getting a polished console and SDKs — that is precisely the niche Kheish is built for. Read [Production](./operations/production) for how to run a real instance.
+
+## When Kheish is the wrong tool
+
+A page that only tells you when to say yes is a brochure, not documentation. Do not use Kheish when:
+
+- **Your task is genuinely stateless and one-shot.** Classifying a spreadsheet column? Summarizing one PDF? Call the provider API directly. A daemon adds moving parts you do not need.
+- **You need a fixed, deterministic pipeline with no reasoning.** If every branch is known in advance and nothing decides anything, a workflow tool or plain code is simpler.
+- **You want zero operational footprint and are fine with hosted data.** If running any process at all is a dealbreaker and your data can live in a vendor cloud, a hosted platform is less work.
+- **You need a browser-embedded, in-page assistant with no backend.** Kheish is a backend runtime; it is not a client-side widget.
+
+Kheish earns its keep when the work is stateful, tool-using, occasionally gated by a human, potentially long-running, reachable from more than one place, and sensitive enough that you want the keys and history under your control. If that describes what you are building, keep reading. If it does not, one of the alternatives above will serve you better, and that is fine.
+
+## The philosophy, stated plainly
+
+Kheish is built around a deliberate separation:
+
+- **The daemon owns state and truth.** Sessions, runs, approvals, routes, secrets, schedules, memory, assets — all of it lives in and is governed by the daemon.
+- **Everything else is a client or a producer.** The Kheish Air console, the Python and Web SDKs, external connector sidecars, the capture runtime — none of them hold the truth. They ask the daemon and observe.
+
+```text
+   ┌────────────────────────── clients & producers ──────────────────────────┐
+   │                                                                          │
+   │   Kheish Air        SDKs            connector          capture           │
+   │   (web console)     (Python/Web)    sidecars           runtime           │
+   │        │                │               │                 │              │
+   └────────┼────────────────┼───────────────┼─────────────────┼──────────────┘
+            │                │               │                 │
+            ▼                ▼               ▼                 ▼
+   ══════════════════ HTTP + Server-Sent Events (one contract) ═══════════════
+            │
+            ▼
+   ┌──────────────────────────── kheish-daemon ───────────────────────────────┐
+   │  control plane · runtime (prompts, tools, permissions, hooks, providers)  │
+   │  auth layer (accounts, route keys, OAuth, revocation)                     │
+   │  orchestration (agents, sidechains, mailboxes, projects, tasks)           │
+   │  persistence (journals, checkpoints, memory, assets, deliveries)          │
+   └───────────────────────────────────────────────────────────────────────────┘
+```
+
+This is why the docs keep saying "the daemon owns X." It is not a slogan; it is the invariant that makes the whole system coherent. Once you internalize it, you always know where to look: if it is state, it is in the daemon, and you reach it through the control plane — not by poking at files or trusting a client's local copy. Read [Architecture](./concepts/architecture) for the subsystem-by-subsystem view.
+
+## The objects you will actually work with
+
+Kheish's product model is a small vocabulary of durable objects. You do not need all of them on day one, but knowing they exist tells you what the system can do.
+
+- **Sessions** — durable units of work with a journal and checkpoints. Your agent's "thread."
+- **Runs** — concrete executions inside a session, triggered by input, an approval, an answer, a schedule, or an event.
+- **Personas** — reusable identity and instruction records you bind into a session, so an agent has a consistent character and remit.
+- **Approvals & user questions** — the suspension points that let a run stop for a human and resume safely.
+- **Routes & auth_ref** — the credential indirection: named execution identities backed by encrypted secret slots.
+- **Schedules** — durable cron-like triggers that wake a session on a cadence (your morning digest, a nightly sweep).
+- **Memory & learnings** — durable knowledge that accumulates across runs, plus recovered run-memory after interruptions.
+- **Tools & MCP** — built-in runtime tools plus Model Context Protocol servers that give agents real capabilities (read your GitHub, search the web, and so on).
+- **Connectors** — daemon-managed ingress and egress so external systems (HTTP, Slack, Telegram) can start runs and receive replies.
+- **Assets** — files (documents, images, retained audio) stored once and reusable across runs by stable id.
+- **Agents, sidechains, tasks** — the orchestration primitives for multi-step and multi-agent work.
+- **Channels & projects** — shared conversation spaces and durable coordination across multiple sessions.
+
+Cross-references, so you can dive where it matters to you: [Sessions and runs](./concepts/sessions-and-runs), [Memory](./concepts/memory), [Agents, personas, and skills](./concepts/agents-personas-skills), [Schedules](./automation/schedules), [Connectors](./automation/connectors), [Tools and MCP](./automation/tools-and-mcp).
+
+## Governance, drawn as a timeline
+
+Because approvals are the feature people most often underestimate, here is the actual shape of a gated run over time. Notice that the human step can happen much later, from a different client, and the run does not fail while it waits.
+
+```text
+  t0   input arrives ──▶ run starts in session "acme-support"
+  t1   agent drafts a reply, decides a refund is warranted
+  t2   agent calls the refund tool
+        │
+        ▼
+  t3   PERMISSION GATE: refund requires approval
+        run SUSPENDS, writes a pending approval to the journal
+        ── you may now close the console, the CLI, everything ──
+        .
+        .   (minutes or hours pass; the daemon holds the state)
+        .
+  t7   a human opens ANY client, sees the pending approval, clicks Approve
+  t8   run RESUMES exactly at the refund tool call
+  t9   refund executes, agent finishes the reply
+  t10  output stored; optionally routed to Slack via a connector
+```
+
+Nothing about `t3 → t7` is fragile. The suspension is durable state, not an in-memory promise. That is the whole point: safety that survives time, restarts, and a change of operator. The same mechanism powers user questions — the run parks on "which plan is this customer on?" and resumes with your typed answer.
+
+## Security, drawn as a boundary
+
+Local-first is not a vibe; it is a concrete boundary you can point at. Here is where a provider key lives and does not live.
+
+```text
+   your laptop / your server
+   ┌──────────────────────────────────────────────────────────┐
+   │  kheish-daemon                                            │
+   │  ┌────────────────────────────────────────────────────┐  │
+   │  │  encrypted auth store (master key generated on      │  │
+   │  │  first `up`, kept at 0600 in the state root)        │  │
+   │  │    auth_ref "openai.prod"  = ●●●●●●●● (never leaves) │  │
+   │  │    auth_ref "anthropic.prod" = ●●●●●●●●              │  │
+   │  └────────────────────────────────────────────────────┘  │
+   │        ▲ resolved only inside the daemon, per run         │
+   └────────┼──────────────────────────────────────────────────┘
+            │ clients only ever send a route NAME, never a key
+   ┌────────┴───────────────┐   ┌───────────────┐   ┌───────────┐
+   │ Kheish Air (browser)   │   │ Python SDK    │   │ webhook   │
+   │ "use route: openai"    │   │ "route: openai"│   │ "openai"  │
+   └────────────────────────┘   └───────────────┘   └───────────┘
+     no key here                 no key here          no key here
+```
+
+A stolen client token, a leaked log line, a compromised script — none of them yields a working provider credential, because none of them ever held one. And when a key rotates, it rotates in one place. This is the security posture that raw API calls (keys scattered across processes) and hosted platforms (keys on someone else's cloud) structurally cannot give you.
+
+## What you actually get on day one
+
+This is not a someday-when-you-configure-everything story. From a single command you get a running system:
+
+- Run `kheish-daemon up`. The daemon boots, generates its own encryption master key, serves the **Kheish Air** web console at `http://127.0.0.1:4000/`, and opens your browser to it. It boots even with no provider key configured yet.
+- A four-step first-launch wizard walks you through connecting a model, optionally adding tools and secrets, and starting your first agent from a ready-made template — every step live against your real daemon, nothing mocked.
+- You land in a chat with a working agent. From there the console gives you a debrief of what your agents have been doing, a calendar of schedules, and a memory page showing what your agents have learned.
+
+The full walkthrough — with screenshots-in-words of each wizard step, what to type, and what you will see — is the [Quickstart](./welcome/quickstart). It is genuinely five minutes.
+
+## Nothing is hidden from you
+
+A quiet advantage of the daemon owning state is that you can always ask it what is true — and get an authoritative answer, not a client's guess. This matters more than it sounds. With a lot of agent tooling, "why did it do that?" is answered by squinting at scattered logs and inferring. With Kheish, the state is a real thing you can query.
+
+- The **session journal** is the append-only record of what actually happened: messages, tool activity, permission audits, checkpoints, and outputs. It is the ground truth, and it is on your disk.
+- The **CLI and HTTP API** read that truth directly. You can list runs, inspect a session, follow the live event stream, and see pending approvals and questions without trusting any intermediary.
+- A **status** view gives you the operator's snapshot: readiness, the active route, run queues, schedules, agents, and storage health.
+- A **doctor** view actively probes connectivity, the event stream, auth, and routes when you need to diagnose rather than just observe.
+
+The rule the docs repeat — prefer the daemon's CLI and API over poking at files — is not gatekeeping. It is because the daemon is the authority, and asking it is how you get an answer that is both correct and safe. When you are debugging a run that surprised you, you are never reduced to guessing. You read what happened, in order, from the source of truth. That is a different debugging experience than reconstructing a stateless script's behavior from log fragments, and it is one of the things you will quietly come to rely on.
+
+If you ever do find yourself with a run that seems stuck, paused, or wrong, there is a fixed order of evidence to gather — start from the session, then its runs, then pending approvals and questions — and the durable state makes every step of that answerable rather than speculative.
+
+## Frequently asked, honestly answered
+
+**Is Kheish a model, or a wrapper around a model?**
+Neither, exactly. It is the durable *runtime* around whatever model you choose. It drives providers (OpenAI, Anthropic, Google, xAI, OpenRouter) but its value is the state, governance, and security layer, not the tokens.
+
+**Do I have to run a server?**
+You run the daemon, yes — but `kheish-daemon up` makes that one command on your own machine, and Docker makes it a container. It is far closer to "start a local app" than "stand up infrastructure." For real deployments, see [Production](./operations/production).
+
+**Where does my data live?**
+In the daemon's state root on disk you control: journals, checkpoints, memory, and an encrypted secret store. Not in a vendor cloud. That is the local-first promise.
+
+**Can multiple people or systems use the same agent?**
+Yes. That is the point of a single control plane. The console, SDKs, a CLI, webhooks, and schedules can all drive the same durable session. See [SDKs and API](./integrate/sdks-and-api).
+
+**What happens if the daemon restarts mid-run?**
+In-flight sessions and their pending approvals are recovered from the journal. A run parked on an approval or a question comes back parked, waiting for the same human decision. Durability is the default, not a mode you enable.
+
+**Is this overkill for a simple script?**
+For a truly stateless one-shot, yes — use the provider API directly. Kheish earns its complexity the moment you need memory, tools with permissions, human approvals, scheduling, or multi-client access. Be honest with yourself about which one you are building.
+
+**How do agents get real capabilities like reading GitHub or searching the web?**
+Through built-in runtime tools and Model Context Protocol (MCP) servers, gated by permission modes and, where you choose, human approvals. See [Tools and MCP](./automation/tools-and-mcp).
+
+**Can an external event start an agent?**
+Yes — connectors turn HTTP, Slack, and Telegram traffic into runs, and can route replies back out. See [Connectors](./automation/connectors).
+
+## A day in the life of one agent
+
+Abstract properties are easy to nod along to and hard to feel. So here is one agent, `weekly-digest`, lived through a realistic week. Watch how many separate things touch the same durable session, and how none of them would be possible if the state died with a process.
+
+**Monday, 9:00 — a schedule wakes it up.** You never opened a client. A durable schedule fires and starts a run in the `weekly-digest` session with the input "write my Monday digest." The agent recalls, from durable memory, what it flagged last week, drafts a short digest, and stores the output. You read it on your phone at 9:15. The run began and finished with no human present — the daemon was the only thing awake.
+
+**Monday, 11:00 — you chat with it.** You open Kheish Air, land in the same session, and type "actually, add a section tracking open pull requests." Your message submits a direct-input run into the *same* session. The agent has the full history — the digest it just wrote, the persona that defines its remit — because sessions are durable and shared, not per-client.
+
+**Tuesday, 14:30 — it needs a tool and a decision.** The pull-request section needs live data, so the agent calls a GitHub MCP tool you connected during onboarding. One action — posting a summary comment back to a repo — is gated. The run suspends on an approval. You are in a meeting. Nothing breaks; the pending approval sits in the journal.
+
+**Tuesday, 16:00 — a teammate approves it.** A colleague with access opens the console, sees the pending approval, and clicks Approve. They did not start the run. They are on a different machine. The run resumes at the exact tool call and completes. The audit trail records who approved what.
+
+**Wednesday, 02:00 — the daemon restarts.** A host reboot. The daemon comes back, recovers the `weekly-digest` session from its journal, and re-establishes any in-flight state. Thursday's scheduled run fires as if nothing happened.
+
+**Friday — you inspect what it learned.** On the Memory page you see the agent has accumulated durable learnings across the week — patterns it noticed, facts you confirmed. Next Monday's digest is better because the state carried forward.
+
+Count the distinct actors that touched one session across that week: a schedule, you in a browser, an MCP tool, a teammate approving from another machine, a daemon restart, and the memory subsystem. In a stateless model, each of those is a different process with its own amnesia. In Kheish, they are all clients of one durable truth. That is the entire value proposition in one paragraph.
+
+## How a request flows through the daemon
+
+When something asks the daemon to do work — a chat message, a webhook, a schedule firing — it travels a consistent path. Understanding it once means you always know where to look when something surprises you.
+
+```text
+   (1) INPUT ARRIVES
+       console message │ webhook event │ schedule fires │ approval answered
+                       └──────────────┬──────────────────────────────────┘
+                                      ▼
+   (2) DAEMON VALIDATES & PREPARES
+       • checks request metadata and permissions
+       • resolves the route  (route_id → auth_ref → decrypted key, in-daemon)
+       • resolves reply targets (where output should go, if anywhere)
+       • creates or queues a RUN in the target session
+                                      ▼
+   (3) RUNTIME EXECUTES THE RUN
+       • assembles the prompt from persona + durable session history + memory
+       • applies permissions, hooks, and the tool surface (built-in + MCP)
+       • drives the model over the selected provider route
+       • each step is JOURNALED to disk as it happens
+                                      ▼
+   (4) THE RUN REACHES ONE OF THREE OUTCOMES
+       ┌── completes ─────────▶ output stored
+       ├── suspends ─────────▶ pending approval OR user question (durable)
+       └── spawns work ──────▶ sidechains / background tasks
+                                      ▼
+   (5) DAEMON PERSISTS & OPTIONALLY ROUTES
+       • output saved to the session journal
+       • if reply targets exist, delivery is queued and retried
+       • clients watching the SSE stream see every event live
+```
+
+Two details are worth internalizing. First, step (2) is where the credential indirection lives — the raw key is resolved *inside* the daemon, per run, and never handed to whatever triggered the input. Second, step (3) journals continuously, which is why step (4)'s "suspends" outcome is durable rather than a fragile in-memory pause: the suspension point is written down, so a restart resumes it. This same flow serves a human typing in the console and a cron schedule firing at 3am; there is no separate, less-durable path for automated triggers.
+
+## The runtime is extensible without changing the contract
+
+A common fear with any runtime is that it boxes you in. Kheish's answer is that the *control-plane contract* stays stable while the runtime underneath has well-defined extension points. You can add capability without every client having to change.
+
+- **Model providers and routing.** OpenAI, Anthropic, Google, xAI, and OpenRouter are supported drivers; routes let you name and swap them, override models live, and pin a route per session. Changing a model does not change how clients talk to the daemon.
+- **Tools.** Built-in runtime tools plus daemon control tools, all gated by permission modes and, where you choose, human approvals.
+- **MCP.** Model Context Protocol servers add tools and instructions — including secret-store-backed bearer configs and scoped OAuth accounts for HTTP MCP servers — so agents can reach real systems.
+- **Hooks.** Lifecycle hooks let you observe and shape execution at defined points without forking the runtime.
+- **Skills.** Reusable, promotable procedural skills that agents can apply, and that can be refined from what agents actually learn.
+- **Connectors.** Daemon-managed ingress and egress for HTTP, Slack, and Telegram, plus generic output plugins and queued, retried delivery.
+- **Capture and observations.** Host-local capture pushes observations (screenshots, frames, audio segments) into daemon-owned sources that runs can later use.
+
+The through-line: you extend what an agent *can do* without destabilizing how the outside world *talks to it*. That separation is what lets a Kheish deployment grow for years without a rewrite. The detail lives in [Tools and MCP](./automation/tools-and-mcp) and [Architecture](./concepts/architecture).
+
+## Growing with Kheish: a realistic progression
+
+You do not adopt all of this at once, and you should not. Here is the path most people actually walk, so you can see where you are and what is next.
+
+**Stage 0 — one agent, one chat.** You run `kheish-daemon up`, connect a model in the wizard, pick a template, and chat. You are using durable sessions and a persona without thinking about it. Most people stay here happily for a while.
+
+**Stage 1 — give it tools.** You connect an MCP server or two so the agent can read a real system. You meet permission modes and, the first time a risky action comes up, approvals. The agent stops being a chatbot and starts being useful.
+
+**Stage 2 — make it recurring.** You add a schedule so the agent does something every morning without you. Now it is an automation, not a tool you have to poke. The debrief card starts telling you what it has been up to.
+
+**Stage 3 — let the world reach it.** You wire a connector so a webhook, a Slack command, or a Telegram message can start runs, and replies route back out. The agent is now part of your systems, not a thing you open in a browser.
+
+**Stage 4 — operate it for real.** You move the daemon to a server or a container, turn on bearer auth, set explicit routes and secret slots, and back up the state root. You read [Production](./operations/production) and [Security](./operations/security). The one-command toy becomes a dependable service.
+
+**Stage 5 — coordinate many.** You reach for channels, projects, and multi-agent orchestration when one agent is no longer enough and work has to be divided, discussed, and assigned across durable sessions.
+
+The important thing is that each stage builds on the same daemon and the same objects. You are never rebuilding; you are turning on more of what was always there. That is the payoff of the daemon owning state from the very first command.
+
+## What durability actually protects you from
+
+"Durable" is a word that gets thrown around until it means nothing. So here is a concrete list of the failure modes that break a naive agent, and what the daemon does about each. This is the value of state-on-disk expressed as insurance, not adjectives.
+
+| Failure mode | Naive stateless agent | Kheish daemon |
+| --- | --- | --- |
+| You close the laptop mid-task | Work lost, agent forgets | Session and run survive; read the result later |
+| The process crashes at 2am | Half-finished work vanishes | Journaled state recovers on restart |
+| An action needs a human, but nobody is around | You either skip the check or the run fails | Run suspends durably and waits, indefinitely |
+| The human who approves is not the one who started it | No handoff exists | Any client can resolve the pending approval |
+| The provider hiccups mid-run | Whole attempt is thrown away | Run state is preserved; failures are visible and inspectable |
+| You need the same agent from Slack and a script | Two disconnected copies | One durable session, many clients |
+| A key leaks in a log | The key is usable | Clients only ever held a route name |
+| You rotate a credential | Edit every client and redeploy | Rotate one secret slot; everything follows |
+| You want to know what happened | Reconstruct from scattered logs | Read the journal; the truth is one place |
+
+```text
+   TIME ───────────────────────────────────────────────────────────────▶
+
+   naive:   [start]──work──work── ✗ CRASH ─────────────────────────────
+                                    everything after the last checkpoint
+                                    you never wrote is simply gone.
+
+   kheish:  [start]──▶journal──▶journal──▶ ✗ CRASH ──▶ [restart] ──▶ resume
+                       │        │                        recovers the
+                       ▼        ▼                        session + pending
+                    on disk   on disk                    approval + run state
+```
+
+Notice that none of these are exotic. Laptops close, processes crash, people step away, keys leak, providers flake. A stateless agent treats every one of them as catastrophic because it has nowhere to stand. The daemon treats them as ordinary because the truth is on disk and the truth is one place. You will not appreciate this on day one. You will appreciate it the first time a run you had forgotten about is still sitting there, exactly where it paused, waiting for you.
+
+## When one agent is not enough
+
+Most people start with a single agent and stay there a long time, which is exactly right. But some work genuinely needs division of labor — a reviewer and an implementer, a researcher feeding a writer, a fleet of sessions coordinating on a release. Kheish has durable primitives for that so you do not collapse everything into one overloaded session or wire brittle glue between separate scripts.
+
+```text
+   ┌───────────── project "release-2026-q2" (durable coordination) ─────────────┐
+   │                                                                            │
+   │   member: researcher      member: implementer      member: reviewer        │
+   │      (session)                (session)                (session)           │
+   │         │                        │                        │                │
+   │         └──────────┬─────────────┴────────────┬───────────┘                │
+   │                    ▼                          ▼                            │
+   │            linked channel "release-room"   project tasks                   │
+   │            (shared public log,             (assignment, dependencies,      │
+   │             reactions, turn-taking)         one latest run each)           │
+   └────────────────────────────────────────────────────────────────────────────┘
+```
+
+- **Sidechains and agents** let one run spawn focused sub-work under bounded quotas, so a big task decomposes without losing the thread.
+- **Channels** are durable public conversation spaces with their own message log and reactions, where multiple agent-backed sessions and humans can talk without merging into one session.
+- **Projects and project tasks** add durable membership, linked channels, and assignable work items across many sessions — the coordination layer for real multi-agent efforts.
+- **Mailboxes** carry cross-agent messages so sessions can hand work to each other explicitly.
+
+You do not need any of this to get value from Kheish, and reaching for it too early is a classic over-engineering trap. But when the day comes that one agent is genuinely doing three jobs, these primitives are already there, durable and inspectable, built on the same daemon you started with. That is the difference between a system that grows and one you outgrow.
+
+## A glossary you can keep open
+
+The docs use a consistent vocabulary. If a term ever feels slippery, it is defined here.
+
+| Term | What it means in Kheish |
+| --- | --- |
+| **Daemon** | The long-lived process that owns all state and truth; everything else is a client of it. |
+| **Session** | A durable unit of work with an append-only journal and checkpoints — your agent's thread. |
+| **Run** | One concrete execution inside a session, triggered by input, an approval, an answer, a schedule, or an event. |
+| **Persona** | Reusable identity and instruction record bound into a session to give an agent a consistent character and remit. |
+| **Approval** | A durable suspension point where a run waits for a human yes/no before a gated action, then resumes. |
+| **User question** | A durable suspension point where a run waits for structured information from a person, then resumes with the answer. |
+| **Route** | A named execution identity a client may reference; it selects a provider and model without exposing a key. |
+| **auth_ref** | A stable encrypted secret slot the daemon resolves a route's credential from — rotatable in one place. |
+| **Schedule** | A durable, cron-like trigger that wakes a session on a cadence. |
+| **Memory / learnings** | Durable knowledge that accumulates across runs, plus recovered run-memory after interruptions. |
+| **Tool / MCP** | A capability an agent can invoke; MCP servers add external tools and instructions to the runtime. |
+| **Connector** | Daemon-managed ingress and egress that turns external traffic (HTTP, Slack, Telegram) into runs and routes replies. |
+| **Asset** | A file (document, image, retained audio) stored once and reusable across runs by stable id. |
+| **State root** | The directory on your disk where the daemon keeps journals, checkpoints, memory, and its encrypted secret store. |
+| **Control plane** | The stable HTTP + SSE contract every client speaks to reach the daemon. |
+| **Kheish Air** | The embedded web console the daemon serves at its root, and the fastest way to drive it by hand. |
+
+Keep that table nearby while you read the rest of the docs. Every concept page expands one row of it.
+
+## Where to go next
+
+- **Just run it.** The [Quickstart](./welcome/quickstart) takes you from zero to a talking agent with `kheish-daemon up` and the Kheish Air console in about five minutes.
+- **Understand the shape.** [Architecture](./concepts/architecture) lays out the subsystems and how a request flows through them.
+- **Learn the backbone.** [Sessions and runs](./concepts/sessions-and-runs) is the execution model everything else sits on.
+- **Give agents memory.** [Memory](./concepts/memory) explains durable knowledge, learnings, and recovered run-memory.
+- **Shape who your agents are.** [Agents, personas, and skills](./concepts/agents-personas-skills).
+- **Automate it.** [Schedules](./automation/schedules), [Connectors](./automation/connectors), and [Tools and MCP](./automation/tools-and-mcp).
+- **Operate it safely.** [Security](./operations/security) and [Production](./operations/production).
+- **Integrate it.** [SDKs and API](./integrate/sdks-and-api) for driving the daemon from your own code.
+
+The rest of the documentation assumes the one idea from the top of this page: the daemon owns state, and everything else talks to it. Hold onto that, and the whole system will keep making sense.

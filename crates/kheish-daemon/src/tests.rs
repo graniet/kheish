@@ -57944,25 +57944,21 @@ async fn docs_routes_serve_embedded_documentation() -> Result<()> {
         .flat_map(|group| group["pages"].as_array().cloned().unwrap_or_default())
         .map(|page| page["path"].as_str().unwrap_or_default().to_string())
         .collect::<Vec<_>>();
-    assert!(
-        first_paths
-            .iter()
-            .any(|path| path == "introduction/start-here")
-    );
+    assert!(first_paths.iter().any(|path| path == "welcome/quickstart"));
 
     let page = client
-        .get(format!("{base}/v1/docs/introduction/start-here"))
+        .get(format!("{base}/v1/docs/welcome/quickstart"))
         .send()
         .await?
         .error_for_status()?
         .json::<Value>()
         .await?;
-    assert_eq!(page["title"], json!("Start Here"));
+    assert_eq!(page["title"], json!("Quickstart"));
     assert!(
         page["content"]
             .as_str()
             .unwrap_or_default()
-            .starts_with("# Start Here")
+            .starts_with("# Quickstart")
     );
 
     let missing = client

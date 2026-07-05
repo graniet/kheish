@@ -1,151 +1,435 @@
 ---
-title: Sessions and runs
-description: Durable sessions, queued runs, and the separation between conversation state and concrete execution.
+title: Sessions, runs, and structured contracts
+description: The durable session/run boundary, plus the structured input and output contracts that make a session speak strict JSON on both ends — validated fail-closed, repaired when possible, delivered canonically.
 ---
 
-# Sessions and runs
+# Sessions, runs, and structured contracts
 
-Sessions and runs are the core execution boundary in Kheish.
+Two ideas sit at the center of how Kheish executes work: the split between a **session** and a **run**, and the pair of **structured contracts** that can pin a session's input and output to strict JSON schemas. The first is about durability and asynchrony — a session is the long-lived context, a run is one concrete execution against it. The second is about *shape* — turning a chat surface that normally speaks free-form prose into a typed boundary that rejects malformed input before it starts and refuses to deliver malformed output.
 
-## Sessions
+This page covers both, in depth, and then follows the output past the engine into **reply targets**, the **delivery queue**, and the **dead-letter** ledger where undeliverable messages go to be replayed rather than lost. It is a companion to [Architecture and the run state machine](./architecture), which documents the run lifecycle, the journal, and the recovery model that everything here rests on. Read that page for the state machine; read this one for what flows *through* it and how the JSON contracts on both ends are enforced.
 
-A session is a durable conversation and control context. It owns:
+Related concepts you will see cross-linked throughout: [Recovered run memory](./memory), [Agents, personas, and skills](./agents-personas-skills), [Schedules and automation](../automation/schedules), [Security and operations](../operations/security), and the [Quickstart](../welcome/quickstart) if you want to try any of this against a live daemon first.
 
-- the conversation identifier and optional thread identifier
-- the append-only session journal
-- checkpoints and metadata used for restore
-- session-scoped control state such as tasks, bindings, reply targets, and active inline skills
-- an optional bound persona snapshot captured from one daemon-managed persona record
-- an optional persisted session capability scope that can further restrict skills and MCP visibility
-- an optional persisted session credential scope that can further restrict routes, connector credentials, and credentialed MCP usage
-- an optional persisted route policy used as the default for future runs in that session
-- the primary agent mapping and any session-scoped sidechain state related to that session
+## Sessions: the durable context
 
-Sessions are designed to survive restarts. The daemon restores them from persisted records rather than relying on caller memory.
+A session is a durable conversation and control context. It is the thing that survives restarts, accumulates history, and carries the policy that later runs inherit. Concretely, a session owns:
 
-## Runs
+- the conversation identifier and an optional thread identifier;
+- the append-only session journal — the ordered stream of events that *is* the conversation;
+- checkpoints and metadata used to restore it after a restart or a compaction;
+- session-scoped control state: tasks, bindings, reply targets, and active inline skills;
+- an optional bound **persona snapshot** copied from one daemon-managed persona record;
+- an optional persisted **capability scope** that can further restrict which skills and MCP servers are visible;
+- an optional persisted **credential scope** that can further restrict which routes, connector secrets, and credentialed MCP servers may actually be used;
+- an optional persisted **route policy** used as the default for future runs in the session;
+- an optional persisted **structured input contract** and **structured output contract** (the subject of the second half of this page);
+- the primary agent mapping and any sidechain state hanging off it.
 
-A run is one concrete execution request associated with a session. Runs are created for:
+The daemon restores sessions from persisted records rather than trusting caller memory. That is the whole point of a session: a client can disconnect, a connector can redeliver, the daemon can restart for a deploy, and the session is still there with its history, its policy, and its pending work intact.
 
-- direct input submitted through the CLI or HTTP API
-- channel-driven public turns
-- scheduled inputs
-- approval resumes
-- user-question resumes
-- mailbox-driven execution
-- parent clarification flows
+## Runs: one concrete execution
 
-Each run has its own lifecycle and status independent of the client that submitted it.
+A run is one concrete execution request associated with a session. Runs are created from many sources — direct input over the CLI or HTTP API, channel-driven public turns, scheduled inputs, approval resumes, user-question resumes, mailbox-driven execution, and parent clarification flows — but each run has its own lifecycle and status **independent of the client that submitted it**. You submit a run and get back a run id; the run's status is authoritative, not whatever your client remembers.
 
-Channel-driven public turns are still normal session runs. The shared public conversation itself lives in the channel resource, not in the session journal. Read [Channels and public conversations](./channels-and-public-conversations) for that model.
+Several higher-level features are *projections* over runs rather than separate execution paths:
 
-Project-task start is also still a normal session run. The project owns assignment, dependencies, and optional public discussion state, but the actual execution still happens inside the assignee session. Read [Projects and project tasks](./projects-and-project-tasks) for that coordination layer.
+- A **channel-driven public turn** is still a normal session run. The shared public conversation lives in the channel resource; the session run is where the turn actually executes. See [Channels and public conversations](../reference/channels-api).
+- A **project-task start** is still a normal session run. The project owns assignment and dependencies; the work happens inside the assignee session. See [Projects and project tasks](../reference/projects-api).
+- A **Flow start** is still a normal session run. A Flow records the Playbook version and correlation metadata *around* the run, but the run remains the source of truth. See [Playbooks and flows](../reference/playbooks-and-flows-api).
 
-Flow start is also still a normal session run. A Flow records the Playbook version and correlation metadata around the run, but the run remains the concrete execution source of truth. Read [Playbooks and flows](./playbooks-and-flows) for that projection layer.
+Keeping all of these as ordinary runs is what makes the tooling uniform: the same run-inspection surface, the same statuses, the same journal apply to a scheduled job, a public channel post, and a plain chat turn alike.
 
-## Input payloads
+### Why the split matters
 
-Runs can be created from plain text or from multimodal input that references daemon-owned assets.
+Separating sessions from runs buys several properties that a stateless request/response model cannot offer:
 
-The daemon supports two request shapes:
+- the same session accumulates many runs over its lifetime;
+- callers submit work asynchronously and inspect it later, without holding a connection open;
+- run-scoped route and model selection do not mutate the daemon globally;
+- a session keeps one stable persona snapshot across later runs without automatically following later persona edits;
+- a session can narrow the daemon-global skill and MCP inventory without changing the daemon itself;
+- a session can carry a default route policy so every run does not have to repeat the same override;
+- approvals and questions resume the exact suspended run instead of blindly starting a new one;
+- a terminal run can seed a compact, daemon-owned recovered-memory layer for later runs in the same session (see [Recovered run memory](./memory)).
 
-- compatibility `content` plus `attachments`
-- ordered `input_items` for interleaving text and files
+```text
+   SESSION ⊃ RUNS  (one durable context, many executions over time)
 
-In both cases the session journal keeps normalized asset references rather than relying on caller-local paths. Read [Assets and multimodal input](./assets-and-multimodal-input) for the exact model.
+   ┌──────────────────────── session ────────────────────────────────────────┐
+   │ journal · checkpoints · metadata sidecars                                │
+   │ persona snapshot · capability scope · credential scope · route policy    │
+   │ input contract · output contract · reply-target defaults                 │
+   │                                                                          │
+   │   run-1 ▸ input          Completed                                       │
+   │   run-2 ▸ scheduled      Completed                                       │
+   │   run-3 ▸ input          WaitingForApproval  ← active (holds the slot)   │
+   │   run-4 ▸ input          Queued              ← waits behind run-3        │
+   │   run-5 ▸ mailbox        Queued                                          │
+   └──────────────────────────────────────────────────────────────────────────┘
+        one active run at a time · route/model pinned per run · policy inherited
+```
 
-## Why the split matters
+### Input payloads and the envelope
 
-Separating sessions from runs gives Kheish several important properties:
+A run can be created from plain text or from multimodal input that references daemon-owned assets. The daemon accepts two request shapes: a compatibility `content` plus `attachments`, and an ordered `input_items` list for interleaving text and files in a specific order. In both cases the session journal records **normalized asset references** — stable ids the daemon owns — rather than caller-local paths, so a restored session does not depend on a client's filesystem. The normalized record is the **input envelope**, and it is the first thing the engine reads when a run starts. For the multimodal model in detail, see [Assets and multimodal input](../reference/assets-api).
 
-- the same session can accumulate many runs over time
-- callers can submit work asynchronously and inspect it later
-- run-scoped route and model selection does not mutate the daemon globally
-- a session can keep one stable persona snapshot across later runs without following later persona edits automatically
-- a session can narrow the daemon-global skill and MCP inventory without changing the daemon itself
-- sessions can carry a default route policy without forcing every run to repeat the same override
-- approvals and questions can resume the exact suspended run instead of starting a new one blindly
+### Run-scoped routing
 
-## Run-derived recovery
+Route and model selection are **pinned when a run is created**, and the effective precedence is fixed:
 
-Terminal runs can also seed a compact recovered-memory layer for later runs in the same session.
+1. an explicit override on the run itself;
+2. the session's persisted route policy;
+3. the daemon default route.
 
-This is daemon-owned derived state, not an extra user-authored note stream. The daemon stores sanitized compact summaries from terminal runs and can inject a bounded, policy-controlled subset of them back into later prompts for the same session. Read [Recovered run memory](./recovered-run-memory) for the exact storage, ranking, retention, and budgeting rules.
+Once a run is created, it does not drift. If the daemon defaults change while a run is queued or active, that run keeps the route it was created with. On a named-route daemon, the stored session route policy keeps the configured route id — not merely the underlying provider family — so "use the reviewer route" stays "the reviewer route" even if several routes share a provider.
 
-## Run-scoped routing
+The daemon also checks, at creation time, that the resolved route is actually *ready* — present in the route inventory and not in an error state. If a route's auth has expired and can be refreshed automatically (an OAuth-account route, say), the daemon refreshes it and proceeds; if it cannot, the submission fails with an actionable message ("route `x` is not ready: … Action: …") rather than creating a run that would immediately fail on its first model call. This is another instance of the fail-closed principle: catch the problem where a human submitted the work and can react, not deep inside an async run.
 
-Route and model selection are pinned when a run is created. Effective route precedence is:
+### The anatomy of a run
 
-1. explicit run override
-2. persisted session route policy
-3. daemon default route
+Every run exposes a stable **view** — the record you get back when you submit a run or inspect one. It is worth knowing what that view carries, because it is the surface every client, connector, and operator tool reads:
 
-If daemon defaults change later, an active or queued run does not drift to a different route unexpectedly.
+- **identity**: the run id, the owning session id, and the owning agent id;
+- **kind** and **status**: what the run is and where it is in its lifecycle;
+- **timestamps**: when it was submitted, last updated, actually started (once it leaves the queue), and finished (once terminal);
+- **queue position**: its place in the session queue while it is queued;
+- **request summary**: a compact, human-readable digest of the request — source plugin, source kind, actor, a short text preview, and the resolved provider and model;
+- **input attachments** and **input metadata**: the normalized daemon-owned attachments that formed the input and any caller metadata attached to it;
+- **pending approvals** and **pending questions**: the ids *and* the full payloads of anything the run is currently blocked on (so a client can render the exact decision to make without a second call);
+- **outputs**: the run-local output records captured as the run produces them;
+- **deliveries**: the redacted outbound delivery state associated with the run (see [deliveries and dead letters](#deliveries-and-dead-letters-getting-the-answer-out-reliably));
+- **error**: the terminal or transient error description, when there is one.
 
-On a named-route daemon, the stored route policy keeps the configured route id, not only the technical provider family.
+The request summary is intentionally a *summary*: a truncated text preview, not the full payload. The full, replayable request lives in a separate durable payload the daemon uses to replay or resume the run — for example, an approval-resume run stores the original request alongside the resolution so it can rebuild exactly what to run. Keeping the heavy payload out of the compact view is what makes listing and polling runs cheap.
 
-## Session reply-target defaults
+### Run idempotency
 
-Sessions can also carry durable reply-target defaults.
+Because runs are created from unreliable sources — a client that retries, a connector that redelivers, a scheduler that fires — the operations that create or resume runs accept **idempotency keys**. The daemon stores, per key, a hash of the key and a **request fingerprint**: a versioned SHA-256 over the behaviorally relevant parts of the request. On a repeat with the same key:
 
-Those defaults are prospective:
+- if a run already exists for the key and the fingerprint matches, the existing run is returned — no duplicate;
+- if a submission for the key is in flight, the caller briefly waits (polling for up to two seconds) and then returns the run that submission created;
+- if the key is reused with a *different* fingerprint, the daemon rejects the request with an idempotency conflict rather than guessing which payload was meant.
 
-- future session inputs can snapshot them into new runs
-- future daemon-owned output can fall back to them
-- future background shell tasks created after the change can snapshot them
-- future schedule fires can observe them when the stored schedule request does not already carry explicit reply routing
+The same pattern guards approval and user-question resolutions, so re-posting a decision (because the first response was lost) resolves the run once and returns the already-resolved run instead of double-resuming it. Idempotency protects *submission and resolution*, not *effects*: it stops a retried request from creating a second run, but a run that already produced a side effect (sent a message through a tool, say) has still produced it. Tools that must not double-fire should be idempotent themselves or gated behind approvals. For the full mechanism, including how it interacts with the run queue, see [the idempotency section of the Architecture page](./architecture#idempotency-submitting-the-same-work-twice).
 
-They are not retroactive:
+### Session reply-target defaults are prospective
 
-- an active or queued run keeps the reply targets it already captured
-- a suspended run waiting for approval or structured user input keeps its in-flight reply state
-- an already created background shell task keeps the reply targets it already captured
-- an already materialized run created from a schedule fire keeps the reply targets it already captured
+A session can carry durable reply-target defaults, but they are deliberately **prospective, not retroactive**. Future inputs can snapshot them into new runs; future daemon-owned output can fall back to them; future background tasks and future schedule fires can observe them. But an already-active or queued run keeps the reply targets it already captured, a suspended run keeps its in-flight reply state, and an already-materialized scheduled run keeps what it captured at materialization. Changing a session's reply-target defaults changes its *future* delivery behavior; it never rewrites work already in flight. This is the same principle as run-scoped routing: state is captured at run creation so that in-flight work is stable.
 
-Kheish therefore treats session reply-target mutation as a way to change the session's future delivery defaults, not as a live rewrite of in-flight work.
+## Structured contracts: making a session speak strict JSON
 
-## Waiting states
+By default a session is conversational on both ends: you send prose, the model answers with prose. That is the right default for most work, but it is the wrong default when a session is a *component* in a larger system — when something downstream needs to parse the answer, or when something upstream is a machine that should only ever submit well-formed requests. For those cases a session can be pinned to **structured contracts**: an **input contract** that validates every submission, and an **output contract** that validates (and if necessary repairs) every final answer. Either can be set independently; together they turn a session into a typed function `JSON → JSON` with the model in the middle.
 
-Runs can pause in the middle of execution. The most important waiting states are:
+Both contracts are built on the same schema type and the same validator, so their semantics line up exactly. Understanding that shared core makes both contracts easy to reason about.
 
-- waiting for approval
-- waiting for structured user input
-- queued behind another active run in the same session
+### The schema and validator, precisely
 
-The daemon keeps enough state to resume these runs without reconstructing them from caller context.
+A contract schema is a recursive description of a JSON value. Each node has a **kind** — one of `any`, `string`, `number`, `boolean`, `object`, or `array` — and, for objects and arrays, structure:
 
-## Session persona bindings
+- an **object** node carries required `fields` and `optional_fields`, each keyed by property name and each itself a schema node;
+- an **array** node carries an `items` schema that every element must match;
+- `string`, `number`, `boolean`, and `any` are leaves (`any` accepts any JSON value).
 
-Kheish treats personas as a two-layer model:
+Validation walks the value against the schema and reports the **JSON path of the first mismatch**. This is not a cosmetic detail — the path is the product. A validation error reads like `$.items[2].price: expected a number, got a string` or `$.status: missing required field` or `$.meta: unknown field \`debug\``. That exact string is what the daemon shows a rejected caller, and what the engine feeds back to the model as repair guidance. Good paths make both a human and a model able to fix the problem on the first try; vague errors make them guess.
 
-- the daemon stores mutable persona records
-- each session stores an optional immutable persona snapshot copied from one persona record
+The validator is **strict about unknown fields**. Objects are closed: any property not declared as a required or optional field is a validation error (`unknown field`). Required fields that are missing are errors; optional fields that are present are validated but a present-and-null optional field is treated as absent. Arrays validate every element against the item schema, reporting the offending index.
 
-That means:
+```text
+   VALIDATION WALK  (schema vs value → first-mismatch JSON path)
 
-- persona changes are session-scoped, not run-scoped
-- existing sessions do not follow later persona updates automatically
-- binding or clearing a session persona is restricted to sessions that are idle for topology mutation
-- sidechains inherit the parent session's current persona snapshot when they are spawned
+   schema:  object { status: string(req), count: number(req), tags: array<string>(opt) }
+   value:   { "status": "ok", "count": "3", "tags": ["a", 7] }
 
-Sessions can also carry one persisted capability scope override. The runtime derives an `effective_capability_scope` by intersecting:
+     $                      object?          ✓
+     $.status               string?          ✓
+     $.count                number?          ✗  →  "$.count: expected a number, got a string"
+                                                   (walk stops at the first mismatch)
 
-- the persona binding baseline, if one exists
-- the session-local capability scope override
+   value:   { "status": "ok", "count": 3, "extra": true }
+     $.extra                declared field?  ✗  →  "$.extra: unknown field `extra`"   (closed object)
+```
 
-That effective scope controls:
+The same schema type renders **to** a plain JSON Schema fragment and parses **from** one. When it renders, objects come out closed (`additionalProperties: false`) with their required fields listed — the rendered schema matches exactly what the validator enforces, so what a model is shown is what will be checked. When it parses a JSON Schema, it accepts a **strict subset** and — this is the important part — it never silently drops a constraint it cannot enforce:
 
-- which skills are visible and usable
-- which MCP servers, tools, and helper tools are visible
+- supported keywords are `type`, `properties`, `required`, `additionalProperties`, `items`, and `description` (plus `$schema` and `title` at the root);
+- every unsupported keyword is collected and reported with its path, and parsing fails rather than accepting a schema whose constraints it would ignore;
+- `type: integer` maps to `number`; objects **must** set `additionalProperties: false` (a contract that silently accepted unknown fields would be a footgun); a `required` entry that names a property not in `properties` is an error.
 
-Read [Personas](./personas) for the full record-versus-binding model and the authoring workflow.
+The reason for this strictness is a matter of trust. A tool schema can afford to be lenient — if a keyword is not understood, falling back to unstructured handling is safe, because a tool call is going to be checked by the tool anyway. A *contract* is a promise the daemon makes about what it will accept or deliver. Accepting a constraint it cannot enforce would make that promise a lie, so the contract parser refuses.
 
-Sessions can also carry one persisted credential scope override. That scope gates:
+### A schema in three forms
 
-- which daemon routes may resolve credentials
-- which connector secrets may be used
-- which credentialed MCP servers may actually execute
+The same contract lives in three representations, and it helps to see them side by side. Suppose you want to require an object with a required string `status`, a required number `count`, and an optional array of string `tags`. As the JSON Schema you author it, as the closed schema the contract enforces, and as the errors the validator emits, it looks like this:
 
-Sidechains inherit both the effective capability boundary and the effective credential boundary from the parent, then optionally narrow them further.
+```text
+   AUTHORED JSON SCHEMA                          ENFORCED (rendered back, closed)
+   {                                             object {
+     "type": "object",                             fields:        { status: string,
+     "properties": {                                                count:  number },
+       "status": { "type": "string" },             optional:      { tags: array<string> }
+       "count":  { "type": "number" },           }
+       "tags": {                                  → rendered as:
+         "type": "array",                           { "type":"object",
+         "items": { "type": "string" }                "properties": { status, count, tags },
+       }                                              "required": ["count","status"],
+     },                                               "additionalProperties": false }
+     "required": ["status", "count"],
+     "additionalProperties": false
+   }
 
-Read [MCP](../runtime/mcp), [Skills](../runtime/skills), and [Security and auth](../operators/security-and-auth) for the filtered runtime and auth surfaces those scopes produce.
+   VALUES AND WHAT THE VALIDATOR SAYS
+   { "status":"ok", "count":3 }                       ✓ (tags optional, absent)
+   { "status":"ok", "count":3, "tags":["a","b"] }     ✓
+   { "status":"ok" }                                  ✗ $.count: missing required field
+   { "status":"ok", "count":"3" }                     ✗ $.count: expected a number, got a string
+   { "status":"ok", "count":3, "note":"x" }           ✗ $.note: unknown field `note`
+   { "status":"ok", "count":3, "tags":["a", 7] }      ✗ $.tags[1]: expected a string, got a number
+```
+
+Two things to notice. The rendered schema lists `required` in sorted order and closes the object explicitly — because that is exactly what the validator checks, there is never a gap between "what the model was shown" and "what will be enforced." And the errors are precise down to the array index and field name, which is what makes them useful both as a rejection reason to a caller and as repair guidance to the model.
+
+If you hand the parser a schema it cannot honor, it tells you what and where. An object without `additionalProperties: false` yields `objects must set additionalProperties: false`; an unsupported keyword like `pattern` or `minimum` yields `unsupported JSON Schema keyword \`pattern\`` at its path; a `required` entry naming a property you forgot to declare yields `required field \`x\` is not declared in properties`. All issues are collected and reported together, so you fix the schema once rather than discovering problems one at a time.
+
+### Designing contract schemas
+
+A few practical habits make contracts pleasant to live with rather than a source of surprising run failures:
+
+- **Prefer optional fields to required ones when a value might genuinely be absent.** A required field the model cannot always fill turns into repair turns and, eventually, failed runs. Optional-and-absent is a first-class, valid state; a present-and-null optional field is treated as absent, so the model can signal "nothing here" naturally.
+- **Keep the value space achievable.** The subset validates *kinds and structure*, not ranges, patterns, or enumerations. If you need a constrained value (a status that must be one of three words), you cannot express it in the schema; validate it inside the run and use an early failure or a structured question instead of pretending the schema will catch it.
+- **Match the schema to a capable model's habits.** Deeply nested required structures with many sibling required fields are where models slip. Flatter shapes with clear names conform on the first try more often, which means fewer repair turns and lower cost.
+- **Remember it is per session.** A schema you set becomes the contract for every future run in the session. Design it for the *range* of work that session will do, not for one input you have in front of you.
+
+## Input contracts: fail-closed at the door
+
+A **structured input contract** says: every payload submitted to this session must be a single JSON value matching this schema. The daemon enforces it at the **ingress boundary**, before any run is created. This ordering is the whole safety property: a violating payload is rejected outright and **no run ever exists** for it. You cannot end up with a run whose input was malformed, because the malformed input never became a run.
+
+Enforcement runs like this, for each submission to a contracted session:
+
+1. **Extract the JSON candidate.** The submitted text (or the concatenation of its text items) is trimmed and, if it is wrapped in a single Markdown code fence, unwrapped. Extraction is lenient about that one cosmetic wrapper so a well-formed payload inside a fence is not rejected for formatting — but validation past this point is strict.
+2. **Parse it as a single JSON value.** If it is not valid JSON, or not a *single* value, the submission is rejected with an `input_contract_violated` bad-request error carrying the parse error. Fail-closed.
+3. **Validate against the schema.** A schema mismatch is rejected with `input_contract_violated` and the JSON-path error string, so the caller learns exactly which field was wrong.
+4. **Canonicalize.** An accepted value is re-serialized canonically (minified, deterministic key order) and that canonical string replaces the submitted content. When the submission used ordered `input_items`, the text fragments collapse into one canonical JSON item where the first text item stood, and any asset or board references keep their order and position.
+
+```text
+   INPUT CONTRACT — INGRESS BOUNDARY  (fail-closed, before any run)
+
+   submit(text or input_items)  ─┐
+                                 ▼
+        extract JSON candidate (strip one code fence)
+                                 │
+                 ┌───────────────┴───────────────┐
+            valid single JSON?                    │
+                 │ no                             │ yes
+                 ▼                                ▼
+        400 input_contract_violated       validate against schema
+        "…not a single JSON value: …"           │
+        (NO RUN CREATED)          ┌─────────────┴─────────────┐
+                              matches?                          │
+                                  │ no                          │ yes
+                                  ▼                             ▼
+                     400 input_contract_violated       re-serialize canonically
+                     "$.field: expected …"             (minified, sorted keys)
+                     (NO RUN CREATED)                          │
+                                                               ▼
+                                                   canonical value on the envelope
+                                                   → run created (status Queued)
+```
+
+Two consequences are worth stating outright. First, **the agent always reads normalized JSON.** Whatever whitespace, key order, or fencing the caller sent, the run's input is the canonical form, so the model's view is stable and the journal stores one deterministic representation. Second, **the parsed value travels on the envelope metadata**, so downstream logic that wants the structured input as real JSON — not as a string it has to re-parse — can read it directly.
+
+The input contract is the right tool when a session is an API endpoint for other software: a connector, a scheduled job, or another Kheish session that should only ever hand this one well-typed requests. It converts "the caller sent garbage" from a run that wastes tokens discovering the garbage into a synchronous rejection at the door.
+
+## Output contracts: validate at the completion boundary, repair, or fail closed
+
+A **structured output contract** says: the final answer of every run in this session must be a single JSON value matching this schema. The engine enforces it at the **completion boundary** — the moment the model produces a final answer with no further tool calls — and it does something the input contract cannot: when the answer is *close but wrong*, it gives the model a bounded number of chances to fix it before giving up.
+
+The completion boundary is where a run decides it is done. The engine reaches it when a turn produces no tool executions (the model stopped calling tools and just answered). At that boundary, in order: it checks any completion requirements (for example, "you must have written the workspace file"), and then, if the session has an output contract, it validates the final answer.
+
+Validation reuses the same extractor and validator as the input contract: extract the JSON candidate (stripping one fence), parse it as a single JSON value, validate against the schema. Three outcomes:
+
+- **The answer conforms.** The parsed value becomes the run's `structured_output`, and the run completes with that as its delivered payload.
+- **The answer does not conform, and the repair budget is not exhausted.** The engine appends a **repair message** to the conversation — the validation error (the JSON-path string) plus the schema rendered as JSON Schema plus an instruction to reply with *only* the corrected JSON, no prose and no fences — and takes another turn. Crucially, the repair turn is run with tools **withheld entirely** (`tool_choice: none`, parallel tool calls off), so the model cannot wander off calling tools instead of correcting its payload. Its only job on a repair turn is to answer.
+- **The answer does not conform and the repair budget is exhausted.** The run **fails closed** with an error like `structured output contract unsatisfied after N repair attempts: <last validation error>`. A contracted session never delivers a non-conforming answer; if it cannot produce one, it fails visibly instead.
+
+```text
+   OUTPUT CONTRACT — COMPLETION BOUNDARY (validate → repair loop → deliver or fail)
+
+   model produces final answer (no more tool calls)
+        │
+        ▼
+   completion requirements satisfied? ──no──▶ follow-up turn (bounded) … then fail if still unmet
+        │ yes
+        ▼
+   output contract set? ──no──▶ complete with prose answer
+        │ yes
+        ▼
+   extract JSON · parse · validate  ───conforms──▶ structured_output = value ──▶ COMPLETED
+        │ does not conform
+        ▼
+   repair_count ≥ budget? ──yes──▶ FAILED  "contract unsatisfied after N repair attempts: <error>"
+        │ no
+        ▼
+   append repair message (JSON-path error + rendered schema + "reply ONLY corrected JSON")
+   repair_count += 1 ;  next turn with tools WITHHELD (tool_choice: none)
+        │
+        └────────────▶ back to the completion boundary
+```
+
+### The repair budget
+
+The budget is deliberately small and hard-capped. A contract may request a `max_repair_attempts`; if it does not, the default is **3**. Whatever it requests, the effective budget is clamped to a hard ceiling of **5**. A model that cannot produce conforming JSON in a handful of focused, tool-free attempts is not going to get there in fifty — it is going to burn tokens. The cap turns "keep trying forever" into "try a few times, then fail so a human or an upstream system can react."
+
+Note the important sequencing: a run under an output contract can still take **as many tool-calling turns as it needs** before the final answer. The contract only governs the *final* answer at the completion boundary. Repair attempts are counted separately from ordinary turns, and only the tool-free repair turns are constrained. So a run can research, call tools, compact its context, and then — only at the very end — be held to producing conforming JSON.
+
+### Canonical JSON on the wire
+
+When an output contract is satisfied, the delivered content is the **canonical, minified JSON** — fences stripped, keys deterministically ordered — not the raw text the model typed. If the model answered with a fenced, whitespace-heavy blob (a Markdown `json` code fence wrapping `{ "status": "ok",   "count": 3 }`), the delivered `content` is the canonical string `{"count":3,"status":"ok"}`. The delivery also carries the structured payload as **real JSON** in its metadata (an `output_kind` of `structured_output` and a `structured_output` field holding the parsed value), so a webhook or downstream consumer can read typed JSON without re-parsing a string. This is what "delivered canonically to webhooks" means in practice: the wire format is normalized and machine-consumable, and it is identical regardless of how the model happened to format its answer.
+
+```text
+   MODEL ANSWER ──▶ CANONICAL DELIVERY
+
+   model typed (wrapped in a ~~~json … ~~~ markdown fence):
+                  { "status": "ok",   "count": 3 }
+        │  extract (strip fence) · parse · validate · re-serialize
+        ▼
+   delivered content:  {"count":3,"status":"ok"}          (canonical, minified, sorted keys)
+   delivery metadata:  output_kind = "structured_output"
+                       structured_output = { "status": "ok", "count": 3 }   (real JSON, not a string)
+```
+
+### Input and output contracts together
+
+Set both on one session and you have a typed pipeline: inputs are validated and canonicalized at the door, the model does its work, and the final answer is validated (and repaired) before it leaves. The two contracts are independent — you can set either alone — but they compose into a session that behaves like a well-typed function with an LLM inside. That is the intended shape for a session used as a building block: something upstream can only ever hand it valid requests, and something downstream can rely on getting valid responses or an explicit failure.
+
+Both contracts persist as session metadata (in their own sidecars), so they survive restarts and are part of a session's durable identity. Setting, changing, or clearing a contract is a session configuration change, not a per-run flag — every future run in the session inherits it until you change it.
+
+### Contracts and completion requirements at the boundary
+
+The output contract is not the only gate at the completion boundary. A run can also carry **completion requirements** — conditions that must hold before a run is allowed to finish, such as "a specific workspace file must have been written." These are checked *before* the output contract, and they interact in a way worth understanding.
+
+When the model produces a final answer with no tool calls, the engine first asks: are the completion requirements satisfied? If not, it appends a follow-up message nudging the model toward the missing requirement and takes another turn — but this follow-up is bounded (a small number of attempts) and, where the requirement is "write file X," the follow-up turn can even force the relevant tool (`write_file` or `edit_file`) so the model does the thing rather than talk about it. Only once the requirements are met does the engine evaluate the output contract. So the ordering at the boundary is: **completion requirements first (may force a tool), then output contract (repairs are tool-free).** A run that satisfies neither will exhaust the requirement follow-ups first and fail there; a run that satisfies the requirements but cannot produce conforming JSON will exhaust the repair budget and fail there. Both are fail-closed; they just fail at different gates.
+
+This layering matters when you design a contracted session that also does real side-effecting work. You can require that the run *produce an artifact* (a file, say) via a completion requirement, and *report a typed summary* via the output contract. The engine drives the model to satisfy both before it will call the run complete, and it drives them in the order that makes sense: do the work, then describe it in the required shape.
+
+### Determinism: why canonicalization is worth the surprise
+
+It is easy to be annoyed the first time you notice that your delivered content is minified and its keys reordered when the model formatted its answer beautifully. The determinism is the point, and it earns its keep in three places.
+
+First, **the journal stores one representation.** Whatever the caller sent or the model typed, the canonical form is what lands durably, so replaying a session is byte-stable and a checkpoint digest over the conversation is meaningful. Second, **idempotency fingerprints are stable.** The behaviorally relevant request is hashed; canonicalizing the input means the same logical request produces the same fingerprint regardless of incidental formatting, so a retry is recognized as a retry. Third, **downstream diffing works.** A consumer that stores yesterday's delivery and compares it to today's is comparing normalized JSON to normalized JSON, so a real change shows up and a cosmetic reformat does not. If you truly need the model's literal, pretty-printed bytes, an output contract is the wrong tool — but if you are consuming the answer as data, canonical JSON is exactly what you want.
+
+## Sessions narrow, they do not widen
+
+One more property ties the durable-session idea to the security model, because it explains why a session is more than a transcript. A session can carry a **capability scope** and a **credential scope** that *narrow* what runs in that session may do, relative to the daemon's global inventory:
+
+- the **capability scope** gates which skills are visible and usable and which MCP servers, tools, and helper tools are visible;
+- the **credential scope** gates which daemon routes may resolve credentials, which connector secrets may be used, and which credentialed MCP servers may actually execute.
+
+The direction is always *narrowing*. A session can restrict the daemon-global inventory to a subset; it cannot grant itself access the daemon does not already offer. When a persona is bound to a session, its baseline capability policy is intersected with any session-local override to produce the effective scope — again, an intersection, never a union. And sidechains inherit both the effective capability boundary and the effective credential boundary from their parent, then may narrow them further. This is what makes a session a safe unit to hand a specific, bounded job: you can stand up a session that can only see the two skills and one connector it needs, set a strict input contract so it only accepts well-formed requests, set a strict output contract so it only emits well-formed responses, and know that nothing running inside it can reach past those boundaries. For the full model of scopes, personas, and how the effective scope is derived, see [Agents, personas, and skills](./agents-personas-skills) and [Security and operations](../operations/security).
+
+## Waiting states, briefly
+
+Runs can pause mid-execution. The most important waiting states are waiting for approval, waiting for structured user input, and queued behind another active run in the same session. The daemon keeps enough durable state to resume these without reconstructing them from a client's memory. Approvals and structured questions are covered in full in [Approvals and structured questions](../automation/tools-and-mcp) and in the state-machine detail on the [Architecture](./architecture#approvals-and-structured-questions-pausing-without-losing-your-place) page; the short version is that a suspended run resumes exactly where it stopped, and a batch of questions is resolved atomically — all answers to one request land together, or the resolution is refused.
+
+The interaction with contracts is worth a note: a run that suspends for approval or a question and then resumes is still bound by the session's output contract. The pause does not exempt the eventual final answer from validation. Whatever a run does between suspensions, the completion boundary is the same gate.
+
+## Reply targets: where an answer is addressed
+
+A run's output has to go somewhere. **Reply targets** are the addresses — resolved when the run is created — that say where the answer should be delivered. They come from a few places, in a defined order: explicit reply targets on the submission itself, then the session's prospective reply-target defaults, then daemon-owned fallbacks for background work. Connector-driven submissions can also *persist* their explicit reply targets back onto the session as new defaults, but only when the session is idle — so a connector establishing "reply here from now on" does not race an in-flight run.
+
+The key property, repeated from earlier, is that reply targets are **captured at run creation** and stable for the life of the run. A run knows where its answer goes the moment it is created; nothing that happens to the session's defaults afterward changes where *that* run's output is addressed.
+
+## Deliveries and dead letters: getting the answer out, reliably
+
+Producing an answer is not the same as delivering it. When output must reach an external system — a webhook, a chat connector, an output plugin — the daemon does not fire-and-forget. It enqueues the delivery and drives it through a retry policy, and if it exhausts that policy it **dead-letters** the delivery rather than dropping it. An undelivered message becomes an explicit, inspectable, replayable record — never a silent loss.
+
+A delivery moves through states: it starts `pending`, becomes `retrying` after a failed attempt that is worth retrying, and — if it never succeeds within its budget — ends `dead_lettered`. The retry policy is bounded on every axis: an initial delay, a maximum delay, a cap on how long a provider-requested "retry after" can push the next attempt, and a maximum number of attempts. Consecutive retryable failures against one target can **open a circuit** for that target, so a downstream that is hard-down does not get hammered — its deliveries wait for the circuit rather than retrying into a wall, and other targets keep flowing.
+
+```text
+   DELIVERY LIFECYCLE  (retry with bounds → dead-letter → operator replay)
+
+   output ready ──▶ enqueue delivery ──▶ PENDING
+                                          │  attempt
+                        ┌─────────────────┴──────────────────┐
+                    success                                failure
+                        │                              retryable?
+                        ▼                        ┌─────────┴─────────┐
+                   delivered (done)           yes                    no
+                                                │                     │
+                                     backoff (initial→max,            │
+                                     honoring capped retry-after)     │
+                                     attempts < max?                  │
+                                     ┌────────┴────────┐              │
+                                    yes               no             │
+                                     │                 ▼             ▼
+                                     └──▶ RETRYING   DEAD_LETTERED ◀──┘
+                                     (circuit may open after                │
+                                      consecutive retryable failures)       │  operator
+                                                                            ▼
+                                                        replay (single / bulk / force) → back to PENDING
+                                                        resolve (mark handled, with reason)
+```
+
+Dead letters are not a graveyard; they are a queue for a human. An operator can **replay** a single dead letter, **bulk-replay** a filtered set (with a dry-run to preview what would be replayed), optionally **force** a replay past a guard, or **resolve** a dead letter as handled with a recorded reason (when the right fix was to do something out of band rather than resend). Both the dead-letter ledger and the resolved-dead-letter ledger are durable and survive restarts, and the daemon exposes counts — retrying, dead-lettered, unresolved-dead-lettered, targets blocked behind an earlier retry, open circuits — as metrics so the backlog is observable rather than discovered by a user who never got their message.
+
+The reason this machinery exists is that the interesting failures in an autonomous system are the delivery failures. The model produced a perfectly good, contract-conforming answer; the webhook was down for ninety seconds; the naive outcome is a lost result and a confused user. The delivery queue turns that into a retried-then-parked record an operator can replay when the webhook comes back — which is exactly the behavior you want from a system that is supposed to run without someone watching it.
+
+## Worked example: a contracted session end to end
+
+Tie it together with a concrete, generic scenario. Suppose you stand up a session as a "triage" endpoint that other software calls. You set an **input contract** requiring `{ "subject": string, "body": string, "priority"?: string }` and an **output contract** requiring `{ "category": string, "severity": number, "needs_human": boolean }`, and you point its reply target at a webhook.
+
+1. A caller submits `{ "subject": "disk full", "body": "…", "priority": "high" }` — perhaps wrapped in a code fence, perhaps with odd spacing. The ingress boundary strips the fence, parses it, validates it against the input schema, and canonicalizes it. A run is created with the canonical JSON as its input.
+2. A caller that instead submits `{ "subject": "disk full" }` (missing `body`) never creates a run: it gets `400 input_contract_violated: $.body: missing required field` synchronously. No tokens spent.
+3. The run executes. The model may call tools — look something up, check a threshold — over as many turns as it needs.
+4. At the completion boundary the model answers. If it answers with prose, or with JSON missing `severity`, the engine appends a repair message (`$.severity: missing required field`, plus the schema, plus "reply with only the corrected JSON") and takes a tool-free repair turn. It has up to the effective budget of such turns.
+5. When the model produces `{ "category": "storage", "severity": 3, "needs_human": false }`, the run completes. The delivery carries the canonical minified string as `content` and the parsed object as `structured_output` metadata.
+6. The delivery is enqueued to the webhook. If the webhook is up, it is delivered. If it is down, the delivery retries with bounded backoff and, if it never succeeds, dead-letters for you to replay when the webhook recovers.
+
+At no point does a malformed request become a run, and at no point does a non-conforming answer reach the webhook. The failure modes are all explicit: a rejected submission, a failed run, or a dead-lettered delivery — each inspectable, none silent.
+
+## Failure modes and honest limits
+
+**An output contract can make a run fail that would otherwise have "succeeded."** If the model simply cannot produce conforming JSON within the repair budget, the run fails closed. That is by design — you asked for a guarantee about the output shape, and the only honest way to keep it is to fail when it cannot be met — but it means a contract raises the bar for what "done" means. Set schemas that a capable model can actually satisfy, and prefer optional fields over required ones where the value genuinely might be absent.
+
+**The input contract validates shape, not meaning.** It guarantees the payload parses and matches the schema; it does not guarantee the values make sense. `{ "priority": "banana" }` passes a `priority: string` schema. If you need constrained values, either encode them structurally where the subset allows, or validate them inside the run and use a structured question or an early failure when they are wrong.
+
+**Contracts are per session, not per run.** Setting a contract changes every future run in that session. There is no per-request opt-out. If you need both contracted and free-form behavior, use two sessions.
+
+**Canonicalization changes the bytes, deliberately.** The delivered content is not the model's literal text; it is the canonical re-serialization. Consumers that expected the model's exact formatting (including key order) will see normalized JSON instead. This is a feature — it makes deliveries deterministic — but it is a behavior to know about if you were diffing raw model output.
+
+**Dead letters need an operator.** The delivery queue will retry and park, but it will not invent a working destination. A growing unresolved-dead-letter count means something downstream is broken and needs attention; the daemon makes the backlog visible, but clearing it is an operational act.
+
+**Reply-target and route changes are prospective.** Changing a session's defaults never rewrites in-flight runs. If you need a run to use new routing or new reply targets, that is a property of the *next* run, not a retroactive edit to the current one.
+
+## Frequently asked questions
+
+**Can I set only an output contract and leave input free-form?** Yes. The two contracts are independent. A common shape is a free-form input (a human describes something in prose) with a strict output contract (the answer must be typed for a downstream consumer).
+
+**What happens to a run that was already queued when I set a contract?** Contracts apply to runs as they execute against the current session configuration. Set a contract before you rely on it; do not assume a change retroactively re-validates an input that was already accepted under the old configuration.
+
+**Does the repair loop count against `max_turns`?** Repair attempts are tracked with their own counter and their own hard cap, separate from the ordinary turn budget. The point is that repair is bounded regardless of how many normal turns the run took to get to its answer.
+
+**Why is my delivered content minified and reordered when the model formatted it nicely?** Because an output contract delivers the *canonical* re-serialization, not the model's literal bytes. That determinism is intentional; the pretty formatting was cosmetic.
+
+**A caller says their submission was rejected but I never saw a run — is that a bug?** No, that is the input contract working. A violating payload is rejected at the ingress boundary before any run exists. The rejection is synchronous and carries a JSON-path reason; there is deliberately no run to find.
+
+**How do I get a message back that dead-lettered?** Replay it — individually, or as a filtered bulk replay (dry-run first to see the set) — once the destination is healthy again, or resolve it with a reason if you handled it out of band. Nothing is lost while it sits in the dead-letter ledger.
+
+**Where does structured output show up if I am not using a webhook?** The same structured payload is captured on the run's output records and delivered through whatever reply targets the run captured. The webhook case is just the most illustrative because it makes the canonical-JSON-on-the-wire behavior concrete.
+
+## Where to go next
+
+- [Architecture and the run state machine](./architecture) — the run lifecycle, the journal and sidecars, turn-boundary durability, and the recovery model these contracts rely on.
+- [Approvals and structured questions](../automation/tools-and-mcp) — the suspend/resume model for human decisions, including atomic multi-question resolution.
+- [Recovered run memory](./memory) — how terminal runs seed a bounded memory layer for later runs in the same session.
+- [Agents, personas, and skills](./agents-personas-skills) — the persona snapshots and capability/credential scopes a contracted session executes under.
+- [Schedules and automation](../automation/schedules) — scheduled inputs and observation materializations, which are runs and are subject to the same contracts.
+- [Security and operations](../operations/security) — the auth layer, secret slots, and the operational discipline around deliveries and the state root.
+- [Quickstart](../welcome/quickstart) — set a contract on a session and watch an invalid payload bounce and a valid one flow.
+
+### Evidence note
+
+- Code verified: `crates/kheish-types/src/model.rs` (the schema type, the JSON-path validator, strict JSON Schema parsing and rendering, the output contract and its repair budget) and `crates/kheish-types/src/session.rs` (the input/output contract metadata keys and the structured input contract), `crates/kheish-daemon/src/state/session_ingress.rs` (fail-closed input-contract enforcement and canonical re-serialization at ingress), `crates/kheish-core/src/engine.rs` (the completion boundary, output-contract validation, the tool-free repair loop, and canonical structured output), and `crates/kheish-daemon/src/delivery.rs` with `crates/kheish-daemon/src/state/output_workflow.rs` (delivery retry policy, circuits, and the dead-letter/resolve/replay ledgers).
+- CLI/API verified: input and output contracts are set and cleared through the sessions surface; contract violations surface as `input_contract_violated` bad-requests; dead-letter counts and replay/resolve are exposed through the delivery surfaces.
+- Daemon live tested for this note: yes — a true-binary end-to-end test drives a contracted session and asserts the canonical minified JSON reaches a webhook with the parsed payload in metadata; repair and fail-closed paths are covered by engine and daemon tests.
+- Provider-specific tested for this note: no; contract validation, repair, canonicalization, and delivery are provider-neutral.

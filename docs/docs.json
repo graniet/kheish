@@ -16,116 +16,70 @@
   "navigation": {
     "groups": [
       {
-        "group": "Home",
+        "group": "Welcome",
         "pages": [
-          "index"
-        ]
-      },
-      {
-        "group": "Get started",
-        "pages": [
-          "introduction/start-here",
-          "introduction/quickstart",
-          "operators/running-the-daemon",
-          "operators/docker-and-containers",
-          "operators/security-and-auth",
-          "introduction/python-sdk-quickstart",
-          "introduction/web-sdk-quickstart",
-          "integrations/webhook-quickstart",
-          "introduction/overview",
-          "introduction/architecture-overview"
+          "index",
+          "welcome/quickstart"
         ]
       },
       {
         "group": "Concepts",
         "pages": [
+          "concepts/architecture",
           "concepts/sessions-and-runs",
-          "concepts/playbooks-and-flows",
-          "concepts/projects-and-project-tasks",
-          "concepts/channels-and-public-conversations",
-          "concepts/connectors-and-reply-targets",
-          "concepts/personas",
-          "concepts/recovered-run-memory",
-          "concepts/semantic-learning-and-procedural-skills",
-          "concepts/assets-and-multimodal-input",
-          "concepts/capture-and-observations",
-          "concepts/agents-and-sidechains",
-          "concepts/tasks-and-schedules",
-          "concepts/approvals-and-questions",
-          "concepts/state-and-recovery"
+          "concepts/memory",
+          "concepts/agents-personas-skills"
         ]
       },
       {
-        "group": "Runtime",
+        "group": "Automation",
         "pages": [
-          "runtime/providers-and-routing",
-          "runtime/context-windows",
-          "runtime/openrouter",
-          "runtime/tools",
-          "runtime/permissions",
-          "runtime/hooks",
-          "runtime/skills",
-          "runtime/mcp"
-        ]
-      },
-      {
-        "group": "Integrations",
-        "pages": [
-          "integrations/connectors",
-          "integrations/multi-input-sessions",
-          "integrations/output-routing",
-          "integrations/capture-quickstart"
+          "automation/schedules",
+          "automation/connectors",
+          "automation/tools-and-mcp"
         ]
       },
       {
         "group": "Operations",
         "pages": [
-          "operators/runtime-configuration",
-          "operators/kheish-stack",
-          "operators/linear-github-feature-loop",
-          "operators/kheish-stack-api-spec",
-          "operators/production-runbooks",
-          "operators/mcp-catalog",
-          "operators/oauth",
-          "operators/playbooks-and-flows",
-          "operators/deployment-and-hardening",
-          "operators/debugging-and-recovery"
+          "operations/security",
+          "operations/production"
         ]
       },
       {
-        "group": "API",
+        "group": "Integrate",
+        "pages": [
+          "integrate/sdks-and-api"
+        ]
+      },
+      {
+        "group": "API reference",
         "pages": [
           "reference/control-plane-api",
+          "reference/sessions-and-runs-api",
+          "reference/tasks-schedules-agents-api",
+          "reference/questions-and-approvals-api",
+          "reference/runtime-api",
+          "reference/connectors-api",
+          "reference/external-connectors-protocol",
+          "reference/learnings-api",
+          "reference/skills-api",
+          "reference/assets-api",
+          "reference/personas-api",
           "reference/playbooks-and-flows-api",
           "reference/projects-api",
           "reference/channels-api",
-          "reference/personas-api",
-          "reference/assets-api",
           "reference/boards-api",
-          "reference/observations-and-derivations-api",
-          "reference/connectors-api",
-          "reference/external-connectors-protocol",
-          "reference/runtime-api",
-          "reference/sessions-and-runs-api",
-          "reference/questions-and-approvals-api",
-          "reference/tasks-schedules-agents-api",
-          "reference/learnings-api",
-          "reference/skills-api"
+          "reference/observations-and-derivations-api"
         ]
       },
       {
         "group": "Operational reference",
         "pages": [
           "reference/connector-configuration",
+          "reference/built-in-tools",
           "reference/skill-format",
-          "reference/hook-reference",
-          "reference/built-in-tools"
-        ]
-      },
-      {
-        "group": "Contributing",
-        "pages": [
-          "contributing/development"
+          "reference/hook-reference"
         ]
       }
     ]

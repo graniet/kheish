@@ -28,7 +28,7 @@ pub struct DocsGroupView {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct DocsPageSummaryView {
-    /// The stable page path, e.g. `introduction/start-here`.
+    /// The stable page path, e.g. `welcome/quickstart`.
     pub path: String,
     pub title: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -160,21 +160,21 @@ mod tests {
     fn manifest_exposes_navigation_groups_with_titled_pages() {
         let manifest = docs_manifest();
         assert!(!manifest.groups.is_empty(), "docs.json groups embedded");
-        let start_here = manifest
+        let quickstart = manifest
             .groups
             .iter()
             .flat_map(|group| &group.pages)
-            .find(|page| page.path == "introduction/start-here")
-            .expect("start-here page listed");
-        assert_eq!(start_here.title, "Start Here");
-        assert!(!start_here.description.is_empty());
+            .find(|page| page.path == "welcome/quickstart")
+            .expect("quickstart page listed");
+        assert_eq!(quickstart.title, "Quickstart");
+        assert!(!quickstart.description.is_empty());
     }
 
     #[test]
     fn pages_load_with_frontmatter_stripped() {
-        let page = docs_page("introduction/start-here").expect("page exists");
-        assert_eq!(page.title, "Start Here");
-        assert!(page.content.starts_with("# Start Here"));
+        let page = docs_page("welcome/quickstart").expect("page exists");
+        assert_eq!(page.title, "Quickstart");
+        assert!(page.content.starts_with("# Quickstart"));
         assert!(!page.content.contains("---\ntitle"));
     }
 

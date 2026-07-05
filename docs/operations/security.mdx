@@ -1,0 +1,884 @@
+---
+title: The security model
+description: Kheish's local-first posture, the encrypted write-only secret store, control-plane auth modes, capability and credential scopes, learning-plane governance, PII and debug redaction, connector network posture, and an honest account of what Kheish does and does not protect against.
+---
+
+# The security model
+
+Kheish runs a lot of autonomous, tool-wielding computation on your behalf, often
+against real credentials and real external systems. Its security model is built
+around a few blunt principles: keep the blast radius local by default, never hand
+a root credential to the code that runs a model, make durable state changes pass
+through governance, and be honest about where the guarantees stop.
+
+This page is the whole model in one place. It covers the local-first posture, the
+encrypted secret store and its write-only semantics, the control-plane
+authentication modes, the capability and credential scopes that enforce
+least-privilege at execution time, the learning-plane governance that keeps
+durable memory from being poisoned, the redaction applied to run memories and
+debug artifacts, the network posture of outbound connectors, and — importantly —
+an honest threat model of what Kheish does *not* defend against. It pairs with
+[tools, MCP, and human approval](../automation/tools-and-mcp), which covers the
+runtime-side gates; this page covers the deployment-side foundations under them.
+
+## The trust boundary map
+
+Start with the shape of the whole system, because most security reasoning is
+really "which side of which boundary is this thing on?" Kheish has a small number
+of trust boundaries, and almost every control on this page is about one of them.
+
+```
+                       KHEISH TRUST BOUNDARIES
+
+   ┌───────────────────────── operator / host ─────────────────────────┐
+   │  You, the shell, the state_root on disk, the master key.           │
+   │  Highest trust. Can read/write everything the daemon can.          │
+   │                                                                    │
+   │   ┌──────────────────── control plane (HTTP) ───────────────────┐  │
+   │   │  auth modes: loopback-auto | bearer(admin/read-only) | none │  │
+   │   │  CORS: loopback origins or an exact allowlist                │  │
+   │   │                                                              │  │
+   │   │   ┌──────────────────── daemon core ────────────────────┐   │  │
+   │   │   │  AuthManager (root of trust for secrets)             │   │  │
+   │   │   │  Broker (subjects → grants → short-lived leases)     │   │  │
+   │   │   │  encrypted secret store  |  signed audit ledger      │   │  │
+   │   │   │  learning plane (governed durable memory)            │   │  │
+   │   │   │                                                      │   │  │
+   │   │   │   ┌──────────── execution (per session) ────────┐    │   │  │
+   │   │   │   │  agents run models + tools here.             │    │   │  │
+   │   │   │   │  LOWEST trust. Never sees a root credential. │    │   │  │
+   │   │   │   │  Bounded by CapabilityScope ∩ CredentialScope│    │   │  │
+   │   │   │   └──────┬───────────────────────────────┬──────┘    │   │  │
+   │   │   │          │ route lease                    │ conn lease │  │  │
+   │   │   └──────────┼────────────────────────────────┼──────────┘   │  │
+   │   └──────────────┼────────────────────────────────┼──────────────┘  │
+   └──────────────────┼────────────────────────────────┼─────────────────┘
+                      ▼                                 ▼
+              model providers                   connectors / MCP servers
+             (OpenAI, Anthropic, ...)          (Slack, HTTP, stdio, ...)
+              — external, untrusted             — external, untrusted
+```
+
+The single most load-bearing line on this diagram is the innermost one:
+**execution is the lowest-trust zone, and it never sees a root credential.** An
+agent that resolves a provider route or reaches a connector does so through a
+short-lived, revocable *lease*, not the underlying API key. Everything else —
+the secret store, the broker, the auth modes — exists to keep that property true
+while still letting the daemon get real work done.
+
+## Local-first posture
+
+Kheish's default deployment is a daemon bound to loopback on your own machine,
+owning a `state_root` directory that holds sessions, assets, secrets, and audit.
+This is not a diminished mode; it is the intended one. A local daemon on loopback
+is, by construction, only reachable by processes on the same host, which is why
+`auto` auth mode can run tokenless there without exposing anything to the network.
+
+The `up` onboarding flow leans into this. When you launch it without providing an
+auth-store master key, it generates one, writes it to
+`<state_root>/auth-store-master.key` with owner-only (`0600`) permissions, and
+points `KHEISH_AUTH_STORE_MASTER_KEY_FILE` at it — idempotently, so a relaunch
+reuses the existing key rather than minting a new one and orphaning your encrypted
+secrets. The result is that a first-run local daemon comes up with an encrypted
+secret store, a signing key, and no unauthenticated network surface, without you
+having to assemble any of that by hand.
+
+Going beyond loopback is a deliberate act with deliberate requirements, covered
+next. The rule of thumb: everything about Kheish is safe-by-default *because* it
+assumes local, and every step away from local re-imposes the controls that local
+gave you for free.
+
+## Control-plane authentication
+
+The control plane is the HTTP API that drives the daemon — starting runs,
+inspecting sessions, managing secrets and connectors. It has three auth modes,
+selected at startup with `--http-auth-mode`:
+
+| Mode | Behavior |
+| --- | --- |
+| `auto` | Tokenless on loopback binds; requires an admin token for any non-loopback exposure |
+| `bearer` | Always requires a bearer token; classifies each token as admin or read-only |
+| `none` | No authentication. Local development only. |
+
+`auto` is the pragmatic default: it keeps local development frictionless while
+making it *impossible* to accidentally bind an unauthenticated control plane to a
+non-loopback address. The daemon builder enforces the same boundary as the CLI,
+so even embedding Kheish as a library cannot slip past it. Treat `none` as a
+local-dev convenience and nothing more.
+
+### Admin vs read-only, and route classification
+
+In `bearer` mode you can configure two distinct tokens: an **admin** token for
+mutating operations, and an optional **read-only** token for inspection. The
+classification is not just "GET is read-only." Every non-GET/HEAD/OPTIONS method
+requires admin. And among the read methods, the daemon maintains an explicit
+allowlist of genuinely-read-only paths; anything sensitive, or anything not on
+the allowlist, requires admin.
+
+```
+        REQUEST → REQUIRED ACCESS → TOKEN CHECK
+
+   incoming request (method, path)
+        │
+        ▼
+   is method GET / HEAD / OPTIONS? ── no ──▶ required = ADMIN
+        │ yes
+        ▼
+   does path match a "requires admin" read pattern?
+   (assets/*/raw, runs/*/debug/*, runtime/secrets,
+    runtime/auth/{subjects,leases,accounts}, runtime/hooks,
+    runtime/revisions, logs, stacks, stacks/*/ledger)
+        │ yes ─────────────────────────────▶ required = ADMIN
+        │ no
+        ▼
+   does path match the explicit read-only allowlist?
+   (status, sessions, runs, agents, assets metadata,
+    schedules, learnings, personas, ... )
+        │ yes ─────────────────────────────▶ required = READ_ONLY
+        │ no (unknown path)
+        ▼
+   required = ADMIN  (fail safe: unknown read paths need admin)
+        │
+        ▼
+   ┌──────────────────────────────────────────────┐
+   │ token digest (SHA-256, constant-time compare) │
+   │  matches admin?    ─▶ allow                    │
+   │  matches readonly? ─▶ allow iff required==RO   │
+   │  else              ─▶ 401 / 403, audited       │
+   └──────────────────────────────────────────────┘
+```
+
+The "unknown read paths require admin" rule is the important safety property: a
+new endpoint added tomorrow does not accidentally leak to a read-only token just
+because it responds to GET. It has to be *explicitly* added to the allowlist to
+be read-only.
+
+The paths kept behind admin even for reads are the ones that expose bytes or
+secrets you would not want a read-only tenant to see: raw asset bytes, run debug
+artifacts, the daemon secret inventory, account-backed auth inventory, brokered
+subject and lease inspection, hooks, revisions, logs, and stack ledgers. And
+even a *read-only* token can still reveal session content, run views, runtime
+metadata, and connector summaries — so do not hand a read-only token to an
+untrusted tenant or an uncontrolled browser client. Read-only means "cannot
+mutate," not "cannot see anything sensitive."
+
+### Token hygiene, rotation, and audit
+
+A few hard rules keep token handling honest:
+
+- Admin and read-only tokens must be **distinct**. The daemon rejects duplicate
+  inline tokens at startup, rejects identical token-file paths, and — if hot
+  rotation ever makes the two file contents momentarily identical — refuses *all*
+  bearer tokens until they diverge again. It fails closed rather than letting one
+  token serve both roles.
+- Tokens are never compared as raw strings. Each is hashed to a 32-byte digest
+  and compared in constant time, so a match cannot leak timing information.
+- Token *files* are re-read when their metadata changes, so rotation is a matter
+  of writing the file; the next request that observes the change invalidates the
+  old token. Supply files via `--http-admin-token-file` /
+  `--http-readonly-token-file` or the `_FILE` environment variants.
+- Auth and CORS failures are written to
+  `<state_root>/control-plane-auth/audit.jsonl`, one JSON line each, with the
+  event, timestamp, method, path, reason, origin, required access, and remote
+  address when known. **Token bytes are never written.** The file is created
+  owner-only on Unix.
+- Failure audit volume is rate-limited per reason and remote address. A flood of
+  bad tokens returns `429` and writes a single transition event instead of an
+  unbounded stream of duplicate lines — you get signal, not a self-inflicted
+  disk fill.
+
+The audit file records a small, stable set of events, which is what you alert on:
+
+| Event | Meaning |
+| --- | --- |
+| `auth_failure` | A request presented a missing, malformed, or invalid token, or a read-only token hit an admin-only route |
+| `auth_rate_limited` | Repeated failures from one bucket crossed the per-window threshold; a single transition event is written |
+| `cors_origin_rejected` | A browser origin was not loopback-compatible and not on the exact allowlist |
+| `cors_origin_rate_limited` | Repeated CORS rejections from one bucket crossed the threshold |
+
+A steady trickle of `auth_failure` from one address is a probe; a sudden
+`auth_rate_limited` transition is either an attack or a misconfigured client
+hammering the daemon with a stale token. Because the writes are serialized and
+rate-limited, the audit stays useful under a flood instead of drowning in
+duplicate lines.
+
+CORS is a separate axis from auth and is not an auth substitute. By default the
+control plane accepts browser origins whose host is loopback-compatible
+(`localhost`, `127.0.0.1`, `[::1]`); for a hosted UI you set an exact origin
+allowlist. Each allowlisted origin must be an exact `http`/`https` loopback
+origin with no path, query, fragment, or wildcard — the loopback-origin parser
+deliberately rejects spoofed hosts like `http://127.0.0.1.example.com` and
+`http://localhost.evil.test`, so an attacker cannot dress a remote origin up to
+look local. Keep bearer auth on for every non-loopback bind regardless of CORS.
+
+Connector ingress routes do *not* reuse control-plane tokens — each connector
+carries its own transport auth, separate from the operator auth used to manage
+it. That separation means the token an external service uses to *reach* a
+connector is independent of the admin token that can *reconfigure* it: leaking a
+connector's inbound token does not hand out control-plane access. The per-connector
+models are:
+
+- **Per-connector HTTP bearer** for generic inbound HTTP.
+- **Slack signing secret** for Slack, verifying that a request genuinely came
+  from Slack.
+- **Telegram secret token** for Telegram webhook validation.
+
+Daemon-managed connectors still use the normal control-plane auth boundary for
+their CRUD endpoints, so mutating a connector's configuration requires an admin
+token even though the connector's own transport auth is a separate secret. See
+[security and auth](/operators/security-and-auth) for the full operator runbook
+and [connectors](../automation/connectors) for the ingress model.
+
+## The encrypted secret store
+
+Every durable secret Kheish holds — provider API keys, connector tokens, MCP
+credentials, OAuth accounts — lives in one encrypted store under the state root,
+managed by the `AuthManager`. Its defining property is that it is
+**write-only from the operator's perspective**: you can write a secret and you
+can rotate it, but nothing — not the CLI, not the HTTP API, not a running agent —
+can read the raw value back out.
+
+```
+             SECRET STORE DATA FLOW  (write-only)
+
+   operator                          daemon                       consumers
+   ────────                          ──────                       ─────────
+
+   secrets set openai.prod           ┌───────────────────┐
+   --from-env OPENAI_API_KEY  ──────▶│ encrypt with       │
+                                     │ master key         │
+                                     │ (AEAD envelope)    │
+                                     └─────────┬──────────┘
+                                               ▼
+                                     ┌───────────────────┐
+                                     │ state_root/auth/   │   encrypted at rest
+                                     │ global-slots.json  │   owner-only file
+                                     └─────────┬──────────┘
+                                               │
+             ┌─────────────────────────────────┼──────────────────────────┐
+             │ READ PATH (metadata only)        │ USE PATH (never exposed) │
+             ▼                                   ▼                          
+   secrets list / get                  broker mints a short-lived lease;    
+   returns:                            the raw value is injected only where 
+     slot_id, provider, mode,          it is consumed:                      
+     summary, updated_at_ms              • provider route request           
+   NEVER the secret value                • connector child-process env      
+                                         • MCP stdio child env / HTTP header
+                                               │
+                                               ▼
+                                     external system (provider, connector,
+                                     MCP server) — value used, then gone
+```
+
+Concretely, `kheish-daemon secrets list` and `secrets get <ref>` return only
+metadata: `slot_id`, `provider`, `mode`, a `summary`, and `updated_at_ms`. There
+is no "reveal" endpoint. This is intentional — the daemon is a secret *custodian*,
+not a secret *vault you query*. The same store backs connector and MCP secrets:
+runtime APIs accept write-only secret values and bind them to slot references,
+and subsequent reads only show redacted metadata (whether the secret is
+configured, whether it points at `inline`/`env`/`secret_ref`, which ref or env
+name is bound).
+
+### One store, many kinds of secret
+
+The same encrypted store is the single home for every durable secret class, which
+keeps the security surface small — there is one thing to encrypt, back up, and
+protect, not five:
+
+| Secret class | Slot shape | Written with |
+| --- | --- | --- |
+| Provider route API keys | `<name>.prod` (via `auth_ref`) | `secrets set` |
+| Account-backed provider auth | same slot, imported | `secrets import-codex` / `import-claude-code` |
+| Built-in MCP catalog credentials | `mcp.<entry>.<CREDENTIAL>` | `mcp auth set` |
+| Custom MCP secrets | `mcp.custom.<server>.<KEY>` | `secrets set --provider generic` |
+| MCP OAuth accounts | `mcp.oauth.<id>` | `mcp oauth login` |
+| Connector transport secrets | connector-scoped refs | connector runtime API |
+
+Account-backed auth (OpenAI Codex, Anthropic Claude, MCP OAuth) has its own
+redacted status surface: `runtime auth accounts list/get/refresh/revoke` returns
+status metadata only and never token bytes, and Kheish rejects OAuth scope
+escalation on refresh — an agent cannot consent its way into broader scopes than
+were originally granted. Whatever the class, the read path returns metadata and
+the use path goes through a broker lease; nothing in the table has a "reveal the
+value" operation.
+
+### The master key
+
+The store is encrypted at rest under `KHEISH_AUTH_STORE_MASTER_KEY` (or the
+`_FILE` variant). Three things about it are non-negotiable:
+
+- **Generate it once per persistent `state_root` and reuse it.** Replacing the
+  key later makes every existing encrypted slot unreadable — you have not rotated
+  your secrets, you have orphaned them.
+- **Without a master key, the daemon cannot store new runtime-managed secrets.**
+  It can still read env-backed config, but writing a new secret-store entry
+  through the CLI or API requires the daemon to have been started with a master
+  key. This is why `up` auto-generates one — so the write path works out of the
+  box.
+- **On container platforms, mount it as a file** and point
+  `KHEISH_AUTH_STORE_MASTER_KEY_FILE` at it. That is the recommended path when
+  your orchestrator already manages secret files. The same file pattern exists
+  for the control-plane bearer tokens (`KHEISH_DAEMON_ADMIN_TOKEN_FILE`,
+  `KHEISH_DAEMON_READONLY_TOKEN_FILE`).
+
+Routes reference secrets by a stable `auth_ref` slot id rather than inlining keys,
+so one slot can back many routes, the daemon refuses to start when a referenced
+slot is missing, and `secrets set` on an existing ref is the standard rotation
+path. Built-in MCP catalog credentials use `mcp.<entry>.<CREDENTIAL>` slots;
+OAuth accounts use `mcp.oauth.<id>` slots. The one loader concession to history:
+older plaintext store files are still accepted for backward compatibility, so do
+not assume an existing state root is encrypted until it has been rewritten
+through the current store path.
+
+### Bootstrapping route secrets
+
+The recommended operator flow separates *naming* a credential slot from
+*populating* it, so the route file never contains a raw key. You define named
+routes with `auth_ref`, populate those refs offline, then start the daemon
+against the same state root and master key:
+
+```bash
+export KHEISH_AUTH_STORE_MASTER_KEY="$(kheish-daemon secrets generate)"
+
+kheish-daemon secrets set openai.prod \
+  --offline --state-root .kheish-daemon-data \
+  --provider openai --from-env OPENAI_API_KEY
+
+kheish-daemon secrets set anthropic.prod \
+  --offline --state-root .kheish-daemon-data \
+  --provider anthropic --from-env ANTHROPIC_API_KEY
+```
+
+```toml
+# routes.toml
+version = 1
+default_route = "openai"
+
+[routes.openai]
+driver = "openai"
+default_model = "gpt-5.4"
+auth_ref = "openai.prod"
+
+[routes.anthropic]
+driver = "anthropic"
+default_model = "claude-opus-4-6"
+auth_ref = "anthropic.prod"
+```
+
+When account-backed auth is preferable to a static API key, import it into the
+same slot with `secrets import-codex <ref>` or
+`secrets import-claude-code <ref>`; the route file does not change, because it
+still references the slot by `auth_ref`. Whichever backing you choose, actual
+route use still passes through the broker — so route *selection* can succeed while
+credential *resolution* is later denied by the execution's effective
+`CredentialScope`. That two-step (select, then resolve-under-scope) is what lets
+you keep one broad route inventory on the daemon and still deny a specific child
+the credential.
+
+Alongside the long-lived slots, the daemon persists broker revocation and
+issued-lease state under the same state-root auth area. Back that up together
+with the encrypted store when you need durable revocation history to survive a
+restart — otherwise a revocation you issued before a crash could be forgotten
+across the boundary.
+
+## Brokered runtime auth
+
+The write-only store answers "where do secrets live." The broker answers "how
+does execution use a secret without ever holding it." `AuthManager` is the root
+of trust for long-lived credentials, but at execution time the daemon does not
+hand those roots to agents, sidecars, or delegated work. It derives three
+brokered objects instead:
+
+- **`AuthSubject`** — the execution identity asking for credential-backed work,
+  such as `session:demo` or `agent:agent-7`.
+- **`CredentialGrant`** — the allowed audience for that subject after scope
+  checks.
+- **`CredentialLease`** — the short-lived opaque lease actually used for one
+  route resolution or one connector/MCP credential request.
+
+```
+        BROKERED CREDENTIAL FLOW
+
+   agent needs to call model route "openai"
+        │
+        ▼
+   AuthSubject = session:demo / agent:agent-7
+        │
+        ▼
+   CredentialScope check: is "openai" route allowed?
+        │ no ─────────────▶ DENIED (route selection may have
+        │                   succeeded; resolution is denied here)
+        │ yes
+        ▼
+   CredentialGrant issued (audience = openai route)
+        │
+        ▼
+   CredentialLease minted  ── short-lived, opaque, revocable ──┐
+        │                                                       │
+        ▼                                                       │
+   provider request runs using the lease, not the API key      │
+        │                                                       │
+        ▼                                                       │
+   revoke-subject / revoke-lease / revoke-slot ────────────────┘
+   invalidates future resolutions AND active leases immediately
+```
+
+The payoff is revocation and audit without secret exposure. Revoking a subject,
+a lease, or a whole auth slot invalidates both future resolutions and currently
+active leases immediately. Audit can refer to subjects, principals, grants, and
+leases without the root secret ever appearing. And the pattern is uniform:
+provider routes resolve through route leases, connector child processes receive
+connector leases scoped to explicit env keys and concrete backing secret refs,
+and scoped MCP OAuth resolution uses leases scoped to one server, slot, and
+approved scope hash — with the HTTP client re-authorizing before each call.
+Inspect and revoke through the API (`GET/POST /v1/runtime/auth/...`) or the CLI:
+
+```bash
+kheish-daemon runtime auth subject session:demo
+kheish-daemon runtime auth revoke-subject session:demo
+kheish-daemon runtime auth revoke-lease route-lease-abc123
+kheish-daemon runtime auth revoke-slot openai.prod
+```
+
+Account-backed auth (OpenAI Codex, Anthropic Claude, MCP OAuth) has its own
+redacted status surface under `runtime auth accounts ...`; every read returns
+status metadata only, never token bytes.
+
+## Capability and credential scopes as least-privilege
+
+Two independent scopes enforce least-privilege at execution time, and keeping
+them separate is what gives Kheish precise control:
+
+- **`CapabilityScope`** controls what a session or child can *see and call* —
+  which tools, MCP servers, and skills are even present in the surface.
+- **`CredentialScope`** controls which auth-backed resources that execution may
+  *actually resolve* — routes, connectors, connector credential env keys, and
+  MCP servers.
+
+`CredentialScope` supports allow/deny lists on each axis: `route_allow` /
+`route_deny`, `connector_allow` / `connector_deny`, `connector_credential_allow`
+/ `connector_credential_deny`, and `mcp_server_allow` / `mcp_server_deny`. There
+is one rule that trips people up and is worth stating loudly:
+
+> If you scope connectors with `connector_allow` or `connector_deny` and omit
+> `connector_credential_allow`, the concrete connector secret env keys default to
+> **denied**. Naming a connector as usable does not automatically grant its
+> credentials — you grant those explicitly.
+
+That default-deny is the least-privilege principle made concrete: access to a
+resource and access to its *credentials* are separate grants, and the safe
+default is to withhold the credential.
+
+```
+   VISIBILITY  vs  USABILITY  (why two scopes)
+
+   CapabilityScope says:  "you can SEE the slack connector's tools"
+   CredentialScope says:  "...but you may NOT resolve slack-prod:BOT_TOKEN"
+
+   {
+     "route_allow": ["openai", "anthropic"],
+     "connector_allow": ["slack-prod"],
+     "connector_credential_allow": ["slack-prod:BOT_TOKEN"],
+     "mcp_server_deny": ["github"]
+   }
+                    │
+                    ▼
+   effective authority = CapabilityScope  ∩  CredentialScope
+   (a child can only ever narrow this; never widen it)
+```
+
+Sessions persist a credential scope directly, and sidechains can request a
+*narrower* child scope that is always intersected with the parent. A child can
+never widen either scope — this is the same non-escalation property enforced on
+permission modes. When a delegated child requests no explicit credential scope,
+the default is to keep route access but deny connector credentials and
+credentialed MCP. The full mechanics of how personas and sidechains inherit these
+boundaries are in [agents, personas, and skills](../concepts/agents-personas-skills).
+
+## Learning-plane governance as a security feature
+
+Kheish can turn what an agent learns into durable memory and even into promoted
+procedural skills that future runs execute. That is powerful, and it is also an
+attack surface: if a compromised or manipulated run could write arbitrary durable
+memory, it could poison every future run. So the learning plane is *governed* —
+nothing mutates durable memory ungoverned. Treat this as a security control, not
+just a quality feature.
+
+```
+        LEARNING GOVERNANCE PIPELINE
+
+   run produces a candidate learning
+        │
+        ▼
+   ┌─────────────────────────────────────────────┐
+   │ 1. secret-shaped rejection                   │
+   │    content that redacts non-trivially, or     │
+   │    contains "<redacted", or looks like a      │
+   │    secret assignment → REJECTED               │
+   └───────────────────┬─────────────────────────┘
+                       │ passes
+                       ▼
+   ┌─────────────────────────────────────────────┐
+   │ 2. policy evaluation                         │
+   │    scope rules, dedup, same-subject conflict  │
+   └───────────────────┬─────────────────────────┘
+                       │
+                       ▼
+   ┌─────────────────────────────────────────────┐
+   │ 3. model-backed judge (when enabled)         │
+   │    confirms or downgrades the action; can     │
+   │    only reject or narrow, never widen         │
+   └───────────────────┬─────────────────────────┘
+                       │
+                       ▼
+   ┌─────────────────────────────────────────────┐
+   │ 4. promotion gate (for procedural skills)     │
+   │    workspace-scoped procedure only; must run   │
+   │    via fork + verification profile; evidence-  │
+   │    bound rollout: draft→verified→canary→active │
+   └───────────────────┬─────────────────────────┘
+                       ▼
+              durable memory / active skill
+```
+
+Each stage is a real defense:
+
+- **Secret-shaped content is rejected.** Before a candidate can become durable,
+  its fields are checked for secret material. If the content redacts to something
+  different from itself under the standard redactor, already contains a
+  `<redacted` marker, or parses as a secret-like assignment, it is refused. A
+  promoted skill's name, instructions, description, when-to-use, version, and
+  runtime fields (`allowed_tools`, `blocked_tools`, `agent_profile`, `provider`,
+  `model`, `fallback_model`) are each independently checked and rejected if they
+  look like they carry a secret. You cannot smuggle a credential into durable
+  memory.
+- **A judge reviews it.** When the model-backed judge is enabled, it evaluates
+  each candidate and can confirm or *downgrade* the intended action — it is
+  clamped so it can only reject or narrow, never escalate to a broader
+  publication than policy already allowed. A judge failure is handled explicitly
+  (recorded, not silently ignored).
+- **Promotion is evidence-bound.** Turning a reviewed `procedure` learning into a
+  daemon-owned skill is the most privileged path, so it is the most constrained:
+  only workspace-scoped procedures qualify, they must execute through `fork` and
+  resolve to the `verification` child-agent profile, and they roll out through
+  `draft → verified → canary → active`. `verified` and `active` require recorded
+  evidence — a completed verification run, then a clean canary — and active
+  definitions are fingerprinted so any change to instructions, version,
+  prompt-visible metadata, or runtime demands a fresh draft. A promoted skill
+  runs in its own dedicated child worktree, off the parent session root.
+
+The net effect: durable memory is append-through-governance, and a single
+manipulated run cannot rewrite the shared brain of the deployment. The full
+concept is in [memory](../concepts/memory).
+
+## PII redaction in run memories
+
+Run memory — the persisted, searchable summary of what a run did — passes through
+a redactor before it is written. Two layers apply. First, the standard secret
+redactor scrubs anything that looks like a credential: assignment values, tokens
+with known prefixes (`sk-`, `sk-ant-`, `sk-proj-`, `ghp_`, `github_pat_`,
+`xoxb-`, `xoxp-`, `AKIA`), `Bearer` tokens, JWTs, PEM private-key blocks, and
+sensitive URL query values. Second, when `redact_pii` is enabled in the
+run-memory policy (it is on by default), common PII patterns such as long digit
+sequences are additionally scrubbed. The daemon counts redacted fields so you can
+see the redactor is doing work, and previews are truncated. This means the
+searchable memory layer is not a place where a phone number or an API key quietly
+accumulates in plaintext across a thousand runs.
+
+## Redaction in debug artifacts
+
+Full debug capture is the deepest visibility Kheish offers — it can include raw
+prompt and provider payload data — and it is explicitly **not a privacy
+boundary**. Redacted debug capture summarizes some sensitive attachment blocks,
+but it is still operational evidence, not something safe to share widely. Two
+controls make debug capture safer to use when you must:
+
+- Start the daemon with `KHEISH_DEBUG_CAPTURE_KEY` (or `_FILE`) so persisted
+  debug artifact bodies are **encrypted at rest**.
+- Set `KHEISH_DEBUG_REDACT_TOKENS` (or `_FILE`) with deployment-specific tokens
+  that should be scrubbed from bundles before persistence. This is how you catch
+  opaque secrets the built-in patterns cannot recognize — the daemon also feeds
+  its own auth-managed literal tokens and short-lived broker tokens into the same
+  scrubber, so a daemon-minted secret is redacted even though it does not look
+  like a provider key.
+
+Operationally: only enable full capture on isolated instances, and turn the level
+back down once an investigation is done. Debug bytes behind an admin-only route
+that are also encrypted at rest are defensible; debug bytes left at full capture
+on a shared instance are a leak waiting to happen. The route that serves debug
+artifacts (`runs/*/debug/*`) is one of the admin-only read paths precisely so a
+read-only token cannot pull raw capture — the classification and the encryption
+reinforce each other rather than either standing alone.
+
+## Connector shared tokens and credential leases
+
+Connectors are the daemon's outbound edge — Slack, Telegram, HTTP, external
+child-process connectors. Their credentials follow the same broker discipline as
+provider routes: a connector child process does not receive the raw connector
+secret in its ambient environment. It receives a short-lived connector lease
+scoped to explicit env keys and the concrete backing secret refs, minted per
+delivery. Combined with the `connector_credential_allow` default-deny described
+earlier, this means an execution can be allowed to *use* a connector while being
+denied the credential that connector needs — a distinction that matters when you
+delegate delivery to a lower-trust child. Connector transport auth (the token a
+connector presents to Slack or an HTTP endpoint) is also separate from the
+control-plane operator auth used to manage the connector's configuration. See
+[connectors](../automation/connectors) for the delivery model.
+
+## Network posture of outbound HTTP and remote_http sidecars
+
+An autonomous agent that can make the daemon fetch a URL is a classic
+server-side request forgery (SSRF) risk: point it at `http://169.254.169.254/` or
+an internal service and you have a pivot. Kheish's outbound HTTP surfaces —
+`remote_http` reply targets and external connector base URLs — reject private and
+otherwise-non-public network destinations by default.
+
+```
+        OUTBOUND HTTP GUARD  (SSRF defense)
+
+   connector / reply target base_url
+        │
+        ▼
+   userinfo in URL? ─── yes ──▶ REJECT ("must not include userinfo")
+        │ no
+        ▼
+   host is "localhost" / "*.localhost"? ─ yes ─▶ REJECT
+        │ no
+        ▼
+   host is a literal IP?
+        │ yes ─▶ ensure_public_ip:
+        │         reject private, loopback, link-local, broadcast,
+        │         documentation, 0.0.0.0/8, ≥224.0.0.0 (multicast/
+        │         reserved), 100.64.0.0/10 CGNAT, IPv6 ULA/link-local
+        │ no (hostname)
+        ▼
+   resolve host → for EVERY resolved address, ensure_public_ip
+        │
+        ▼
+   all public? ── no ──▶ REJECT ("resolved to a private network address")
+        │ yes
+        ▼
+   request proceeds, pinned to the checked addresses
+```
+
+The guard checks *every* resolved address, not just the first, so a hostname that
+resolves to a mix of public and private addresses is rejected — you cannot slip a
+private address in behind a public one via DNS. Outbound reply targets also strip
+a set of dangerous headers (`authorization`, `cookie`, `host`,
+`x-forwarded-*`, and others) so an agent cannot smuggle credentials or spoof
+routing through a reply target's header map. This behavior is guarded by an
+explicit `allow_private_network` flag that defaults to `false`; you turn it on
+only for a deployment where reaching a private address is the deliberate intent
+and the destination is trusted. The same transcript-facing bounds that apply to
+MCP output apply here — but as with MCP, these are safety limits, not a
+replacement for network-level egress controls in a hostile environment.
+
+## Signed external-action audit
+
+Every external action — provider requests, connector deliveries, hooks, and other
+networked or system-facing boundaries — is written to a separate append-only
+audit ledger. Each record is signed with an Ed25519 key and chained to the
+previous record's hash, so tampering is detectable: altering a past entry breaks
+the chain. Records carry the action id, phase, kind, the session/agent/run/tool
+identifiers, principal and grant ids when known, the target, request and response
+digests, and the signature material. Inspect a run's external actions with
+`GET /v1/runs/{run_id}/external-actions` or
+`kheish-daemon runs external-actions <run_id>`.
+
+The audit is **fail-closed**: if the signed ledger cannot initialize or becomes
+unavailable, future external actions are *rejected* rather than proceeding
+unrecorded. There is one honest caveat, and it is important. By default the
+signing key lives inside the state root, next to the records it signs. That means
+the tamper-evidence guarantee only holds against a party who *cannot write to the
+state directory* — for a reviewer reading an exported copy, the chain is
+meaningful; for an attacker who already has write access to `state_root`, it is
+not, because they could forge entries and re-sign the whole ledger. For a real
+integrity guarantee against someone who can reach the state directory, move the
+signing key *off* the state root — a separate volume, a secret manager, or another
+host — via `KHEISH_EXTERNAL_ACTION_AUDIT_SIGNING_KEY_FILE`. The daemon emits a
+startup warning whenever it falls back to the co-located key, precisely so this
+choice is never silent.
+
+## What Kheish does not protect against
+
+An honest security model names its edges. Kheish is a serious execution system,
+but it is not a sandboxing or confidential-computing product, and the following
+are explicitly outside its guarantees. Read this section as the operator
+contract: these are the things *you* must handle around Kheish.
+
+- **A compromised host.** Everything rests on the integrity of the machine
+  running the daemon and the `state_root` directory. Anyone who can read the
+  state root can read your encrypted secrets *if* they also have the master key,
+  and — as noted above — anyone who can *write* the state root can forge the audit
+  ledger unless the signing key lives elsewhere. Kheish assumes the host and the
+  operator account are trusted. It does not defend the state root against a local
+  attacker who already owns the box.
+- **A leaked master key.** The secret store is only as strong as the master key.
+  If both the encrypted store and the master key leak together, the secrets are
+  recoverable. Keep the key out of the state-root backups, or store it in a
+  separate secret manager.
+- **The model itself.** Kheish gates what tools a model *can* call and requires
+  human approval for dangerous ones, but it does not make the model trustworthy.
+  A model can still produce wrong, biased, or manipulated output within its
+  allowed surface. Prompt injection through tool output (a malicious web page, a
+  hostile MCP server response) is a real risk; Kheish labels that content
+  untrusted and bounds it, but labeling is not immunity. Keep account-impacting
+  tools behind `ask` and keep capability scopes tight.
+- **A malicious MCP server or connector endpoint.** Kheish bounds the *bytes* an
+  MCP server or connector can push back into a transcript, and it isolates
+  secret-backed stdio children's environments, but it does not sandbox the child
+  process itself at the OS level. A malicious local stdio server runs with the
+  privileges you gave it. Run high-risk servers under external OS/container
+  limits, and pin the exact image or version rather than trusting a catalog
+  default.
+- **Full debug capture as a privacy boundary.** Stated plainly again because it
+  matters: full debug capture can contain raw sensitive data. Encryption at rest
+  and token redaction reduce the risk; they do not make a debug bundle safe to
+  hand to an untrusted party.
+- **A read-only token as a confidentiality boundary.** A read-only control-plane
+  token can still see session content, run views, and connector summaries. It
+  prevents mutation, not disclosure. Do not issue it to anyone you would not let
+  read your sessions.
+- **Denial of service from your own configuration.** Removing the agent turn
+  ceiling (`KHEISH_AGENT_MAX_TURNS=0`), widening tool limits, or enabling
+  write-capable MCP profiles globally are all things you *can* do, and the daemon
+  will warn but not stop you. Runaway cost or resource use from an over-permissive
+  configuration is an operator responsibility.
+
+None of these are hidden weaknesses — they are the boundary of a local-first,
+least-privilege execution model. Kheish's job is to keep the blast radius small
+by default, keep root credentials out of execution, force durable changes through
+governance, and leave a signed trail. Securing the host, the master key, and the
+network around the daemon is the deployment's job.
+
+## The model in one page
+
+If you remember five things from this page, remember these — they are the load-
+bearing invariants everything else supports:
+
+1. **Execution never holds a root credential.** Agents resolve routes and
+   connectors through short-lived, revocable broker leases, never the underlying
+   key. Revoking a subject, lease, or slot bites immediately.
+2. **The secret store is write-only.** You can set and rotate a secret; nothing
+   can read the raw value back — not the CLI, not the API, not an agent. The store
+   is encrypted at rest under a master key you generate once per state root.
+3. **Access and credentials are separate grants.** `CapabilityScope` governs what
+   is visible; `CredentialScope` governs what is usable; effective authority is
+   their intersection, and a child can only narrow it. Naming a connector as usable
+   does not grant its credential — that is a separate, default-denied allow.
+4. **Durable memory changes are governed.** Secret-shaped content is rejected, a
+   judge can only reject or narrow, and promoted procedural skills are
+   evidence-bound through a fingerprinted rollout. One manipulated run cannot
+   rewrite the deployment's shared memory.
+5. **Every effect is audited, and the audit fails closed.** External actions are
+   signed and chained; permission decisions are durably recorded; if the signed
+   ledger cannot initialize, external actions are refused rather than run
+   unrecorded. Move the signing key off the state root to make that guarantee hold
+   against a host intruder.
+
+## Hardening a non-loopback deployment
+
+Everything above composes into a short checklist for the moment you move off
+loopback. Each item re-imposes a control that local-first gave you for free.
+
+```
+        LOOPBACK-DEFAULT  ──▶  HARDENED EXPOSURE
+
+   [ ] --http-auth-mode bearer            (never rely on auto off-loopback)
+   [ ] distinct admin + read-only tokens  (files, not inline; 0600)
+   [ ] KHEISH_AUTH_STORE_MASTER_KEY_FILE  (mounted secret, off backups)
+   [ ] audit signing key OFF state_root   (separate volume / secret mgr)
+   [ ] exact CORS allowlist               (no wildcard, exact origins only)
+   [ ] KHEISH_DEBUG_CAPTURE_KEY set       (encrypt debug at rest)
+   [ ] KHEISH_DEBUG_REDACT_TOKENS set     (scrub deployment secrets)
+   [ ] tight per-persona capability scope (narrow model-visible MCP tools)
+   [ ] credential scopes on delegation    (default-deny connector creds)
+   [ ] no write-capable MCP profile global (scope writes to the role needing it)
+   [ ] agent turn ceiling kept bounded    (don't set MAX_TURNS=0 blindly)
+```
+
+Walking the list in words:
+
+1. **Force `bearer`.** `auto` is safe *because* it refuses non-loopback binds
+   without a token, but stating `bearer` explicitly removes any doubt and makes
+   the intent auditable. Provide both tokens as files so rotation is a file
+   write, and keep the files distinct — the daemon fails closed if they ever
+   match.
+2. **Externalize the master key.** Mount it as a file and keep it out of the
+   backups that contain the encrypted store. A store and its key in the same
+   backup archive is a single point of compromise.
+3. **Move the audit signing key off the state root.** This is the difference
+   between "tamper-evident to a reviewer" and "tamper-evident to an attacker with
+   write access." If the ledger is part of your security story against a host
+   intruder, the key must live somewhere that intruder cannot rewrite.
+4. **Pin CORS to exact origins.** The loopback default is for development; a
+   hosted UI gets an exact allowlist and nothing broader.
+5. **Encrypt and scrub debug.** If you keep debug evidence in a production-like
+   environment at all, encrypt the bodies and register deployment-specific
+   redaction tokens so opaque secrets are scrubbed before persistence.
+6. **Narrow the model-visible surface per role.** Keep the daemon MCP inventory
+   broad if you like, but expose only the tools a persona actually needs through
+   its capability scope, and default-deny connector credentials on delegated
+   children. The scaling pressure — and the risk — is the *model-visible* surface,
+   not the daemon inventory.
+
+## Rotation and incident response
+
+Because credentials are referenced by slot and used through leases, both routine
+rotation and emergency revocation are cheap and surgical.
+
+**Routine rotation.** Rotating a static route key is `secrets set` on the
+existing `auth_ref`. Rotating a control-plane token is a file write that the next
+request picks up. Rotating an MCP server's secret is `mcp auth set` (or
+`secrets set` on the ref) followed by a daemon restart, because MCP inventory is
+resolved at startup and an already-connected server keeps its old material until
+it reconnects.
+
+**Emergency revocation.** When you suspect a specific execution identity or lease
+is compromised, you do not have to rotate the underlying secret at all — you
+revoke the brokered object:
+
+```bash
+# stop one execution identity from resolving any further credentials
+kheish-daemon runtime auth revoke-subject agent:agent-7
+
+# kill one specific lease immediately (future resolutions AND the active lease)
+kheish-daemon runtime auth revoke-lease route-lease-abc123
+
+# cut every active route/connector/MCP lease tied to one auth slot,
+# without deleting the slot itself
+kheish-daemon runtime auth revoke-slot openai.prod
+```
+
+Revocation takes effect immediately for both future resolutions and active
+leases, which is the property that makes it a real incident tool rather than a
+"rotate and wait" gesture. If the concern is the underlying secret rather than a
+lease, rotate the slot *and* revoke its leases; if the concern is a whole
+compromised host, the honest answer is that broker revocation cannot save a box
+the attacker already owns — treat it as a host incident, not a Kheish one.
+
+**Reasoning about a suspected leak.** The two audit trails answer different
+questions. The signed external-action ledger
+(`runs external-actions <run_id>`) tells you *what an execution actually did* at
+external boundaries — which providers and connectors it reached, with request and
+response digests. The permission audit
+(`sessions/{id}/permission-audits`) tells you *what was decided* for each
+sensitive tool call and how. Together they let you reconstruct a run without ever
+needing the secret values, which is exactly the point of keeping execution
+credential-free.
+
+## Where to go next
+
+- [Tools, MCP, and human approval](../automation/tools-and-mcp) — the runtime-side
+  gates that sit on top of this foundation: the permission pipeline, approvals,
+  and MCP capability/credential gating.
+- [Agents, personas, and skills](../concepts/agents-personas-skills) — how
+  capability and credential scopes flow through personas and sidechains.
+- [Memory](../concepts/memory) — the durable-memory model and the governance
+  that keeps it from being poisoned.
+- [Connectors](../automation/connectors) — the outbound delivery edge and its
+  credential and network posture.
+- [Production](../operations/production) — hardening a real deployment: bearer
+  auth, token rotation, key placement, and running at scale.
+- [Security and auth](/operators/security-and-auth) — the operator-facing runbook
+  for control-plane auth, brokered runtime auth, and route secrets.
