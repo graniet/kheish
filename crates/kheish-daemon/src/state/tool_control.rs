@@ -246,6 +246,66 @@ where
             .await
     }
 
+    async fn agent_list_project_tasks(
+        &self,
+        session_id: &str,
+        project_id: Option<&str>,
+        status: Option<kheish_types::TaskStatus>,
+    ) -> Result<Vec<crate::ProjectTaskView>> {
+        self.0
+            .agent_list_project_tasks(session_id, project_id, status)
+            .await
+    }
+
+    async fn agent_claim_project_task(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        project_id: &str,
+        task_id: &str,
+    ) -> Result<crate::ProjectTaskView> {
+        self.0
+            .agent_claim_project_task(session_id, run_id, project_id, task_id)
+            .await
+    }
+
+    async fn agent_update_project_task(
+        &self,
+        session_id: &str,
+        run_id: Option<&str>,
+        project_id: &str,
+        task_id: &str,
+        status: Option<kheish_types::TaskStatus>,
+        output: Option<String>,
+    ) -> Result<crate::ProjectTaskView> {
+        self.0
+            .agent_update_project_task(session_id, run_id, project_id, task_id, status, output)
+            .await
+    }
+
+    async fn agent_create_project_task(
+        &self,
+        session_id: &str,
+        project_id: &str,
+        title: String,
+        description: String,
+        blocked_by: Vec<String>,
+        parent_task_id: Option<String>,
+        assign_to_self: bool,
+    ) -> Result<crate::ProjectTaskView> {
+        self.0
+            .agent_create_project_task(
+                session_id,
+                project_id,
+                title,
+                description,
+                blocked_by,
+                parent_task_id,
+                assign_to_self,
+            )
+            .await
+    }
+
     async fn create_channel_stimulus(
         &self,
         session_id: &str,

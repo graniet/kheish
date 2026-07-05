@@ -1158,6 +1158,9 @@ pub struct CreateProjectTaskRequest {
     /// The task identifiers that currently block this project task.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked_by: Vec<String>,
+    /// Optional parent task identifier when this task is a subtask.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
     /// Optional latest run identifier associated with this task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_run_id: Option<String>,
@@ -1199,6 +1202,12 @@ pub struct UpdateProjectTaskRequest {
     /// Optional full replacement dependency list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_by: Option<Vec<String>>,
+    /// Optional replacement parent task identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
+    /// Whether the current parent task link should be cleared.
+    #[serde(default)]
+    pub clear_parent: bool,
     /// Optional replacement latest run identifier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_run_id: Option<String>,

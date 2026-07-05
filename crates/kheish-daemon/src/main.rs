@@ -1724,6 +1724,8 @@ struct CreateProjectTaskArgs {
     #[arg(long = "blocked-by")]
     blocked_by: Vec<String>,
     #[arg(long)]
+    parent_task_id: Option<String>,
+    #[arg(long)]
     latest_run_id: Option<String>,
     #[arg(long = "task-output")]
     task_output: Option<String>,
@@ -1761,6 +1763,10 @@ struct UpdateProjectTaskArgs {
     blocked_by: Vec<String>,
     #[arg(long)]
     replace_blocked_by: bool,
+    #[arg(long)]
+    parent_task_id: Option<String>,
+    #[arg(long)]
+    clear_parent: bool,
     #[arg(long)]
     latest_run_id: Option<String>,
     #[arg(long = "task-output")]

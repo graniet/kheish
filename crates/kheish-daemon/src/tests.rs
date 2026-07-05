@@ -3446,6 +3446,7 @@ async fn create_test_project_task(
             discussion_channel_id: None,
             discussion_thread_root_message_id: None,
             blocked_by: Vec::new(),
+            parent_task_id: None,
             latest_run_id: None,
             output: None,
             metadata: json!({"fixture": true}),
@@ -8245,6 +8246,165 @@ async fn project_task_failed_run_updates_task_status_and_output() -> Result<()> 
 }
 
 #[tokio::test]
+async fn project_agent_tools_claim_advance_and_create_subtasks() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-project-agent-tools");
+    let tool_call = |id: &str, name: &str, input: serde_json::Value| ModelStreamEvent::ToolCall {
+        call: kheish_types::ToolCallRecord {
+            id: id.to_string(),
+            name: name.to_string(),
+            input,
+            assistant_message_id: None,
+            assistant_provider_response_id: None,
+        },
+    };
+    let (address, shutdown) = scripted_daemon(
+        &state_root,
+        vec![
+            Ok(vec![
+                ModelStreamEvent::MessageId {
+                    value: "assistant-pt-1".to_string(),
+                },
+                tool_call("call-pt-list", "project_list_tasks", json!({})),
+                tool_call(
+                    "call-pt-claim",
+                    "project_claim_task",
+                    json!({
+                        "project_id": "project-alpha",
+                        "project_task_id": "project-task-open",
+                    }),
+                ),
+                ModelStreamEvent::Stop {
+                    reason: kheish_types::ModelFinishReason::ToolCalls,
+                },
+            ]),
+            Ok(vec![
+                ModelStreamEvent::MessageId {
+                    value: "assistant-pt-2".to_string(),
+                },
+                tool_call(
+                    "call-pt-update",
+                    "project_update_task",
+                    json!({
+                        "project_id": "project-alpha",
+                        "project_task_id": "project-task-open",
+                        "status": "completed",
+                        "output": "done by agent",
+                    }),
+                ),
+                tool_call(
+                    "call-pt-create",
+                    "project_create_task",
+                    json!({
+                        "project_id": "project-alpha",
+                        "title": "Follow-up subtask",
+                        "description": "Second half of the work",
+                        "parent_task_id": "project-task-open",
+                        "assign_to_self": true,
+                    }),
+                ),
+                ModelStreamEvent::Stop {
+                    reason: kheish_types::ModelFinishReason::ToolCalls,
+                },
+            ]),
+            Ok(scripted_events(
+                "assistant-pt-3",
+                "claimed, finished, and decomposed",
+                kheish_types::ModelFinishReason::Completed,
+            )),
+        ],
+    )
+    .await?;
+    let base = format!("http://{address}");
+    let client = Client::new();
+
+    let session = create_test_session(&client, &base, "project-worker").await?;
+    create_test_channel(&client, &base, "project-room", "Project Room", Vec::new()).await?;
+    create_test_project(
+        &client,
+        &base,
+        "project-alpha",
+        &session.session_id,
+        "project-room",
+    )
+    .await?;
+    client
+        .post(format!("{base}/v1/projects/project-alpha/tasks"))
+        .json(&crate::CreateProjectTaskRequest {
+            project_task_id: Some("project-task-open".to_string()),
+            title: "Open work item".to_string(),
+            description: "Unassigned work an agent can pull".to_string(),
+            status: None,
+            assignment: crate::ProjectTaskAssignmentRequest::default(),
+            discussion_channel_id: None,
+            discussion_thread_root_message_id: None,
+            blocked_by: Vec::new(),
+            parent_task_id: None,
+            latest_run_id: None,
+            output: None,
+            metadata: serde_json::Value::Null,
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let submitted = client
+        .post(format!("{base}/v1/sessions/project-worker/runs"))
+        .json(&test_submit_input_request("pull the open project work"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<RunView>()
+        .await?;
+    let run = wait_for_run_status(
+        &client,
+        &base,
+        &submitted.run_id,
+        &[DaemonRunStatus::Completed],
+    )
+    .await?;
+
+    let task = client
+        .get(format!(
+            "{base}/v1/projects/project-alpha/tasks/project-task-open"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<crate::ProjectTaskView>()
+        .await?;
+    assert_eq!(task.assignee_member_id.as_deref(), Some("worker"));
+    assert_eq!(task.primary_session_id.as_deref(), Some("project-worker"));
+    assert_eq!(task.latest_run_id.as_deref(), Some(run.run_id.as_str()));
+    assert_eq!(task.status, kheish_types::TaskStatus::Completed);
+    // The agent-recorded output survives run settlement: the terminal task
+    // guard keeps sync from overwriting it with the run's canonical output.
+    assert_eq!(task.output.as_deref(), Some("done by agent"));
+
+    let tasks = client
+        .get(format!("{base}/v1/projects/project-alpha/tasks"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<crate::ProjectTaskView>>()
+        .await?;
+    let subtask = tasks
+        .iter()
+        .find(|task| task.title == "Follow-up subtask")
+        .expect("agent-created subtask listed");
+    assert_eq!(subtask.parent_task_id.as_deref(), Some("project-task-open"));
+    assert_eq!(subtask.assignee_member_id.as_deref(), Some("worker"));
+    assert_eq!(subtask.status, kheish_types::TaskStatus::Pending);
+    assert_eq!(
+        subtask.metadata["created_by_session_id"],
+        json!("project-worker")
+    );
+
+    let _ = shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
 async fn project_guards_channel_deletion_and_active_session_end() -> Result<()> {
     let temp = tempdir()?;
     let state_root = temp.path().join("daemon-project-guards");
@@ -8649,6 +8809,7 @@ async fn project_task_rejects_latest_run_from_another_session() -> Result<()> {
             discussion_channel_id: None,
             discussion_thread_root_message_id: None,
             blocked_by: Vec::new(),
+            parent_task_id: None,
             latest_run_id: Some(run.run_id.clone()),
             output: None,
             metadata: json!({"fixture": true}),
@@ -8731,6 +8892,7 @@ async fn project_task_create_rejects_active_latest_run() -> Result<()> {
             discussion_channel_id: None,
             discussion_thread_root_message_id: None,
             blocked_by: Vec::new(),
+            parent_task_id: None,
             latest_run_id: Some(active.run_id.clone()),
             output: Some("caller output must not be accepted".to_string()),
             metadata: json!({"fixture": true}),
@@ -8788,6 +8950,7 @@ async fn project_task_create_rejects_active_latest_run() -> Result<()> {
             discussion_channel_id: None,
             discussion_thread_root_message_id: None,
             blocked_by: Vec::new(),
+            parent_task_id: None,
             latest_run_id: Some(active.run_id.clone()),
             output: Some("caller output must be ignored".to_string()),
             metadata: json!({"fixture": true}),
@@ -9488,6 +9651,7 @@ async fn project_status_blocks_new_tasks_when_not_active() -> Result<()> {
             discussion_channel_id: None,
             discussion_thread_root_message_id: None,
             blocked_by: Vec::new(),
+            parent_task_id: None,
             latest_run_id: None,
             output: None,
             metadata: json!({"fixture": true}),
@@ -9558,6 +9722,7 @@ async fn project_lists_and_assignment_aliases_resolve_through_api() -> Result<()
             discussion_channel_id: None,
             discussion_thread_root_message_id: None,
             blocked_by: Vec::new(),
+            parent_task_id: None,
             latest_run_id: None,
             output: None,
             metadata: json!({"fixture": true}),
@@ -9587,6 +9752,7 @@ async fn project_lists_and_assignment_aliases_resolve_through_api() -> Result<()
             discussion_channel_id: None,
             discussion_thread_root_message_id: None,
             blocked_by: Vec::new(),
+            parent_task_id: None,
             latest_run_id: None,
             output: None,
             metadata: json!({"fixture": true}),
@@ -9657,6 +9823,7 @@ async fn project_task_dependencies_reject_self_and_cycles() -> Result<()> {
             discussion_channel_id: None,
             discussion_thread_root_message_id: None,
             blocked_by: Vec::new(),
+            parent_task_id: None,
             latest_run_id: None,
             output: None,
             metadata: json!({"fixture": true}),
@@ -9766,6 +9933,7 @@ async fn project_task_dependency_cycle_validation_is_atomic_under_concurrency() 
             discussion_channel_id: None,
             discussion_thread_root_message_id: None,
             blocked_by: Vec::new(),
+            parent_task_id: None,
             latest_run_id: None,
             output: None,
             metadata: json!({"fixture": true}),
@@ -9908,6 +10076,7 @@ async fn project_task_dependencies_block_start_and_unlock_after_completion() -> 
             discussion_channel_id: None,
             discussion_thread_root_message_id: None,
             blocked_by: vec!["project-task-dependency-a".to_string()],
+            parent_task_id: None,
             latest_run_id: None,
             output: None,
             metadata: json!({"fixture": true}),

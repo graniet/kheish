@@ -551,6 +551,9 @@ where
         let blocked_by = self
             .normalize_project_task_dependencies(project_id, &project_task_id, request.blocked_by)
             .await?;
+        let parent_task_id = self
+            .normalize_project_task_parent(project_id, &project_task_id, request.parent_task_id)
+            .await?;
         let assignee_member_id = assignee.as_ref().map(|member| member.member_id.clone());
         let primary_session_id = assignee
             .as_ref()
@@ -591,6 +594,7 @@ where
                 latest_run_id,
                 discussion,
                 blocked_by,
+                parent_task_id,
                 output,
                 created_at_ms: now,
                 updated_at_ms: now,
@@ -671,6 +675,16 @@ where
                     .await?,
             ),
             None => None,
+        };
+        let parent_task_id = if request.clear_parent {
+            Some(None)
+        } else if request.parent_task_id.is_some() {
+            Some(
+                self.normalize_project_task_parent(project_id, task_id, request.parent_task_id)
+                    .await?,
+            )
+        } else {
+            None
         };
         let title = request.title.map(|value: String| value.trim().to_string());
         let description = request
@@ -786,6 +800,12 @@ where
                     task.blocked_by = blocked_by.clone();
                     changed = true;
                 }
+                if let Some(parent_task_id) = parent_task_id.as_ref()
+                    && task.parent_task_id != *parent_task_id
+                {
+                    task.parent_task_id = parent_task_id.clone();
+                    changed = true;
+                }
                 if let Some(discussion) = discussion.as_ref()
                     && task.discussion != *discussion
                 {
@@ -811,22 +831,34 @@ where
         project_id: &str,
         task_id: &str,
     ) -> Result<bool> {
-        let dependents = self
+        let tasks = self
             .project_service
             .list_tasks(project_id, None, None, None)
-            .await?
-            .into_iter()
+            .await?;
+        let dependents = tasks
+            .iter()
             .filter(|task| {
                 task.blocked_by
                     .iter()
                     .any(|dependency| dependency == task_id)
             })
-            .map(|task| task.project_task_id)
+            .map(|task| task.project_task_id.clone())
             .collect::<Vec<_>>();
         if !dependents.is_empty() {
             anyhow::bail!(
                 "cannot delete project task {task_id}; it still blocks tasks {}",
                 dependents.join(", ")
+            );
+        }
+        let children = tasks
+            .iter()
+            .filter(|task| task.parent_task_id.as_deref() == Some(task_id))
+            .map(|task| task.project_task_id.clone())
+            .collect::<Vec<_>>();
+        if !children.is_empty() {
+            anyhow::bail!(
+                "cannot delete project task {task_id}; it is still the parent of tasks {}",
+                children.join(", ")
             );
         }
         self.project_service.delete_task(project_id, task_id).await
@@ -1015,6 +1047,15 @@ where
                     &linked_task.project_task_id,
                     |task| {
                         if task.latest_run_id.as_deref() != Some(run.run_id.as_str()) {
+                            return Ok(false);
+                        }
+                        // A terminal task keeps its recorded status and output:
+                        // agents finalize tasks mid-run via project_update_task,
+                        // and the settling run must not overwrite that record.
+                        if matches!(
+                            task.status,
+                            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+                        ) {
                             return Ok(false);
                         }
                         let mut changed = false;
@@ -1430,6 +1471,222 @@ where
         self.ensure_project_task_dependencies_acyclic(project_id, task_id, &normalized)
             .await?;
         Ok(normalized)
+    }
+
+    /// Validates one optional parent-task link: the parent must exist in the
+    /// same project, differ from the task itself, and the resulting parent
+    /// chain must stay acyclic.
+    async fn normalize_project_task_parent(
+        &self,
+        project_id: &str,
+        task_id: &str,
+        parent_task_id: Option<String>,
+    ) -> Result<Option<String>> {
+        let Some(parent_task_id) = trim_optional_string(parent_task_id) else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            parent_task_id != task_id,
+            "project task {task_id} cannot be its own parent"
+        );
+        let tasks = self
+            .project_service
+            .list_tasks(project_id, None, None, None)
+            .await?;
+        let parents_by_id = tasks
+            .iter()
+            .map(|task| (task.project_task_id.clone(), task.parent_task_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        anyhow::ensure!(
+            parents_by_id.contains_key(&parent_task_id),
+            "unknown parent project task {parent_task_id}"
+        );
+        let mut current = Some(parent_task_id.clone());
+        let mut hops = 0usize;
+        while let Some(ancestor) = current {
+            anyhow::ensure!(
+                ancestor != task_id,
+                "project task parent chain would form a cycle through {task_id}"
+            );
+            hops += 1;
+            anyhow::ensure!(hops <= tasks.len(), "project task parent chain is cyclic");
+            current = parents_by_id.get(&ancestor).cloned().flatten();
+        }
+        Ok(Some(parent_task_id))
+    }
+
+    /// Lists the project tasks one member session may act on, across every
+    /// project it belongs to or one named project.
+    pub(crate) async fn agent_list_project_tasks(
+        &self,
+        session_id: &str,
+        project_id: Option<&str>,
+        status: Option<TaskStatus>,
+    ) -> Result<Vec<crate::projects::ProjectTaskView>> {
+        let member_project_ids = self
+            .project_service
+            .project_ids_for_session(session_id)
+            .await;
+        let selected = match project_id {
+            Some(project_id) => {
+                anyhow::ensure!(
+                    member_project_ids.iter().any(|id| id == project_id),
+                    "session {session_id} is not a member of project {project_id}"
+                );
+                vec![project_id.to_string()]
+            }
+            None => member_project_ids,
+        };
+        let mut tasks = Vec::new();
+        for project_id in &selected {
+            tasks.extend(
+                self.project_service
+                    .list_tasks(project_id, None, status.as_ref(), None)
+                    .await?,
+            );
+        }
+        Ok(tasks)
+    }
+
+    /// Claims one project task for the calling member session and binds it
+    /// to the caller's current run.
+    pub(crate) async fn agent_claim_project_task(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        project_id: &str,
+        task_id: &str,
+    ) -> Result<crate::projects::ProjectTaskView> {
+        let member = self
+            .project_service
+            .member_for_session(project_id, session_id)
+            .await
+            .ok_or_else(|| {
+                anyhow!("session {session_id} is not a member of project {project_id}")
+            })?;
+        self.project_service
+            .claim_task(project_id, task_id, &member.member_id, session_id, run_id)
+            .await
+    }
+
+    /// Applies one agent-driven status/output update to a task the calling
+    /// session currently holds. Terminal statuses keep the caller's run as
+    /// provenance; `blocked` unbinds the run so run settlement no longer
+    /// drives the task.
+    pub(crate) async fn agent_update_project_task(
+        &self,
+        session_id: &str,
+        run_id: Option<&str>,
+        project_id: &str,
+        task_id: &str,
+        status: Option<TaskStatus>,
+        output: Option<String>,
+    ) -> Result<crate::projects::ProjectTaskView> {
+        if let Some(status) = status.as_ref() {
+            anyhow::ensure!(
+                matches!(
+                    status,
+                    TaskStatus::InProgress
+                        | TaskStatus::Blocked
+                        | TaskStatus::Completed
+                        | TaskStatus::Failed
+                ),
+                "agents may only move tasks to in_progress, blocked, completed, or failed"
+            );
+        }
+        let output = trim_optional_string(output);
+        anyhow::ensure!(
+            status.is_some() || output.is_some(),
+            "provide a status, an output, or both"
+        );
+        let session_id = session_id.to_string();
+        let run_id = run_id.map(ToOwned::to_owned);
+        self.project_service
+            .update_task(project_id, task_id, move |task| {
+                anyhow::ensure!(
+                    task.primary_session_id.as_deref() == Some(session_id.as_str()),
+                    "project task {} is not held by session {session_id}",
+                    task.project_task_id
+                );
+                anyhow::ensure!(
+                    !matches!(
+                        task.status,
+                        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+                    ),
+                    "project task {} is already {}",
+                    task.project_task_id,
+                    task_status_label(&task.status)
+                );
+                let mut changed = false;
+                if let Some(status) = status.as_ref()
+                    && task.status != *status
+                {
+                    task.status = status.clone();
+                    task.latest_run_id = match status {
+                        TaskStatus::Blocked => None,
+                        _ => run_id.clone().or_else(|| task.latest_run_id.clone()),
+                    };
+                    changed = true;
+                }
+                if let Some(output) = output.as_ref()
+                    && task.output.as_deref() != Some(output.as_str())
+                {
+                    task.output = Some(output.clone());
+                    changed = true;
+                }
+                if changed {
+                    task.updated_at_ms = now_ms();
+                }
+                Ok(changed)
+            })
+            .await
+    }
+
+    /// Creates one task (optionally a subtask) on behalf of a member session,
+    /// with an optional self-assignment.
+    pub(crate) async fn agent_create_project_task(
+        &self,
+        session_id: &str,
+        project_id: &str,
+        title: String,
+        description: String,
+        blocked_by: Vec<String>,
+        parent_task_id: Option<String>,
+        assign_to_self: bool,
+    ) -> Result<crate::projects::ProjectTaskView> {
+        anyhow::ensure!(
+            self.project_service
+                .member_for_session(project_id, session_id)
+                .await
+                .is_some(),
+            "session {session_id} is not a member of project {project_id}"
+        );
+        let assignment = if assign_to_self {
+            crate::ProjectTaskAssignmentRequest {
+                assignee_session_id: Some(session_id.to_string()),
+                ..Default::default()
+            }
+        } else {
+            crate::ProjectTaskAssignmentRequest::default()
+        };
+        self.create_project_task(
+            project_id,
+            crate::CreateProjectTaskRequest {
+                project_task_id: None,
+                title,
+                description,
+                status: None,
+                assignment,
+                discussion_channel_id: None,
+                discussion_thread_root_message_id: None,
+                blocked_by,
+                parent_task_id,
+                latest_run_id: None,
+                output: None,
+                metadata: serde_json::json!({ "created_by_session_id": session_id }),
+            },
+        )
+        .await
     }
 
     async fn ensure_project_task_dependencies_ready(

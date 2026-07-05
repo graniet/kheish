@@ -660,6 +660,47 @@ pub trait DaemonToolControl: Send + Sync {
         request: crate::CreateChannelStimulusRequest,
     ) -> Result<crate::ChannelStimulusView>;
 
+    /// Lists the project tasks visible to the current member session.
+    async fn agent_list_project_tasks(
+        &self,
+        session_id: &str,
+        project_id: Option<&str>,
+        status: Option<kheish_types::TaskStatus>,
+    ) -> Result<Vec<crate::ProjectTaskView>>;
+
+    /// Claims one project task for the current session and run.
+    async fn agent_claim_project_task(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        project_id: &str,
+        task_id: &str,
+    ) -> Result<crate::ProjectTaskView>;
+
+    /// Advances one project task held by the current session.
+    async fn agent_update_project_task(
+        &self,
+        session_id: &str,
+        run_id: Option<&str>,
+        project_id: &str,
+        task_id: &str,
+        status: Option<kheish_types::TaskStatus>,
+        output: Option<String>,
+    ) -> Result<crate::ProjectTaskView>;
+
+    /// Creates one task or subtask in a project the current session belongs to.
+    #[allow(clippy::too_many_arguments)]
+    async fn agent_create_project_task(
+        &self,
+        session_id: &str,
+        project_id: &str,
+        title: String,
+        description: String,
+        blocked_by: Vec<String>,
+        parent_task_id: Option<String>,
+        assign_to_self: bool,
+    ) -> Result<crate::ProjectTaskView>;
+
     /// Generates one or more daemon-owned image assets.
     async fn generate_image(
         &self,

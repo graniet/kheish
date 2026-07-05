@@ -51,6 +51,27 @@ struct FakeControlState {
     channel_thread_messages: BTreeMap<(String, String), Vec<crate::ChannelMessageView>>,
     channel_reaction_requests: Vec<(String, String, String, String)>,
     channel_stimulus_requests: Vec<(String, String, crate::CreateChannelStimulusRequest)>,
+    project_task_calls: Vec<String>,
+}
+
+fn fixture_project_task(task_id: &str) -> crate::ProjectTaskView {
+    crate::ProjectTaskView {
+        project_task_id: task_id.to_string(),
+        project_id: "project-1".to_string(),
+        title: "fixture".to_string(),
+        description: String::new(),
+        status: kheish_types::TaskStatus::Pending,
+        assignee_member_id: None,
+        primary_session_id: None,
+        latest_run_id: None,
+        discussion: None,
+        blocked_by: Vec::new(),
+        parent_task_id: None,
+        output: None,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        metadata: serde_json::Value::Null,
+    }
 }
 
 struct FakeControl {
@@ -597,6 +618,66 @@ impl DaemonToolControl for FakeControl {
             last_error: None,
             metadata: request.metadata,
         })
+    }
+
+    async fn agent_list_project_tasks(
+        &self,
+        _session_id: &str,
+        project_id: Option<&str>,
+        status: Option<kheish_types::TaskStatus>,
+    ) -> Result<Vec<crate::ProjectTaskView>> {
+        self.state
+            .lock()
+            .project_task_calls
+            .push(format!("list:{:?}:{:?}", project_id, status));
+        Ok(vec![fixture_project_task("project-task-1")])
+    }
+
+    async fn agent_claim_project_task(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        project_id: &str,
+        task_id: &str,
+    ) -> Result<crate::ProjectTaskView> {
+        self.state
+            .lock()
+            .project_task_calls
+            .push(format!("claim:{session_id}:{run_id}:{project_id}:{task_id}"));
+        Ok(fixture_project_task(task_id))
+    }
+
+    async fn agent_update_project_task(
+        &self,
+        session_id: &str,
+        _run_id: Option<&str>,
+        project_id: &str,
+        task_id: &str,
+        status: Option<kheish_types::TaskStatus>,
+        output: Option<String>,
+    ) -> Result<crate::ProjectTaskView> {
+        self.state.lock().project_task_calls.push(format!(
+            "update:{session_id}:{project_id}:{task_id}:{:?}:{:?}",
+            status, output
+        ));
+        Ok(fixture_project_task(task_id))
+    }
+
+    async fn agent_create_project_task(
+        &self,
+        session_id: &str,
+        project_id: &str,
+        title: String,
+        _description: String,
+        _blocked_by: Vec<String>,
+        parent_task_id: Option<String>,
+        assign_to_self: bool,
+    ) -> Result<crate::ProjectTaskView> {
+        self.state.lock().project_task_calls.push(format!(
+            "create:{session_id}:{project_id}:{title}:{:?}:{assign_to_self}",
+            parent_task_id
+        ));
+        Ok(fixture_project_task("project-task-created"))
     }
 
     async fn generate_image(

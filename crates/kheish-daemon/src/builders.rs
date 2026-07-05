@@ -1142,6 +1142,10 @@ mod tests {
                 "list_skills",
                 "message_agent",
                 "notify_operator",
+                "project_claim_task",
+                "project_create_task",
+                "project_list_tasks",
+                "project_update_task",
                 "read_channel_thread",
                 "read_file",
                 "request_parent_clarification",
@@ -1430,6 +1434,7 @@ mod tests {
                 | "list_mcp_resources"
                 | "list_skills"
                 | "message_agent"
+                | "project_list_tasks"
                 | "read_channel_thread"
                 | "read_file"
                 | "read_mcp_resource"

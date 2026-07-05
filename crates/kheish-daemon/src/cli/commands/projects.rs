@@ -253,6 +253,7 @@ pub(crate) async fn run_projects_command(
                             discussion_thread_root_message_id: args
                                 .discussion_thread_root_message_id,
                             blocked_by: args.blocked_by,
+                            parent_task_id: args.parent_task_id,
                             latest_run_id: args.latest_run_id,
                             output: args.task_output,
                             metadata,
@@ -287,6 +288,8 @@ pub(crate) async fn run_projects_command(
                                 .discussion_thread_root_message_id,
                             clear_discussion: args.clear_discussion,
                             blocked_by: args.replace_blocked_by.then_some(args.blocked_by),
+                            parent_task_id: args.parent_task_id,
+                            clear_parent: args.clear_parent,
                             latest_run_id: args.latest_run_id,
                             output: args.task_output,
                             clear_output: args.clear_output,

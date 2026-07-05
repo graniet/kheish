@@ -7,6 +7,7 @@ mod helpers;
 mod operator;
 mod output;
 mod planning;
+mod projects;
 mod scheduling;
 mod skills;
 mod tasks;
@@ -44,6 +45,9 @@ pub use helpers::{
 use operator::{AskOperatorTool, NotifyOperatorTool};
 use output::{EditImageTool, EmitOutputTool, GenerateAudioTool, GenerateImageTool, StoreAssetTool};
 use planning::{AskUserQuestionTool, EnterPlanModeTool, ExitPlanModeTool, TodoWriteTool};
+use projects::{
+    ProjectClaimTaskTool, ProjectCreateTaskTool, ProjectListTasksTool, ProjectUpdateTaskTool,
+};
 use scheduling::{
     ScheduleCancelTool, ScheduleCreateTool, ScheduleGetTool, ScheduleListTool, SchedulePauseTool,
     ScheduleResumeTool, ScheduleTriggerNowTool, WakeAfterTool, WakeAtTool,
@@ -88,6 +92,10 @@ pub fn register_daemon_control_tools(
     runtime.register(ReadChannelThreadTool::new(control.clone()));
     runtime.register(SetChannelReactionTool::new(control.clone()));
     runtime.register(CreateChannelStimulusTool::new(control.clone()));
+    runtime.register(ProjectListTasksTool::new(control.clone()));
+    runtime.register(ProjectClaimTaskTool::new(control.clone()));
+    runtime.register(ProjectUpdateTaskTool::new(control.clone()));
+    runtime.register(ProjectCreateTaskTool::new(control.clone()));
     runtime.register(ListSkillsTool::new(control.clone()));
     runtime.register(UseSkillTool::new(control.clone()));
     runtime.register(SpawnAgentTool::new(control.clone()));

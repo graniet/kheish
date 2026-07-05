@@ -170,6 +170,9 @@ pub struct ProjectTaskView {
     /// The task identifiers that currently block this task.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked_by: Vec<String>,
+    /// The parent task identifier when this task is a subtask.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
     /// Optional recorded task output or conclusion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
@@ -374,6 +377,7 @@ mod tests {
             status: TaskStatus::Pending,
             assignee_member_id: None,
             primary_session_id: None,
+            parent_task_id: None,
             latest_run_id: None,
             discussion: None,
             blocked_by: Vec::new(),

@@ -724,6 +724,124 @@ impl ProjectService {
         })
     }
 
+    /// Claims one unassigned task for a member session, atomically: the
+    /// project must be active, the task non-terminal and either unassigned
+    /// or already held by the same member, and every dependency completed.
+    /// The claim binds the task to the caller's current run so run-driven
+    /// status sync applies when that run settles.
+    pub(crate) async fn claim_task(
+        &self,
+        project_id: &str,
+        task_id: &str,
+        member_id: &str,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<ProjectTaskView> {
+        let mut state = self.state.lock().await;
+        let project = state
+            .projects
+            .get(project_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown project {project_id}"))?;
+        anyhow::ensure!(
+            project.summary.status == ProjectStatus::Active,
+            "project {} is {} and cannot accept new work",
+            project.summary.project_id,
+            format!("{:?}", project.summary.status).to_ascii_lowercase()
+        );
+        let previous_project = project.clone();
+        let current_task = state
+            .tasks
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown project task {task_id}"))?;
+        anyhow::ensure!(
+            current_task.project_id == project_id,
+            "project task {task_id} does not belong to project {project_id}"
+        );
+        anyhow::ensure!(
+            !is_terminal_task_status(&current_task.status),
+            "project task {task_id} is already {}",
+            task_status_label(&current_task.status)
+        );
+        if let Some(assignee) = current_task.assignee_member_id.as_deref() {
+            anyhow::ensure!(
+                assignee == member_id,
+                "project task {task_id} is already assigned to member {assignee}"
+            );
+        }
+        let mut pending_dependencies = Vec::new();
+        for dependency in &current_task.blocked_by {
+            let Some(dependency_task) = state.tasks.get(dependency) else {
+                bail!("unknown project task dependency {dependency}");
+            };
+            if dependency_task.status != TaskStatus::Completed {
+                pending_dependencies.push(format!(
+                    "{} ({})",
+                    dependency,
+                    task_status_label(&dependency_task.status)
+                ));
+            }
+        }
+        anyhow::ensure!(
+            pending_dependencies.is_empty(),
+            "project task {task_id} is still blocked by {}",
+            pending_dependencies.join(", ")
+        );
+        let task = state
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| anyhow!("unknown project task {task_id}"))?;
+        let previous_task = current_task;
+        task.assignee_member_id = Some(member_id.to_string());
+        task.primary_session_id = Some(session_id.to_string());
+        task.latest_run_id = Some(run_id.to_string());
+        task.status = TaskStatus::InProgress;
+        task.updated_at_ms = crate::now_ms();
+        state.rebuild_indexes();
+        if let Some(project) = state.projects.get_mut(project_id) {
+            project.summary.updated_at_ms = crate::now_ms();
+        }
+        let claimed_task = state
+            .tasks
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown project task {task_id}"))?;
+        let updated_project = state
+            .projects
+            .get(project_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown project {project_id}"))?;
+        if let Err(error) = self.store.save_task(&claimed_task) {
+            state
+                .tasks
+                .insert(task_id.to_string(), previous_task.clone());
+            state.projects.insert(
+                previous_project.summary.project_id.clone(),
+                previous_project,
+            );
+            state.rebuild_indexes();
+            return Err(error);
+        }
+        if let Err(error) = self.store.save_project(&updated_project) {
+            state
+                .tasks
+                .insert(task_id.to_string(), previous_task.clone());
+            state.projects.insert(
+                previous_project.summary.project_id.clone(),
+                previous_project,
+            );
+            state.rebuild_indexes();
+            return match self.store.save_task(&previous_task) {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(anyhow!(
+                    "failed to persist project summary after claiming task {task_id}; rollback also failed: {rollback_error}"
+                )),
+            };
+        }
+        Ok(claimed_task)
+    }
+
     /// Removes one persisted project-task record.
     pub(crate) async fn delete_task(&self, project_id: &str, task_id: &str) -> Result<bool> {
         let mut state = self.state.lock().await;
@@ -956,6 +1074,7 @@ mod tests {
                 status: TaskStatus::Pending,
                 assignee_member_id: Some("member-1".to_string()),
                 primary_session_id: Some("session-1".to_string()),
+                parent_task_id: None,
                 latest_run_id: None,
                 discussion: None,
                 blocked_by: Vec::new(),
@@ -989,6 +1108,7 @@ mod tests {
                     status: TaskStatus::Pending,
                     assignee_member_id: Some("member-1".to_string()),
                     primary_session_id: Some("session-1".to_string()),
+                    parent_task_id: None,
                     latest_run_id: None,
                     discussion: None,
                     blocked_by: Vec::new(),
@@ -1021,6 +1141,7 @@ mod tests {
             status: TaskStatus::Pending,
             assignee_member_id: Some("member-1".to_string()),
             primary_session_id: Some("session-1".to_string()),
+            parent_task_id: None,
             latest_run_id: None,
             discussion: None,
             blocked_by: Vec::new(),
@@ -1037,6 +1158,7 @@ mod tests {
             status: TaskStatus::Pending,
             assignee_member_id: Some("member-1".to_string()),
             primary_session_id: Some("session-1".to_string()),
+            parent_task_id: None,
             latest_run_id: None,
             discussion: None,
             blocked_by: vec!["project-task-a".to_string()],
