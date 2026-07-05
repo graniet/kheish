@@ -152,6 +152,12 @@ enum Command {
     /// Start the daemon HTTP server.
     #[command(visible_alias = "start")]
     Serve(ServeArgs),
+    /// Start the daemon with onboarding defaults and open the web console.
+    ///
+    /// Equivalent to `serve` but boots with zero required keys: it generates and
+    /// persists an auth-store master key, tolerates an empty route inventory, and
+    /// opens the embedded console so the rest of setup happens in the browser.
+    Up(UpArgs),
     /// Fetch a combined capabilities and runtime snapshot.
     Status,
     /// Run connectivity and control-plane diagnostics.
@@ -397,6 +403,10 @@ struct ServeArgs {
     routes_file: Option<PathBuf>,
     #[arg(long, env = "KHEISH_DEFAULT_ROUTE")]
     default_route: Option<String>,
+    /// Boot even when no model route can be resolved (onboarding mode); routes
+    /// can then be added live via `POST /v1/runtime/routes`.
+    #[arg(long, env = "KHEISH_ALLOW_EMPTY_ROUTES", default_value_t = false)]
+    allow_empty_routes: bool,
     #[arg(long, env = "KHEISH_MODEL")]
     model: Option<String>,
     #[arg(long, env = "KHEISH_API_KEY", hide_env_values = true)]
@@ -555,6 +565,16 @@ struct ServeArgs {
     scheduler_retry_jitter_ms: u64,
     #[arg(long, env = "KHEISH_SCHEDULER_RETRY_MAX_ATTEMPTS", default_value_t = 0)]
     scheduler_retry_max_attempts: u32,
+}
+
+/// Onboarding wrapper around `serve`: all `serve` flags plus console-open control.
+#[derive(Args, Debug, Clone)]
+struct UpArgs {
+    #[command(flatten)]
+    serve: ServeArgs,
+    /// Do not open a browser to the console after boot.
+    #[arg(long, env = "KHEISH_NO_OPEN", default_value_t = false)]
+    no_open: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -4482,6 +4502,93 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_up_command_with_onboarding_flags() {
+        let default = Cli::parse_from(["kheish-daemon", "up"]);
+        match default.command.expect("command") {
+            Command::Up(args) => {
+                assert!(!args.no_open, "up opens the console by default");
+                assert!(
+                    !args.serve.allow_empty_routes,
+                    "the serve --allow-empty-routes flag stays opt-in"
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let no_open = Cli::parse_from(["kheish-daemon", "up", "--no-open"]);
+        match no_open.command.expect("command") {
+            Command::Up(args) => assert!(args.no_open),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let serve = Cli::parse_from(["kheish-daemon", "serve", "--allow-empty-routes"]);
+        match serve.command.expect("command") {
+            Command::Serve(args) => assert!(args.allow_empty_routes),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn up_master_key_generation_is_idempotent() {
+        let _guard = auth_store_env_lock().lock();
+        let saved_env = std::env::var_os(AUTH_STORE_MASTER_KEY_ENV);
+        let saved_file = std::env::var_os(kheish_auth::AUTH_STORE_MASTER_KEY_FILE_ENV);
+        unsafe {
+            std::env::remove_var(AUTH_STORE_MASTER_KEY_ENV);
+            std::env::remove_var(kheish_auth::AUTH_STORE_MASTER_KEY_FILE_ENV);
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_root = temp.path().join("up-state");
+
+        ensure_up_master_key(&state_root).expect("first ensure generates a key");
+        let key_path = state_root.join("auth-store-master.key");
+        assert!(key_path.exists(), "the master key file should be created");
+        let first = std::fs::read(&key_path).expect("read generated key");
+        assert!(!first.is_empty());
+        assert_eq!(
+            std::env::var_os(kheish_auth::AUTH_STORE_MASTER_KEY_FILE_ENV),
+            Some(key_path.clone().into_os_string()),
+            "the file env var should point at the persisted key"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&key_path)
+                .expect("key metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "the master key must be 0600");
+        }
+        let loaded = kheish_auth::load_auth_store_master_key_from_env()
+            .expect("load key")
+            .expect("key present after ensure");
+
+        // Simulate a fresh relaunch: env is not inherited, but the file remains.
+        unsafe {
+            std::env::remove_var(kheish_auth::AUTH_STORE_MASTER_KEY_FILE_ENV);
+        }
+        ensure_up_master_key(&state_root).expect("second ensure reuses the key");
+        let second = std::fs::read(&key_path).expect("read key again");
+        assert_eq!(first, second, "a relaunch must reuse the persisted key");
+        let reloaded = kheish_auth::load_auth_store_master_key_from_env()
+            .expect("reload key")
+            .expect("key present on relaunch");
+        assert_eq!(loaded, reloaded);
+
+        unsafe {
+            std::env::remove_var(kheish_auth::AUTH_STORE_MASTER_KEY_FILE_ENV);
+            match saved_env {
+                Some(value) => std::env::set_var(AUTH_STORE_MASTER_KEY_ENV, value),
+                None => std::env::remove_var(AUTH_STORE_MASTER_KEY_ENV),
+            }
+            if let Some(value) = saved_file {
+                std::env::set_var(kheish_auth::AUTH_STORE_MASTER_KEY_FILE_ENV, value);
+            }
+        }
+    }
+
+    #[test]
     fn cli_parses_runtime_permission_command() {
         let cli = Cli::parse_from([
             "kheish-daemon",
@@ -7260,6 +7367,7 @@ auth_ref = "openrouter.primary"
             provider: ProviderKind::Anthropic,
             routes_file: None,
             default_route: None,
+            allow_empty_routes: false,
             model: None,
             api_key: None,
             google_api_key: None,

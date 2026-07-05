@@ -623,6 +623,11 @@ pub struct DaemonConfig {
     /// Whether the serving process acquired the daemon state-root lock.
     #[serde(skip)]
     pub state_root_lock_held: bool,
+    /// Whether the daemon may boot with no model routes (onboarding `up` mode).
+    ///
+    /// A per-boot toggle, not durable configuration, so it is never serialized.
+    #[serde(skip)]
+    pub allow_empty_routes: bool,
     /// Daemon-owned child-agent bounds.
     #[serde(default)]
     pub subagent_policy: SubagentPolicyConfig,
@@ -663,6 +668,7 @@ impl DaemonConfig {
             control_plane_auth_token_files: ControlPlaneAuthTokenFiles::default(),
             control_plane_cors: ControlPlaneCorsConfig::loopback(),
             state_root_lock_held: false,
+            allow_empty_routes: false,
             subagent_policy: SubagentPolicyConfig::default(),
             scheduler_policy: SchedulerPolicyConfig::default(),
             scheduler_enabled: true,

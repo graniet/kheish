@@ -304,6 +304,211 @@ where
         Ok(runtime)
     }
 
+    /// Adds one model route to the live inventory and persists it.
+    ///
+    /// The API key lands in the encrypted secret store; the state-root routes
+    /// overlay records only the slot, so the route rebuilds at every boot the
+    /// same way a routes-file entry does. If the inventory was empty (an
+    /// onboarding `up` daemon), the first route added becomes the default.
+    pub(crate) async fn add_model_route(
+        &self,
+        request: crate::AddModelRouteRequest,
+    ) -> Result<RuntimeSettingsView> {
+        let route_id = request.route_id.trim().to_string();
+        if route_id.is_empty()
+            || route_id.len() > 64
+            || !route_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(DaemonProblem::bad_request(
+                "runtime",
+                "route_id_invalid",
+                "route ids use 1-64 ascii alphanumerics, `-`, or `_`",
+            )
+            .into());
+        }
+        let provider = crate::model_routing::RouteProviderKind::parse(&request.provider)
+            .ok_or_else(|| {
+                DaemonProblem::bad_request(
+                    "runtime",
+                    "route_provider_invalid",
+                    "provider must be one of anthropic, google, openai, openrouter, xai",
+                )
+            })?;
+        let model = request.model.trim().to_string();
+        if model.is_empty() {
+            return Err(DaemonProblem::bad_request(
+                "runtime",
+                "route_model_required",
+                "a model is required to add a route",
+            )
+            .into());
+        }
+        let Some(control) = self.model_control.as_ref() else {
+            return Err(DaemonProblem::conflict(
+                "runtime",
+                "model_routing_unavailable",
+                "this daemon has no mutable model router",
+            )
+            .into());
+        };
+
+        let _overlay_guard = self.routes_overlay.lock().await;
+        if control
+            .available_routes()
+            .iter()
+            .any(|route| route.route_id == route_id)
+        {
+            return Err(DaemonProblem::conflict(
+                "runtime",
+                "route_exists",
+                format!("model route `{route_id}` is already configured"),
+            )
+            .into());
+        }
+
+        // Resolve the effective key and the secret slot that will hold it. An
+        // inline key is stored fresh; an existing secret ref is reused verbatim.
+        let (api_key, secret_ref, stored_new_secret) = match (
+            request.api_key.as_deref(),
+            request.api_key_secret_ref.as_deref(),
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(DaemonProblem::bad_request(
+                    "runtime",
+                    "route_api_key_ambiguous",
+                    "provide either api_key or api_key_secret_ref, not both",
+                )
+                .into());
+            }
+            (Some(api_key), None) => {
+                let api_key = api_key.trim();
+                if api_key.is_empty() {
+                    return Err(DaemonProblem::bad_request(
+                        "runtime",
+                        "route_api_key_empty",
+                        "api_key cannot be empty",
+                    )
+                    .into());
+                }
+                let secret_ref = format!("routes.{route_id}.api_key");
+                self.put_generic_secret_without_reload(&secret_ref, api_key)
+                    .await?;
+                (api_key.to_string(), secret_ref, true)
+            }
+            (None, Some(secret_ref)) => {
+                let value = self.generic_secret_value(secret_ref)?.ok_or_else(|| {
+                    DaemonProblem::bad_request(
+                        "runtime",
+                        "route_secret_ref_missing",
+                        format!("no secret is stored at `{secret_ref}`"),
+                    )
+                })?;
+                (value, secret_ref.to_string(), false)
+            }
+            (None, None) => {
+                return Err(DaemonProblem::bad_request(
+                    "runtime",
+                    "route_api_key_required",
+                    "api_key or api_key_secret_ref is required",
+                )
+                .into());
+            }
+        };
+
+        let configured = crate::model_routing::build_inline_api_key_route(
+            &route_id,
+            provider,
+            &model,
+            &api_key,
+            Some(secret_ref.clone()),
+        );
+        if let Err(error) = control.add_route(configured) {
+            if stored_new_secret {
+                let _ = self.delete_auth_slot_without_reload(&secret_ref).await;
+            }
+            return Err(error);
+        }
+
+        let mut entries = self.routes_overlay.entries();
+        entries.push(crate::services::RouteOverlayEntry {
+            route_id: route_id.clone(),
+            provider: request.provider.trim().to_ascii_lowercase(),
+            model,
+            api_key_secret_ref: secret_ref.clone(),
+        });
+        if let Err(error) = self.routes_overlay.save(&entries) {
+            // The route must not outlive a failed persist: an unrecorded hot-add
+            // would silently vanish at the next boot.
+            let _ = control.remove_route(&route_id);
+            if stored_new_secret {
+                let _ = self.delete_auth_slot_without_reload(&secret_ref).await;
+            }
+            return Err(error);
+        }
+
+        let runtime = self.runtime_settings_unlocked();
+        self.events.publish(DaemonEvent::RuntimeUpdated {
+            runtime: runtime.clone(),
+        });
+        Ok(runtime)
+    }
+
+    /// Removes one runtime-added model route.
+    ///
+    /// Routes from the operator's routes file (or legacy provider flags) are
+    /// startup-owned and refused here — edit the configuration and restart.
+    pub(crate) async fn remove_model_route(&self, route_id: &str) -> Result<RuntimeSettingsView> {
+        let Some(control) = self.model_control.as_ref() else {
+            return Err(DaemonProblem::conflict(
+                "runtime",
+                "model_routing_unavailable",
+                "this daemon has no mutable model router",
+            )
+            .into());
+        };
+        let _overlay_guard = self.routes_overlay.lock().await;
+        let mut entries = self.routes_overlay.entries();
+        let Some(index) = entries.iter().position(|entry| entry.route_id == route_id) else {
+            if control
+                .available_routes()
+                .iter()
+                .any(|route| route.route_id == route_id)
+            {
+                return Err(DaemonProblem::conflict(
+                    "runtime",
+                    "route_startup_owned",
+                    format!(
+                        "model route `{route_id}` comes from startup configuration; edit it and restart"
+                    ),
+                )
+                .into());
+            }
+            return Err(DaemonProblem::not_found(
+                "runtime",
+                "route_not_found",
+                format!("unknown model route `{route_id}`"),
+            )
+            .into());
+        };
+        let removed = entries.remove(index);
+        control.remove_route(route_id)?;
+        self.routes_overlay.save(&entries)?;
+        // Drop the route's owned secret slot. A shared/explicit secret ref (one
+        // this route did not mint) is left in place for whatever else uses it.
+        if removed.api_key_secret_ref == format!("routes.{route_id}.api_key") {
+            let _ = self
+                .delete_auth_slot_without_reload(&removed.api_key_secret_ref)
+                .await;
+        }
+        let runtime = self.runtime_settings_unlocked();
+        self.events.publish(DaemonEvent::RuntimeUpdated {
+            runtime: runtime.clone(),
+        });
+        Ok(runtime)
+    }
+
     /// Creates one daemon-managed skill under the state-root skill directory.
     ///
     /// The document lands in `<state_root>/skills/<name>/SKILL.md` using the

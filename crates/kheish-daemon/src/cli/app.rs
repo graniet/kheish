@@ -17,6 +17,7 @@ pub(crate) async fn run() -> Result<()> {
         .expect("normalized CLI should always produce a command")
     {
         crate::Command::Serve(args) => crate::cli::serve::run_serve(args).await,
+        crate::Command::Up(args) => crate::cli::serve::run_up(args).await,
         crate::Command::Status => {
             let status = crate::cli::commands::runtime::fetch_daemon_status(&client).await?;
             printer.print(&status)

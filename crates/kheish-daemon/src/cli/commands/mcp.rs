@@ -269,7 +269,7 @@ async fn run_mcp_oauth_login(
     };
     eprintln!("{}", serde_json::to_string_pretty(&prompt)?);
     if !args.no_open {
-        let _ = open_browser_url(&auth_request.authorization_url);
+        let _ = crate::cli::open_browser_url(&auth_request.authorization_url);
     }
     let code = tokio::time::timeout(Duration::from_secs(args.timeout_sec), code_rx)
         .await
@@ -426,19 +426,4 @@ async fn oauth_callback(
         Ok(_) => "Kheish OAuth login completed. You can close this tab.".to_string(),
         Err(error) => format!("Kheish OAuth login failed: {error}"),
     }
-}
-
-fn open_browser_url(url: &str) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    let mut command = std::process::Command::new("open");
-    #[cfg(target_os = "linux")]
-    let mut command = std::process::Command::new("xdg-open");
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = std::process::Command::new("cmd");
-        command.args(["/C", "start"]);
-        command
-    };
-    command.arg(url).spawn()?;
-    Ok(())
 }

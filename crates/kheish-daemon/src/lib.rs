@@ -9,6 +9,7 @@ mod capture_provision;
 mod channels;
 mod config;
 mod connectors;
+mod console_assets;
 mod control_tools;
 mod debug;
 mod delivery;
@@ -44,29 +45,29 @@ mod web_search;
 mod tests;
 
 pub use api::{
-    AckMailboxResponse, AddMcpServerRequest, AgentAuditListQuery, AgentSummaryCountsView,
-    AgentSummaryListPage, AgentSummaryListQuery, AgentSummaryView, AssetDeleteQuery,
-    AssetDeletionFileView, AssetDeletionPlanView, AssetGcPlanView, AssetGcRequest, AssetListQuery,
-    AssetReferenceView, AssetReferencesView, AssetStartupRepairDiagnosticView,
-    AssetStartupRepairStatusView, AssetSummaryView, AssetView, BoardListQuery,
-    CancelUserQuestionRequest, ChannelListQuery, ChannelMemberRequest, ChannelMessageListQuery,
-    ChannelStimulusListQuery, ChannelThreadWorkListQuery, CheckPermissionMatrixRequest,
-    CheckPermissionRequest, ConnectorSecretInput, ConnectorSecretView, ConnectorSourceView,
-    ConnectorView, CreateAssetRequest, CreateBoardRequest, CreateBoardRevisionRequest,
-    CreateChannelRequest, CreateChannelStimulusRequest, CreateDeliveryRequest,
-    CreateDerivationRequest, CreateLearningCandidateRequest, CreateLearningSkillRequest,
-    CreatePersonaRequest, CreateProjectRequest, CreateProjectTaskRequest,
-    CreateRuntimeSkillRequest, CreateScheduleRequest, CreateSessionRequest,
-    DaemonAgentStatusSummaryView, DaemonCapabilities, DaemonControlPlaneAuthTokenFileStatusView,
-    DaemonControlPlaneCorsPolicy, DaemonControlPlaneStatusView, DaemonEventStatusView,
-    DaemonHealthSeverity, DaemonHealthView, DaemonHealthWarningView, DaemonProviderReadinessView,
-    DaemonProviderRouteReadinessView, DaemonReadinessState, DaemonRunStatusSummaryView,
-    DaemonScheduleStatusSummaryView, DaemonSessionStatusSummaryView,
-    DaemonSessionStorageStatusView, DaemonStateRootLockStatusView, DaemonStatusProbeState,
-    DaemonStatusView, DaemonStorageProbeView, DaemonStorageStatusView, DaemonTaskStatusSummaryView,
-    DeliveryBackpressureResetRequest, DeliveryBulkReplayRequest, DeliveryListQuery,
-    DeliveryResolveRequest, DerivationListQuery, EndSessionRequest, EventStreamQuery,
-    ExternalConnectorView, HookDeadLetterView, HookStatusView, HttpConnectorView,
+    AckMailboxResponse, AddMcpServerRequest, AddModelRouteRequest, AgentAuditListQuery,
+    AgentSummaryCountsView, AgentSummaryListPage, AgentSummaryListQuery, AgentSummaryView,
+    AssetDeleteQuery, AssetDeletionFileView, AssetDeletionPlanView, AssetGcPlanView,
+    AssetGcRequest, AssetListQuery, AssetReferenceView, AssetReferencesView,
+    AssetStartupRepairDiagnosticView, AssetStartupRepairStatusView, AssetSummaryView, AssetView,
+    BoardListQuery, CancelUserQuestionRequest, ChannelListQuery, ChannelMemberRequest,
+    ChannelMessageListQuery, ChannelStimulusListQuery, ChannelThreadWorkListQuery,
+    CheckPermissionMatrixRequest, CheckPermissionRequest, ConnectorSecretInput,
+    ConnectorSecretView, ConnectorSourceView, ConnectorView, CreateAssetRequest,
+    CreateBoardRequest, CreateBoardRevisionRequest, CreateChannelRequest,
+    CreateChannelStimulusRequest, CreateDeliveryRequest, CreateDerivationRequest,
+    CreateLearningCandidateRequest, CreateLearningSkillRequest, CreatePersonaRequest,
+    CreateProjectRequest, CreateProjectTaskRequest, CreateRuntimeSkillRequest,
+    CreateScheduleRequest, CreateSessionRequest, DaemonAgentStatusSummaryView, DaemonCapabilities,
+    DaemonControlPlaneAuthTokenFileStatusView, DaemonControlPlaneCorsPolicy,
+    DaemonControlPlaneStatusView, DaemonEventStatusView, DaemonHealthSeverity, DaemonHealthView,
+    DaemonHealthWarningView, DaemonProviderReadinessView, DaemonProviderRouteReadinessView,
+    DaemonReadinessState, DaemonRunStatusSummaryView, DaemonScheduleStatusSummaryView,
+    DaemonSessionStatusSummaryView, DaemonSessionStorageStatusView, DaemonStateRootLockStatusView,
+    DaemonStatusProbeState, DaemonStatusView, DaemonStorageProbeView, DaemonStorageStatusView,
+    DaemonTaskStatusSummaryView, DeliveryBackpressureResetRequest, DeliveryBulkReplayRequest,
+    DeliveryListQuery, DeliveryResolveRequest, DerivationListQuery, EndSessionRequest,
+    EventStreamQuery, ExternalConnectorView, HookDeadLetterView, HookStatusView, HttpConnectorView,
     InlineAssetUpload, InputAttachmentRequest, InterruptSessionResponse,
     LearningCandidateListQuery, LearningListQuery, LearningSkillRolloutResultRequest,
     LearningSkillsListQuery, ListPage, ListPageMeta, ListPageQuery, McpToolCallRequest,

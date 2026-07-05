@@ -32,6 +32,18 @@ pub(crate) trait DaemonModelControl: Send + Sync {
         provider: Option<&str>,
         model: Option<&str>,
     ) -> Result<ResolvedModelRoute>;
+
+    /// Registers one route in the live inventory. Controls that do not support
+    /// runtime route mutation reject the request.
+    fn add_route(&self, _route: ConfiguredModelRoute) -> Result<()> {
+        bail!("this daemon does not support adding model routes at runtime")
+    }
+
+    /// Removes one route from the live inventory. Returns whether it existed.
+    /// Controls that do not support runtime route mutation reject the request.
+    fn remove_route(&self, _route_id: &str) -> Result<bool> {
+        bail!("this daemon does not support removing model routes at runtime")
+    }
 }
 
 /// Current version of the daemon-visible route capability matrix.
@@ -725,30 +737,32 @@ struct ActiveModelSelection {
     model: String,
 }
 
+/// A route registry shared between the live [`RoutedModelDriver`] and its
+/// [`RoutedModelControl`]. Both hold the same `Arc`, so a route added or removed
+/// through the runtime API is visible to in-flight resolution immediately.
+type SharedModelRoutes = Arc<RwLock<Vec<Arc<DynamicModelRoute>>>>;
+
 pub(crate) struct RoutedModelDriver {
-    routes: Vec<Arc<DynamicModelRoute>>,
+    routes: SharedModelRoutes,
     active_selection: Arc<RwLock<ActiveModelSelection>>,
 }
 
 impl RoutedModelDriver {
-    fn new(
-        routes: Vec<Arc<DynamicModelRoute>>,
-        active_selection: Arc<RwLock<ActiveModelSelection>>,
-    ) -> Self {
+    fn new(routes: SharedModelRoutes, active_selection: Arc<RwLock<ActiveModelSelection>>) -> Self {
         Self {
             routes,
             active_selection,
         }
     }
 
-    fn active_route(&self) -> Arc<DynamicModelRoute> {
+    fn active_route(&self) -> Option<Arc<DynamicModelRoute>> {
         let active_route_id = self.active_selection.read().route_id.clone();
-        self.routes
+        let routes = self.routes.read();
+        routes
             .iter()
             .find(|route| route.route_id() == active_route_id)
             .cloned()
-            .or_else(|| self.routes.first().cloned())
-            .expect("routed model driver requires at least one route")
+            .or_else(|| routes.first().cloned())
     }
 
     fn select_route(
@@ -759,6 +773,7 @@ impl RoutedModelDriver {
         if let Some(route_id) = scope.and_then(|scope| scope.provider.as_deref()) {
             if let Some(route) = self
                 .routes
+                .read()
                 .iter()
                 .find(|route| route.route_id() == route_id)
                 .cloned()
@@ -770,15 +785,26 @@ impl RoutedModelDriver {
             );
         }
         if let Some(model) = explicit_model {
-            let active_route = self.active_route();
-            if active_route.supports_model(model) {
+            if let Some(active_route) = self.active_route()
+                && active_route.supports_model(model)
+            {
                 return Ok(active_route);
             }
-            if let Some(route) = self.routes.iter().find(|route| route.supports_model(model)) {
-                return Ok(route.clone());
+            if let Some(route) = self
+                .routes
+                .read()
+                .iter()
+                .find(|route| route.supports_model(model))
+                .cloned()
+            {
+                return Ok(route);
             }
         }
-        Ok(self.active_route())
+        self.active_route().ok_or_else(|| {
+            anyhow!(
+                "daemon has no model routes configured; add one via POST /v1/runtime/routes before running"
+            )
+        })
     }
 
     fn scoped_model(scope: Option<&ExecutionScope>) -> Option<String> {
@@ -859,11 +885,20 @@ fn record_route_resolution_debug(
 }
 
 pub(crate) struct RoutedModelControl {
-    routes: Vec<Arc<DynamicModelRoute>>,
+    routes: SharedModelRoutes,
     active_selection: Arc<RwLock<ActiveModelSelection>>,
+    retry: ModelRetryPolicy,
+    budget: ModelBudget,
+    observer: Arc<dyn RuntimeObserver>,
+    debug: DebugControl,
 }
 
 impl RoutedModelControl {
+    /// Builds the live driver and its control handle from an initial inventory.
+    ///
+    /// An empty inventory is allowed: the daemon boots in a degraded state with
+    /// no routes, and the first route added through the runtime API becomes the
+    /// default. Runs fail with a clear error until a route exists.
     pub(crate) fn new<R>(
         route_configs: Vec<R>,
         retry: ModelRetryPolicy,
@@ -874,54 +909,104 @@ impl RoutedModelControl {
     where
         R: Into<ConfiguredModelRoute>,
     {
-        let mut route_configs = route_configs.into_iter().map(Into::into);
-        let primary = route_configs
-            .next()
-            .ok_or_else(|| anyhow!("routed model control requires at least one route"))?;
         let mut routes = Vec::new();
-        let primary_route_id = primary.route_id().to_string();
-        let primary_model = primary.model_name().to_string();
         let mut seen_route_ids = HashSet::new();
-        seen_route_ids.insert(primary_route_id.clone());
-        routes.push(DynamicModelRoute::new(
-            primary,
-            retry.clone(),
-            budget.clone(),
-            observer.clone(),
-            debug.clone(),
-        )?);
-        for alternate in route_configs {
-            let route_id = alternate.route_id().to_string();
+        let mut active_selection = ActiveModelSelection {
+            route_id: String::new(),
+            model: String::new(),
+        };
+        for (index, configured) in route_configs.into_iter().map(Into::into).enumerate() {
+            let route_id = configured.route_id().to_string();
             if !seen_route_ids.insert(route_id.clone()) {
                 bail!("duplicate provider route `{route_id}`");
             }
+            if index == 0 {
+                active_selection.route_id = route_id;
+                active_selection.model = configured.model_name().to_string();
+            }
             routes.push(DynamicModelRoute::new(
-                alternate,
+                configured,
                 retry.clone(),
                 budget.clone(),
                 observer.clone(),
                 debug.clone(),
             )?);
         }
-        let active_selection = Arc::new(RwLock::new(ActiveModelSelection {
-            route_id: primary_route_id,
-            model: primary_model,
-        }));
+        let routes: SharedModelRoutes = Arc::new(RwLock::new(routes));
+        let active_selection = Arc::new(RwLock::new(active_selection));
         let runtime = RoutedModelDriver::new(routes.clone(), active_selection.clone());
         let control = Arc::new(Self {
             routes,
             active_selection,
+            retry,
+            budget,
+            observer,
+            debug,
         });
         Ok((runtime, control))
     }
 
     fn active_route(&self) -> Option<Arc<DynamicModelRoute>> {
         let active_route_id = self.active_selection.read().route_id.clone();
-        self.routes
+        let routes = self.routes.read();
+        routes
             .iter()
             .find(|route| route.route_id() == active_route_id)
             .cloned()
-            .or_else(|| self.routes.first().cloned())
+            .or_else(|| routes.first().cloned())
+    }
+
+    /// Registers one route in the shared registry, live for the next request.
+    ///
+    /// When the inventory was empty the new route becomes the default so runs
+    /// resolve to it without an explicit selector.
+    fn add_route(&self, configured: ConfiguredModelRoute) -> Result<()> {
+        let route_id = configured.route_id().to_string();
+        let model = configured.model_name().to_string();
+        let route = DynamicModelRoute::new(
+            configured,
+            self.retry.clone(),
+            self.budget.clone(),
+            self.observer.clone(),
+            self.debug.clone(),
+        )?;
+        let mut routes = self.routes.write();
+        if routes.iter().any(|route| route.route_id() == route_id) {
+            bail!("model route `{route_id}` already exists");
+        }
+        let becomes_default = routes.is_empty();
+        routes.push(route);
+        drop(routes);
+        if becomes_default {
+            *self.active_selection.write() = ActiveModelSelection { route_id, model };
+        }
+        Ok(())
+    }
+
+    /// Removes one route from the shared registry. Returns whether it existed.
+    ///
+    /// If the removed route was the active default, the default falls back to
+    /// the first remaining route (or none when the inventory empties out).
+    fn remove_route(&self, route_id: &str) -> Result<bool> {
+        let mut routes = self.routes.write();
+        let Some(index) = routes.iter().position(|route| route.route_id() == route_id) else {
+            return Ok(false);
+        };
+        routes.remove(index);
+        let mut selection = self.active_selection.write();
+        if selection.route_id == route_id {
+            match routes.first() {
+                Some(route) => {
+                    selection.route_id = route.route_id().to_string();
+                    selection.model = route.current_model();
+                }
+                None => {
+                    selection.route_id = String::new();
+                    selection.model = String::new();
+                }
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -932,6 +1017,7 @@ impl DaemonModelControl for RoutedModelControl {
 
     fn available_routes(&self) -> Vec<ResolvedModelRoute> {
         self.routes
+            .read()
             .iter()
             .map(|route| ResolvedModelRoute {
                 route_id: route.route_id().to_string(),
@@ -945,7 +1031,8 @@ impl DaemonModelControl for RoutedModelControl {
 
     fn route_diagnostics(&self) -> Vec<RouteDiagnosticView> {
         let mut diagnostics = Vec::new();
-        if self.routes.is_empty() {
+        let routes = self.routes.read();
+        if routes.is_empty() {
             diagnostics.push(RouteDiagnosticView {
                 severity: RouteDiagnosticSeverity::Error,
                 code: "route_inventory_empty".to_string(),
@@ -956,8 +1043,7 @@ impl DaemonModelControl for RoutedModelControl {
         }
 
         let active_route_id = self.active_selection.read().route_id.clone();
-        if !self
-            .routes
+        if !routes
             .iter()
             .any(|route| route.route_id() == active_route_id)
         {
@@ -971,7 +1057,7 @@ impl DaemonModelControl for RoutedModelControl {
             });
         }
 
-        for route in &self.routes {
+        for route in routes.iter() {
             let model = route.current_model();
             if model.trim().is_empty() {
                 diagnostics.push(RouteDiagnosticView {
@@ -1000,6 +1086,7 @@ impl DaemonModelControl for RoutedModelControl {
         let resolved = self.resolve_route(provider, Some(&model))?;
         let route = self
             .routes
+            .read()
             .iter()
             .find(|route| route.route_id() == resolved.route_id.as_str())
             .cloned()
@@ -1019,10 +1106,10 @@ impl DaemonModelControl for RoutedModelControl {
         model: Option<&str>,
     ) -> Result<ResolvedModelRoute> {
         let active_route = self.active_route();
+        let routes = self.routes.read();
         let route = match (provider, model) {
             (Some(provider), Some(model)) => {
-                let route = self
-                    .routes
+                let route = routes
                     .iter()
                     .find(|route| route.route_id() == provider)
                     .cloned();
@@ -1032,8 +1119,7 @@ impl DaemonModelControl for RoutedModelControl {
                     None => None,
                 }
             }
-            (Some(provider), None) => self
-                .routes
+            (Some(provider), None) => routes
                 .iter()
                 .find(|route| route.route_id() == provider)
                 .cloned(),
@@ -1042,8 +1128,7 @@ impl DaemonModelControl for RoutedModelControl {
                     if active_route.supports_model(model) {
                         Some(active_route.clone())
                     } else {
-                        let matches = self
-                            .routes
+                        let matches = routes
                             .iter()
                             .filter(|route| route.supports_model(model))
                             .cloned()
@@ -1083,8 +1168,7 @@ impl DaemonModelControl for RoutedModelControl {
                 }
                 (None, None) => unreachable!("explicit route guard requires provider or model"),
             },
-            None => self
-                .routes
+            None => routes
                 .first()
                 .cloned()
                 .ok_or_else(|| anyhow!("daemon has no model routes configured"))?,
@@ -1101,6 +1185,68 @@ impl DaemonModelControl for RoutedModelControl {
             capabilities,
         })
     }
+
+    fn add_route(&self, route: ConfiguredModelRoute) -> Result<()> {
+        RoutedModelControl::add_route(self, route)
+    }
+
+    fn remove_route(&self, route_id: &str) -> Result<bool> {
+        RoutedModelControl::remove_route(self, route_id)
+    }
+}
+
+/// Provider drivers accepted by the runtime route-add API.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RouteProviderKind {
+    Anthropic,
+    Google,
+    OpenAi,
+    OpenRouter,
+    XAi,
+}
+
+impl RouteProviderKind {
+    /// Parses one provider identifier from the runtime route-add request.
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "anthropic" => Some(Self::Anthropic),
+            "google" | "gemini" => Some(Self::Google),
+            "openai" => Some(Self::OpenAi),
+            "openrouter" => Some(Self::OpenRouter),
+            "xai" | "grok" => Some(Self::XAi),
+            _ => None,
+        }
+    }
+}
+
+/// Builds one runtime-added route from an inline API key.
+///
+/// The key is embedded directly in the provider config; the daemon persists it
+/// in the encrypted secret store separately and rebuilds the route from there at
+/// boot. `auth_ref` records the secret slot so `/v1/runtime` surfaces it.
+pub(crate) fn build_inline_api_key_route(
+    route_id: &str,
+    provider: RouteProviderKind,
+    model: &str,
+    api_key: &str,
+    auth_ref: Option<String>,
+) -> ConfiguredModelRoute {
+    let route = match provider {
+        RouteProviderKind::Anthropic => {
+            ModelRouteConfig::Anthropic(AnthropicProviderConfig::new(model, api_key))
+        }
+        RouteProviderKind::Google => {
+            ModelRouteConfig::Google(GoogleProviderConfig::new(model, api_key))
+        }
+        RouteProviderKind::OpenAi => {
+            ModelRouteConfig::OpenAi(OpenAiProviderConfig::new(model, api_key))
+        }
+        RouteProviderKind::OpenRouter => {
+            ModelRouteConfig::OpenRouter(OpenRouterProviderConfig::new(model, api_key))
+        }
+        RouteProviderKind::XAi => ModelRouteConfig::XAi(XAiProviderConfig::new(model, api_key)),
+    };
+    ConfiguredModelRoute::new(route_id.to_string(), route).with_auth_ref(auth_ref)
 }
 
 #[cfg(test)]
@@ -1224,7 +1370,10 @@ mod tests {
     #[test]
     fn scoped_missing_route_is_not_rerouted_to_active_route() {
         let driver = RoutedModelDriver::new(
-            vec![test_anthropic_route(), test_openai_route()],
+            Arc::new(RwLock::new(vec![
+                test_anthropic_route(),
+                test_openai_route(),
+            ])),
             Arc::new(RwLock::new(ActiveModelSelection {
                 route_id: "anthropic".to_string(),
                 model: "claude-opus-4-6".to_string(),

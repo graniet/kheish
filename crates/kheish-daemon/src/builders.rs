@@ -538,6 +538,69 @@ fn agent_loop_policy_from(raw: Option<&str>) -> LoopPolicy {
     policy
 }
 
+/// Appends runtime-added model routes (from the state-root overlay) to the boot
+/// inventory, resolving each API key from the encrypted secret store.
+///
+/// Broken or shadowing entries are logged and skipped rather than failing boot,
+/// mirroring how runtime-added MCP servers reconnect: a hot-added resource must
+/// never block startup the way a required startup route does.
+pub(crate) fn load_routes_overlay_into(
+    route_configs: &mut Vec<ConfiguredModelRoute>,
+    state_root: &Path,
+    auth_manager: &AuthManager,
+) {
+    let overlay = crate::services::RoutesOverlayService::new(state_root);
+    let mut seen_route_ids = route_configs
+        .iter()
+        .map(|route| route.route_id().to_string())
+        .collect::<std::collections::HashSet<_>>();
+    for entry in overlay.entries() {
+        if !seen_route_ids.insert(entry.route_id.clone()) {
+            tracing::warn!(
+                route = %entry.route_id,
+                "runtime-added model route shadowed by a startup route; skipped"
+            );
+            continue;
+        }
+        let Some(provider) = crate::model_routing::RouteProviderKind::parse(&entry.provider) else {
+            tracing::warn!(
+                route = %entry.route_id,
+                provider = %entry.provider,
+                "runtime-added model route has an unknown provider; skipped"
+            );
+            continue;
+        };
+        let api_key =
+            match auth_manager.secret_value(&AuthSlotId::new(entry.api_key_secret_ref.clone())) {
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    tracing::warn!(
+                        route = %entry.route_id,
+                        secret_ref = %entry.api_key_secret_ref,
+                        "runtime-added model route secret is missing; skipped"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        route = %entry.route_id,
+                        error = %format!("{error:#}"),
+                        "failed to resolve runtime-added model route secret; skipped"
+                    );
+                    continue;
+                }
+            };
+        let route = crate::model_routing::build_inline_api_key_route(
+            &entry.route_id,
+            provider,
+            &entry.model,
+            &api_key,
+            Some(entry.api_key_secret_ref.clone()),
+        );
+        route_configs.push(configured_route_with_asset_root(route, state_root));
+    }
+}
+
 /// Builds a production-ready daemon service around the provided primary and fallback routes.
 pub async fn build_provider_daemon<R>(
     config: DaemonConfig,
@@ -583,20 +646,28 @@ where
                 config.workspace_root.display()
             )
         })?;
-    let route_configs = route_configs
+    let mut route_configs = route_configs
         .into_iter()
         .map(Into::into)
         .map(|route| configured_route_with_asset_root(route, &config.state_root))
         .collect::<Vec<_>>();
+    // Rebuild routes added through the runtime API in earlier daemon lives. A
+    // broken overlay route logs and skips: it must never block boot the way a
+    // required startup route does, and it never shadows a startup route.
+    load_routes_overlay_into(
+        &mut route_configs,
+        &config.state_root,
+        auth_manager.as_ref(),
+    );
     validate_route_capability_overrides(
         &route_configs,
         &extra_image_backends,
         &extra_transcription_backends,
     )?;
-    let primary_route = route_configs
-        .first()
-        .cloned()
-        .context("daemon requires at least one provider route")?;
+    if route_configs.is_empty() && !config.allow_empty_routes {
+        anyhow::bail!("daemon requires at least one provider route");
+    }
+    let primary_route = route_configs.first().cloned();
     let events = DaemonEventBus::new_with_persistent_epoch(
         config.event_history_capacity,
         &config.state_root.join("events").join("event-id-epoch"),
@@ -760,7 +831,9 @@ where
     )?;
     let retry = daemon_model_retry_policy();
     let budget = daemon_model_budget_for_config(&config);
-    let primary_provider_name = primary_route.route_id().to_string();
+    let primary_provider_name = primary_route
+        .as_ref()
+        .map(|route| route.route_id().to_string());
     let (model, model_control) = RoutedModelControl::new(
         route_configs,
         retry,
@@ -775,7 +848,7 @@ where
         &config.state_root,
         model_driver,
         Some(model_control_trait.clone()),
-        Some(primary_provider_name),
+        primary_provider_name,
         system_prompt.clone(),
         hook_tools,
         observer.clone(),

@@ -18,6 +18,7 @@ mod persona;
 mod playbook;
 mod procedural_skills;
 mod project;
+mod routes_overlay;
 mod run;
 mod runtime_config;
 mod schedule;
@@ -53,6 +54,7 @@ pub(crate) use persona::PersonaService;
 pub(crate) use playbook::PlaybookService;
 pub(crate) use procedural_skills::LearningSkillService;
 pub(crate) use project::ProjectService;
+pub(crate) use routes_overlay::{RouteOverlayEntry, RoutesOverlayService};
 pub(crate) use run::{AgentRunSummaryOverlay, RunService};
 pub(crate) use runtime_config::RuntimeConfigService;
 pub(crate) use schedule::{

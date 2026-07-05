@@ -57975,3 +57975,219 @@ async fn docs_routes_serve_embedded_documentation() -> Result<()> {
     wait_for_daemon_shutdown(&client, &base).await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn console_is_served_at_root_with_spa_fallback() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-console");
+    let (address, shutdown) = scripted_daemon(&state_root, Vec::new()).await?;
+    let base = format!("http://{address}");
+    let client = Client::new();
+
+    // GET / serves the embedded console shell as HTML.
+    let root = client.get(format!("{base}/")).send().await?;
+    assert_eq!(root.status(), StatusCode::OK);
+    assert!(
+        root.headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/html")),
+        "console root should be served as HTML"
+    );
+    let root_body = root.text().await?;
+    assert!(
+        root_body.contains("Console bundle missing"),
+        "root should serve the committed placeholder shell"
+    );
+
+    // A client-side route with no file extension falls back to the same shell.
+    let spa = client.get(format!("{base}/playground")).send().await?;
+    assert_eq!(spa.status(), StatusCode::OK);
+    let spa_body = spa.text().await?;
+    assert_eq!(spa_body, root_body, "SPA routes serve the console shell");
+
+    // Unknown API routes keep their existing JSON 404 problem unchanged.
+    let unknown = client.get(format!("{base}/v1/unknown")).send().await?;
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    let problem = unknown.json::<crate::ProblemDetails>().await?;
+    assert_eq!(problem.code, "route_not_found");
+
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+    Ok(())
+}
+
+/// Boots a daemon whose model router is a real [`RoutedModelControl`] (so routes
+/// can be hot-added) seeded with one startup-owned route, and reloads any
+/// persisted routes overlay exactly like `build_provider_daemon` does at boot.
+async fn scripted_routes_daemon(state_root: &Path) -> Result<(SocketAddr, oneshot::Sender<()>)> {
+    ensure_auth_store_master_key();
+    let events = DaemonEventBus::new(256);
+    let debug = DebugControl::new(DebugCaptureLevel::Off);
+    let observer: Arc<dyn RuntimeObserver> = DaemonObserver::shared(
+        events.clone(),
+        debug.clone(),
+        FileDebugStore::new(state_root),
+    );
+    // One boot-file route so the startup-owned 409 path is exercised.
+    let mut route_configs = vec![ConfiguredModelRoute::new(
+        "openai-boot",
+        ModelRouteConfig::OpenAi(OpenAiProviderConfig::new("gpt-5.4", "boot-key")),
+    )];
+    let auth_manager = AuthManager::new(state_root.join("auth/global-slots.json"))?;
+    crate::builders::load_routes_overlay_into(
+        &mut route_configs,
+        state_root,
+        auth_manager.as_ref(),
+    );
+    let (driver, control) = RoutedModelControl::new(
+        route_configs,
+        daemon_model_retry_policy(),
+        daemon_model_budget(),
+        observer.clone(),
+        debug.clone(),
+    )?;
+    let model = Arc::new(driver);
+    let permissions = Arc::new(PermissionEngine::new(
+        vec![],
+        vec![],
+        vec![],
+        observer.clone(),
+    ));
+    let model_control = Some(control as Arc<dyn DaemonModelControl>);
+    start_test_daemon_with_policy_and_scheduler(
+        state_root,
+        model,
+        permissions,
+        model_control,
+        events,
+        debug,
+        observer,
+        crate::SubagentPolicyConfig::default(),
+        None,
+        None,
+        false,
+        false,
+        true,
+        |_tools| {},
+    )
+    .await
+}
+
+fn runtime_route_ids(runtime: &serde_json::Value) -> Vec<String> {
+    runtime["routes"]
+        .as_array()
+        .map(|routes| {
+            routes
+                .iter()
+                .filter_map(|route| route["route_id"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn runtime_model_routes_hot_add_persists_and_deletes() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-routes-hot");
+    let (address, shutdown) = scripted_routes_daemon(&state_root).await?;
+    let base = format!("http://{address}");
+    let client = Client::new();
+
+    // Add a route with an inline (fake) key. Validity is only checked when the
+    // route is actually called, so it surfaces immediately in /v1/runtime.
+    let added = client
+        .post(format!("{base}/v1/runtime/routes"))
+        .json(&serde_json::json!({
+            "route_id": "openai-live",
+            "provider": "openai",
+            "model": "gpt-5.4",
+            "api_key": "sk-fake-inline",
+        }))
+        .send()
+        .await?;
+    assert_eq!(added.status(), StatusCode::OK);
+    let added_body = added.json::<serde_json::Value>().await?;
+    assert!(
+        runtime_route_ids(&added_body).contains(&"openai-live".to_string()),
+        "hot-added route should appear in the runtime inventory: {added_body:#}"
+    );
+    let live_route = added_body["routes"]
+        .as_array()
+        .and_then(|routes| {
+            routes
+                .iter()
+                .find(|route| route["route_id"] == "openai-live")
+        })
+        .expect("added route present");
+    assert_eq!(live_route["auth_ref"], "routes.openai-live.api_key");
+
+    // Adding the same id again conflicts.
+    let duplicate = client
+        .post(format!("{base}/v1/runtime/routes"))
+        .json(&serde_json::json!({
+            "route_id": "openai-live",
+            "provider": "openai",
+            "model": "gpt-5.4",
+            "api_key": "sk-fake-inline",
+        }))
+        .send()
+        .await?;
+    assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+
+    // A startup-owned (boot-file) route cannot be deleted through the API.
+    let delete_boot = client
+        .delete(format!("{base}/v1/runtime/routes/openai-boot"))
+        .send()
+        .await?;
+    assert_eq!(delete_boot.status(), StatusCode::CONFLICT);
+
+    // Restart: the overlay route reloads from the state root.
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+    let (restart_address, restart_shutdown) = scripted_routes_daemon(&state_root).await?;
+    let restart_base = format!("http://{restart_address}");
+    let after_restart = client
+        .get(format!("{restart_base}/v1/runtime"))
+        .send()
+        .await?
+        .json::<serde_json::Value>()
+        .await?;
+    let ids = runtime_route_ids(&after_restart);
+    assert!(
+        ids.contains(&"openai-live".to_string()),
+        "overlay route should survive restart: {ids:?}"
+    );
+    assert!(
+        ids.contains(&"openai-boot".to_string()),
+        "boot route should still be present: {ids:?}"
+    );
+
+    // Deleting the overlay route removes it and leaves the boot route.
+    let deleted = client
+        .delete(format!("{restart_base}/v1/runtime/routes/openai-live"))
+        .send()
+        .await?;
+    assert_eq!(deleted.status(), StatusCode::OK);
+    let after_delete = deleted.json::<serde_json::Value>().await?;
+    let remaining = runtime_route_ids(&after_delete);
+    assert!(
+        !remaining.contains(&"openai-live".to_string()),
+        "deleted route should be gone: {remaining:?}"
+    );
+    assert!(
+        remaining.contains(&"openai-boot".to_string()),
+        "boot route should remain after overlay delete: {remaining:?}"
+    );
+
+    // Deleting an unknown route is a 404.
+    let missing = client
+        .delete(format!("{restart_base}/v1/runtime/routes/never-existed"))
+        .send()
+        .await?;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    let _ = restart_shutdown.send(());
+    wait_for_daemon_shutdown(&client, &restart_base).await?;
+    Ok(())
+}

@@ -1,0 +1,6 @@
+# The console bundle is produced by scripts/bundle-console.sh and is not
+# committed. Only the placeholder index.html (and this ignore file) are tracked
+# so the crate always compiles without a prior console build.
+*
+!.gitignore
+!index.html

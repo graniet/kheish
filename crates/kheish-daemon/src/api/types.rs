@@ -4271,6 +4271,23 @@ pub struct AddMcpServerRequest {
     pub server: kheish_mcp::CodexServerConfig,
 }
 
+/// Runtime model-route registration payload.
+///
+/// Exactly one credential source is required: an inline `api_key` (stored in the
+/// encrypted secret store under `routes.<route_id>.api_key`) or an
+/// `api_key_secret_ref` pointing at an existing secret slot.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AddModelRouteRequest {
+    pub route_id: String,
+    /// Provider driver: `anthropic`, `google`, `openai`, `openrouter`, or `xai`.
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_secret_ref: Option<String>,
+}
+
 /// Runtime permission mode request payload.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SetPermissionModeRequest {

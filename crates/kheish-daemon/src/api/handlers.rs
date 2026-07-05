@@ -722,6 +722,11 @@ where
             "/v1/runtime/mcp/servers/{name}",
             delete(remove_mcp_server::<M>),
         )
+        .route("/v1/runtime/routes", post(add_model_route::<M>))
+        .route(
+            "/v1/runtime/routes/{route_id}",
+            delete(remove_model_route::<M>),
+        )
         .route("/v1/runtime/skills", post(create_runtime_skill::<M>))
         .route(
             "/v1/runtime/skills/{skill_name}",
@@ -994,7 +999,6 @@ where
             post(ack_mailbox_message::<M>),
         )
         .route("/v1/mailboxes", post(post_mailbox::<M>))
-        .fallback(control_plane_not_found)
         .layer(DefaultBodyLimit::max(CONTROL_PLANE_JSON_BODY_LIMIT_BYTES))
         .layer(middleware::from_fn_with_state(
             authorizer,
@@ -1011,7 +1015,37 @@ where
             control_plane_problem_details_middleware,
         ))
         .with_state(probe_state);
-    Router::new().merge(probes).merge(control_plane)
+    // Unmatched requests fall through to the embedded console. API paths keep
+    // their existing JSON 404 so `/v1/*` behavior is unchanged; every other path
+    // serves the console bundle (with SPA fallback), letting one binary host both
+    // the control plane and the operator console on the same loopback origin.
+    Router::new()
+        .merge(probes)
+        .merge(control_plane)
+        .fallback(console_or_api_not_found)
+}
+
+async fn console_or_api_not_found(OriginalUri(uri): OriginalUri) -> Response {
+    let path = uri.path();
+    if path.starts_with("/v1") || path.starts_with("/healthz") || path.starts_with("/readyz") {
+        return control_plane_not_found(OriginalUri(uri))
+            .await
+            .into_response();
+    }
+    match crate::console_assets::lookup(path) {
+        Some((bytes, content_type)) => (
+            [(header::CONTENT_TYPE, HeaderValue::from_static(content_type))],
+            bytes,
+        )
+            .into_response(),
+        None => ApiError::coded(
+            StatusCode::NOT_FOUND,
+            "console",
+            "asset_not_found",
+            format!("unknown console asset {path}"),
+        )
+        .into_response(),
+    }
 }
 
 async fn healthz() -> impl IntoResponse {
@@ -1817,6 +1851,14 @@ const CONTROL_PLANE_OPENAPI_ROUTES: &[OpenApiRouteSpec] = &[
     },
     OpenApiRouteSpec {
         path: "/v1/runtime/mcp/servers/{name}",
+        methods: &["DELETE"],
+    },
+    OpenApiRouteSpec {
+        path: "/v1/runtime/routes",
+        methods: &["POST"],
+    },
+    OpenApiRouteSpec {
+        path: "/v1/runtime/routes/{route_id}",
         methods: &["DELETE"],
     },
     OpenApiRouteSpec {
@@ -5156,6 +5198,34 @@ where
 {
     state
         .remove_mcp_server(&name)
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn add_model_route<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    Json(request): Json<crate::AddModelRouteRequest>,
+) -> Result<Json<RuntimeSettingsView>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    state
+        .add_model_route(request)
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn remove_model_route<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    AxumPath(route_id): AxumPath<String>,
+) -> Result<Json<RuntimeSettingsView>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    state
+        .remove_model_route(&route_id)
         .await
         .map(Json)
         .map_err(internal_error)

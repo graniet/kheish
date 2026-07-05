@@ -41,3 +41,22 @@ pub(crate) use wait::{
     wait_for_all_runs_after_approval_resolution, wait_for_run,
     wait_for_run_after_approval_resolution,
 };
+
+/// Best-effort: spawns the platform browser-open helper for `url`.
+///
+/// Shared by `mcp oauth login` and `up` so the console-open and OAuth-open flows
+/// behave identically across platforms.
+pub(crate) fn open_browser_url(url: &str) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(target_os = "linux")]
+    let mut command = std::process::Command::new("xdg-open");
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/C", "start"]);
+        command
+    };
+    command.arg(url).spawn()?;
+    Ok(())
+}
