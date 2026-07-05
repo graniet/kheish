@@ -1631,6 +1631,29 @@ pub struct SetSessionOutputContractRequest {
     pub max_repair_attempts: Option<u8>,
 }
 
+/// Session input-contract update payload.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetSessionInputContractRequest {
+    /// The JSON Schema every submitted payload must match.
+    pub schema: Value,
+}
+
+/// Structured input contract projected through the control plane.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructuredInputContractView {
+    /// Canonical JSON Schema rendering of the enforced schema.
+    pub schema: Value,
+}
+
+impl From<&kheish_types::StructuredInputContract> for StructuredInputContractView {
+    fn from(contract: &kheish_types::StructuredInputContract) -> Self {
+        Self {
+            schema: contract.schema.to_json_schema(),
+        }
+    }
+}
+
 /// Structured output contract projected through the control plane.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StructuredOutputContractView {
@@ -2637,6 +2660,9 @@ pub struct SessionViewSummary {
         skip_serializing_if = "kheish_types::SessionToolOverrides::is_empty"
     )]
     pub tool_overrides: kheish_types::SessionToolOverrides,
+    /// Structured input contract enforced on the session's submissions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_contract: Option<StructuredInputContractView>,
     /// Structured output contract enforced on the session's runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_contract: Option<StructuredOutputContractView>,
@@ -2676,6 +2702,9 @@ pub struct SessionView {
         skip_serializing_if = "kheish_types::SessionToolOverrides::is_empty"
     )]
     pub tool_overrides: kheish_types::SessionToolOverrides,
+    /// Structured input contract enforced on the session's submissions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_contract: Option<StructuredInputContractView>,
     /// Structured output contract enforced on the session's runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_contract: Option<StructuredOutputContractView>,

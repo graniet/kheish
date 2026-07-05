@@ -904,6 +904,8 @@ where
             .await?;
         self.normalize_submit_input_request(session_id, &mut request)
             .await?;
+        self.enforce_session_input_contract(session_id, &mut request)
+            .await?;
         let input_attachments = self
             .input_attachment_refs_for_request(session_id, &request)
             .await?;

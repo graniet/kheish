@@ -1221,6 +1221,7 @@ fn validate_stack(context: &StackContext) -> Result<StackValidation> {
     validate_session_operator_configs(document, &mut validation);
     validate_session_tool_overrides(document, &mut validation);
     validate_session_output_contracts(document, &mut validation);
+    validate_session_input_contracts(document, &mut validation);
     validate_mcp_requirement_details(&document.spec.requires.mcp, &mut validation);
     validate_unique(
         "spec.playbooks[] playbook_id/version",
@@ -1280,6 +1281,20 @@ fn validate_session_output_contracts(document: &StackDocument, validation: &mut 
                     kheish_types::MAX_OUTPUT_CONTRACT_REPAIR_ATTEMPTS
                 ));
             }
+        }
+    }
+}
+
+fn validate_session_input_contracts(document: &StackDocument, validation: &mut StackValidation) {
+    for (index, session) in document.spec.sessions.iter().enumerate() {
+        let Some(contract) = session.input_contract.as_ref() else {
+            continue;
+        };
+        if let Err(error) = kheish_types::StructuredFieldSchema::from_json_schema(&contract.schema)
+        {
+            validation.errors.push(format!(
+                "spec.sessions[{index}].input_contract.schema: {error}"
+            ));
         }
     }
 }
@@ -3377,6 +3392,32 @@ where
                 }
             }
         }
+        match session.input_contract.as_ref() {
+            Some(contract) => {
+                client
+                    .post_json::<_, crate::SessionView>(
+                        &format!("/v1/sessions/{encoded}/input-contract"),
+                        &crate::SetSessionInputContractRequest {
+                            schema: contract.schema.to_json_schema(),
+                        },
+                    )
+                    .await?;
+            }
+            None => {
+                // Clearing costs a request and older daemons lack the route:
+                // only reconcile away a contract the live session really has.
+                if live
+                    .as_ref()
+                    .is_some_and(|view| view.input_contract.is_some())
+                {
+                    client
+                        .delete_json::<crate::SessionView>(&format!(
+                            "/v1/sessions/{encoded}/input-contract"
+                        ))
+                        .await?;
+                }
+            }
+        }
         ledger.record_resource(&context.ownership_id(), &key, session.digest.clone());
         ledger.save(ledger_path).await?;
         report.applied.push(StackAction::new(
@@ -4015,6 +4056,11 @@ fn session_matches(live: &crate::SessionView, desired: &ResolvedSession) -> bool
                 .output_contract
                 .as_ref()
                 .map(crate::StructuredOutputContractView::from)
+        && live.input_contract
+            == desired
+                .input_contract
+                .as_ref()
+                .map(crate::StructuredInputContractView::from)
         && live.reply_targets == desired_reply_targets
 }
 
@@ -4890,6 +4936,8 @@ struct StackSessionSpec {
     tool_overrides: Option<kheish_types::SessionToolOverrides>,
     #[serde(default)]
     output_contract: Option<StackOutputContractSpec>,
+    #[serde(default)]
+    input_contract: Option<StackInputContractSpec>,
 }
 
 /// Manifest-side structured output contract: standard JSON Schema, converted
@@ -4901,6 +4949,15 @@ struct StackOutputContractSpec {
     schema: Value,
     #[serde(default)]
     max_repair_attempts: Option<u8>,
+}
+
+/// Manifest-side structured input contract: standard JSON Schema, converted
+/// strictly at resolve time so unsupported keywords fail validation instead
+/// of silently weakening the contract.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StackInputContractSpec {
+    schema: Value,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -5212,6 +5269,23 @@ impl ResolvedStack {
                                     )
                                 })?,
                                 max_repair_attempts: spec.max_repair_attempts,
+                            })
+                        })
+                        .transpose()?,
+                    input_contract: session
+                        .input_contract
+                        .as_ref()
+                        .map(|spec| {
+                            Ok::<_, anyhow::Error>(kheish_types::StructuredInputContract {
+                                schema: kheish_types::StructuredFieldSchema::from_json_schema(
+                                    &spec.schema,
+                                )
+                                .map_err(|error| {
+                                    anyhow!(
+                                        "session {} input_contract schema: {error}",
+                                        session.session_id
+                                    )
+                                })?,
                             })
                         })
                         .transpose()?,
@@ -5539,6 +5613,7 @@ struct ResolvedSession {
     reply_targets: Option<Vec<crate::SessionReplyTargetRequest>>,
     tool_overrides: Option<kheish_types::SessionToolOverrides>,
     output_contract: Option<kheish_types::StructuredOutputContract>,
+    input_contract: Option<kheish_types::StructuredInputContract>,
     digest: String,
 }
 
@@ -5555,6 +5630,7 @@ impl ResolvedSession {
             "reply_targets": self.reply_targets,
             "tool_overrides": self.tool_overrides,
             "output_contract": self.output_contract,
+            "input_contract": self.input_contract,
         })
     }
 }
@@ -6281,6 +6357,7 @@ mod tests {
             persona: None,
             operator: Default::default(),
             tool_overrides: Default::default(),
+            input_contract: None,
             output_contract: None,
             reply_targets: Vec::new(),
             outputs: Vec::new(),
@@ -6496,6 +6573,7 @@ mod tests {
                 persona,
                 operator: Default::default(),
                 tool_overrides: kheish_types::SessionToolOverrides::default(),
+                input_contract: None,
                 output_contract: None,
                 reply_targets: Vec::new(),
                 outputs: Vec::new(),
@@ -7615,6 +7693,99 @@ spec:
                 .iter()
                 .any(|error| error.contains("max_repair_attempts must be <= 5"))
         );
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_unsupported_input_contract_schema() {
+        let raw = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: input-contract-invalid
+spec:
+  sessions:
+    - session_id: intake
+      input_contract:
+        schema:
+          type: object
+          additionalProperties: false
+          required: ["kind"]
+          properties:
+            kind:
+              type: string
+              enum: ["order", "refund"]
+"#;
+
+        let validation = validate_stack_context(&context(raw)).await.unwrap();
+
+        assert!(!validation.valid);
+        assert!(validation.errors.iter().any(|error| {
+            error.contains("spec.sessions[0].input_contract.schema")
+                && error.contains("unsupported JSON Schema keyword `enum`")
+        }));
+    }
+
+    #[tokio::test]
+    async fn input_contract_changes_the_session_digest() {
+        let with_contract = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: input-contract-digest
+spec:
+  sessions:
+    - session_id: intake
+      input_contract:
+        schema:
+          type: object
+          additionalProperties: false
+          required: ["kind"]
+          properties:
+            kind:
+              type: string
+"#;
+        let without_contract = r#"
+apiVersion: kheish.ai/v1alpha1
+kind: KheishStack
+metadata:
+  name: input-contract-digest
+spec:
+  sessions:
+    - session_id: intake
+"#;
+
+        let resolved_with = ResolvedStack::from_context(&context(with_contract))
+            .await
+            .unwrap();
+        let resolved_with_again = ResolvedStack::from_context(&context(with_contract))
+            .await
+            .unwrap();
+        let resolved_without = ResolvedStack::from_context(&context(without_contract))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resolved_with.sessions[0].digest,
+            resolved_with_again.sessions[0].digest
+        );
+        assert_ne!(
+            resolved_with.sessions[0].digest,
+            resolved_without.sessions[0].digest
+        );
+
+        let live_with = crate::SessionView {
+            input_contract: resolved_with.sessions[0]
+                .input_contract
+                .as_ref()
+                .map(crate::StructuredInputContractView::from),
+            ..fake_session_view("intake")
+        };
+        assert!(session_matches(&live_with, &resolved_with.sessions[0]));
+        assert!(!session_matches(&live_with, &resolved_without.sessions[0]));
+        assert!(!session_matches(
+            &fake_session_view("intake"),
+            &resolved_with.sessions[0]
+        ));
     }
 
     #[tokio::test]

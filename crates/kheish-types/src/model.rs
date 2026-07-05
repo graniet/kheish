@@ -655,6 +655,18 @@ pub fn metadata_with_structured_output_contract(
     Ok(Value::Object(object))
 }
 
+/// A structured input contract: when set on a session, every submitted
+/// input payload must be a single JSON value matching the schema. The
+/// daemon validates at the ingress boundary and rejects non-conforming
+/// payloads before any run is created; accepted payloads are re-serialized
+/// canonically so the agent always reads normalized JSON.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StructuredInputContract {
+    /// The schema every submitted payload must match.
+    pub schema: StructuredFieldSchema,
+}
+
 /// Describes the requested response format for one model turn.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

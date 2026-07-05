@@ -57671,3 +57671,253 @@ async fn store_asset_tool_exports_workspace_files_and_rejects_escapes() -> Resul
     wait_for_daemon_shutdown(&client, &base).await?;
     Ok(())
 }
+
+async fn put_input_contract(
+    client: &Client,
+    base: &str,
+    session_id: &str,
+    schema: Value,
+) -> Result<reqwest::Response> {
+    Ok(client
+        .put(format!("{base}/v1/sessions/{session_id}/input-contract"))
+        .json(&json!({ "schema": schema }))
+        .send()
+        .await?)
+}
+
+#[tokio::test]
+async fn session_input_contract_roundtrip_and_validation() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-input-contract");
+    let (address, shutdown) = scripted_daemon(&state_root, Vec::new()).await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+    create_test_session(&client, &base, "input-contract-demo").await?;
+
+    let unset = client
+        .get(format!(
+            "{base}/v1/sessions/input-contract-demo/input-contract"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    assert_eq!(unset, Value::Null);
+
+    // Unsupported keywords are rejected with their JSON paths, never dropped.
+    let rejected = put_input_contract(
+        &client,
+        &base,
+        "input-contract-demo",
+        json!({
+            "type": "object",
+            "properties": {"status": {"type": "string", "enum": ["open"]}},
+            "required": ["status"],
+            "additionalProperties": false,
+        }),
+    )
+    .await?;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        rejected
+            .text()
+            .await?
+            .contains("unsupported JSON Schema keyword `enum`")
+    );
+
+    let accepted = put_input_contract(
+        &client,
+        &base,
+        "input-contract-demo",
+        output_contract_schema_json(),
+    )
+    .await?;
+    assert_eq!(accepted.status(), StatusCode::OK);
+    let view = accepted.json::<SessionView>().await?;
+    let contract = view.input_contract.expect("contract projected on the view");
+    assert_eq!(contract.schema, output_contract_schema_canonical());
+
+    let fetched = client
+        .get(format!(
+            "{base}/v1/sessions/input-contract-demo/input-contract"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    assert_eq!(fetched["schema"], output_contract_schema_canonical());
+
+    let cleared = client
+        .delete(format!(
+            "{base}/v1/sessions/input-contract-demo/input-contract"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionView>()
+        .await?;
+    assert!(cleared.input_contract.is_none());
+
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_input_contract_persists_across_restart() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-input-contract-restart");
+
+    let (address, shutdown) = scripted_daemon(&state_root, Vec::new()).await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+    create_test_session(&client, &base, "input-contract-restart").await?;
+    let accepted = put_input_contract(
+        &client,
+        &base,
+        "input-contract-restart",
+        output_contract_schema_json(),
+    )
+    .await?;
+    assert_eq!(accepted.status(), StatusCode::OK);
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+
+    let (address, shutdown) = scripted_daemon(&state_root, Vec::new()).await?;
+    let base = format!("http://{address}");
+    let fetched = client
+        .get(format!(
+            "{base}/v1/sessions/input-contract-restart/input-contract"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    assert_eq!(fetched["schema"], output_contract_schema_canonical());
+
+    let _ = shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn structured_input_contract_rejects_nonconforming_payloads_fail_closed() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-input-contract-reject");
+    // No scripted model turn: nothing may ever reach the model.
+    let (address, shutdown) = scripted_daemon(&state_root, Vec::new()).await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+    create_test_session(&client, &base, "input-reject-demo").await?;
+    let accepted = put_input_contract(
+        &client,
+        &base,
+        "input-reject-demo",
+        output_contract_schema_json(),
+    )
+    .await?;
+    assert_eq!(accepted.status(), StatusCode::OK);
+
+    // Prose is not a JSON payload.
+    let prose = client
+        .post(format!("{base}/v1/sessions/input-reject-demo/runs"))
+        .json(&json!({ "content": "just some prose", "generation": {} }))
+        .send()
+        .await?;
+    assert_eq!(prose.status(), StatusCode::BAD_REQUEST);
+    let body = prose.text().await?;
+    assert!(body.contains("structured input contract violated"));
+    assert!(body.contains("not a single JSON value"));
+
+    // Valid JSON that misses the schema is rejected with the JSON path.
+    let mismatch = client
+        .post(format!("{base}/v1/sessions/input-reject-demo/runs"))
+        .json(&json!({ "content": "{\"status\": \"open\"}", "generation": {} }))
+        .send()
+        .await?;
+    assert_eq!(mismatch.status(), StatusCode::BAD_REQUEST);
+    let body = mismatch.text().await?;
+    assert!(body.contains("structured input contract violated"));
+    assert!(body.contains("count"));
+
+    // Fail-closed: no run was created by either rejection.
+    let runs = client
+        .get(format!("{base}/v1/runs"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<RunView>>()
+        .await?;
+    assert!(
+        runs.iter().all(|run| run.session_id != "input-reject-demo"),
+        "a rejected submission must not create a run: {runs:?}"
+    );
+
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn structured_input_contract_canonicalizes_accepted_payloads() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-input-contract-accept");
+    let (address, shutdown) = scripted_daemon(
+        &state_root,
+        vec![Ok(scripted_events(
+            "assistant-ack",
+            "Understood.",
+            kheish_types::ModelFinishReason::Completed,
+        ))],
+    )
+    .await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+    create_test_session(&client, &base, "input-accept-demo").await?;
+    let accepted = put_input_contract(
+        &client,
+        &base,
+        "input-accept-demo",
+        output_contract_schema_json(),
+    )
+    .await?;
+    assert_eq!(accepted.status(), StatusCode::OK);
+
+    // A fenced, whitespace-heavy but conforming payload is accepted and the
+    // agent reads the canonical re-serialization (keys sorted, minified).
+    let run = submit_test_input(
+        &client,
+        &base,
+        "input-accept-demo",
+        "```json\n{\"status\": \"ok\",   \"count\": 3}\n```",
+    )
+    .await?;
+    wait_for_run_status(&client, &base, &run.run_id, &[DaemonRunStatus::Completed]).await?;
+
+    let events = client
+        .get(format!("{base}/v1/sessions/input-accept-demo/events"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    let user_contents = events["session"]["journal"]
+        .as_array()
+        .expect("journal array")
+        .iter()
+        .filter(|entry| entry["event"]["type"] == "message_appended")
+        .filter(|entry| entry["event"]["message"]["role"] == "user")
+        .map(|entry| entry["event"]["message"]["content"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        user_contents,
+        vec![json!("{\"count\":3,\"status\":\"ok\"}")],
+        "the user message must carry the canonical payload"
+    );
+
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+    Ok(())
+}

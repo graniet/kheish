@@ -419,6 +419,11 @@ where
         let persona_binding = self.load_session_persona_binding(session_id).await?;
         let operator = self.load_session_operator_config(session_id).await?;
         let tool_overrides = self.load_session_tool_overrides(session_id).await?;
+        let input_contract = self
+            .load_session_input_contract(session_id)
+            .await?
+            .as_ref()
+            .map(crate::StructuredInputContractView::from);
         let output_contract = self
             .load_session_output_contract(session_id)
             .await?
@@ -442,6 +447,7 @@ where
             persona,
             operator,
             tool_overrides,
+            input_contract,
             output_contract,
             reply_targets,
             outputs: self.delivery_service.session_outputs(session_id).await?,
@@ -492,6 +498,11 @@ where
             let credential_scope = self.load_session_credential_scope(&session_id).await?;
             let operator = self.load_session_operator_config(&session_id).await?;
             let tool_overrides = self.load_session_tool_overrides(&session_id).await?;
+            let input_contract = self
+                .load_session_input_contract(&session_id)
+                .await?
+                .as_ref()
+                .map(crate::StructuredInputContractView::from);
             let output_contract = self
                 .load_session_output_contract(&session_id)
                 .await?
@@ -516,6 +527,7 @@ where
                 persona,
                 operator,
                 tool_overrides,
+                input_contract,
                 output_contract,
                 reply_targets,
             });

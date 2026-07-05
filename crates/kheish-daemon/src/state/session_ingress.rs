@@ -448,6 +448,34 @@ where
         Ok(view)
     }
 
+    pub(crate) async fn set_session_input_contract(
+        &self,
+        session_id: &str,
+        contract: Option<kheish_types::StructuredInputContract>,
+    ) -> Result<SessionView> {
+        self.run_service
+            .with_session_idle_guard(session_id, || async {
+                self.agent_id_for_session(session_id).await?;
+                self.save_session_input_contract(session_id, contract.as_ref())
+                    .await?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                if error.to_string().contains("has active or queued runs") {
+                    anyhow::anyhow!(
+                        "session {session_id} has non-terminal work or live descendants; input-contract changes are only allowed while the session is idle"
+                    )
+                } else {
+                    error
+                }
+            })?;
+        let agent_id = self.agent_id_for_session(session_id).await?;
+        let view = self.session_view(session_id, &agent_id).await?;
+        self.publish_snapshot(&view);
+        Ok(view)
+    }
+
     pub(crate) async fn set_session_capability_scope(
         &self,
         session_id: &str,
@@ -1248,6 +1276,72 @@ where
         }
         validate_input_attachment_requests(&request.attachments)?;
         validate_submit_input_items(&request.input_items)?;
+        Ok(())
+    }
+
+    /// Enforces the session's structured input contract, if any: the
+    /// submitted text payload must be one JSON value matching the schema.
+    /// Violations reject the submission before any run is created
+    /// (fail-closed); accepted payloads are re-serialized canonically and
+    /// the parsed value travels on the envelope metadata.
+    pub(super) async fn enforce_session_input_contract(
+        &self,
+        session_id: &str,
+        request: &mut SubmitInputRequest,
+    ) -> Result<()> {
+        let Some(contract) = self.load_session_input_contract(session_id).await? else {
+            return Ok(());
+        };
+        let text = if request.input_items.is_empty() {
+            request.content.clone()
+        } else {
+            request
+                .input_items
+                .iter()
+                .filter_map(|item| match item {
+                    SubmitInputItemRequest::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let candidate = kheish_types::extract_json_text(&text);
+        let value: Value = serde_json::from_str(candidate).map_err(|error| {
+            DaemonProblem::bad_request(
+                "sessions",
+                "input_contract_violated",
+                format!(
+                    "structured input contract violated: the payload is not a single JSON value: {error}"
+                ),
+            )
+        })?;
+        contract.schema.validate_value(&value).map_err(|error| {
+            DaemonProblem::bad_request(
+                "sessions",
+                "input_contract_violated",
+                format!("structured input contract violated: {error}"),
+            )
+        })?;
+        let canonical = serde_json::to_string(&value)?;
+        if request.input_items.is_empty() {
+            request.content = canonical;
+        } else {
+            // Keep asset/board references in order; the text fragments
+            // collapse into one canonical JSON item where the first stood.
+            let mut replaced = false;
+            request.input_items.retain_mut(|item| match item {
+                SubmitInputItemRequest::Text { text } => {
+                    if replaced {
+                        false
+                    } else {
+                        replaced = true;
+                        *text = canonical.clone();
+                        true
+                    }
+                }
+                _ => true,
+            });
+        }
         Ok(())
     }
 

@@ -37,6 +37,8 @@ pub const SESSION_OPERATOR_CONFIG_METADATA_KEY: &str = "session_operator_config"
 pub const SESSION_TOOL_OVERRIDES_METADATA_KEY: &str = "session_tool_overrides";
 /// Stable metadata key carrying one session's structured output contract.
 pub const SESSION_OUTPUT_CONTRACT_METADATA_KEY: &str = "session_output_contract";
+/// Session metadata key persisting the structured input contract.
+pub const SESSION_INPUT_CONTRACT_METADATA_KEY: &str = "session_input_contract";
 /// Stable metadata key used to persist hook runtime state.
 pub const HOOK_RUNTIME_STATE_METADATA_KEY: &str = "hook_runtime_state";
 /// Sentinel value for an unbounded autonomous-agent turn policy.
@@ -776,6 +778,18 @@ pub fn session_tool_overrides_from_metadata(
         .cloned()
         .map(serde_json::from_value)
         .unwrap_or_else(|| Ok(SessionToolOverrides::default()))
+}
+
+/// Decodes the structured input contract from persisted session metadata.
+pub fn session_input_contract_from_metadata(
+    metadata: &Value,
+) -> serde_json::Result<Option<crate::StructuredInputContract>> {
+    metadata
+        .get(SESSION_INPUT_CONTRACT_METADATA_KEY)
+        .filter(|value| !value.is_null())
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
 }
 
 /// Decodes the structured output contract from persisted session metadata.
