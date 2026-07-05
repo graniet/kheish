@@ -2645,17 +2645,19 @@ async fn get_docs_manifest() -> Json<&'static crate::docs::DocsManifestView> {
     Json(crate::docs::docs_manifest())
 }
 
-async fn get_docs_page(
-    AxumPath(path): AxumPath<String>,
-) -> Result<Json<crate::docs::DocsPageView>, ApiError> {
-    crate::docs::docs_page(&path).map(Json).ok_or_else(|| {
-        ApiError::coded(
-            StatusCode::NOT_FOUND,
-            "docs",
-            "docs_page_not_found",
-            format!("unknown documentation page `{path}`"),
-        )
-    })
+async fn get_docs_page(AxumPath(path): AxumPath<String>) -> Result<Response, ApiError> {
+    if let Some(page) = crate::docs::docs_page(&path) {
+        return Ok(Json(page).into_response());
+    }
+    if let Some((bytes, mime)) = crate::docs::docs_asset(&path) {
+        return Ok(([(header::CONTENT_TYPE, mime)], bytes).into_response());
+    }
+    Err(ApiError::coded(
+        StatusCode::NOT_FOUND,
+        "docs",
+        "docs_page_not_found",
+        format!("unknown documentation page `{path}`"),
+    ))
 }
 
 async fn get_runtime<M>(State(state): State<Arc<DaemonState<M>>>) -> Json<RuntimeSettingsView>

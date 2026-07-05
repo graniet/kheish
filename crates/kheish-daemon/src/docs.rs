@@ -52,8 +52,28 @@ struct DocsJson {
     navigation: DocsNavigation,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct DocsNavigation {
+    #[serde(default)]
+    groups: Vec<DocsJsonGroup>,
+    #[serde(default)]
+    tabs: Vec<DocsJsonTab>,
+}
+
+impl DocsNavigation {
+    /// Flattens the navigation into one ordered group list: top-level groups
+    /// first, then each tab's groups. The console renders a flat sidebar, so
+    /// Mintlify tabs only affect the hosted site's layout.
+    fn into_groups(self) -> Vec<DocsJsonGroup> {
+        let mut groups = self.groups;
+        groups.extend(self.tabs.into_iter().flat_map(|tab| tab.groups));
+        groups
+    }
+}
+
+#[derive(Deserialize)]
+struct DocsJsonTab {
+    #[serde(default)]
     groups: Vec<DocsJsonGroup>,
 }
 
@@ -74,11 +94,11 @@ pub fn docs_manifest() -> &'static DocsManifestView {
         let parsed = serde_json::from_str::<DocsJson>(raw).unwrap_or(DocsJson {
             name: "Kheish daemon".to_string(),
             description: String::new(),
-            navigation: DocsNavigation { groups: Vec::new() },
+            navigation: DocsNavigation::default(),
         });
         let groups = parsed
             .navigation
-            .groups
+            .into_groups()
             .into_iter()
             .map(|group| DocsGroupView {
                 group: group.group,
@@ -129,6 +149,26 @@ pub fn docs_page(path: &str) -> Option<DocsPageView> {
         description: frontmatter_field(front, "description").unwrap_or_default(),
         content: body.trim_start().to_string(),
     })
+}
+
+/// Loads one embedded static asset (page images, logos) by its docs-relative
+/// path, returning the bytes and content type. Only image extensions are
+/// served; everything else — including traversal attempts — returns `None`.
+pub fn docs_asset(path: &str) -> Option<(&'static [u8], &'static str)> {
+    let normalized = path.trim().trim_matches('/');
+    if normalized.is_empty() || normalized.contains("..") {
+        return None;
+    }
+    let mime = match normalized.rsplit('.').next() {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("svg") => "image/svg+xml",
+        Some("webp") => "image/webp",
+        _ => return None,
+    };
+    let file = DOCS_DIR.get_file(normalized)?;
+    Some((file.contents(), mime))
 }
 
 /// Splits a leading `---` YAML frontmatter block from the markdown body.
@@ -183,5 +223,15 @@ mod tests {
         assert!(docs_page("nope/missing").is_none());
         assert!(docs_page("../Cargo").is_none());
         assert!(docs_page("").is_none());
+    }
+
+    #[test]
+    fn assets_serve_images_and_reject_everything_else() {
+        let (bytes, mime) = docs_asset("logo.png").expect("embedded logo");
+        assert!(!bytes.is_empty());
+        assert_eq!(mime, "image/png");
+        assert!(docs_asset("docs.json").is_none(), "non-image rejected");
+        assert!(docs_asset("../Cargo.toml").is_none());
+        assert!(docs_asset("nope/missing.png").is_none());
     }
 }

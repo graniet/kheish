@@ -164,6 +164,8 @@ Let us walk each one.
 
 Your agents think with a model, and this step is where you give the daemon a way to call one. It is the only step you cannot skip, for the obvious reason that an agent with no model cannot do anything.
 
+![The wizard's Model step: pick a provider, paste one key, and it lands in the daemon's encrypted store](/images/wizard-model.png)
+
 You will see the supported providers to choose from, each with a sensible default model:
 
 | Provider | Default model shown | Key looks like |
@@ -188,6 +190,8 @@ When you have a model connected and chosen, click **Continue**.
 
 A model can reason, but on its own it cannot *do* much — it cannot read your GitHub, check your Linear issues, look something up on the live web. Tools change that. Kheish gives agents capabilities through the **Model Context Protocol (MCP)**: small servers that expose tools an agent can call.
 
+![The wizard's Tools step: featured MCP servers you can connect in one click](/images/wizard-tools.png)
+
 This step offers a handful of featured, popular MCP servers so you can plug one in without leaving onboarding:
 
 - **GitHub** — let an agent read repositories, issues, and pull requests
@@ -204,6 +208,8 @@ When you are done (or if you are skipping), click **Continue** or **Skip for now
 ### Step 3 — Secrets (optional)
 
 Your agents will often need credentials that are not provider keys and not tied to a specific tool yet — an API token for some service you will wire up later, a webhook signing secret, anything. This step lets you park those in the daemon's encrypted store now so they are ready when you need them.
+
+![The wizard's Secrets step: write-only slots in the encrypted store](/images/wizard-secrets.png)
 
 You give each secret a **slot name** and a value. The convention is a dotted namespace so slots stay organized, for example:
 
@@ -324,6 +330,8 @@ If you started from the Daily digest template, you already have a schedule. Open
 - **Calendar** — a Google-Calendar-style month view of when your schedules fire. Your 9:00 daily digest shows up as a recurring event. You can click a day to create a new schedule anchored to it.
 - **List** — a table of every schedule with its cadence, target session, status, run count, and last fire time.
 
+![The Schedules calendar: recurring agent work laid out like a regular calendar](/images/schedules-calendar.png)
+
 Creating a schedule is deliberately calendar-like: you give it a title, a target session, a date and time, and a repeat cadence. The cadences you can choose are:
 
 | Cadence | Meaning |
@@ -365,6 +373,8 @@ Onboarding dropped you into a chat, but Kheish Air is a full operator surface. Y
 | **Logs** | The daemon's own tracing feed — scheduler, deliveries, MCP, model routing, errors — in one explorer. |
 | **Docs** | These very docs, served by your daemon, matching its exact version. |
 | **Settings** | Point the console at a different daemon, among other console-side preferences. |
+
+![The Docs page: this documentation, served by your own daemon](/images/docs-tab.png)
 
 The **Inbox** deserves a special mention on a first read. As you give agents more capability and let them run unattended, the moments where a run pauses for your yes/no or your answer stop being something you happen to catch in a chat and start being a queue you work through. The Inbox is that queue. If you ever wonder "is anything waiting on me?", that is the page. The [Connectors](../automation/connectors) and [Tools and MCP](../automation/tools-and-mcp) pages explain what generates that work.
 

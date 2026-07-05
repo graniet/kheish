@@ -10,78 +10,169 @@
   },
   "logo": {
     "light": "/logo.png",
-    "dark": "/logo.png"
+    "dark": "/logo-dark.png"
   },
   "favicon": "/logo.png",
+  "navbar": {
+    "links": [
+      {
+        "label": "GitHub",
+        "href": "https://github.com/graniet/kheish"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Get started",
+      "href": "/welcome/quickstart"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/graniet/kheish"
+    }
+  },
+  "contextual": {
+    "options": [
+      "copy",
+      "view"
+    ]
+  },
   "navigation": {
-    "groups": [
+    "tabs": [
       {
-        "group": "Welcome",
-        "pages": [
-          "index",
-          "welcome/quickstart"
+        "tab": "Guides",
+        "icon": "book-open",
+        "groups": [
+          {
+            "group": "Welcome",
+            "icon": "rocket",
+            "pages": [
+              "index",
+              "welcome/quickstart"
+            ]
+          },
+          {
+            "group": "Concepts",
+            "icon": "layer-group",
+            "pages": [
+              "concepts/architecture",
+              "concepts/sessions-and-runs",
+              "concepts/memory",
+              "concepts/agents-personas-skills"
+            ]
+          },
+          {
+            "group": "Automation",
+            "icon": "clock",
+            "pages": [
+              "automation/schedules",
+              "automation/connectors",
+              "automation/tools-and-mcp"
+            ]
+          },
+          {
+            "group": "Operations",
+            "icon": "shield-halved",
+            "pages": [
+              "operations/security",
+              "operations/production"
+            ]
+          },
+          {
+            "group": "Integrate",
+            "icon": "plug",
+            "pages": [
+              "integrate/sdks-and-api"
+            ]
+          }
         ]
       },
       {
-        "group": "Concepts",
-        "pages": [
-          "concepts/architecture",
-          "concepts/sessions-and-runs",
-          "concepts/memory",
-          "concepts/agents-personas-skills"
-        ]
-      },
-      {
-        "group": "Automation",
-        "pages": [
-          "automation/schedules",
-          "automation/connectors",
-          "automation/tools-and-mcp"
-        ]
-      },
-      {
-        "group": "Operations",
-        "pages": [
-          "operations/security",
-          "operations/production"
-        ]
-      },
-      {
-        "group": "Integrate",
-        "pages": [
-          "integrate/sdks-and-api"
-        ]
-      },
-      {
-        "group": "API reference",
-        "pages": [
-          "reference/control-plane-api",
-          "reference/sessions-and-runs-api",
-          "reference/tasks-schedules-agents-api",
-          "reference/questions-and-approvals-api",
-          "reference/runtime-api",
-          "reference/connectors-api",
-          "reference/external-connectors-protocol",
-          "reference/learnings-api",
-          "reference/skills-api",
-          "reference/assets-api",
-          "reference/personas-api",
-          "reference/playbooks-and-flows-api",
-          "reference/projects-api",
-          "reference/channels-api",
-          "reference/boards-api",
-          "reference/observations-and-derivations-api"
-        ]
-      },
-      {
-        "group": "Operational reference",
-        "pages": [
-          "reference/connector-configuration",
-          "reference/built-in-tools",
-          "reference/skill-format",
-          "reference/hook-reference"
+        "tab": "API reference",
+        "icon": "code",
+        "groups": [
+          {
+            "group": "API reference",
+            "icon": "code",
+            "pages": [
+              "reference/control-plane-api",
+              "reference/sessions-and-runs-api",
+              "reference/tasks-schedules-agents-api",
+              "reference/questions-and-approvals-api",
+              "reference/runtime-api",
+              "reference/connectors-api",
+              "reference/external-connectors-protocol",
+              "reference/learnings-api",
+              "reference/skills-api",
+              "reference/assets-api",
+              "reference/personas-api",
+              "reference/playbooks-and-flows-api",
+              "reference/projects-api",
+              "reference/channels-api",
+              "reference/boards-api",
+              "reference/observations-and-derivations-api"
+            ]
+          },
+          {
+            "group": "Operational reference",
+            "icon": "book",
+            "pages": [
+              "reference/connector-configuration",
+              "reference/built-in-tools",
+              "reference/skill-format",
+              "reference/hook-reference"
+            ]
+          }
         ]
       }
     ]
-  }
+  },
+  "redirects": [
+    { "source": "/introduction/start-here", "destination": "/welcome/quickstart" },
+    { "source": "/introduction/quickstart", "destination": "/welcome/quickstart" },
+    { "source": "/introduction/overview", "destination": "/" },
+    { "source": "/introduction/architecture-overview", "destination": "/concepts/architecture" },
+    { "source": "/introduction/python-sdk-quickstart", "destination": "/integrate/sdks-and-api" },
+    { "source": "/introduction/web-sdk-quickstart", "destination": "/integrate/sdks-and-api" },
+    { "source": "/concepts/playbooks-and-flows", "destination": "/reference/playbooks-and-flows-api" },
+    { "source": "/concepts/projects-and-project-tasks", "destination": "/reference/projects-api" },
+    { "source": "/concepts/channels-and-public-conversations", "destination": "/reference/channels-api" },
+    { "source": "/concepts/connectors-and-reply-targets", "destination": "/automation/connectors" },
+    { "source": "/concepts/personas", "destination": "/concepts/agents-personas-skills" },
+    { "source": "/concepts/recovered-run-memory", "destination": "/concepts/memory" },
+    { "source": "/concepts/semantic-learning-and-procedural-skills", "destination": "/concepts/memory" },
+    { "source": "/concepts/assets-and-multimodal-input", "destination": "/reference/assets-api" },
+    { "source": "/concepts/capture-and-observations", "destination": "/reference/observations-and-derivations-api" },
+    { "source": "/concepts/agents-and-sidechains", "destination": "/concepts/agents-personas-skills" },
+    { "source": "/concepts/tasks-and-schedules", "destination": "/automation/schedules" },
+    { "source": "/concepts/approvals-and-questions", "destination": "/automation/tools-and-mcp" },
+    { "source": "/concepts/state-and-recovery", "destination": "/concepts/architecture" },
+    { "source": "/runtime/providers-and-routing", "destination": "/operations/production" },
+    { "source": "/runtime/context-windows", "destination": "/concepts/architecture" },
+    { "source": "/runtime/openrouter", "destination": "/operations/production" },
+    { "source": "/runtime/tools", "destination": "/automation/tools-and-mcp" },
+    { "source": "/runtime/permissions", "destination": "/automation/tools-and-mcp" },
+    { "source": "/runtime/hooks", "destination": "/reference/hook-reference" },
+    { "source": "/runtime/skills", "destination": "/reference/skill-format" },
+    { "source": "/runtime/mcp", "destination": "/automation/tools-and-mcp" },
+    { "source": "/integrations/connectors", "destination": "/automation/connectors" },
+    { "source": "/integrations/multi-input-sessions", "destination": "/automation/connectors" },
+    { "source": "/integrations/output-routing", "destination": "/automation/connectors" },
+    { "source": "/integrations/capture-quickstart", "destination": "/reference/observations-and-derivations-api" },
+    { "source": "/integrations/webhook-quickstart", "destination": "/integrate/sdks-and-api" },
+    { "source": "/operators/running-the-daemon", "destination": "/operations/production" },
+    { "source": "/operators/docker-and-containers", "destination": "/operations/production" },
+    { "source": "/operators/security-and-auth", "destination": "/operations/security" },
+    { "source": "/operators/runtime-configuration", "destination": "/operations/production" },
+    { "source": "/operators/kheish-stack", "destination": "/operations/production" },
+    { "source": "/operators/kheish-stack-api-spec", "destination": "/operations/production" },
+    { "source": "/operators/linear-github-feature-loop", "destination": "/operations/production" },
+    { "source": "/operators/production-runbooks", "destination": "/operations/production" },
+    { "source": "/operators/mcp-catalog", "destination": "/automation/tools-and-mcp" },
+    { "source": "/operators/oauth", "destination": "/automation/tools-and-mcp" },
+    { "source": "/operators/playbooks-and-flows", "destination": "/reference/playbooks-and-flows-api" },
+    { "source": "/operators/deployment-and-hardening", "destination": "/operations/production" },
+    { "source": "/operators/debugging-and-recovery", "destination": "/operations/production" },
+    { "source": "/contributing/development", "destination": "/" }
+  ]
 }
