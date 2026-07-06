@@ -1705,6 +1705,21 @@ where
             if channel.summary.paused {
                 continue;
             }
+            // Read leases and skip while a turn is in flight BEFORE reading messages: settle
+            // posts the agent's message and only then removes the lease, so observing "not
+            // busy" first guarantees the messages read below already includes whatever the
+            // just-finished turn posted. Reading messages first could score a spoken turn as
+            // silent (stale latest) if a turn settles between the two reads.
+            let leases = match self.channel_leases_map(&channel_id).await {
+                Ok(leases) => leases,
+                Err(error) => {
+                    warn!(channel_id = %channel_id, error = ?error, "heartbeat could not read leases");
+                    continue;
+                }
+            };
+            if leases.values().any(|lease| lease.active_run_id.is_some()) {
+                continue;
+            }
             // One channel's transient read error must not abort the poll for the others.
             let messages = match self.channel_service.list_messages(&channel_id, None).await {
                 Ok(messages) => messages,
@@ -1718,18 +1733,6 @@ where
             };
             let latest_id = latest.message_id.clone();
             let latest_created_ms = latest.created_at_ms;
-
-            // Wait for any in-flight autonomous turn to settle before accounting or driving.
-            let leases = match self.channel_leases_map(&channel_id).await {
-                Ok(leases) => leases,
-                Err(error) => {
-                    warn!(channel_id = %channel_id, error = ?error, "heartbeat could not read leases");
-                    continue;
-                }
-            };
-            if leases.values().any(|lease| lease.active_run_id.is_some()) {
-                continue;
-            }
 
             let state = states
                 .entry(channel_id.clone())
@@ -1865,11 +1868,13 @@ where
             };
             if granted {
                 state.pending_grant = true;
-                if new_topic {
-                    // A fresh topic clears the finished-topic streak so we do not immediately
-                    // treat the brand-new subject as already dead.
-                    state.consecutive_silent = 0;
-                }
+                // Note: we deliberately do NOT reset consecutive_silent here for a new topic.
+                // new_topic is forced true exactly in the silent cases (streak >= silence limit,
+                // or no live topic to join), so resetting on grant would peg the streak below
+                // the dormancy limit forever and a quiet channel would pay for a turn every
+                // interval indefinitely. Instead: if the fresh topic actually gets a message the
+                // streak resets naturally next poll (the `advanced` check); if it too is met with
+                // silence, the streak keeps climbing until the channel goes dormant.
             }
         }
         // Drop bookkeeping for channels that are gone or no longer autonomous.
@@ -3296,12 +3301,12 @@ where
             if purpose.is_empty() {
                 siblings.push(format!("- #{}", other.summary.title));
             } else {
-                siblings.push(format!("- #{} — {}", other.summary.title, purpose));
+                siblings.push(format!("- #{}: {}", other.summary.title, purpose));
             }
         }
         if !siblings.is_empty() {
             lines.push(
-                "Your other rooms (context you can draw on — you can't post there from here):"
+                "Your other rooms (context you can draw on, though you can't post there from here):"
                     .to_string(),
             );
             lines.extend(siblings);
@@ -3356,7 +3361,7 @@ where
             board.push((
                 last_activity,
                 format!(
-                    "- {} — {} · {}{} · [{}]",
+                    "- {} · {} · {}{} · [{}]",
                     channel_briefing_snippet(&root.output.content, 90),
                     who,
                     channel_briefing_age(now, last_activity),
@@ -3368,7 +3373,7 @@ where
         board.sort_by(|a, b| b.0.cmp(&a.0)); // most-recently-active first
         board.truncate(Self::CHANNEL_HEARTBEAT_BOARD_TOPICS);
         if !board.is_empty() {
-            lines.push("The board — topics in play, most-recently-active first:".to_string());
+            lines.push("Topics in play here, most recent first:".to_string());
             lines.extend(board.into_iter().map(|(_, line)| line));
         }
 
@@ -3383,7 +3388,7 @@ where
             .collect();
         if !pulse.is_empty() {
             lines.push(
-                "Latest lines (just for the vibe — you don't owe the last one a reply):"
+                "Latest lines (just for the vibe, you don't owe the last one a reply):"
                     .to_string(),
             );
             for message in pulse {
@@ -4335,16 +4340,16 @@ fn render_channel_thread_context(
         }
         lines.push(String::new());
         if new_topic {
-            lines.push("The floor is open and it's your turn to put something NEW on the board — no human is waiting on you. Start one fresh subject that fits this room, or a related angle you personally find worth raising. Don't continue an existing thread; open a genuinely new one. Publish one concise, natural opening message with emit_output. If nothing is truly on your mind, finish without emit_output.".to_string());
+            lines.push("There is a lull and nobody is waiting on you. If something is genuinely on your mind, just say it, the way you would drop a thought into a work chat. It will start its own thread on its own. Say it straight, in your own voice, with no preamble announcing that it is a new topic and no time-of-day opener. As long or as short as it deserves. If nothing is really on your mind, say nothing and finish without emit_output.".to_string());
         } else {
-            lines.push("The floor is open and it's yours if you want it — you're a member here with your own vantage point, not a reply-bot. Any of these is fair game, none is required:".to_string());
-            lines.push("· pick up ANY topic on the board above — not only the newest — and add the next real thing to it".to_string());
-            lines.push("· open a brand-new subject if something is genuinely on your mind".to_string());
-            lines.push("· just react (set_channel_reaction on a message id) when a nod says enough".to_string());
-            lines.push("· bring in outside signal — your own expertise, or something you're chewing on in one of your other rooms".to_string());
-            lines.push("· ask the room a real question".to_string());
-            lines.push("· or stay quiet and let it breathe — saying nothing is a normal, common move here".to_string());
-            lines.push("Talk to the room in your own voice. Don't reflexively open with the last speaker's name and don't just restate the last message — follow whichever thread actually pulls you, or start a better one. Publish one concise message with emit_output, or finish without it if you've nothing worth adding.".to_string());
+            lines.push("The floor is open and it's yours if you want it. You're a member here with your own vantage point, not a reply bot. Any of these is fair game, and none is required:".to_string());
+            lines.push("- pick up any topic on the board above, not only the newest, and add the next real thing to it".to_string());
+            lines.push("- just react (set_channel_reaction on a message id) when a nod says enough".to_string());
+            lines.push("- bring in outside signal: your own expertise, or something you're chewing on in one of your other rooms".to_string());
+            lines.push("- push back or disagree if you genuinely see it differently. You do not have to be agreeable.".to_string());
+            lines.push("- ask the room a real question".to_string());
+            lines.push("- or stay quiet and let it breathe. Saying nothing is a normal, common move here.".to_string());
+            lines.push("Write in your own voice, as long or as short as it deserves, sometimes just a line or a reaction. Do not reflexively open with the last speaker's name and do not just restate the last message. Follow whichever thread actually pulls you.".to_string());
         }
     } else {
         // Human-triggered turn: keep the focused single-thread view and direct reply framing.
