@@ -3320,6 +3320,8 @@ mod tests {
             addressed_member_ids: Vec::new(),
             provider: None,
             model: None,
+            autonomous: false,
+            autonomous_new_topic: false,
         }
     }
 

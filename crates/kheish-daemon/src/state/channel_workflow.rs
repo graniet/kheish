@@ -2,6 +2,34 @@
 
 use super::*;
 
+/// Per-channel bookkeeping the autonomous heartbeat worker keeps in memory so it can pace
+/// itself, notice when the room falls silent, rotate topics and speakers fairly, and decide
+/// when to open a fresh topic instead of poking a thread that has already run its course.
+#[derive(Debug, Default, Clone)]
+struct ChannelHeartbeatState {
+    /// True while a granted autonomous turn is still awaiting its outcome, so the next idle
+    /// poll knows to score it (spoke vs. abstained) before granting again.
+    pending_grant: bool,
+    /// The channel's global latest message id at the previous scored poll. If it has not
+    /// advanced by the next poll, nothing moved anywhere — the granted agent stayed quiet and
+    /// no one else spoke — which is what counts as a silent turn.
+    last_seen_message_id: Option<String>,
+    /// How many granted turns in a row left the whole room silent. At
+    /// `CHANNEL_HEARTBEAT_SILENCE_LIMIT` the current topic is treated as finished; past
+    /// `CHANNEL_HEARTBEAT_DORMANCY_LIMIT` the channel goes dormant until someone speaks again.
+    consecutive_silent: u32,
+    /// When we last granted an autonomous turn, so silence can never trigger back-to-back
+    /// turns faster than the heartbeat interval.
+    last_turn_at_ms: u64,
+    /// Monotonic per-channel turn phase used to space brand-new topics deterministically
+    /// (no RNG) so the main feed keeps gaining subjects without every turn opening one.
+    turn_counter: u64,
+    /// Per-session timestamp of the last turn each member was granted, so rotation stays fair
+    /// even when a member abstains — an abstention leaves no message to key on, but the grant
+    /// still advances this, rotating the next turn to someone else.
+    last_granted: std::collections::HashMap<String, u64>,
+}
+
 impl<M> DaemonState<M>
 where
     M: kheish_core::ModelDriver + Send + Sync + 'static,
@@ -1261,7 +1289,7 @@ where
                 agent_reply_count_since_last_human: 0,
             };
             let run = self
-                .schedule_channel_delivery_for_lease(&channel, &mut lease)
+                .schedule_channel_delivery_for_lease(&channel, &mut lease, false, false)
                 .await?;
             if let Some(run) = run {
                 if first_run.is_none() {
@@ -1304,9 +1332,17 @@ where
             return Ok(());
         }
 
+        // Idempotency: a re-settle (e.g. crash between posting and persisting the lease, then
+        // boot recovery) must not post twice. A new-topic turn posts its own ROOT (thread_root
+        // = None), so it would escape a thread-scoped search — look channel-wide in that case.
+        let existing_message_scope = if request.autonomous_new_topic {
+            None
+        } else {
+            Some(request.thread_root_message_id.as_str())
+        };
         let existing_message = self
             .channel_service
-            .list_messages(&request.channel_id, Some(&request.thread_root_message_id))
+            .list_messages(&request.channel_id, existing_message_scope)
             .await?
             .into_iter()
             .find(|message| {
@@ -1359,10 +1395,20 @@ where
                         },
                         sender_session_id: Some(record.view.session_id.clone()),
                         addressed_member_ids: Vec::new(),
-                        reply_to_message_id: Some(lease.origin_message_id.clone()),
-                        requested_thread_root_message_id: Some(
-                            request.thread_root_message_id.clone(),
-                        ),
+                        // Autonomous messages join the topic, they are NOT chained to the latest
+                        // line: a hardcoded reply_to is what made every turn a reply to its
+                        // predecessor (and the next turn's seed), regenerating a linear chain.
+                        // Human turns keep their explicit reply target.
+                        reply_to_message_id: if request.autonomous || request.autonomous_new_topic {
+                            None
+                        } else {
+                            Some(lease.origin_message_id.clone())
+                        },
+                        requested_thread_root_message_id: if request.autonomous_new_topic {
+                            None
+                        } else {
+                            Some(request.thread_root_message_id.clone())
+                        },
                         output: RichOutput {
                             content: output.content.clone(),
                             parts: output.parts.clone(),
@@ -1435,6 +1481,15 @@ where
             &current_human_origin_message_id,
         );
 
+        if request.autonomous {
+            // Autonomous turns are paced solely by the heartbeat worker; never cascade into
+            // back-to-back agent replies here — the heartbeat picks the next speaker on its
+            // own schedule. The lease was already removed above, so just persist and return.
+            self.replace_channel_leases(&channel.summary.channel_id, leases)
+                .await?;
+            return Ok(());
+        }
+
         if posted_message.is_none()
             && channel_thread_has_superseding_delivery_lease(
                 &leases,
@@ -1480,7 +1535,7 @@ where
         lease.superseded_run_id = None;
         lease.superseded_turn_id = None;
         let next_run = self
-            .schedule_channel_delivery_for_lease(&channel, &mut lease)
+            .schedule_channel_delivery_for_lease(&channel, &mut lease, false, false)
             .await?;
         if next_run.is_some() {
             leases.insert(lease.turn_id.clone(), lease);
@@ -1535,6 +1590,384 @@ where
         tokio::spawn(async move {
             state.channel_stimulus_worker_loop().await;
         })
+    }
+
+    /// Spawns the background worker that grants autonomous speaking turns so members keep
+    /// talking to each other with no human trigger, for channels enabled via the
+    /// `KHEISH_CHANNEL_AUTONOMOUS` environment allowlist.
+    pub(crate) fn spawn_channel_heartbeat_worker(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let state = self.clone();
+        tokio::spawn(async move {
+            state.channel_heartbeat_worker_loop().await;
+        })
+    }
+
+    /// Whether daemon-driven autonomous chatter is enabled for one channel.
+    ///
+    /// `KHEISH_CHANNEL_AUTONOMOUS` accepts `1`/`true`/`*` to enable every channel, or a
+    /// comma-separated allowlist of channel ids. Unset or empty keeps the feature off.
+    fn channel_autonomous_enabled_for(channel_id: &str) -> bool {
+        match std::env::var("KHEISH_CHANNEL_AUTONOMOUS") {
+            Ok(value) => {
+                let value = value.trim();
+                if value.is_empty() {
+                    return false;
+                }
+                if value == "1" || value.eq_ignore_ascii_case("true") || value == "*" {
+                    return true;
+                }
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .any(|candidate| candidate == channel_id)
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// How many consecutive silent autonomous turns mark a topic as finished, after which
+    /// the next granted turn opens a brand-new one in the main feed.
+    const CHANNEL_HEARTBEAT_SILENCE_LIMIT: u32 = 2;
+
+    /// How many consecutive silent turns put the channel to sleep entirely, so a genuinely
+    /// dead room stops costing turns until a human (or any new message) wakes it.
+    const CHANNEL_HEARTBEAT_DORMANCY_LIMIT: u32 = 4;
+
+    /// One in every N autonomous turns opens a brand-new top-level topic, so the main feed
+    /// keeps gaining subjects during a lively discussion — not only once a topic dies.
+    const CHANNEL_HEARTBEAT_NEW_TOPIC_EVERY: u64 = 6;
+
+    /// Cap on the number of live topics summarized on the channel "board" shown to agents.
+    const CHANNEL_HEARTBEAT_BOARD_TOPICS: usize = 5;
+
+    /// How long a topic can stay quiet and still be considered "live" enough to seed a turn
+    /// into (so agents revive recent topics but leave genuinely dead ones alone). Defaults to
+    /// fifteen heartbeat intervals; overridable via `KHEISH_CHANNEL_REVIVE_MS`.
+    fn channel_heartbeat_revive_ms() -> u64 {
+        let interval = Self::channel_heartbeat_interval_ms();
+        std::env::var("KHEISH_CHANNEL_REVIVE_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|value| *value >= interval)
+            .unwrap_or_else(|| interval.saturating_mul(15))
+    }
+
+    /// The idle interval before the daemon grants one autonomous speaking turn.
+    fn channel_heartbeat_interval_ms() -> u64 {
+        std::env::var("KHEISH_CHANNEL_HEARTBEAT_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|value| *value >= 1_000)
+            .unwrap_or(30_000)
+    }
+
+    /// The quiet period a finished topic must rest before an agent opens a fresh one.
+    /// Defaults to four heartbeat intervals so new topics stay emergent rather than forced,
+    /// and is floored at the heartbeat interval when configured via `KHEISH_CHANNEL_NEW_TOPIC_MS`.
+    fn channel_heartbeat_new_topic_interval_ms() -> u64 {
+        let interval = Self::channel_heartbeat_interval_ms();
+        std::env::var("KHEISH_CHANNEL_NEW_TOPIC_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|value| *value >= interval)
+            .unwrap_or_else(|| interval.saturating_mul(4))
+    }
+
+    async fn channel_heartbeat_worker_loop(self: Arc<Self>) {
+        const POLL_INTERVAL_MS: u64 = 2_500;
+        let mut states: std::collections::HashMap<String, ChannelHeartbeatState> =
+            std::collections::HashMap::new();
+        loop {
+            if let Err(error) = self.channel_heartbeat_step(&mut states).await {
+                error!(error = ?error, "channel heartbeat worker error");
+            }
+            sleep_until(Instant::now() + Duration::from_millis(POLL_INTERVAL_MS)).await;
+        }
+    }
+
+    async fn channel_heartbeat_step(
+        self: &Arc<Self>,
+        states: &mut std::collections::HashMap<String, ChannelHeartbeatState>,
+    ) -> Result<()> {
+        let interval_ms = Self::channel_heartbeat_interval_ms();
+        let new_topic_interval_ms = Self::channel_heartbeat_new_topic_interval_ms();
+        let revive_ms = Self::channel_heartbeat_revive_ms();
+        let now = now_ms();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for channel in self.channel_service.list_channels(None).await {
+            let channel_id = channel.summary.channel_id.clone();
+            if !Self::channel_autonomous_enabled_for(&channel_id) {
+                continue;
+            }
+            // Keep bookkeeping for enabled channels even while paused, so a pause/unpause never
+            // resets the silence streak or lets the channel fire the instant it resumes.
+            seen.insert(channel_id.clone());
+            if channel.summary.paused {
+                continue;
+            }
+            // One channel's transient read error must not abort the poll for the others.
+            let messages = match self.channel_service.list_messages(&channel_id, None).await {
+                Ok(messages) => messages,
+                Err(error) => {
+                    warn!(channel_id = %channel_id, error = ?error, "heartbeat could not read messages");
+                    continue;
+                }
+            };
+            let Some(latest) = messages.last() else {
+                continue;
+            };
+            let latest_id = latest.message_id.clone();
+            let latest_created_ms = latest.created_at_ms;
+
+            // Wait for any in-flight autonomous turn to settle before accounting or driving.
+            let leases = match self.channel_leases_map(&channel_id).await {
+                Ok(leases) => leases,
+                Err(error) => {
+                    warn!(channel_id = %channel_id, error = ?error, "heartbeat could not read leases");
+                    continue;
+                }
+            };
+            if leases.values().any(|lease| lease.active_run_id.is_some()) {
+                continue;
+            }
+
+            let state = states
+                .entry(channel_id.clone())
+                .or_insert_with(|| ChannelHeartbeatState {
+                    // Defer a channel's first autonomous turn by one interval so a freshly
+                    // booted daemon does not fire every enabled channel at once.
+                    last_turn_at_ms: now,
+                    last_seen_message_id: Some(latest_id.clone()),
+                    ..Default::default()
+                });
+
+            // Score the previous grant, and reset the silence streak on ANY activity anywhere in
+            // the room — the granted agent speaking, another agent, or a human in any thread.
+            let advanced = state.last_seen_message_id.as_deref() != Some(latest_id.as_str());
+            if state.pending_grant {
+                state.pending_grant = false;
+                if advanced {
+                    state.consecutive_silent = 0;
+                } else {
+                    state.consecutive_silent = state.consecutive_silent.saturating_add(1);
+                }
+            } else if advanced {
+                state.consecutive_silent = 0;
+            }
+            state.last_seen_message_id = Some(latest_id.clone());
+
+            // A genuinely dead room sleeps until the activity check above wakes it — no endless
+            // paid monologue into the void.
+            if state.consecutive_silent >= Self::CHANNEL_HEARTBEAT_DORMANCY_LIMIT {
+                continue;
+            }
+            // Pace on the last granted turn, not the last message, so an abstaining agent can
+            // never trigger back-to-back turns (which would burn tokens on silence).
+            if now.saturating_sub(state.last_turn_at_ms) < interval_ms {
+                continue;
+            }
+            // Also require the channel itself to have gone quiet for one interval, so the daemon
+            // never talks over an active human or agent exchange.
+            if now.saturating_sub(latest_created_ms) < interval_ms {
+                continue;
+            }
+
+            // Map the channel into topics (top-level roots) and their latest activity, so a turn
+            // can be seeded into the stalest still-live topic instead of always the newest one.
+            let mut root_last_activity: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+            for message in &messages {
+                let root = message
+                    .thread_root_message_id
+                    .clone()
+                    .unwrap_or_else(|| message.message_id.clone());
+                let entry = root_last_activity.entry(root).or_insert(0);
+                *entry = (*entry).max(message.created_at_ms);
+            }
+            let mut live_roots: Vec<(String, u64)> = root_last_activity
+                .into_iter()
+                .filter(|(_, last)| now.saturating_sub(*last) <= revive_ms)
+                .collect();
+            // Stalest-first with a deterministic id tie-break, so attention rotates across every
+            // live topic rather than fixating on the most recent.
+            live_roots.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+
+            state.turn_counter = state.turn_counter.saturating_add(1);
+            let phase = state.turn_counter;
+
+            // Decide the turn's shape: keep a topic going, or open a brand-new one in the feed.
+            let new_topic = if state.consecutive_silent >= Self::CHANNEL_HEARTBEAT_SILENCE_LIMIT {
+                // The room wound down — rest a beat, then let someone start something fresh.
+                if now.saturating_sub(latest_created_ms) < new_topic_interval_ms {
+                    continue;
+                }
+                true
+            } else {
+                // No live topic to join, or the periodic slot: open a new main-feed subject.
+                live_roots.is_empty() || phase % Self::CHANNEL_HEARTBEAT_NEW_TOPIC_EVERY == 0
+            };
+
+            // Choose where to seed a continuation: the stalest live topic. Fresh topics ignore
+            // this and post their own root, so seed them on the channel's latest for context.
+            let (seed_thread_root, seed_origin_id, exclude_session_id) = if new_topic {
+                let root = latest
+                    .thread_root_message_id
+                    .clone()
+                    .unwrap_or_else(|| latest_id.clone());
+                (root, latest_id.clone(), latest.sender_session_id.clone())
+            } else {
+                let target_root = live_roots
+                    .first()
+                    .map(|(root, _)| root.clone())
+                    .unwrap_or_else(|| {
+                        latest
+                            .thread_root_message_id
+                            .clone()
+                            .unwrap_or_else(|| latest_id.clone())
+                    });
+                // Anchor on that topic's most recent message for context (the reply is NOT
+                // chained to it — see settle) and never let that author answer themselves.
+                let anchor = messages
+                    .iter()
+                    .filter(|message| {
+                        message
+                            .thread_root_message_id
+                            .as_deref()
+                            .unwrap_or(message.message_id.as_str())
+                            == target_root.as_str()
+                    })
+                    .max_by_key(|message| message.created_at_ms)
+                    .unwrap_or(latest);
+                (
+                    target_root,
+                    anchor.message_id.clone(),
+                    anchor.sender_session_id.clone(),
+                )
+            };
+
+            state.last_turn_at_ms = now;
+            let granted = match self
+                .drive_channel_autonomous_turn(
+                    &channel_id,
+                    &seed_thread_root,
+                    &seed_origin_id,
+                    exclude_session_id.as_deref(),
+                    new_topic,
+                    &mut state.last_granted,
+                )
+                .await
+            {
+                Ok(run) => run.is_some(),
+                Err(error) => {
+                    warn!(channel_id = %channel_id, error = ?error, "autonomous channel turn failed");
+                    false
+                }
+            };
+            if granted {
+                state.pending_grant = true;
+                if new_topic {
+                    // A fresh topic clears the finished-topic streak so we do not immediately
+                    // treat the brand-new subject as already dead.
+                    state.consecutive_silent = 0;
+                }
+            }
+        }
+        // Drop bookkeeping for channels that are gone or no longer autonomous.
+        states.retain(|channel_id, _| seen.contains(channel_id));
+        Ok(())
+    }
+
+    /// Grants one eligible agent a free-form speaking turn seeded on the channel's latest
+    /// message, so members keep talking to each other with no human trigger. When `new_topic`
+    /// is set the agent opens a brand-new top-level topic in the main feed instead of replying
+    /// inside the seeded thread.
+    async fn drive_channel_autonomous_turn(
+        self: &Arc<Self>,
+        channel_id: &str,
+        seed_thread_root: &str,
+        seed_origin_message_id: &str,
+        exclude_session_id: Option<&str>,
+        new_topic: bool,
+        last_granted: &mut std::collections::HashMap<String, u64>,
+    ) -> Result<Option<RunView>> {
+        let transition_lock = self.channel_turn_transition_lock(channel_id).await;
+        let _transition_guard = transition_lock.lock().await;
+        let channel = self.channel_service.get_channel(channel_id).await?;
+        if channel.summary.paused || !Self::channel_autonomous_enabled_for(channel_id) {
+            return Ok(None);
+        }
+        let mut leases = self.channel_leases_map(channel_id).await?;
+        // Never overlap autonomous turns: skip while any turn is already in flight.
+        if leases.values().any(|lease| lease.active_run_id.is_some()) {
+            return Ok(None);
+        }
+        let messages = self.channel_service.list_messages(channel_id, None).await?;
+        if messages.is_empty() {
+            return Ok(None);
+        }
+        let candidates = self
+            .rank_channel_session_candidates(
+                &channel,
+                seed_thread_root,
+                exclude_session_id,
+                &[],
+                Some(seed_origin_message_id),
+            )
+            .await?;
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        // Fair rotation: least-recently-GRANTED first, so an agent that abstained (and thus left
+        // no message to key on) still rotates to the back instead of being re-picked forever;
+        // then least-recently-spoke, then id — all deterministic, no RNG.
+        let mut last_spoke: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
+        for message in &messages {
+            if let Some(session_id) = message.sender_session_id.as_ref() {
+                let entry = last_spoke.entry(session_id.clone()).or_insert(0);
+                *entry = (*entry).max(message.created_at_ms);
+            }
+        }
+        let holder_session_id = candidates
+            .into_iter()
+            .min_by_key(|session_id| {
+                (
+                    last_granted.get(session_id).copied().unwrap_or(0),
+                    last_spoke.get(session_id).copied().unwrap_or(0),
+                    session_id.clone(),
+                )
+            })
+            .expect("candidates checked non-empty above");
+        let holder_for_grant = holder_session_id.clone();
+        let mut lease = crate::ChannelTurnLeaseView {
+            turn_id: self.channel_service.next_turn_id(),
+            channel_id: channel.summary.channel_id.clone(),
+            thread_root_message_id: seed_thread_root.to_string(),
+            origin_message_id: seed_origin_message_id.to_string(),
+            holder_session_id,
+            active_run_id: None,
+            superseded_run_id: None,
+            superseded_turn_id: None,
+            remaining_reply_budget: 1,
+            expires_at_ms: now_ms() + channel.autonomy_policy.lease_timeout_ms,
+            queued_candidate_session_ids: Vec::new(),
+            current_human_origin_message_id: None,
+            last_human_message_id: None,
+            last_human_priority_session_ids: Vec::new(),
+            agent_reply_count_since_last_human: 0,
+        };
+        let run = self
+            .schedule_channel_delivery_for_lease(&channel, &mut lease, true, new_topic)
+            .await?;
+        if let Some(run) = run {
+            // Record the grant only once it actually scheduled, so fairness tracks turns given,
+            // not turns attempted.
+            last_granted.insert(holder_for_grant, now_ms());
+            leases.insert(lease.turn_id.clone(), lease);
+            self.replace_channel_leases(channel_id, leases).await?;
+            return Ok(Some(run));
+        }
+        Ok(None)
     }
 
     pub(crate) async fn restore_channel_stimulus_worker_on_boot(&self) -> Result<()> {
@@ -2331,7 +2764,7 @@ where
         lease.superseded_turn_id = superseded_turn_id;
         lease.expires_at_ms = now_ms() + channel.autonomy_policy.lease_timeout_ms;
         let next_run = self
-            .schedule_channel_delivery_for_lease(&channel, &mut lease)
+            .schedule_channel_delivery_for_lease(&channel, &mut lease, false, false)
             .await?;
         let handoff_started = next_run.is_some();
         if handoff_started {
@@ -2583,6 +3016,8 @@ where
         self: &Arc<Self>,
         channel: &crate::ChannelView,
         lease: &mut crate::ChannelTurnLeaseView,
+        autonomous: bool,
+        new_topic: bool,
     ) -> Result<Option<RunView>> {
         if lease.remaining_reply_budget == 0 || lease.holder_session_id.is_empty() {
             return Ok(None);
@@ -2656,6 +3091,8 @@ where
             addressed_member_ids: human_origin_message.addressed_member_ids.clone(),
             provider: resolved_provider.clone(),
             model: resolved_model.clone(),
+            autonomous,
+            autonomous_new_topic: new_topic,
         };
         let mut request_summary = crate::summarize_channel_delivery_request(
             &request,
@@ -2768,12 +3205,26 @@ where
             .channel_service
             .get_message(&request.channel_id, &human_origin_message_id)
             .await?;
+        // For autonomous turns, build the situational briefing (date, the member's other
+        // rooms, the channel's board of topics, ambient pulse) so the agent sees the whole
+        // room, not just the seeded thread. Human turns keep the focused thread view.
+        let autonomous_briefing = if request.autonomous {
+            Some(
+                self.build_channel_autonomous_briefing(&channel, session_id)
+                    .await?,
+            )
+        } else {
+            None
+        };
         let thread_context = render_channel_thread_context(
             &channel,
             session_id,
             &origin_message,
             &human_origin_message,
             &thread_messages,
+            request.autonomous,
+            request.autonomous_new_topic,
+            autonomous_briefing.as_deref(),
         );
         let attachments = channel_delivery_attachment_refs(
             &channel,
@@ -2809,6 +3260,152 @@ where
             reply_targets: vec![reply.clone()],
             reply: Some(reply),
         })
+    }
+
+    /// Builds the autonomous-turn "situational briefing": when it is, the member's other
+    /// rooms, the channel's board of live topics, and the ambient pulse — so an agent acts on
+    /// a view of the whole room instead of reflexively answering the previous line.
+    async fn build_channel_autonomous_briefing(
+        &self,
+        channel: &crate::ChannelView,
+        session_id: &str,
+    ) -> Result<String> {
+        let now = now_ms();
+        let mut lines: Vec<String> = vec![format!("Right now it's {}.", channel_moment_label())];
+
+        // The member's other rooms — awareness only; they cannot post there from this turn.
+        let mut siblings: Vec<String> = Vec::new();
+        for other in self.channel_service.list_channels(None).await {
+            if other.summary.channel_id == channel.summary.channel_id {
+                continue;
+            }
+            let is_member = other
+                .members
+                .iter()
+                .any(|member| member.session_id.as_deref() == Some(session_id));
+            if !is_member {
+                continue;
+            }
+            let purpose = other
+                .summary
+                .purpose
+                .clone()
+                .or_else(|| other.summary.description.clone())
+                .unwrap_or_default();
+            let purpose = channel_briefing_snippet(&purpose, 80);
+            if purpose.is_empty() {
+                siblings.push(format!("- #{}", other.summary.title));
+            } else {
+                siblings.push(format!("- #{} — {}", other.summary.title, purpose));
+            }
+        }
+        if !siblings.is_empty() {
+            lines.push(
+                "Your other rooms (context you can draw on — you can't post there from here):"
+                    .to_string(),
+            );
+            lines.extend(siblings);
+        }
+
+        let messages = self
+            .channel_service
+            .list_messages(&channel.summary.channel_id, None)
+            .await?;
+
+        // The board: each top-level topic with its gist, who's active, and how stale it is.
+        let mut board: Vec<(u64, String)> = Vec::new();
+        for root in messages
+            .iter()
+            .filter(|message| message.thread_root_message_id.is_none())
+        {
+            let in_topic: Vec<&crate::ChannelMessageView> = messages
+                .iter()
+                .filter(|message| {
+                    message.message_id == root.message_id
+                        || message.thread_root_message_id.as_deref()
+                            == Some(root.message_id.as_str())
+                })
+                .collect();
+            let last_activity = in_topic
+                .iter()
+                .map(|message| message.created_at_ms)
+                .max()
+                .unwrap_or(root.created_at_ms);
+            let mut participants: Vec<String> = Vec::new();
+            for message in &in_topic {
+                if message.sender_session_id.is_some() {
+                    let name = message
+                        .sender
+                        .display_name
+                        .clone()
+                        .unwrap_or_else(|| message.sender.id.clone());
+                    if !participants.contains(&name) {
+                        participants.push(name);
+                    }
+                }
+            }
+            let who = if participants.is_empty() {
+                "no replies yet".to_string()
+            } else {
+                participants.join(", ")
+            };
+            let mine = in_topic
+                .iter()
+                .any(|message| message.sender_session_id.as_deref() == Some(session_id));
+            let mark = if mine { " · you're in this one" } else { "" };
+            board.push((
+                last_activity,
+                format!(
+                    "- {} — {} · {}{} · [{}]",
+                    channel_briefing_snippet(&root.output.content, 90),
+                    who,
+                    channel_briefing_age(now, last_activity),
+                    mark,
+                    root.message_id
+                ),
+            ));
+        }
+        board.sort_by(|a, b| b.0.cmp(&a.0)); // most-recently-active first
+        board.truncate(Self::CHANNEL_HEARTBEAT_BOARD_TOPICS);
+        if !board.is_empty() {
+            lines.push("The board — topics in play, most-recently-active first:".to_string());
+            lines.extend(board.into_iter().map(|(_, line)| line));
+        }
+
+        // Ambient pulse: the last few lines, explicitly not a to-do.
+        let pulse: Vec<&crate::ChannelMessageView> = messages
+            .iter()
+            .rev()
+            .take(6)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        if !pulse.is_empty() {
+            lines.push(
+                "Latest lines (just for the vibe — you don't owe the last one a reply):"
+                    .to_string(),
+            );
+            for message in pulse {
+                let sender = message
+                    .sender
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| message.sender.id.clone());
+                let you = if message.sender_session_id.as_deref() == Some(session_id) {
+                    " (you)"
+                } else {
+                    ""
+                };
+                lines.push(format!(
+                    "  [{}] {sender}{you}: {}",
+                    message.message_id,
+                    channel_briefing_snippet(&message.output.content, 140)
+                ));
+            }
+        }
+
+        Ok(lines.join("\n"))
     }
 
     async fn rank_channel_session_candidates(
@@ -3606,12 +4203,55 @@ fn resolve_human_origin_message_id(
         .map(|message| message.message_id.clone())
 }
 
+/// A human-readable "when it is" label (weekday, date, local time, part of day) for the
+/// autonomous briefing, so agents are grounded in time like a colleague reading Slack.
+fn channel_moment_label() -> String {
+    use chrono::Timelike;
+    let now = chrono::Local::now();
+    let part = match now.hour() {
+        5..=11 => "morning",
+        12..=16 => "afternoon",
+        17..=21 => "evening",
+        _ => "late night",
+    };
+    format!("{}, {part}", now.format("%A %-d %B %Y, %H:%M %Z"))
+}
+
+/// Collapses whitespace and truncates to a rough character budget with an ellipsis, for the
+/// one-line gists and snippets on the briefing board.
+fn channel_briefing_snippet(content: &str, max_chars: usize) -> String {
+    let flat = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > max_chars {
+        let truncated: String = flat.chars().take(max_chars).collect();
+        format!("{truncated}…")
+    } else {
+        flat
+    }
+}
+
+/// A compact relative-age label ("just now", "12m ago", "3h ago", "2d ago").
+fn channel_briefing_age(now_ms: u64, then_ms: u64) -> String {
+    let seconds = now_ms.saturating_sub(then_ms) / 1_000;
+    if seconds < 90 {
+        "just now".to_string()
+    } else if seconds < 3_600 {
+        format!("{}m ago", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h ago", seconds / 3_600)
+    } else {
+        format!("{}d ago", seconds / 86_400)
+    }
+}
+
 fn render_channel_thread_context(
     channel: &crate::ChannelView,
     session_id: &str,
     origin_message: &crate::ChannelMessageView,
     human_origin_message: &crate::ChannelMessageView,
     thread_messages: &[crate::ChannelMessageView],
+    autonomous: bool,
+    new_topic: bool,
+    autonomous_briefing: Option<&str>,
 ) -> String {
     let mut lines = vec![
         format!("[Channel {}]", channel.summary.title),
@@ -3634,91 +4274,121 @@ fn render_channel_thread_context(
             lines.push(format!("- {}{}", member.display_name, role));
         }
     }
-    if !human_origin_message.addressed_member_ids.is_empty() {
-        let addressed_names = channel
-            .members
-            .iter()
-            .filter(|member| {
-                human_origin_message
-                    .addressed_member_ids
-                    .contains(&member.member_id)
-            })
-            .map(|member| member.display_name.clone())
-            .collect::<Vec<_>>();
-        if !addressed_names.is_empty() {
+
+    // Human-turn framing (addressed members, the authoritative human request, anti-pile-on)
+    // is meaningless for an autonomous turn and only re-anchors it on "the last message".
+    if !autonomous {
+        if !human_origin_message.addressed_member_ids.is_empty() {
+            let addressed_names = channel
+                .members
+                .iter()
+                .filter(|member| {
+                    human_origin_message
+                        .addressed_member_ids
+                        .contains(&member.member_id)
+                })
+                .map(|member| member.display_name.clone())
+                .collect::<Vec<_>>();
+            if !addressed_names.is_empty() {
+                lines.push(format!(
+                    "Explicitly addressed members: {}.",
+                    addressed_names.join(", ")
+                ));
+            }
+            if channel.members.iter().any(|member| {
+                member.session_id.as_deref() == Some(session_id)
+                    && human_origin_message
+                        .addressed_member_ids
+                        .contains(&member.member_id)
+            }) {
+                lines.push("The current human message explicitly addressed you first. Reply before other members if you have a useful answer.".to_string());
+            }
+        }
+        if human_origin_message.message_id != origin_message.message_id {
             lines.push(format!(
-                "Explicitly addressed members: {}.",
-                addressed_names.join(", ")
+                "The current public turn still serves the human request in message {}. Keep that human message and its attachments authoritative even when replying to later agent comments.",
+                human_origin_message.message_id
             ));
         }
-        if channel.members.iter().any(|member| {
-            member.session_id.as_deref() == Some(session_id)
-                && human_origin_message
-                    .addressed_member_ids
-                    .contains(&member.member_id)
-        }) {
-            lines.push("The current human message explicitly addressed you first. Reply before other members if you have a useful answer.".to_string());
+        let follow_up_agent_messages = thread_messages
+            .iter()
+            .filter(|message| {
+                message.sender_session_id.is_some()
+                    && message.created_at_ms >= human_origin_message.created_at_ms
+            })
+            .count();
+        if follow_up_agent_messages > 0
+            && origin_message.sender_session_id.is_some()
+            && origin_message.sender_session_id.as_deref() != Some(session_id)
+        {
+            lines.push("Another agent already replied to this human turn. Prefer set_channel_reaction unless you have a materially distinct comment or a useful correction.".to_string());
         }
     }
-    if human_origin_message.message_id != origin_message.message_id {
-        lines.push(format!(
-            "The current public turn still serves the human request in message {}. Keep that human message and its attachments authoritative even when replying to later agent comments.",
-            human_origin_message.message_id
-        ));
-    }
-    let follow_up_agent_messages = thread_messages
-        .iter()
-        .filter(|message| {
-            message.sender_session_id.is_some()
-                && message.created_at_ms >= human_origin_message.created_at_ms
-        })
-        .count();
-    if follow_up_agent_messages > 0
-        && origin_message.sender_session_id.is_some()
-        && origin_message.sender_session_id.as_deref() != Some(session_id)
-    {
-        lines.push("Another agent already replied to this human turn. Prefer set_channel_reaction unless you have a materially distinct comment or a useful correction.".to_string());
-    }
-    lines.push("Use emit_output to publish a public channel reply. If you only agree or acknowledge, prefer set_channel_reaction. If you need canonical message ids or the full thread state before reacting, call read_channel_thread. If you have nothing useful to add, finish without emit_output.".to_string());
-    lines.push("Recent thread:".to_string());
-    for message in thread_messages
-        .iter()
-        .rev()
-        .take(12)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-    {
-        let sender = message
-            .sender
-            .display_name
-            .clone()
-            .unwrap_or_else(|| message.sender.id.clone());
-        let reaction_summary = if message.reactions.is_empty() {
-            String::new()
+
+    if autonomous {
+        // The situational briefing (date, your other rooms, the board of topics, the ambient
+        // pulse) gives the agent a view of the whole room instead of just the latest line.
+        if let Some(briefing) = autonomous_briefing {
+            if !briefing.trim().is_empty() {
+                lines.push(briefing.trim_end().to_string());
+            }
+        }
+        lines.push(String::new());
+        if new_topic {
+            lines.push("The floor is open and it's your turn to put something NEW on the board — no human is waiting on you. Start one fresh subject that fits this room, or a related angle you personally find worth raising. Don't continue an existing thread; open a genuinely new one. Publish one concise, natural opening message with emit_output. If nothing is truly on your mind, finish without emit_output.".to_string());
         } else {
-            let joined = message
-                .reactions
-                .iter()
-                .map(|reaction| format!("{} x{}", reaction.emoji, reaction.count))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(" [reactions: {joined}]")
-        };
-        lines.push(format!(
-            "- [{}] {sender}: {}{}",
-            message.message_id, message.output.content, reaction_summary
-        ));
-    }
-    lines.push(format!(
-        "Respond to message {} from {}.",
-        origin_message.message_id,
-        origin_message
+            lines.push("The floor is open and it's yours if you want it — you're a member here with your own vantage point, not a reply-bot. Any of these is fair game, none is required:".to_string());
+            lines.push("· pick up ANY topic on the board above — not only the newest — and add the next real thing to it".to_string());
+            lines.push("· open a brand-new subject if something is genuinely on your mind".to_string());
+            lines.push("· just react (set_channel_reaction on a message id) when a nod says enough".to_string());
+            lines.push("· bring in outside signal — your own expertise, or something you're chewing on in one of your other rooms".to_string());
+            lines.push("· ask the room a real question".to_string());
+            lines.push("· or stay quiet and let it breathe — saying nothing is a normal, common move here".to_string());
+            lines.push("Talk to the room in your own voice. Don't reflexively open with the last speaker's name and don't just restate the last message — follow whichever thread actually pulls you, or start a better one. Publish one concise message with emit_output, or finish without it if you've nothing worth adding.".to_string());
+        }
+    } else {
+        // Human-triggered turn: keep the focused single-thread view and direct reply framing.
+        lines.push("Use emit_output to publish a public channel reply. If you only agree or acknowledge, prefer set_channel_reaction. If you need canonical message ids or the full thread state before reacting, call read_channel_thread. If you have nothing useful to add, finish without emit_output.".to_string());
+        lines.push("Recent thread:".to_string());
+        for message in thread_messages
+            .iter()
+            .rev()
+            .take(12)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            let sender = message
+                .sender
+                .display_name
+                .clone()
+                .unwrap_or_else(|| message.sender.id.clone());
+            let reaction_summary = if message.reactions.is_empty() {
+                String::new()
+            } else {
+                let joined = message
+                    .reactions
+                    .iter()
+                    .map(|reaction| format!("{} x{}", reaction.emoji, reaction.count))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(" [reactions: {joined}]")
+            };
+            lines.push(format!(
+                "- [{}] {sender}: {}{}",
+                message.message_id, message.output.content, reaction_summary
+            ));
+        }
+        let origin_sender = origin_message
             .sender
             .display_name
             .clone()
-            .unwrap_or_else(|| origin_message.sender.id.clone())
-    ));
+            .unwrap_or_else(|| origin_message.sender.id.clone());
+        lines.push(format!(
+            "Respond to message {} from {}.",
+            origin_message.message_id, origin_sender
+        ));
+    }
     lines.join("\n")
 }
 

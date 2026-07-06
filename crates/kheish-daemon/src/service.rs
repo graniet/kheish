@@ -475,6 +475,7 @@ pub struct DaemonService {
     debug_retention_task: Option<JoinHandle<()>>,
     channel_lease_task: Option<JoinHandle<()>>,
     channel_stimulus_task: Option<JoinHandle<()>>,
+    channel_heartbeat_task: Option<JoinHandle<()>>,
 }
 
 impl DaemonService {
@@ -1014,6 +1015,7 @@ impl DaemonService {
         let debug_retention_task = Some(state.spawn_debug_retention_worker());
         let channel_lease_task = Some(state.spawn_channel_lease_worker());
         let channel_stimulus_task = Some(state.spawn_channel_stimulus_worker());
+        let channel_heartbeat_task = Some(state.spawn_channel_heartbeat_worker());
         let ingress_tasks = connectors::spawn_ingress_tasks(state.clone());
         let readiness = state.readiness_handle();
         let router = build_router::<M>(
@@ -1041,6 +1043,7 @@ impl DaemonService {
             debug_retention_task,
             channel_lease_task,
             channel_stimulus_task,
+            channel_heartbeat_task,
         })
     }
 
@@ -1157,6 +1160,9 @@ impl Drop for DaemonService {
             task.abort();
         }
         if let Some(task) = &self.channel_stimulus_task {
+            task.abort();
+        }
+        if let Some(task) = &self.channel_heartbeat_task {
             task.abort();
         }
     }

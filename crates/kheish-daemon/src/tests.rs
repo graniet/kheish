@@ -14851,6 +14851,8 @@ async fn daemon_channels_restore_superseding_handoff_run_before_queue_restart() 
             addressed_member_ids: vec!["beta-handoff-recover".to_string()],
             provider: None,
             model: None,
+            autonomous: false,
+            autonomous_new_topic: false,
         },
     };
     run_store.save_run(&alpha_record)?;

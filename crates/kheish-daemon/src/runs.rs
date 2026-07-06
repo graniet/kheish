@@ -110,6 +110,13 @@ pub struct ChannelDeliveryRunRequest {
     /// The resolved model pinned when the turn was queued.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Whether this turn was started autonomously (no human trigger) so the agent may speak freely.
+    #[serde(default)]
+    pub autonomous: bool,
+    /// Whether this autonomous turn should open a brand-new top-level topic in the main feed
+    /// instead of replying inside the seeded thread.
+    #[serde(default)]
+    pub autonomous_new_topic: bool,
 }
 
 /// Explains why one parent clarification was completed.
