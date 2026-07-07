@@ -61,11 +61,13 @@ pub use routing::{
     parse_asset_storage_uri, render_content_parts_text, render_document_attachment_text,
 };
 pub use session::{
-    AffinityEdge, AffinityOpenTab, AffinityStanding, AffinityTabDir, ArchivedTaskCounts,
-    ArchivedTaskRecord, AutocompactTracking, CanonicalStateSnapshot, CheckpointSnapshot,
-    CheckpointTrace, DEFAULT_AGENT_MAX_TURNS, FinalStateSnapshot, HOOK_RUNTIME_STATE_METADATA_KEY,
-    HookRuntimeState, LogEntry, MAX_SOCIAL_LEDGER_EDGES, PlanArtifact, PromptMessageSnapshot,
-    PromptSnapshot, PromptTrace, RunMetaSnapshot, RunPolicySnapshot, RunSnapshot, RunTrace,
+    AFFINITY_CUE_THRESHOLD, AFFINITY_DECAY_HALF_LIFE_MS, AFFINITY_DRIFT_STEP, AFFINITY_TAB_TTL_MS,
+    AffinityDrift, AffinityEdge, AffinityImpression, AffinityOpenTab, AffinityStanding,
+    AffinityTabDir, AffinityTabInput, ArchivedTaskCounts, ArchivedTaskRecord, AutocompactTracking,
+    CanonicalStateSnapshot, CheckpointSnapshot, CheckpointTrace, DEFAULT_AGENT_MAX_TURNS,
+    FinalStateSnapshot, HOOK_RUNTIME_STATE_METADATA_KEY, HookRuntimeState, LogEntry,
+    MAX_SOCIAL_LEDGER_EDGES, PlanArtifact, PromptMessageSnapshot, PromptSnapshot, PromptTrace,
+    RunMetaSnapshot, RunPolicySnapshot, RunSnapshot, RunTrace,
     SESSION_CAPABILITY_SCOPE_METADATA_KEY, SESSION_CONTROL_STATE_METADATA_KEY,
     SESSION_CREDENTIAL_SCOPE_METADATA_KEY, SESSION_EXECUTION_IDENTITY_METADATA_KEY,
     SESSION_GOAL_METADATA_KEY, SESSION_INPUT_CONTRACT_METADATA_KEY,

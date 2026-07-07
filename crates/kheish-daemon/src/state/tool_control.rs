@@ -478,6 +478,14 @@ where
         self.0.load_session_goal(session_id).await
     }
 
+    async fn remember_about(
+        &self,
+        session_id: &str,
+        impression: kheish_types::AffinityImpression,
+    ) -> Result<kheish_types::AffinityEdge> {
+        self.0.remember_about(session_id, impression).await
+    }
+
     async fn create_session_goal(
         &self,
         session_id: &str,

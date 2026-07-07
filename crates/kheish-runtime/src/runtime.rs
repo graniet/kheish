@@ -472,6 +472,15 @@ fn session_workspace_section(
     })
 }
 
+/// Wall-clock milliseconds since the Unix epoch, used to decay the social ledger
+/// toward baseline at load time. Falls back to 0 on a pre-epoch clock.
+fn current_unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn build_system_sections<M>(
     deps: &AgentRuntimeDependencies<M>,
     tool_surface: &ToolSurfaceFilter,
@@ -1179,7 +1188,8 @@ where
         let stored_metadata = serde_json::to_value(&stored.metadata)?;
         let session_control = session_control_state_from_metadata(&stored_metadata)?;
         let session_goal = session_goal_from_metadata(&stored_metadata)?;
-        let session_social_ledger = session_social_ledger_from_metadata(&stored_metadata)?;
+        let session_social_ledger = session_social_ledger_from_metadata(&stored_metadata)?
+            .map(|ledger| ledger.for_prompt(current_unix_millis()));
         let session_operator = session_operator_config_from_metadata(&stored_metadata)?;
         let session_tool_overrides = session_tool_overrides_from_metadata(&stored_metadata)?;
         let session_output_contract = session_output_contract_from_metadata(&stored_metadata)?;
@@ -1901,7 +1911,8 @@ where
         self.session_persona = session_persona_binding_from_metadata(&metadata)?;
         self.session_control = session_control_state_from_metadata(&metadata)?;
         self.session_goal = session_goal_from_metadata(&metadata)?;
-        self.session_social_ledger = session_social_ledger_from_metadata(&metadata)?;
+        self.session_social_ledger = session_social_ledger_from_metadata(&metadata)?
+            .map(|ledger| ledger.for_prompt(current_unix_millis()));
         self.session_operator = session_operator_config_from_metadata(&metadata)?;
         self.session_tool_overrides = session_tool_overrides_from_metadata(&metadata)?;
         self.session_output_contract = session_output_contract_from_metadata(&metadata)?;

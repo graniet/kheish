@@ -347,6 +347,23 @@ where
         self.save_session_social_ledger(session_id, ledger).await
     }
 
+    /// Applies one agent-authored impression to the caller's OWN social ledger:
+    /// load, find-or-insert the peer edge with a bounded nudge (evicting the
+    /// stalest edge at the cap), and persist. Never errors on cap pressure — the
+    /// ledger self-prunes — so it is safe to ride an agent's normal turn.
+    pub(crate) async fn remember_about(
+        &self,
+        session_id: &str,
+        impression: kheish_types::AffinityImpression,
+    ) -> Result<kheish_types::AffinityEdge> {
+        // Ensure the session exists before writing.
+        self.agent_id_for_session(session_id).await?;
+        let mut ledger = self.load_session_social_ledger(session_id).await?;
+        let edge = ledger.apply_impression(impression, crate::runs::now_ms());
+        self.save_session_social_ledger(session_id, ledger).await?;
+        Ok(edge)
+    }
+
     pub(crate) async fn set_session_operator_config(
         &self,
         session_id: &str,

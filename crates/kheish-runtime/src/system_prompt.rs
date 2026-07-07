@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use kheish_types::{
-    AffinityStanding, AffinityTabDir, CompletionRequirement, MAX_SOCIAL_LEDGER_EDGES,
-    SessionControlState, SessionGoal, SessionPersonaBinding, SessionSocialLedger,
-    SystemPromptSection, TaskStatus, ToolDefinition,
+    AFFINITY_CUE_THRESHOLD, AffinityStanding, AffinityTabDir, CompletionRequirement,
+    MAX_SOCIAL_LEDGER_EDGES, SessionControlState, SessionGoal, SessionPersonaBinding,
+    SessionSocialLedger, SystemPromptSection, TaskStatus, ToolDefinition,
 };
 use serde::{Deserialize, Serialize};
 
@@ -302,6 +302,21 @@ fn session_social_ledger_section(ledger: &SessionSocialLedger) -> Option<SystemP
             .filter(|note| !note.is_empty())
         {
             clauses.push(note.to_string());
+        }
+        // Non-numeric warmth cue, relative to the peer's baseline (already decayed
+        // toward baseline by `for_prompt` at load), so a fresh impression reads and
+        // then fades. Scalars themselves are never surfaced.
+        let warmth_gap = edge.warmth - edge.baseline_warmth;
+        if warmth_gap >= AFFINITY_CUE_THRESHOLD {
+            clauses.push("you're on unusually warm terms right now".to_string());
+        } else if warmth_gap <= -AFFINITY_CUE_THRESHOLD {
+            clauses.push("things feel a bit cool between you right now".to_string());
+        }
+        let trust_gap = edge.trust - edge.baseline_trust;
+        if trust_gap >= AFFINITY_CUE_THRESHOLD {
+            clauses.push("you tend to take their word at face value".to_string());
+        } else if trust_gap <= -AFFINITY_CUE_THRESHOLD {
+            clauses.push("you double-check what they hand you".to_string());
         }
         match edge.standing {
             AffinityStanding::Below => clauses.push("you defer to their call here".to_string()),
@@ -895,6 +910,47 @@ mod tests {
         assert!(!colleagues.content.contains("0.7"));
         assert!(!colleagues.content.contains("0.4"));
         assert!(!colleagues.content.to_lowercase().contains("trust"));
+    }
+
+    #[test]
+    fn build_sections_renders_warmth_cue_for_a_note_less_human_peer() {
+        let builder = SystemPromptBuilder::new(
+            SystemPromptEnvironment::new("/workspace", "/bin/bash"),
+            SystemPromptSettings::default(),
+        );
+        // A warmth-only edge on a human peer (no note/standing/tab) still renders,
+        // purely via the non-numeric cue, and the scalar itself never surfaces.
+        let cool = SessionSocialLedger {
+            edges: vec![AffinityEdge {
+                peer_id: "operator".to_string(),
+                display_name: "Operator".to_string(),
+                trust: 0.0,
+                warmth: -0.4,
+                standing: AffinityStanding::Peer,
+                note: None,
+                open_tab: None,
+                baseline_trust: 0.0,
+                baseline_warmth: 0.0,
+                updated_at_ms: 0,
+            }],
+        };
+
+        let sections = builder.build_sections(
+            &sample_tools(),
+            None,
+            None,
+            &[],
+            &SessionControlState::default(),
+            None,
+            Some(&cool),
+        );
+        let colleagues = sections
+            .iter()
+            .find(|section| section.name == "colleagues")
+            .expect("colleagues section missing");
+        assert!(colleagues.content.contains("Operator"));
+        assert!(colleagues.content.to_lowercase().contains("cool"));
+        assert!(!colleagues.content.contains("0.4"));
     }
 
     #[test]

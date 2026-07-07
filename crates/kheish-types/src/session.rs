@@ -544,6 +544,30 @@ pub fn metadata_with_session_goal(
 /// per-agent cost bounded at hundreds of concurrent agents.
 pub const MAX_SOCIAL_LEDGER_EDGES: usize = 8;
 
+/// One `remember_about` nudge moves a `trust`/`warmth` scalar by this much,
+/// clamped to `[-1.0, 1.0]`. Sized so a single decisive impression crosses the
+/// render cue threshold, and a few reinforce toward saturation.
+pub const AFFINITY_DRIFT_STEP: f32 = 0.35;
+
+/// Half-life for relaxing `trust`/`warmth` back toward baseline. An impression
+/// left untouched this long has faded halfway to resting — the "impressions fade
+/// unless reinforced" rule, applied as pure math at load time (never persisted).
+pub const AFFINITY_DECAY_HALF_LIFE_MS: u64 = 3 * 24 * 60 * 60 * 1000;
+
+/// A `trust`/`warmth` scalar this far from baseline (after decay) earns a
+/// non-numeric cue in the rendered section; closer than this renders nothing.
+pub const AFFINITY_CUE_THRESHOLD: f32 = 0.3;
+
+/// Default lifetime of a tab opened via `remember_about`, after which it is swept.
+pub const AFFINITY_TAB_TTL_MS: u64 = 14 * 24 * 60 * 60 * 1000;
+
+/// Longest note / tab text kept on an edge, so one tool call can neither bloat
+/// the per-turn prompt (rendered every turn, up to the cap) nor the sidecar.
+const AFFINITY_TEXT_MAX_CHARS: usize = 280;
+
+/// Longest display name kept on an edge.
+const AFFINITY_NAME_MAX_CHARS: usize = 80;
+
 /// Directional standing of the ledger holder relative to a peer. Optional and
 /// defaults to `peer`, so a flat, non-hierarchical tenant never encodes rank.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -566,6 +590,16 @@ pub enum AffinityTabDir {
     OwedToMe,
     /// The holder owes the peer.
     IOwe,
+}
+
+/// Direction a `trust`/`warmth` scalar moves on one `remember_about` nudge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AffinityDrift {
+    /// Nudge the scalar up (warmer / more trusting).
+    Up,
+    /// Nudge the scalar down (cooler / less trusting).
+    Down,
 }
 
 /// One live, expiring debt/favor between the holder and a peer.
@@ -629,6 +663,40 @@ pub struct SessionSocialLedger {
     pub edges: Vec<AffinityEdge>,
 }
 
+/// A tab the holder wants to open on a peer, before an expiry is stamped.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AffinityTabInput {
+    /// Human-legible description of the debt/favor, from the holder's seat.
+    pub text: String,
+    /// Who owes whom.
+    pub dir: AffinityTabDir,
+}
+
+/// One holder impression of a peer, applied to the ledger by `apply_impression`.
+///
+/// Every field except `peer_id` is optional and leaves the existing edge value
+/// untouched when absent, so an agent records only what actually changed.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AffinityImpression {
+    /// Who the impression is about — a peer session id or ANY actor id, humans
+    /// included (the ledger is holder-private, so peers need not be agents).
+    pub peer_id: String,
+    /// How the holder refers to the peer; sets/updates the edge display name.
+    pub display_name: Option<String>,
+    /// Optional warmth nudge.
+    pub warmth: Option<AffinityDrift>,
+    /// Optional trust nudge.
+    pub trust: Option<AffinityDrift>,
+    /// Optional new standing toward the peer.
+    pub standing: Option<AffinityStanding>,
+    /// Optional replacement note (a concrete impression, trimmed; empty clears it).
+    pub note: Option<String>,
+    /// Optional tab to open; its expiry is stamped on apply.
+    pub tab: Option<AffinityTabInput>,
+    /// When true, clears any existing open tab (a debt/favor is settled).
+    pub settle_tab: bool,
+}
+
 impl SessionSocialLedger {
     /// Returns true when the ledger carries no edges.
     pub fn is_empty(&self) -> bool {
@@ -639,6 +707,144 @@ impl SessionSocialLedger {
     pub fn edge_for(&self, peer_id: &str) -> Option<&AffinityEdge> {
         self.edges.iter().find(|edge| edge.peer_id == peer_id)
     }
+
+    /// Applies one holder impression in place: find-or-insert the peer edge, nudge
+    /// its scalars by a bounded step, update name/standing/note/tab, and stamp
+    /// `updated_at_ms`. When inserting past `MAX_SOCIAL_LEDGER_EDGES`, evicts the
+    /// stalest edge so the ledger stays sparse without ever erroring the caller.
+    /// Returns the resulting edge.
+    pub fn apply_impression(
+        &mut self,
+        impression: AffinityImpression,
+        now_ms: u64,
+    ) -> AffinityEdge {
+        if let Some(edge) = self
+            .edges
+            .iter_mut()
+            .find(|edge| edge.peer_id == impression.peer_id)
+        {
+            apply_impression_to_edge(edge, &impression, now_ms);
+            return edge.clone();
+        }
+
+        if self.edges.len() >= MAX_SOCIAL_LEDGER_EDGES
+            && let Some((index, _)) = self
+                .edges
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, edge)| edge.updated_at_ms)
+        {
+            self.edges.remove(index);
+        }
+
+        let mut edge = AffinityEdge {
+            peer_id: impression.peer_id.clone(),
+            display_name: impression.peer_id.clone(),
+            trust: 0.0,
+            warmth: 0.0,
+            standing: AffinityStanding::default(),
+            note: None,
+            open_tab: None,
+            baseline_trust: 0.0,
+            baseline_warmth: 0.0,
+            updated_at_ms: now_ms,
+        };
+        apply_impression_to_edge(&mut edge, &impression, now_ms);
+        self.edges.push(edge.clone());
+        edge
+    }
+
+    /// Returns a display copy for the prompt: expired tabs dropped and each
+    /// `trust`/`warmth` relaxed toward its baseline by elapsed time. Pure — the
+    /// stored ledger is never mutated by rendering.
+    pub fn for_prompt(&self, now_ms: u64) -> SessionSocialLedger {
+        let edges = self
+            .edges
+            .iter()
+            .map(|edge| {
+                let mut edge = edge.clone();
+                if edge
+                    .open_tab
+                    .as_ref()
+                    .is_some_and(|tab| tab.expires_at_ms != 0 && tab.expires_at_ms <= now_ms)
+                {
+                    edge.open_tab = None;
+                }
+                edge.trust =
+                    decay_toward(edge.trust, edge.baseline_trust, edge.updated_at_ms, now_ms);
+                edge.warmth = decay_toward(
+                    edge.warmth,
+                    edge.baseline_warmth,
+                    edge.updated_at_ms,
+                    now_ms,
+                );
+                edge
+            })
+            .collect();
+        SessionSocialLedger { edges }
+    }
+}
+
+fn nudge_scalar(value: f32, drift: Option<AffinityDrift>) -> f32 {
+    match drift {
+        Some(AffinityDrift::Up) => (value + AFFINITY_DRIFT_STEP).clamp(-1.0, 1.0),
+        Some(AffinityDrift::Down) => (value - AFFINITY_DRIFT_STEP).clamp(-1.0, 1.0),
+        None => value,
+    }
+}
+
+fn decay_toward(value: f32, baseline: f32, updated_at_ms: u64, now_ms: u64) -> f32 {
+    if now_ms <= updated_at_ms {
+        return value;
+    }
+    let elapsed = (now_ms - updated_at_ms) as f32;
+    let factor = 0.5f32.powf(elapsed / AFFINITY_DECAY_HALF_LIFE_MS as f32);
+    baseline + (value - baseline) * factor
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+fn apply_impression_to_edge(edge: &mut AffinityEdge, impression: &AffinityImpression, now_ms: u64) {
+    if let Some(name) = impression
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        edge.display_name = truncate_chars(name, AFFINITY_NAME_MAX_CHARS);
+    }
+    edge.warmth = nudge_scalar(edge.warmth, impression.warmth);
+    edge.trust = nudge_scalar(edge.trust, impression.trust);
+    if let Some(standing) = impression.standing {
+        edge.standing = standing;
+    }
+    if let Some(note) = impression.note.as_deref().map(str::trim) {
+        edge.note = if note.is_empty() {
+            None
+        } else {
+            Some(truncate_chars(note, AFFINITY_TEXT_MAX_CHARS))
+        };
+    }
+    if impression.settle_tab {
+        edge.open_tab = None;
+    } else if let Some(tab) = &impression.tab {
+        if !tab.text.trim().is_empty() {
+            edge.open_tab = Some(AffinityOpenTab {
+                text: truncate_chars(tab.text.trim(), AFFINITY_TEXT_MAX_CHARS),
+                dir: tab.dir,
+                expires_at_ms: now_ms.saturating_add(AFFINITY_TAB_TTL_MS),
+            });
+        }
+    } else if edge
+        .open_tab
+        .as_ref()
+        .is_some_and(|tab| tab.expires_at_ms != 0 && tab.expires_at_ms <= now_ms)
+    {
+        edge.open_tab = None;
+    }
+    edge.updated_at_ms = now_ms;
 }
 
 /// Decodes the persisted social ledger from metadata.
@@ -1005,7 +1211,9 @@ pub fn metadata_with_hook_runtime_state(
 #[cfg(test)]
 mod tests {
     use super::{
-        AffinityEdge, AffinityStanding, SessionPersonaBinding, SessionSocialLedger,
+        AFFINITY_DECAY_HALF_LIFE_MS, AFFINITY_DRIFT_STEP, AFFINITY_TAB_TTL_MS, AffinityDrift,
+        AffinityEdge, AffinityImpression, AffinityOpenTab, AffinityStanding, AffinityTabDir,
+        AffinityTabInput, MAX_SOCIAL_LEDGER_EDGES, SessionPersonaBinding, SessionSocialLedger,
         metadata_with_session_capability_scope, metadata_with_session_persona_binding,
         metadata_with_session_social_ledger, session_capability_scope_from_metadata,
         session_persona_binding_from_metadata, session_social_ledger_from_metadata,
@@ -1050,6 +1258,149 @@ mod tests {
                 .expect("metadata decode should succeed")
                 .is_none()
         );
+    }
+
+    fn fixed_now() -> u64 {
+        1_000_000_000_000
+    }
+
+    #[test]
+    fn apply_impression_creates_edge_for_a_human_peer() {
+        let mut ledger = SessionSocialLedger::default();
+        let edge = ledger.apply_impression(
+            AffinityImpression {
+                peer_id: "operator".to_string(),
+                display_name: Some("Operator".to_string()),
+                warmth: Some(AffinityDrift::Down),
+                note: Some("cassant quand c'est tard".to_string()),
+                tab: Some(AffinityTabInput {
+                    text: "je lui dois un correctif propre".to_string(),
+                    dir: AffinityTabDir::IOwe,
+                }),
+                ..AffinityImpression::default()
+            },
+            fixed_now(),
+        );
+
+        assert_eq!(edge.peer_id, "operator");
+        assert_eq!(edge.display_name, "Operator");
+        assert!((edge.warmth - (-AFFINITY_DRIFT_STEP)).abs() < 1e-4);
+        assert_eq!(edge.standing, AffinityStanding::Peer);
+        assert_eq!(edge.note.as_deref(), Some("cassant quand c'est tard"));
+        let tab = edge.open_tab.expect("tab set");
+        assert_eq!(tab.dir, AffinityTabDir::IOwe);
+        assert_eq!(tab.expires_at_ms, fixed_now() + AFFINITY_TAB_TTL_MS);
+        assert_eq!(ledger.edges.len(), 1);
+        assert!(ledger.edge_for("operator").is_some());
+    }
+
+    #[test]
+    fn apply_impression_accumulates_and_settles_on_existing_edge() {
+        let mut ledger = SessionSocialLedger::default();
+        ledger.apply_impression(
+            AffinityImpression {
+                peer_id: "agent-karim".to_string(),
+                warmth: Some(AffinityDrift::Up),
+                tab: Some(AffinityTabInput {
+                    text: "le compte-rendu Batignolles".to_string(),
+                    dir: AffinityTabDir::IOwe,
+                }),
+                ..AffinityImpression::default()
+            },
+            fixed_now(),
+        );
+        let edge = ledger.apply_impression(
+            AffinityImpression {
+                peer_id: "agent-karim".to_string(),
+                warmth: Some(AffinityDrift::Up),
+                settle_tab: true,
+                ..AffinityImpression::default()
+            },
+            fixed_now() + 1,
+        );
+
+        assert!((edge.warmth - 2.0 * AFFINITY_DRIFT_STEP).abs() < 1e-4);
+        assert!(edge.open_tab.is_none(), "settle clears the tab");
+        assert_eq!(ledger.edges.len(), 1, "same peer updates in place");
+    }
+
+    #[test]
+    fn apply_impression_evicts_the_stalest_edge_at_cap() {
+        let mut ledger = SessionSocialLedger::default();
+        for index in 0..MAX_SOCIAL_LEDGER_EDGES {
+            ledger.apply_impression(
+                AffinityImpression {
+                    peer_id: format!("agent-{index}"),
+                    ..AffinityImpression::default()
+                },
+                fixed_now() + index as u64, // agent-0 is the stalest
+            );
+        }
+        assert_eq!(ledger.edges.len(), MAX_SOCIAL_LEDGER_EDGES);
+
+        ledger.apply_impression(
+            AffinityImpression {
+                peer_id: "agent-new".to_string(),
+                ..AffinityImpression::default()
+            },
+            fixed_now() + 1000,
+        );
+
+        assert_eq!(ledger.edges.len(), MAX_SOCIAL_LEDGER_EDGES, "cap holds");
+        assert!(ledger.edge_for("agent-0").is_none(), "stalest evicted");
+        assert!(ledger.edge_for("agent-new").is_some(), "newest kept");
+    }
+
+    #[test]
+    fn for_prompt_drops_expired_tabs_and_decays_toward_baseline() {
+        let ledger = SessionSocialLedger {
+            edges: vec![AffinityEdge {
+                peer_id: "agent-peer".to_string(),
+                display_name: "Peer".to_string(),
+                trust: 0.0,
+                warmth: 0.7,
+                standing: AffinityStanding::Peer,
+                note: None,
+                open_tab: Some(AffinityOpenTab {
+                    text: "old favor".to_string(),
+                    dir: AffinityTabDir::OwedToMe,
+                    expires_at_ms: 100,
+                }),
+                baseline_trust: 0.0,
+                baseline_warmth: 0.1,
+                updated_at_ms: 0,
+            }],
+        };
+
+        let view = ledger.for_prompt(AFFINITY_DECAY_HALF_LIFE_MS);
+        let edge = &view.edges[0];
+        // one half-life: warmth relaxes halfway from 0.7 toward baseline 0.1 -> 0.4
+        assert!((edge.warmth - 0.4).abs() < 1e-3, "warmth = {}", edge.warmth);
+        assert!(edge.open_tab.is_none(), "expired tab dropped");
+        // the stored ledger is left untouched by rendering
+        assert!((ledger.edges[0].warmth - 0.7).abs() < 1e-6);
+        assert!(ledger.edges[0].open_tab.is_some());
+    }
+
+    #[test]
+    fn apply_impression_truncates_overlong_text() {
+        let mut ledger = SessionSocialLedger::default();
+        let edge = ledger.apply_impression(
+            AffinityImpression {
+                peer_id: "agent-p".to_string(),
+                display_name: Some("N".repeat(500)),
+                note: Some("x".repeat(1000)),
+                tab: Some(AffinityTabInput {
+                    text: "y".repeat(1000),
+                    dir: AffinityTabDir::OwedToMe,
+                }),
+                ..AffinityImpression::default()
+            },
+            fixed_now(),
+        );
+        assert!(edge.display_name.chars().count() <= 80);
+        assert!(edge.note.as_deref().unwrap().chars().count() <= 280);
+        assert!(edge.open_tab.unwrap().text.chars().count() <= 280);
     }
 
     #[test]

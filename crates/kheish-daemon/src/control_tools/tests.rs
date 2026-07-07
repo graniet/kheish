@@ -126,6 +126,15 @@ impl DaemonToolControl for FakeControl {
         Ok(self.state.lock().session_goals.get(session_id).cloned())
     }
 
+    async fn remember_about(
+        &self,
+        _session_id: &str,
+        impression: kheish_types::AffinityImpression,
+    ) -> Result<kheish_types::AffinityEdge> {
+        let mut ledger = kheish_types::SessionSocialLedger::default();
+        Ok(ledger.apply_impression(impression, 0))
+    }
+
     async fn create_session_goal(
         &self,
         session_id: &str,

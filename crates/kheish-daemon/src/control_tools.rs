@@ -11,6 +11,7 @@ mod planning;
 mod projects;
 mod scheduling;
 mod skills;
+mod social;
 mod tasks;
 mod types;
 
@@ -55,6 +56,7 @@ use scheduling::{
     ScheduleResumeTool, ScheduleTriggerNowTool, WakeAfterTool, WakeAtTool,
 };
 use skills::{ListSkillsTool, UseSkillTool};
+use social::RememberAboutTool;
 use tasks::{
     TaskCreateTool, TaskDeleteTool, TaskGetTool, TaskListTool, TaskOutputTool, TaskStopTool,
     TaskUpdateTool,
@@ -118,6 +120,7 @@ pub fn register_daemon_control_tools(
     runtime.register(GetGoalTool::new(control.clone()));
     runtime.register(CreateGoalTool::new(control.clone()));
     runtime.register(UpdateGoalTool::new(control.clone()));
+    runtime.register(RememberAboutTool::new(control.clone()));
     runtime.register(TodoWriteTool::new(control.clone()));
     runtime.register(EnterPlanModeTool::new(control.clone()));
     runtime.register(ExitPlanModeTool::new(control.clone()));

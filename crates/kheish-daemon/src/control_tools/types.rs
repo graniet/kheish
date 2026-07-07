@@ -774,6 +774,14 @@ pub trait DaemonToolControl: Send + Sync {
     /// Loads the current long-running session goal, when present.
     async fn load_session_goal(&self, session_id: &str) -> Result<Option<SessionGoal>>;
 
+    /// Records one agent-authored impression into the caller's own social ledger,
+    /// returning the resulting edge.
+    async fn remember_about(
+        &self,
+        session_id: &str,
+        impression: kheish_types::AffinityImpression,
+    ) -> Result<kheish_types::AffinityEdge>;
+
     /// Creates the current long-running session goal.
     async fn create_session_goal(
         &self,
