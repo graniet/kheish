@@ -22,8 +22,8 @@ use kheish_types::{
     PendingUserQuestion, PostCompactRestoration, RecoveredMemoryBundle, ReplyHandle,
     RetainedUserInput, RichOutput, Role, RunMetaSnapshot, RunStatus, SessionControlState,
     SessionExecutionIdentity, SessionGoal, SessionOperatorConfig, SessionPersonaBinding,
-    SessionSkillsState, SessionToolOverrides, SkillExecutionContext, SourceRef,
-    SystemPromptSection, ToolDefinition, ToolSurfaceFilter, UserQuestionResolution,
+    SessionSkillsState, SessionSocialLedger, SessionToolOverrides, SkillExecutionContext,
+    SourceRef, SystemPromptSection, ToolDefinition, ToolSurfaceFilter, UserQuestionResolution,
     WorkspaceSnapshot, hook_runtime_state_from_metadata, learned_context_from_metadata,
     model_context_window, model_max_output_tokens, normalize_reply_targets,
     recovered_memory_from_metadata, session_capability_scope_from_metadata,
@@ -31,8 +31,8 @@ use kheish_types::{
     session_execution_identity_from_metadata, session_goal_from_metadata,
     session_operator_config_from_metadata, session_output_contract_from_metadata,
     session_persona_binding_from_metadata, session_reply_targets_from_metadata,
-    session_skills_state_from_metadata, session_tool_overrides_from_metadata,
-    session_visible_skills_from_metadata,
+    session_skills_state_from_metadata, session_social_ledger_from_metadata,
+    session_tool_overrides_from_metadata, session_visible_skills_from_metadata,
 };
 
 use crate::execution::{current_cancellation_token, current_execution_scope};
@@ -226,6 +226,7 @@ pub struct AgentRuntime<M> {
     session_persona: Option<SessionPersonaBinding>,
     session_control: SessionControlState,
     session_goal: Option<SessionGoal>,
+    session_social_ledger: Option<SessionSocialLedger>,
     session_operator: SessionOperatorConfig,
     session_tool_overrides: SessionToolOverrides,
     session_output_contract: Option<kheish_types::StructuredOutputContract>,
@@ -479,6 +480,7 @@ fn build_system_sections<M>(
     completion_requirements: &[CompletionRequirement],
     session_control: &SessionControlState,
     session_goal: Option<&SessionGoal>,
+    session_social_ledger: Option<&SessionSocialLedger>,
     session_operator: &SessionOperatorConfig,
     available_skills: &[SkillSummary],
     active_skills: &[ActiveSkillSnapshot],
@@ -493,6 +495,7 @@ fn build_system_sections<M>(
         completion_requirements,
         session_control,
         session_goal,
+        session_social_ledger,
     );
     if let Some(section) = rich_output_tools_section(&tool_definitions) {
         sections.push(section);
@@ -534,6 +537,7 @@ fn build_runtime_system_sections<M>(
     output_contract: Option<&kheish_types::StructuredOutputContract>,
     session_control: &SessionControlState,
     session_goal: Option<&SessionGoal>,
+    session_social_ledger: Option<&SessionSocialLedger>,
     session_operator: &SessionOperatorConfig,
     available_skills: &[SkillSummary],
     active_skills: &[ActiveSkillSnapshot],
@@ -552,6 +556,7 @@ fn build_runtime_system_sections<M>(
         completion_requirements,
         session_control,
         session_goal,
+        session_social_ledger,
         session_operator,
         available_skills,
         active_skills,
@@ -1112,6 +1117,7 @@ where
             None,
             &SessionControlState::default(),
             None,
+            None,
             &SessionOperatorConfig::default(),
             &deps.skills.summaries(),
             &[],
@@ -1139,6 +1145,7 @@ where
             workspace_root_override,
             session_persona: None,
             session_goal: None,
+            session_social_ledger: None,
             session_operator: SessionOperatorConfig::default(),
             session_tool_overrides: SessionToolOverrides::default(),
             session_output_contract: None,
@@ -1172,6 +1179,7 @@ where
         let stored_metadata = serde_json::to_value(&stored.metadata)?;
         let session_control = session_control_state_from_metadata(&stored_metadata)?;
         let session_goal = session_goal_from_metadata(&stored_metadata)?;
+        let session_social_ledger = session_social_ledger_from_metadata(&stored_metadata)?;
         let session_operator = session_operator_config_from_metadata(&stored_metadata)?;
         let session_tool_overrides = session_tool_overrides_from_metadata(&stored_metadata)?;
         let session_output_contract = session_output_contract_from_metadata(&stored_metadata)?;
@@ -1225,6 +1233,7 @@ where
             session_output_contract.as_ref(),
             &session_control,
             session_goal.as_ref(),
+            session_social_ledger.as_ref(),
             &session_operator,
             &filter_skill_summaries_by_scope(
                 deps.skills.summaries(),
@@ -1264,6 +1273,7 @@ where
             session_persona,
             session_control,
             session_goal,
+            session_social_ledger,
             session_operator,
             session_tool_overrides,
             session_output_contract,
@@ -1865,6 +1875,7 @@ where
             self.session_output_contract.as_ref(),
             &self.session_control,
             self.session_goal.as_ref(),
+            self.session_social_ledger.as_ref(),
             &self.session_operator,
             &self.current_available_skills(),
             &self.current_active_skills(),
@@ -1890,6 +1901,7 @@ where
         self.session_persona = session_persona_binding_from_metadata(&metadata)?;
         self.session_control = session_control_state_from_metadata(&metadata)?;
         self.session_goal = session_goal_from_metadata(&metadata)?;
+        self.session_social_ledger = session_social_ledger_from_metadata(&metadata)?;
         self.session_operator = session_operator_config_from_metadata(&metadata)?;
         self.session_tool_overrides = session_tool_overrides_from_metadata(&metadata)?;
         self.session_output_contract = session_output_contract_from_metadata(&metadata)?;

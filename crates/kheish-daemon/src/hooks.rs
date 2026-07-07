@@ -1249,6 +1249,7 @@ impl DaemonHookDispatcher {
             &[],
             &SessionControlState::default(),
             None,
+            None,
         );
         if let Some(system_prompt) = system_prompt {
             sections.push(kheish_types::SystemPromptSection {

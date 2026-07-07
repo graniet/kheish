@@ -41,6 +41,8 @@ pub const SESSION_OUTPUT_CONTRACT_METADATA_KEY: &str = "session_output_contract"
 pub const SESSION_INPUT_CONTRACT_METADATA_KEY: &str = "session_input_contract";
 /// Stable metadata key used to persist hook runtime state.
 pub const HOOK_RUNTIME_STATE_METADATA_KEY: &str = "hook_runtime_state";
+/// Stable metadata key used to persist one session's private social ledger.
+pub const SESSION_SOCIAL_LEDGER_METADATA_KEY: &str = "session_social_ledger";
 /// Sentinel value for an unbounded autonomous-agent turn policy.
 pub const UNBOUNDED_AGENT_MAX_TURNS: usize = 0;
 /// Default turn ceiling for long-running autonomous agents. Unbounded loops
@@ -537,6 +539,143 @@ pub fn metadata_with_session_goal(
     Ok(Value::Object(object))
 }
 
+/// Maximum number of relationship edges kept per session ledger. Beyond this
+/// the lowest-salience edges are evicted, keeping the ledger sparse and the
+/// per-agent cost bounded at hundreds of concurrent agents.
+pub const MAX_SOCIAL_LEDGER_EDGES: usize = 8;
+
+/// Directional standing of the ledger holder relative to a peer. Optional and
+/// defaults to `peer`, so a flat, non-hierarchical tenant never encodes rank.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AffinityStanding {
+    /// The holder defers to this peer.
+    Below,
+    /// The holder and peer are equals.
+    #[default]
+    Peer,
+    /// The holder carries authority over this peer.
+    Above,
+}
+
+/// Direction of a single outstanding social debt or favor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AffinityTabDir {
+    /// The peer owes the holder.
+    OwedToMe,
+    /// The holder owes the peer.
+    IOwe,
+}
+
+/// One live, expiring debt/favor between the holder and a peer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AffinityOpenTab {
+    /// Human-legible description of the debt/favor, from the holder's seat.
+    pub text: String,
+    /// Who owes whom.
+    pub dir: AffinityTabDir,
+    /// Wall-clock expiry in milliseconds; the tab is dropped at/after this time.
+    pub expires_at_ms: u64,
+}
+
+/// One directed, private relationship edge from the ledger holder to a peer.
+///
+/// This is a generic, domain-agnostic primitive: the daemon ships the schema,
+/// the tenant supplies the peers and any seed relationships. The `trust` and
+/// `warmth` scalars are INTERNAL ranking signals in `[-1.0, 1.0]`; they are
+/// never surfaced to the model as numbers and never fed to any business-decision
+/// function. Edges are private to the holder — only the holder's own ledger is
+/// ever written, so there is no shared graph and no cross-session contention.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AffinityEdge {
+    /// Session id of the peer this edge points at.
+    pub peer_id: String,
+    /// Display name of the peer, as the holder refers to them.
+    pub display_name: String,
+    /// Internal trust signal in `[-1.0, 1.0]`. Never surfaced as a number.
+    #[serde(default)]
+    pub trust: f32,
+    /// Internal warmth signal in `[-1.0, 1.0]`. Never surfaced as a number.
+    #[serde(default)]
+    pub warmth: f32,
+    /// Directional standing (deference); defaults to `peer`.
+    #[serde(default)]
+    pub standing: AffinityStanding,
+    /// Concrete facts about dealing with this peer, from the holder's seat —
+    /// stored as facts/quotes, not a generated relationship summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// The single live debt/favor, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_tab: Option<AffinityOpenTab>,
+    /// Resting trust the edge decays toward (the persona-seeded baseline).
+    #[serde(default)]
+    pub baseline_trust: f32,
+    /// Resting warmth the edge decays toward (the persona-seeded baseline).
+    #[serde(default)]
+    pub baseline_warmth: f32,
+    /// Last update timestamp in milliseconds.
+    #[serde(default)]
+    pub updated_at_ms: u64,
+}
+
+/// One session's private, bounded social ledger of directed relationship edges.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionSocialLedger {
+    /// Outbound directed edges from this session to peers (bounded, sparse).
+    #[serde(default)]
+    pub edges: Vec<AffinityEdge>,
+}
+
+impl SessionSocialLedger {
+    /// Returns true when the ledger carries no edges.
+    pub fn is_empty(&self) -> bool {
+        self.edges.is_empty()
+    }
+
+    /// Returns the edge pointing at `peer_id`, if the holder knows them.
+    pub fn edge_for(&self, peer_id: &str) -> Option<&AffinityEdge> {
+        self.edges.iter().find(|edge| edge.peer_id == peer_id)
+    }
+}
+
+/// Decodes the persisted social ledger from metadata.
+pub fn session_social_ledger_from_metadata(
+    metadata: &Value,
+) -> serde_json::Result<Option<SessionSocialLedger>> {
+    metadata
+        .get(SESSION_SOCIAL_LEDGER_METADATA_KEY)
+        .filter(|value| !value.is_null())
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+}
+
+/// Returns metadata with the social ledger merged under the stable key.
+pub fn metadata_with_session_social_ledger(
+    metadata: Value,
+    ledger: Option<&SessionSocialLedger>,
+) -> serde_json::Result<Value> {
+    let mut object = match metadata {
+        Value::Object(map) => map,
+        Value::Null => serde_json::Map::new(),
+        other => {
+            let mut map = serde_json::Map::new();
+            map.insert("user_metadata".to_string(), other);
+            map
+        }
+    };
+    object.insert(
+        SESSION_SOCIAL_LEDGER_METADATA_KEY.to_string(),
+        ledger
+            .map(serde_json::to_value)
+            .transpose()?
+            .unwrap_or(Value::Null),
+    );
+    Ok(Value::Object(object))
+}
+
 /// Decodes persisted session route policy from metadata.
 pub fn session_route_policy_from_metadata(
     metadata: &Value,
@@ -865,12 +1004,52 @@ pub fn metadata_with_hook_runtime_state(
 #[cfg(test)]
 mod tests {
     use super::{
-        SessionPersonaBinding, metadata_with_session_capability_scope,
-        metadata_with_session_persona_binding, session_capability_scope_from_metadata,
-        session_persona_binding_from_metadata,
+        AffinityEdge, AffinityStanding, SessionPersonaBinding, SessionSocialLedger,
+        metadata_with_session_capability_scope, metadata_with_session_persona_binding,
+        metadata_with_session_social_ledger, session_capability_scope_from_metadata,
+        session_persona_binding_from_metadata, session_social_ledger_from_metadata,
     };
     use crate::CapabilityScope;
     use serde_json::json;
+
+    #[test]
+    fn session_social_ledger_round_trips_through_metadata() {
+        let ledger = SessionSocialLedger {
+            edges: vec![AffinityEdge {
+                peer_id: "agent-peer".to_string(),
+                display_name: "Peer".to_string(),
+                trust: 0.5,
+                warmth: -0.25,
+                standing: AffinityStanding::Above,
+                note: Some("covered your on-call swap last week".to_string()),
+                open_tab: None,
+                baseline_trust: 0.25,
+                baseline_warmth: 0.0,
+                updated_at_ms: 42,
+            }],
+        };
+
+        let metadata =
+            metadata_with_session_social_ledger(json!({ "custom": true }), Some(&ledger))
+                .expect("metadata update should succeed");
+
+        assert_eq!(
+            session_social_ledger_from_metadata(&metadata).expect("metadata decode should succeed"),
+            Some(ledger)
+        );
+        assert_eq!(metadata.get("custom"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn session_social_ledger_decode_treats_null_as_absent() {
+        let metadata = metadata_with_session_social_ledger(json!({ "other": 1 }), None)
+            .expect("metadata update should succeed");
+        assert!(
+            session_social_ledger_from_metadata(&metadata)
+                .expect("metadata decode should succeed")
+                .is_none()
+        );
+    }
 
     #[test]
     fn session_persona_binding_round_trips_through_metadata() {

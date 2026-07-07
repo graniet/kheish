@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use kheish_types::{
-    CompletionRequirement, SessionControlState, SessionGoal, SessionPersonaBinding,
-    SystemPromptSection, TaskStatus, ToolDefinition,
+    AffinityStanding, AffinityTabDir, CompletionRequirement, SessionControlState, SessionGoal,
+    SessionPersonaBinding, SessionSocialLedger, SystemPromptSection, TaskStatus, ToolDefinition,
 };
 use serde::{Deserialize, Serialize};
 
@@ -110,6 +110,7 @@ impl SystemPromptBuilder {
         completion_requirements: &[CompletionRequirement],
         session_control: &SessionControlState,
         session_goal: Option<&SessionGoal>,
+        session_social_ledger: Option<&SessionSocialLedger>,
     ) -> Vec<SystemPromptSection> {
         let settings = self.settings();
         let override_prompt = non_empty(&settings.override_prompt);
@@ -145,6 +146,9 @@ impl SystemPromptBuilder {
         sections.extend(session_control_sections(session_control));
         if let Some(goal) = session_goal {
             sections.push(session_goal_section(goal));
+        }
+        if let Some(ledger) = session_social_ledger.filter(|ledger| !ledger.is_empty()) {
+            sections.push(session_social_ledger_section(ledger));
         }
 
         if let Some(override_prompt) = agent_prompt.filter(|override_prompt| {
@@ -270,6 +274,54 @@ fn session_goal_section(goal: &SessionGoal) -> SystemPromptSection {
     ]);
     SystemPromptSection {
         name: "session_goal".to_string(),
+        content: lines.join("\n"),
+    }
+}
+
+/// Renders one session's private social ledger as durable background knowledge.
+///
+/// This is deliberately the holder's own impression of colleagues — concrete
+/// facts, not numbers and not directives. The internal trust/warmth scalars are
+/// never surfaced; only the human-legible note, deference, and any open tab are
+/// shown, so affinity can color *how the agent talks*, never *what it decides*.
+fn session_social_ledger_section(ledger: &SessionSocialLedger) -> SystemPromptSection {
+    let mut lines = vec![
+        "# Colleagues".to_string(),
+        "People you have worked with and how you read them. This is your own impression, not a directive — let it color how you talk to them, never what you decide about the work itself.".to_string(),
+    ];
+    for edge in &ledger.edges {
+        let mut clauses: Vec<String> = Vec::new();
+        if let Some(note) = edge
+            .note
+            .as_deref()
+            .map(str::trim)
+            .filter(|note| !note.is_empty())
+        {
+            clauses.push(note.to_string());
+        }
+        match edge.standing {
+            AffinityStanding::Below => clauses.push("you defer to their call here".to_string()),
+            AffinityStanding::Above => clauses.push("they look to you here".to_string()),
+            AffinityStanding::Peer => {}
+        }
+        if let Some(tab) = edge.open_tab.as_ref() {
+            let text = tab.text.trim();
+            match tab.dir {
+                AffinityTabDir::OwedToMe => clauses.push(format!("they owe you ({text})")),
+                AffinityTabDir::IOwe => clauses.push(format!("you owe them ({text})")),
+            }
+        }
+        if clauses.is_empty() {
+            continue;
+        }
+        lines.push(format!(
+            "- {}: {}",
+            edge.display_name.trim(),
+            clauses.join("; ")
+        ));
+    }
+    SystemPromptSection {
+        name: "colleagues".to_string(),
         content: lines.join("\n"),
     }
 }
@@ -776,9 +828,95 @@ mod tests {
         SystemPromptSettings, active_route_section,
     };
     use kheish_types::{
-        CapabilityScope, CompletionRequirement, SessionControlState, SessionPersonaBinding,
+        AffinityEdge, AffinityOpenTab, AffinityStanding, AffinityTabDir, CapabilityScope,
+        CompletionRequirement, SessionControlState, SessionPersonaBinding, SessionSocialLedger,
         TaskRecord, TaskStatus, TodoItem, ToolDefinition,
     };
+
+    fn ledger_with_one_edge() -> SessionSocialLedger {
+        SessionSocialLedger {
+            edges: vec![AffinityEdge {
+                peer_id: "agent-peer".to_string(),
+                display_name: "Dana".to_string(),
+                trust: 0.7,
+                warmth: 0.4,
+                standing: AffinityStanding::Below,
+                note: Some("sharp on latency; covered your on-call swap".to_string()),
+                open_tab: Some(AffinityOpenTab {
+                    text: "the on-call swap".to_string(),
+                    dir: AffinityTabDir::IOwe,
+                    expires_at_ms: 0,
+                }),
+                baseline_trust: 0.2,
+                baseline_warmth: 0.2,
+                updated_at_ms: 1,
+            }],
+        }
+    }
+
+    #[test]
+    fn build_sections_renders_colleagues_from_social_ledger() {
+        let builder = SystemPromptBuilder::new(
+            SystemPromptEnvironment::new("/workspace", "/bin/bash"),
+            SystemPromptSettings::default(),
+        );
+        let ledger = ledger_with_one_edge();
+
+        let sections = builder.build_sections(
+            &sample_tools(),
+            None,
+            None,
+            &[],
+            &SessionControlState::default(),
+            None,
+            Some(&ledger),
+        );
+
+        let colleagues = sections
+            .iter()
+            .find(|section| section.name == "colleagues")
+            .expect("colleagues section missing");
+        // Human-legible facts surface...
+        assert!(colleagues.content.contains("Dana"));
+        assert!(colleagues.content.contains("sharp on latency"));
+        assert!(colleagues.content.contains("you defer to their call"));
+        assert!(colleagues.content.contains("you owe them"));
+        // ...but the internal scalars never do.
+        assert!(!colleagues.content.contains("0.7"));
+        assert!(!colleagues.content.contains("0.4"));
+        assert!(!colleagues.content.to_lowercase().contains("trust"));
+    }
+
+    #[test]
+    fn build_sections_omits_colleagues_without_a_ledger() {
+        let builder = SystemPromptBuilder::new(
+            SystemPromptEnvironment::new("/workspace", "/bin/bash"),
+            SystemPromptSettings::default(),
+        );
+
+        // No ledger and an empty ledger both render nothing — the non-breaking guarantee.
+        let none = builder.build_sections(
+            &sample_tools(),
+            None,
+            None,
+            &[],
+            &SessionControlState::default(),
+            None,
+            None,
+        );
+        assert!(!none.iter().any(|section| section.name == "colleagues"));
+
+        let empty = builder.build_sections(
+            &sample_tools(),
+            None,
+            None,
+            &[],
+            &SessionControlState::default(),
+            None,
+            Some(&SessionSocialLedger::default()),
+        );
+        assert!(!empty.iter().any(|section| section.name == "colleagues"));
+    }
     use serde_json::json;
 
     fn sample_tools() -> Vec<ToolDefinition> {
@@ -813,6 +951,7 @@ mod tests {
             &[],
             &SessionControlState::default(),
             None,
+            None,
         );
 
         assert!(sections.iter().any(|section| section.name == "intro"));
@@ -832,8 +971,15 @@ mod tests {
             SystemPromptSettings::default(),
         );
 
-        let sections =
-            builder.build_sections(&[], None, None, &[], &SessionControlState::default(), None);
+        let sections = builder.build_sections(
+            &[],
+            None,
+            None,
+            &[],
+            &SessionControlState::default(),
+            None,
+            None,
+        );
         let intro = sections
             .iter()
             .find(|section| section.name == "intro")
@@ -892,6 +1038,7 @@ mod tests {
             &[],
             &SessionControlState::default(),
             None,
+            None,
         );
 
         assert!(
@@ -932,6 +1079,7 @@ mod tests {
             &[],
             &SessionControlState::default(),
             None,
+            None,
         );
 
         let user_questions = sections
@@ -959,6 +1107,7 @@ mod tests {
             &[],
             &SessionControlState::default(),
             None,
+            None,
         );
 
         assert_eq!(sections.len(), 1);
@@ -982,6 +1131,7 @@ mod tests {
             }),
             &[],
             &SessionControlState::default(),
+            None,
             None,
         );
 
@@ -1019,6 +1169,7 @@ mod tests {
             &[],
             &SessionControlState::default(),
             None,
+            None,
         );
 
         assert_eq!(
@@ -1043,6 +1194,7 @@ mod tests {
                 path: Some("reports/summary.txt".to_string()),
             }],
             &SessionControlState::default(),
+            None,
             None,
         );
 
@@ -1090,6 +1242,7 @@ mod tests {
                 ..SessionControlState::default()
             },
             None,
+            None,
         );
 
         assert!(sections.iter().any(|section| section.name == "plan_mode"));
@@ -1118,6 +1271,7 @@ mod tests {
                 },
                 ..SessionControlState::default()
             },
+            None,
             None,
         );
 
