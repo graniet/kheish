@@ -633,6 +633,39 @@ impl SessionService {
         Ok(state.clone())
     }
 
+    /// Loads the stored social ledger for one session.
+    pub(crate) async fn load_session_social_ledger(
+        &self,
+        session_id: &str,
+    ) -> Result<kheish_types::SessionSocialLedger> {
+        self.sessions
+            .load_metadata_value(session_id, kheish_types::SESSION_SOCIAL_LEDGER_METADATA_KEY)
+            .await?
+            .filter(|value| !value.is_null())
+            .map(serde_json::from_value)
+            .transpose()
+            .map(|ledger| ledger.unwrap_or_default())
+            .map_err(Into::into)
+    }
+
+    /// Persists the social ledger for one session.
+    pub(crate) async fn save_session_social_ledger(
+        &self,
+        session_id: &str,
+        ledger: &kheish_types::SessionSocialLedger,
+    ) -> Result<kheish_types::SessionSocialLedger> {
+        self.sessions
+            .append(
+                session_id,
+                PersistedSessionRecord::Metadata {
+                    key: kheish_types::SESSION_SOCIAL_LEDGER_METADATA_KEY.to_string(),
+                    value: serde_json::to_value(ledger)?,
+                },
+            )
+            .await?;
+        Ok(ledger.clone())
+    }
+
     /// Loads the model-facing operator contact policy for one session.
     pub(crate) async fn load_session_operator_config(
         &self,

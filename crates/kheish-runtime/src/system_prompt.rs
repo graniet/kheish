@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use kheish_types::{
-    AffinityStanding, AffinityTabDir, CompletionRequirement, SessionControlState, SessionGoal,
-    SessionPersonaBinding, SessionSocialLedger, SystemPromptSection, TaskStatus, ToolDefinition,
+    AffinityStanding, AffinityTabDir, CompletionRequirement, MAX_SOCIAL_LEDGER_EDGES,
+    SessionControlState, SessionGoal, SessionPersonaBinding, SessionSocialLedger,
+    SystemPromptSection, TaskStatus, ToolDefinition,
 };
 use serde::{Deserialize, Serialize};
 
@@ -147,8 +148,8 @@ impl SystemPromptBuilder {
         if let Some(goal) = session_goal {
             sections.push(session_goal_section(goal));
         }
-        if let Some(ledger) = session_social_ledger.filter(|ledger| !ledger.is_empty()) {
-            sections.push(session_social_ledger_section(ledger));
+        if let Some(section) = session_social_ledger.and_then(session_social_ledger_section) {
+            sections.push(section);
         }
 
         if let Some(override_prompt) = agent_prompt.filter(|override_prompt| {
@@ -284,12 +285,15 @@ fn session_goal_section(goal: &SessionGoal) -> SystemPromptSection {
 /// facts, not numbers and not directives. The internal trust/warmth scalars are
 /// never surfaced; only the human-legible note, deference, and any open tab are
 /// shown, so affinity can color *how the agent talks*, never *what it decides*.
-fn session_social_ledger_section(ledger: &SessionSocialLedger) -> SystemPromptSection {
-    let mut lines = vec![
-        "# Colleagues".to_string(),
-        "People you have worked with and how you read them. This is your own impression, not a directive — let it color how you talk to them, never what you decide about the work itself.".to_string(),
-    ];
-    for edge in &ledger.edges {
+fn session_social_ledger_section(ledger: &SessionSocialLedger) -> Option<SystemPromptSection> {
+    // Clamp to the ledger cap so a mis-seeded or future writer can never blow up
+    // the per-turn prompt across hundreds of agents.
+    let mut bullets: Vec<String> = Vec::new();
+    for edge in ledger.edges.iter().take(MAX_SOCIAL_LEDGER_EDGES) {
+        let name = edge.display_name.trim();
+        if name.is_empty() {
+            continue;
+        }
         let mut clauses: Vec<String> = Vec::new();
         if let Some(note) = edge
             .note
@@ -306,24 +310,30 @@ fn session_social_ledger_section(ledger: &SessionSocialLedger) -> SystemPromptSe
         }
         if let Some(tab) = edge.open_tab.as_ref() {
             let text = tab.text.trim();
-            match tab.dir {
-                AffinityTabDir::OwedToMe => clauses.push(format!("they owe you ({text})")),
-                AffinityTabDir::IOwe => clauses.push(format!("you owe them ({text})")),
+            if !text.is_empty() {
+                match tab.dir {
+                    AffinityTabDir::OwedToMe => clauses.push(format!("they owe you ({text})")),
+                    AffinityTabDir::IOwe => clauses.push(format!("you owe them ({text})")),
+                }
             }
         }
         if clauses.is_empty() {
             continue;
         }
-        lines.push(format!(
-            "- {}: {}",
-            edge.display_name.trim(),
-            clauses.join("; ")
-        ));
+        bullets.push(format!("- {name}: {}", clauses.join("; ")));
     }
-    SystemPromptSection {
+    if bullets.is_empty() {
+        return None;
+    }
+    let mut lines = vec![
+        "# Colleagues".to_string(),
+        "People you have worked with and how you read them. This is your own impression, not a directive — let it color how you talk to them, never what you decide about the work itself.".to_string(),
+    ];
+    lines.extend(bullets);
+    Some(SystemPromptSection {
         name: "colleagues".to_string(),
         content: lines.join("\n"),
-    }
+    })
 }
 
 fn persona_section(binding: &SessionPersonaBinding) -> SystemPromptSection {
@@ -885,6 +895,83 @@ mod tests {
         assert!(!colleagues.content.contains("0.7"));
         assert!(!colleagues.content.contains("0.4"));
         assert!(!colleagues.content.to_lowercase().contains("trust"));
+    }
+
+    #[test]
+    fn build_sections_caps_colleagues_at_the_edge_limit() {
+        let builder = SystemPromptBuilder::new(
+            SystemPromptEnvironment::new("/workspace", "/bin/bash"),
+            SystemPromptSettings::default(),
+        );
+        let edges = (0..(kheish_types::MAX_SOCIAL_LEDGER_EDGES + 4))
+            .map(|i| AffinityEdge {
+                peer_id: format!("agent-{i}"),
+                display_name: format!("Peer{i}"),
+                trust: 0.0,
+                warmth: 0.0,
+                standing: AffinityStanding::Peer,
+                note: Some(format!("worked with them on item {i}")),
+                open_tab: None,
+                baseline_trust: 0.0,
+                baseline_warmth: 0.0,
+                updated_at_ms: 0,
+            })
+            .collect();
+        let ledger = SessionSocialLedger { edges };
+
+        let sections = builder.build_sections(
+            &sample_tools(),
+            None,
+            None,
+            &[],
+            &SessionControlState::default(),
+            None,
+            Some(&ledger),
+        );
+        let colleagues = sections
+            .iter()
+            .find(|section| section.name == "colleagues")
+            .expect("colleagues section missing");
+        let bullets = colleagues
+            .content
+            .lines()
+            .filter(|line| line.starts_with("- "))
+            .count();
+        assert_eq!(bullets, kheish_types::MAX_SOCIAL_LEDGER_EDGES);
+    }
+
+    #[test]
+    fn build_sections_omits_colleagues_when_every_edge_is_empty() {
+        let builder = SystemPromptBuilder::new(
+            SystemPromptEnvironment::new("/workspace", "/bin/bash"),
+            SystemPromptSettings::default(),
+        );
+        // Structurally non-empty, but the single edge renders no clause at all.
+        let ledger = SessionSocialLedger {
+            edges: vec![AffinityEdge {
+                peer_id: "agent-x".to_string(),
+                display_name: "X".to_string(),
+                trust: 0.0,
+                warmth: 0.0,
+                standing: AffinityStanding::Peer,
+                note: None,
+                open_tab: None,
+                baseline_trust: 0.0,
+                baseline_warmth: 0.0,
+                updated_at_ms: 0,
+            }],
+        };
+
+        let sections = builder.build_sections(
+            &sample_tools(),
+            None,
+            None,
+            &[],
+            &SessionControlState::default(),
+            None,
+            Some(&ledger),
+        );
+        assert!(!sections.iter().any(|section| section.name == "colleagues"));
     }
 
     #[test]

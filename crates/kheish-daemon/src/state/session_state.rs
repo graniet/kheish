@@ -259,6 +259,25 @@ where
             .await
     }
 
+    pub(crate) async fn load_session_social_ledger(
+        &self,
+        session_id: &str,
+    ) -> Result<kheish_types::SessionSocialLedger> {
+        self.session_service
+            .load_session_social_ledger(session_id)
+            .await
+    }
+
+    pub(super) async fn save_session_social_ledger(
+        &self,
+        session_id: &str,
+        ledger: kheish_types::SessionSocialLedger,
+    ) -> Result<kheish_types::SessionSocialLedger> {
+        self.session_service
+            .save_session_social_ledger(session_id, &ledger)
+            .await
+    }
+
     pub(super) async fn save_session_operator_config(
         &self,
         session_id: &str,

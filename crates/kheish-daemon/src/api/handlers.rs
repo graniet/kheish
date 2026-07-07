@@ -809,6 +809,10 @@ where
                 .delete(clear_session_route_policy::<M>),
         )
         .route(
+            "/v1/sessions/{session_id}/social-ledger",
+            get(get_session_social_ledger::<M>).put(set_session_social_ledger::<M>),
+        )
+        .route(
             "/v1/sessions/{session_id}/operator",
             get(get_session_operator_config::<M>)
                 .post(set_session_operator_config::<M>)
@@ -5853,6 +5857,35 @@ where
 {
     state
         .set_session_route_policy(&session_id, None)
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn get_session_social_ledger<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Result<Json<kheish_types::SessionSocialLedger>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    state
+        .load_session_social_ledger(&session_id)
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn set_session_social_ledger<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    AxumPath(session_id): AxumPath<String>,
+    Json(ledger): Json<kheish_types::SessionSocialLedger>,
+) -> Result<Json<kheish_types::SessionSocialLedger>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    state
+        .set_session_social_ledger(&session_id, ledger)
         .await
         .map(Json)
         .map_err(internal_error)

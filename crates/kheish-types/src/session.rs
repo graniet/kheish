@@ -575,7 +575,8 @@ pub struct AffinityOpenTab {
     pub text: String,
     /// Who owes whom.
     pub dir: AffinityTabDir,
-    /// Wall-clock expiry in milliseconds; the tab is dropped at/after this time.
+    /// Wall-clock expiry in milliseconds; expired tabs are swept on the
+    /// write/refresh path (in P2), not at render time.
     pub expires_at_ms: u64,
 }
 

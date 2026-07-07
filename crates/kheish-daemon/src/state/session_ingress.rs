@@ -330,6 +330,23 @@ where
         Ok(view)
     }
 
+    pub(crate) async fn set_session_social_ledger(
+        &self,
+        session_id: &str,
+        ledger: kheish_types::SessionSocialLedger,
+    ) -> Result<kheish_types::SessionSocialLedger> {
+        if ledger.edges.len() > kheish_types::MAX_SOCIAL_LEDGER_EDGES {
+            bail!(
+                "social ledger has {} edges; the maximum is {}",
+                ledger.edges.len(),
+                kheish_types::MAX_SOCIAL_LEDGER_EDGES
+            );
+        }
+        // Ensure the session exists before persisting.
+        self.agent_id_for_session(session_id).await?;
+        self.save_session_social_ledger(session_id, ledger).await
+    }
+
     pub(crate) async fn set_session_operator_config(
         &self,
         session_id: &str,
