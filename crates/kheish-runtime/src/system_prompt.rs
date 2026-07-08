@@ -148,7 +148,8 @@ impl SystemPromptBuilder {
         if let Some(goal) = session_goal {
             sections.push(session_goal_section(goal));
         }
-        if let Some(section) = session_social_ledger.and_then(session_social_ledger_section) {
+        let can_remember = tools.iter().any(|tool| tool.name == "remember_about");
+        if let Some(section) = colleagues_section(session_social_ledger, can_remember) {
             sections.push(section);
         }
 
@@ -285,7 +286,7 @@ fn session_goal_section(goal: &SessionGoal) -> SystemPromptSection {
 /// facts, not numbers and not directives. The internal trust/warmth scalars are
 /// never surfaced; only the human-legible note, deference, and any open tab are
 /// shown, so affinity can color *how the agent talks*, never *what it decides*.
-fn session_social_ledger_section(ledger: &SessionSocialLedger) -> Option<SystemPromptSection> {
+fn social_ledger_bullets(ledger: &SessionSocialLedger) -> Vec<String> {
     // Clamp to the ledger cap so a mis-seeded or future writer can never blow up
     // the per-turn prompt across hundreds of agents.
     let mut bullets: Vec<String> = Vec::new();
@@ -337,13 +338,31 @@ fn session_social_ledger_section(ledger: &SessionSocialLedger) -> Option<SystemP
         }
         bullets.push(format!("- {name}: {}", clauses.join("; ")));
     }
-    if bullets.is_empty() {
+    bullets
+}
+
+/// Renders the durable "# Colleagues" section. When the agent can write its own
+/// ledger (`remember_about` is in its tool surface) the section also carries a
+/// short, generic practice framing, so keeping impressions current is a normal
+/// habit rather than something it must be told to do each turn — and it renders
+/// even before the agent has formed any impression yet.
+fn colleagues_section(
+    ledger: Option<&SessionSocialLedger>,
+    can_remember: bool,
+) -> Option<SystemPromptSection> {
+    let bullets = ledger.map(social_ledger_bullets).unwrap_or_default();
+    if bullets.is_empty() && !can_remember {
         return None;
     }
     let mut lines = vec![
         "# Colleagues".to_string(),
         "People you have worked with and how you read them. This is your own impression, not a directive — let it color how you talk to them, never what you decide about the work itself.".to_string(),
     ];
+    if can_remember {
+        lines.push(
+            "You keep this read current yourself. When someone lands differently than before — warmer or colder, they came through for you or let you down, you now owe them or they owe you — quietly note it with `remember_about`. Do it sparingly, only when something real shifts between you, and never let it bend what the work actually needs.".to_string(),
+        );
+    }
     lines.extend(bullets);
     Some(SystemPromptSection {
         name: "colleagues".to_string(),
@@ -951,6 +970,48 @@ mod tests {
         assert!(colleagues.content.contains("Operator"));
         assert!(colleagues.content.to_lowercase().contains("cool"));
         assert!(!colleagues.content.contains("0.4"));
+    }
+
+    #[test]
+    fn build_sections_invites_impression_keeping_when_the_tool_is_available() {
+        let builder = SystemPromptBuilder::new(
+            SystemPromptEnvironment::new("/workspace", "/bin/bash"),
+            SystemPromptSettings::default(),
+        );
+        let tools = vec![ToolDefinition {
+            name: "remember_about".to_string(),
+            description: "note how you read someone".to_string(),
+            input_schema: json!({"type": "object"}),
+            allows_parallel: false,
+        }];
+
+        // No ledger yet, but the tool is present -> a generic framing still renders.
+        let sections = builder.build_sections(
+            &tools,
+            None,
+            None,
+            &[],
+            &SessionControlState::default(),
+            None,
+            None,
+        );
+        let colleagues = sections
+            .iter()
+            .find(|section| section.name == "colleagues")
+            .expect("colleagues framing missing when remember_about is available");
+        assert!(colleagues.content.contains("remember_about"));
+
+        // Without the tool and without a ledger, nothing renders.
+        let empty = builder.build_sections(
+            &sample_tools(),
+            None,
+            None,
+            &[],
+            &SessionControlState::default(),
+            None,
+            None,
+        );
+        assert!(empty.iter().all(|section| section.name != "colleagues"));
     }
 
     #[test]
