@@ -31,6 +31,37 @@ fn default_next_stimulus_id() -> u64 {
     1
 }
 
+/// Durable pacing state for the autonomous channel heartbeat worker.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelHeartbeatStateView {
+    /// The owning channel identifier.
+    pub channel_id: String,
+    /// True while a granted autonomous turn is still awaiting its next-poll outcome.
+    #[serde(default)]
+    pub pending_grant: bool,
+    /// Latest channel message id observed by the heartbeat scorer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_message_id: Option<String>,
+    /// Consecutive autonomous grants that produced no new channel activity.
+    #[serde(default)]
+    pub consecutive_silent: u32,
+    /// When the heartbeat last granted an autonomous turn.
+    #[serde(default)]
+    pub last_turn_at_ms: u64,
+    /// Monotonic per-channel turn phase used to space fresh topics.
+    #[serde(default)]
+    pub turn_counter: u64,
+    /// Per-session timestamp of the last autonomous grant for fair rotation.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub last_granted: BTreeMap<String, u64>,
+    /// Whether the heartbeat has put this channel to sleep until new activity arrives.
+    #[serde(default)]
+    pub dormant: bool,
+    /// Latest heartbeat state update timestamp.
+    #[serde(default)]
+    pub updated_at_ms: u64,
+}
+
 /// The durable participation mode for one channel member.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -534,6 +565,9 @@ pub struct ChannelView {
     /// Computed operational counters used to audit moderation and anti-storm behavior.
     #[serde(default)]
     pub moderation_metrics: ChannelModerationMetricsView,
+    /// Internal autonomous heartbeat pacing state when this channel has been observed by the worker.
+    #[serde(default, skip_serializing)]
+    pub heartbeat_state: Option<ChannelHeartbeatStateView>,
     /// Optional caller-supplied metadata.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub metadata: Value,
@@ -563,6 +597,12 @@ pub struct ChannelTurnLeaseView {
     pub superseded_turn_id: Option<String>,
     /// The remaining autonomous reply budget for the current human turn.
     pub remaining_reply_budget: u32,
+    /// Whether this lease was granted by daemon autonomous channel pacing.
+    #[serde(default)]
+    pub autonomous: bool,
+    /// Whether this autonomous lease should post a brand-new top-level root.
+    #[serde(default)]
+    pub autonomous_new_topic: bool,
     /// The lease expiration timestamp in milliseconds since the Unix epoch.
     pub expires_at_ms: u64,
     /// The candidate sessions considered next when the holder abstains or times out.
@@ -709,6 +749,10 @@ impl FileChannelStore {
         self.root.join("channel-thread-state")
     }
 
+    fn heartbeat_state_root(&self) -> PathBuf {
+        self.root.join("channel-heartbeats")
+    }
+
     fn channel_path(&self, channel_id: &str) -> PathBuf {
         resolve_storage_path_for_read(&self.channels_root(), channel_id, "json")
     }
@@ -727,6 +771,10 @@ impl FileChannelStore {
 
     fn thread_state_path(&self, channel_id: &str) -> PathBuf {
         resolve_storage_path_for_read(&self.thread_state_root(), channel_id, "json")
+    }
+
+    fn heartbeat_state_path(&self, channel_id: &str) -> PathBuf {
+        resolve_storage_path_for_read(&self.heartbeat_state_root(), channel_id, "json")
     }
 
     /// Loads the persisted channel index, tolerating corruption by quarantining broken files.
@@ -801,6 +849,25 @@ impl FileChannelStore {
         })
     }
 
+    /// Loads every persisted channel heartbeat snapshot, quarantining corrupted files.
+    pub(crate) fn load_heartbeat_states(
+        &self,
+    ) -> Result<BTreeMap<String, ChannelHeartbeatStateView>> {
+        load_json_records::<ChannelHeartbeatStateView>(
+            &self.heartbeat_state_root(),
+            "channel heartbeat state",
+        )
+        .map(|records| {
+            let mut map = BTreeMap::new();
+            for state in records {
+                if !state.channel_id.trim().is_empty() {
+                    map.insert(state.channel_id.clone(), state);
+                }
+            }
+            map
+        })
+    }
+
     /// Loads the append-only event log for one channel, quarantining corrupted files.
     pub(crate) fn load_events(&self, channel_id: &str) -> Result<Vec<ChannelEventEntry>> {
         read_jsonl_records(&self.events_path(channel_id), "channel event")
@@ -862,6 +929,30 @@ impl FileChannelStore {
         write_json_pretty_atomically(&path, &states.to_vec())
     }
 
+    /// Persists one channel heartbeat snapshot atomically.
+    pub(crate) fn save_heartbeat_state(
+        &self,
+        channel_id: &str,
+        state: &ChannelHeartbeatStateView,
+    ) -> Result<()> {
+        let path =
+            prepare_storage_path_for_write(&self.heartbeat_state_root(), channel_id, "json")?;
+        let mut state = state.clone();
+        state.channel_id = channel_id.to_string();
+        state
+            .last_granted
+            .retain(|session_id, _| !session_id.trim().is_empty());
+        write_json_pretty_atomically(&path, &state)
+    }
+
+    /// Deletes one persisted channel heartbeat snapshot when it exists.
+    pub(crate) fn delete_heartbeat_state(&self, channel_id: &str) -> Result<()> {
+        delete_if_exists(
+            self.heartbeat_state_path(channel_id),
+            "channel heartbeat state",
+        )
+    }
+
     /// Deletes one persisted channel thread-work snapshot when it exists.
     pub(crate) fn delete_thread_states(&self, channel_id: &str) -> Result<()> {
         delete_if_exists(
@@ -879,6 +970,10 @@ impl FileChannelStore {
         delete_if_exists(
             self.thread_state_path(channel_id),
             "channel thread work state",
+        )?;
+        delete_if_exists(
+            self.heartbeat_state_path(channel_id),
+            "channel heartbeat state",
         )
     }
 }
@@ -954,6 +1049,21 @@ where
         }
     }
     Ok(records)
+}
+
+/// Returns whether one top-level message opened an autonomous root: a stimulus promotion
+/// or an autonomous new-topic delivery. Shared by the moderation metrics and the
+/// root-budget counters so both sides always agree on what counts as an autonomous root.
+pub(crate) fn channel_message_is_autonomous_root(message: &ChannelMessageView) -> bool {
+    match message.metadata.get("source_kind").and_then(Value::as_str) {
+        Some("channel_stimulus") => true,
+        Some("channel_delivery") => message
+            .metadata
+            .get("autonomous_new_topic")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        _ => false,
+    }
 }
 
 fn quarantine_path_for(path: &Path, suffix: u64) -> PathBuf {

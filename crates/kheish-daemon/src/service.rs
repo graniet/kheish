@@ -460,6 +460,22 @@ fn load_channel_thread_states(
         .collect())
 }
 
+fn load_channel_heartbeat_states(
+    store: &FileChannelStore,
+    channels: &std::collections::BTreeMap<String, crate::ChannelView>,
+) -> Result<std::collections::BTreeMap<String, crate::channels::ChannelHeartbeatStateView>> {
+    let persisted = store.load_heartbeat_states()?;
+    Ok(channels
+        .keys()
+        .filter_map(|channel_id| {
+            persisted
+                .get(channel_id)
+                .cloned()
+                .map(|state| (channel_id.clone(), state))
+        })
+        .collect())
+}
+
 /// A running daemon service.
 pub struct DaemonService {
     router: Router,
@@ -694,6 +710,7 @@ impl DaemonService {
         let channel_leases = load_channel_leases(&channel_store, &channels)?;
         let channel_stimuli = load_channel_stimuli(&channel_store, &channels)?;
         let channel_thread_states = load_channel_thread_states(&channel_store, &channels)?;
+        let channel_heartbeat_states = load_channel_heartbeat_states(&channel_store, &channels)?;
         let mut derivations = derivation_store.load_derivations()?;
         let repaired_derivations = derivation_store
             .repair_loaded_derivations(&mut derivations, |asset_id| {
@@ -879,6 +896,7 @@ impl DaemonService {
             channel_leases,
             channel_stimuli,
             channel_thread_states,
+            channel_heartbeat_states,
             derivations,
             learning_candidates,
             learnings,

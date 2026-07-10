@@ -159,6 +159,8 @@ pub(crate) struct RunService {
 struct RunIndexes {
     scheduled_by_fire: BTreeMap<String, BTreeMap<u64, String>>,
     mailbox_by_session: BTreeMap<String, BTreeSet<String>>,
+    active_counts_by_session: BTreeMap<String, usize>,
+    active_channel_delivery_by_thread: BTreeMap<(String, String), BTreeMap<String, usize>>,
 }
 
 impl RunService {
@@ -639,6 +641,39 @@ impl RunService {
             .collect::<Vec<_>>();
         runs.sort_by_key(|run| run.submitted_at_ms);
         Ok(runs)
+    }
+
+    /// Returns active run counts keyed by session from the maintained run index.
+    pub(crate) async fn active_run_counts_by_session(&self) -> BTreeMap<String, usize> {
+        self.indexes.lock().active_counts_by_session.clone()
+    }
+
+    /// Returns sessions with an active channel-delivery run for one channel thread.
+    pub(crate) async fn active_channel_delivery_sessions_for_thread(
+        &self,
+        channel_id: &str,
+        thread_root_message_id: &str,
+    ) -> BTreeSet<String> {
+        self.indexes
+            .lock()
+            .active_channel_delivery_by_thread
+            .get(&(channel_id.to_string(), thread_root_message_id.to_string()))
+            .map(|sessions| sessions.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Returns whether one session already has an active channel-delivery run for a thread.
+    pub(crate) async fn has_active_channel_delivery_for_session_thread(
+        &self,
+        session_id: &str,
+        channel_id: &str,
+        thread_root_message_id: &str,
+    ) -> bool {
+        self.indexes
+            .lock()
+            .active_channel_delivery_by_thread
+            .get(&(channel_id.to_string(), thread_root_message_id.to_string()))
+            .is_some_and(|sessions| sessions.contains_key(session_id))
     }
 
     /// Returns a point-in-time snapshot of all run records.
@@ -3078,6 +3113,7 @@ fn index_run_record(record: &RunRecord, indexes: &mut RunIndexes) {
     if record.view.status.is_terminal() {
         return;
     }
+    index_active_run_record(record, indexes);
     if let Some(origin) = scheduled_run_origin(&record.payload) {
         indexes
             .scheduled_by_fire
@@ -3096,6 +3132,7 @@ fn index_run_record(record: &RunRecord, indexes: &mut RunIndexes) {
 }
 
 fn deindex_run_record(record: &RunRecord, indexes: &mut RunIndexes) {
+    deindex_active_run_record(record, indexes);
     if let Some(origin) = scheduled_run_origin(&record.payload) {
         let remove_schedule = indexes
             .scheduled_by_fire
@@ -3128,6 +3165,77 @@ fn deindex_run_record(record: &RunRecord, indexes: &mut RunIndexes) {
         if remove_session {
             indexes.mailbox_by_session.remove(session_id);
         }
+    }
+}
+
+fn index_active_run_record(record: &RunRecord, indexes: &mut RunIndexes) {
+    *indexes
+        .active_counts_by_session
+        .entry(record.view.session_id.clone())
+        .or_default() += 1;
+    if record.view.kind != DaemonRunKind::ChannelDelivery {
+        return;
+    }
+    let Some(request) = record.payload.channel_delivery_request() else {
+        return;
+    };
+    *indexes
+        .active_channel_delivery_by_thread
+        .entry((
+            request.channel_id.clone(),
+            request.thread_root_message_id.clone(),
+        ))
+        .or_default()
+        .entry(record.view.session_id.clone())
+        .or_default() += 1;
+}
+
+fn deindex_active_run_record(record: &RunRecord, indexes: &mut RunIndexes) {
+    if record.view.status.is_terminal() {
+        return;
+    }
+    let remove_session = indexes
+        .active_counts_by_session
+        .get_mut(&record.view.session_id)
+        .map(|count| {
+            *count = count.saturating_sub(1);
+            *count == 0
+        })
+        .unwrap_or(false);
+    if remove_session {
+        indexes
+            .active_counts_by_session
+            .remove(&record.view.session_id);
+    }
+    if record.view.kind != DaemonRunKind::ChannelDelivery {
+        return;
+    }
+    let Some(request) = record.payload.channel_delivery_request() else {
+        return;
+    };
+    let key = (
+        request.channel_id.clone(),
+        request.thread_root_message_id.clone(),
+    );
+    let remove_thread = indexes
+        .active_channel_delivery_by_thread
+        .get_mut(&key)
+        .map(|sessions| {
+            let remove_session = sessions
+                .get_mut(&record.view.session_id)
+                .map(|count| {
+                    *count = count.saturating_sub(1);
+                    *count == 0
+                })
+                .unwrap_or(false);
+            if remove_session {
+                sessions.remove(&record.view.session_id);
+            }
+            sessions.is_empty()
+        })
+        .unwrap_or(false);
+    if remove_thread {
+        indexes.active_channel_delivery_by_thread.remove(&key);
     }
 }
 
@@ -3195,7 +3303,7 @@ fn output_preview(content: &str, max_chars: usize) -> (String, bool) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, VecDeque};
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::fs;
     use std::sync::atomic::AtomicU64;
     use std::time::{Duration, Instant};
@@ -3522,6 +3630,81 @@ mod tests {
             Some("run-1")
         );
         assert_eq!(service.get_run("run-2").await?.queued_position, Some(1));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_service_active_indexes_filter_terminal_and_thread_scope() -> Result<()> {
+        let temp = tempdir()?;
+        let mut runs = BTreeMap::new();
+
+        let mut first = sample_run("run-1", "session-1");
+        first.view.kind = DaemonRunKind::ChannelDelivery;
+        first.view.status = DaemonRunStatus::Running;
+        first.payload = RunRequestPayload::ChannelDelivery {
+            request: sample_channel_delivery_request(),
+        };
+        runs.insert(first.view.run_id.clone(), first);
+
+        let mut terminal = sample_run("run-2", "session-1");
+        terminal.view.kind = DaemonRunKind::ChannelDelivery;
+        terminal.view.status = DaemonRunStatus::Completed;
+        terminal.payload = RunRequestPayload::ChannelDelivery {
+            request: sample_channel_delivery_request(),
+        };
+        runs.insert(terminal.view.run_id.clone(), terminal);
+
+        let mut waiting = sample_run("run-3", "session-2");
+        waiting.view.kind = DaemonRunKind::ChannelDelivery;
+        waiting.view.status = DaemonRunStatus::WaitingForApproval;
+        waiting.payload = RunRequestPayload::ChannelDelivery {
+            request: sample_channel_delivery_request(),
+        };
+        runs.insert(waiting.view.run_id.clone(), waiting);
+
+        let mut other_thread = sample_run("run-4", "session-3");
+        other_thread.view.kind = DaemonRunKind::ChannelDelivery;
+        other_thread.view.status = DaemonRunStatus::Running;
+        let mut other_thread_request = sample_channel_delivery_request();
+        other_thread_request.thread_root_message_id = "channel-message-other".to_string();
+        other_thread.payload = RunRequestPayload::ChannelDelivery {
+            request: other_thread_request,
+        };
+        runs.insert(other_thread.view.run_id.clone(), other_thread);
+
+        let mut input = sample_run("run-5", "session-4");
+        input.view.kind = DaemonRunKind::Input;
+        input.view.status = DaemonRunStatus::Running;
+        input.payload = RunRequestPayload::Input {
+            request: sample_input_request(),
+            idempotency: None,
+        };
+        runs.insert(input.view.run_id.clone(), input);
+
+        let service = RunService::new(
+            FileRunStore::new(temp.path()),
+            FileRunMemoryStore::new(temp.path()),
+            FileDebugStore::new(temp.path()),
+            DaemonEventBus::new(16),
+            runs,
+            BTreeMap::new(),
+            BTreeMap::<String, PendingQuestionView>::new(),
+            AtomicU64::new(0),
+        );
+
+        let counts = service.active_run_counts_by_session().await;
+        assert_eq!(counts.get("session-1"), Some(&1));
+        assert_eq!(counts.get("session-2"), Some(&1));
+        assert_eq!(counts.get("session-3"), Some(&1));
+        assert_eq!(counts.get("session-4"), Some(&1));
+
+        let active_thread_sessions = service
+            .active_channel_delivery_sessions_for_thread("channel-1", "channel-message-1")
+            .await;
+        assert_eq!(
+            active_thread_sessions,
+            BTreeSet::from(["session-1".to_string(), "session-2".to_string()])
+        );
         Ok(())
     }
 

@@ -5,11 +5,12 @@ use anyhow::{Result, anyhow, bail};
 use tokio::sync::{Mutex, Notify};
 
 use crate::channels::{
-    ChannelAutonomyPolicy, ChannelEvent, ChannelEventEntry, ChannelIndex, ChannelIndexEntry,
-    ChannelMemberView, ChannelMessageView, ChannelParticipationMode, ChannelProgressSnapshotView,
-    ChannelReactionView, ChannelStimulusState, ChannelStimulusView, ChannelSummaryView,
-    ChannelThreadWorkStateView, ChannelTurnLeaseView, ChannelView, ChannelWorkBindingKind,
-    ChannelWorkBindingView, FileChannelStore,
+    ChannelAutonomyPolicy, ChannelEvent, ChannelEventEntry, ChannelHeartbeatStateView,
+    ChannelIndex, ChannelIndexEntry, ChannelMemberView, ChannelMessageView,
+    ChannelParticipationMode, ChannelProgressSnapshotView, ChannelReactionView,
+    ChannelStimulusState, ChannelStimulusView, ChannelSummaryView, ChannelThreadWorkStateView,
+    ChannelTurnLeaseView, ChannelView, ChannelWorkBindingKind, ChannelWorkBindingView,
+    FileChannelStore,
 };
 use crate::now_ms;
 use kheish_types::{ActorRef, RichOutput};
@@ -23,6 +24,7 @@ struct ChannelState {
     leases: BTreeMap<String, BTreeMap<String, ChannelTurnLeaseView>>,
     stimuli: BTreeMap<String, BTreeMap<String, ChannelStimulusView>>,
     thread_states: BTreeMap<String, BTreeMap<String, ChannelThreadWorkStateView>>,
+    heartbeat_states: BTreeMap<String, ChannelHeartbeatStateView>,
 }
 
 impl ChannelState {
@@ -32,6 +34,7 @@ impl ChannelState {
         leases: BTreeMap<String, BTreeMap<String, ChannelTurnLeaseView>>,
         stimuli: BTreeMap<String, BTreeMap<String, ChannelStimulusView>>,
         thread_states: BTreeMap<String, BTreeMap<String, ChannelThreadWorkStateView>>,
+        heartbeat_states: BTreeMap<String, ChannelHeartbeatStateView>,
     ) -> Self {
         let mut ordered_message_ids = BTreeMap::<String, Vec<String>>::new();
         for (channel_id, messages) in &messages {
@@ -56,6 +59,7 @@ impl ChannelState {
             leases,
             stimuli,
             thread_states,
+            heartbeat_states,
         }
     }
 }
@@ -152,6 +156,7 @@ impl ChannelService {
         leases: BTreeMap<String, BTreeMap<String, ChannelTurnLeaseView>>,
         stimuli: BTreeMap<String, BTreeMap<String, ChannelStimulusView>>,
         thread_states: BTreeMap<String, BTreeMap<String, ChannelThreadWorkStateView>>,
+        heartbeat_states: BTreeMap<String, ChannelHeartbeatStateView>,
         next_channel_id: AtomicU64,
         next_message_id: AtomicU64,
         next_turn_id: AtomicU64,
@@ -165,6 +170,7 @@ impl ChannelService {
                 leases,
                 stimuli,
                 thread_states,
+                heartbeat_states,
             )),
             notify: Notify::new(),
             next_channel_id,
@@ -244,6 +250,38 @@ impl ChannelService {
         channels
     }
 
+    /// Lists channels without computed metrics for internal workers that only need policy/member data.
+    pub(crate) async fn list_channels_lightweight(&self, query: Option<&str>) -> Vec<ChannelView> {
+        let query = query
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty());
+        let state = self.state.lock().await;
+        let mut channels = state
+            .channels
+            .values()
+            .filter(|channel| {
+                query.as_ref().is_none_or(|query| {
+                    channel
+                        .summary
+                        .channel_id
+                        .to_ascii_lowercase()
+                        .contains(query)
+                        || channel.summary.title.to_ascii_lowercase().contains(query)
+                        || channel
+                            .summary
+                            .description
+                            .as_deref()
+                            .unwrap_or_default()
+                            .to_ascii_lowercase()
+                            .contains(query)
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        channels.sort_by(|left, right| left.summary.channel_id.cmp(&right.summary.channel_id));
+        channels
+    }
+
     /// Returns one channel by identifier.
     pub(crate) async fn get_channel(&self, channel_id: &str) -> Result<ChannelView> {
         let state = self.state.lock().await;
@@ -284,6 +322,32 @@ impl ChannelService {
                 .then_with(|| left.message_id.cmp(&right.message_id))
         });
         Ok(messages)
+    }
+
+    /// Returns the channel's most recent message, using the same ordering as
+    /// `list_messages` (created-at, then message id). One lock-scoped scan and a
+    /// single clone, so hot pollers (the heartbeat worker) never copy a channel's
+    /// full history just to observe its tail.
+    pub(crate) async fn latest_message(
+        &self,
+        channel_id: &str,
+    ) -> Result<Option<ChannelMessageView>> {
+        let state = self.state.lock().await;
+        anyhow::ensure!(
+            state.channels.contains_key(channel_id),
+            "unknown channel {channel_id}"
+        );
+        Ok(state
+            .messages
+            .get(channel_id)
+            .and_then(|messages| {
+                messages.values().max_by(|left, right| {
+                    left.created_at_ms
+                        .cmp(&right.created_at_ms)
+                        .then_with(|| left.message_id.cmp(&right.message_id))
+                })
+            })
+            .cloned())
     }
 
     /// Returns one durable public channel message.
@@ -650,6 +714,61 @@ impl ChannelService {
             .cloned())
     }
 
+    /// Returns the durable heartbeat pacing state for one channel when it exists.
+    pub(crate) async fn get_heartbeat_state(
+        &self,
+        channel_id: &str,
+    ) -> Result<Option<ChannelHeartbeatStateView>> {
+        let state = self.state.lock().await;
+        anyhow::ensure!(
+            state.channels.contains_key(channel_id),
+            "unknown channel {channel_id}"
+        );
+        Ok(state.heartbeat_states.get(channel_id).cloned())
+    }
+
+    /// Creates or updates the durable heartbeat pacing state for one channel.
+    pub(crate) async fn set_heartbeat_state(
+        &self,
+        channel_id: &str,
+        mut heartbeat_state: ChannelHeartbeatStateView,
+    ) -> Result<ChannelHeartbeatStateView> {
+        {
+            let state = self.state.lock().await;
+            anyhow::ensure!(
+                state.channels.contains_key(channel_id),
+                "unknown channel {channel_id}"
+            );
+        }
+        heartbeat_state.channel_id = channel_id.to_string();
+        self.store
+            .save_heartbeat_state(channel_id, &heartbeat_state)?;
+        let mut state = self.state.lock().await;
+        if !state.channels.contains_key(channel_id) {
+            self.store.delete_heartbeat_state(channel_id)?;
+            bail!("unknown channel {channel_id}");
+        }
+        state
+            .heartbeat_states
+            .insert(channel_id.to_string(), heartbeat_state.clone());
+        Ok(heartbeat_state)
+    }
+
+    /// Deletes the heartbeat pacing state for one channel when it exists.
+    pub(crate) async fn delete_heartbeat_state(&self, channel_id: &str) -> Result<()> {
+        {
+            let state = self.state.lock().await;
+            anyhow::ensure!(
+                state.channels.contains_key(channel_id),
+                "unknown channel {channel_id}"
+            );
+        }
+        self.store.delete_heartbeat_state(channel_id)?;
+        let mut state = self.state.lock().await;
+        state.heartbeat_states.remove(channel_id);
+        Ok(())
+    }
+
     /// Creates or updates the canonical work state for one root thread.
     pub(crate) async fn upsert_thread_state(
         &self,
@@ -872,6 +991,7 @@ impl ChannelService {
             autonomy_policy: request.autonomy_policy,
             default_participation_mode: request.default_participation_mode,
             moderation_metrics: Default::default(),
+            heartbeat_state: None,
             metadata: request.metadata,
         };
         self.store.save_channel(&channel)?;
@@ -894,6 +1014,7 @@ impl ChannelService {
         state
             .thread_states
             .insert(channel.summary.channel_id.clone(), BTreeMap::new());
+        state.heartbeat_states.remove(&channel.summary.channel_id);
         state
             .channels
             .insert(channel.summary.channel_id.clone(), channel.clone());
@@ -950,6 +1071,7 @@ impl ChannelService {
         state.leases.remove(channel_id);
         state.stimuli.remove(channel_id);
         state.thread_states.remove(channel_id);
+        state.heartbeat_states.remove(channel_id);
         let mut index = self.index.lock().await;
         index.channels.remove(channel_id);
         self.store.save_index(&index)
@@ -1364,6 +1486,10 @@ fn channel_with_metrics(state: &ChannelState, channel: &ChannelView, now_ms: u64
     let mut channel = channel.clone();
     channel.moderation_metrics =
         channel_moderation_metrics(state, &channel.summary.channel_id, now_ms);
+    channel.heartbeat_state = state
+        .heartbeat_states
+        .get(&channel.summary.channel_id)
+        .cloned();
     channel
 }
 
@@ -1423,8 +1549,7 @@ fn channel_moderation_metrics(
                     .filter(|message| {
                         message.thread_root_message_id.is_none()
                             && message.created_at_ms >= now_ms.saturating_sub(3_600_000)
-                            && message.metadata.get("source_kind").and_then(Value::as_str)
-                                == Some("channel_stimulus")
+                            && crate::channels::channel_message_is_autonomous_root(message)
                     })
                     .count() as u64
             })
@@ -1471,4 +1596,153 @@ pub(crate) fn stimuli_equivalent(left: &ChannelStimulusView, right: &ChannelStim
         && left.source_kind == right.source_kind
         && left.source_ref == right.source_ref
         && left.content == right.content
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::AtomicU64;
+
+    use anyhow::Result;
+    use kheish_types::{ActorRef, RichOutput};
+    use serde_json::{Value, json};
+    use tempfile::tempdir;
+
+    use super::{ChannelService, CreateChannelMessageRecord, CreateChannelRecord};
+    use crate::channels::{
+        ChannelAutonomyPolicy, ChannelHeartbeatStateView, ChannelIndex, ChannelParticipationMode,
+        FileChannelStore,
+    };
+    use crate::now_ms;
+
+    fn test_service(root: &std::path::Path) -> ChannelService {
+        ChannelService::new(
+            FileChannelStore::new(root),
+            ChannelIndex::default(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            AtomicU64::new(1),
+            AtomicU64::new(1),
+            AtomicU64::new(1),
+            AtomicU64::new(1),
+        )
+    }
+
+    async fn create_empty_channel(service: &ChannelService, channel_id: &str) -> Result<()> {
+        service
+            .create_channel(CreateChannelRecord {
+                channel_id: channel_id.to_string(),
+                title: "Room".to_string(),
+                description: None,
+                purpose: None,
+                pinned_asset_ids: Vec::new(),
+                created_by: "test".to_string(),
+                created_at_ms: 1,
+                members: Vec::new(),
+                autonomy_policy: ChannelAutonomyPolicy::default(),
+                default_participation_mode: ChannelParticipationMode::SelectedOnly,
+                metadata: Value::Null,
+            })
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_state_persists_internally_without_public_serialization() -> Result<()> {
+        let temp = tempdir()?;
+        let service = test_service(temp.path());
+        create_empty_channel(&service, "channel-heartbeat").await?;
+
+        let heartbeat = ChannelHeartbeatStateView {
+            channel_id: "channel-heartbeat".to_string(),
+            pending_grant: true,
+            last_seen_message_id: Some("channel-message-1".to_string()),
+            consecutive_silent: 3,
+            last_turn_at_ms: 42,
+            turn_counter: 7,
+            last_granted: BTreeMap::from([("session-1".to_string(), 40)]),
+            dormant: true,
+            updated_at_ms: 99,
+        };
+        service
+            .set_heartbeat_state("channel-heartbeat", heartbeat.clone())
+            .await?;
+
+        let view = service.get_channel("channel-heartbeat").await?;
+        assert_eq!(view.heartbeat_state, Some(heartbeat.clone()));
+        let public_json = serde_json::to_value(&view)?;
+        assert!(public_json.get("heartbeat_state").is_none());
+
+        let persisted = FileChannelStore::new(temp.path()).load_heartbeat_states()?;
+        assert_eq!(persisted.get("channel-heartbeat"), Some(&heartbeat));
+
+        service.delete_heartbeat_state("channel-heartbeat").await?;
+        assert!(
+            service
+                .get_channel("channel-heartbeat")
+                .await?
+                .heartbeat_state
+                .is_none()
+        );
+        assert!(
+            FileChannelStore::new(temp.path())
+                .load_heartbeat_states()?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn moderation_metrics_count_autonomous_channel_delivery_roots() -> Result<()> {
+        let temp = tempdir()?;
+        let service = test_service(temp.path());
+        create_empty_channel(&service, "channel-metrics").await?;
+        let created_at_ms = now_ms();
+
+        let sender = ActorRef {
+            id: "session-1".to_string(),
+            display_name: Some("Agent".to_string()),
+        };
+        for (message_id, metadata) in [
+            (
+                "channel-message-1",
+                json!({"source_kind": "channel_delivery", "autonomous_new_topic": true}),
+            ),
+            (
+                "channel-message-2",
+                json!({"source_kind": "channel_delivery", "autonomous_new_topic": false}),
+            ),
+            (
+                "channel-message-3",
+                json!({"source_kind": "channel_stimulus"}),
+            ),
+        ] {
+            service
+                .post_message(CreateChannelMessageRecord {
+                    channel_id: "channel-metrics".to_string(),
+                    message_id: message_id.to_string(),
+                    sender: sender.clone(),
+                    sender_session_id: Some("session-1".to_string()),
+                    addressed_member_ids: Vec::new(),
+                    reply_to_message_id: None,
+                    requested_thread_root_message_id: None,
+                    output: RichOutput {
+                        content: message_id.to_string(),
+                        parts: Vec::new(),
+                        artifacts: Vec::new(),
+                    },
+                    created_at_ms,
+                    metadata,
+                })
+                .await?;
+        }
+
+        let view = service.get_channel("channel-metrics").await?;
+        assert_eq!(view.moderation_metrics.recent_autonomous_root_posts_1h, 2);
+        Ok(())
+    }
 }
