@@ -330,6 +330,17 @@ where
         Ok(view)
     }
 
+    /// Returns the per-session lock serializing social-ledger writes, so concurrent
+    /// writers (the `remember_about` tool vs an operator PUT vs membership seeding) can
+    /// never interleave a load-modify-save and silently drop each other's update.
+    async fn session_social_ledger_lock(&self, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.session_social_ledger_locks.lock().await;
+        locks
+            .entry(session_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     pub(crate) async fn set_session_social_ledger(
         &self,
         session_id: &str,
@@ -344,7 +355,31 @@ where
         }
         // Ensure the session exists before persisting.
         self.agent_id_for_session(session_id).await?;
+        let lock = self.session_social_ledger_lock(session_id).await;
+        let _guard = lock.lock().await;
+        let ledger = ledger.normalized_for_storage(crate::runs::now_ms());
         self.save_session_social_ledger(session_id, ledger).await
+    }
+
+    /// Seeds an empty social ledger for one session unless one was ever stored. Joining a
+    /// channel calls this: membership is the session's social opt-in, after which the
+    /// runtime surfaces `remember_about` and the member can start forming impressions.
+    pub(crate) async fn seed_session_social_ledger_if_missing(
+        &self,
+        session_id: &str,
+    ) -> Result<()> {
+        let lock = self.session_social_ledger_lock(session_id).await;
+        let _guard = lock.lock().await;
+        if self
+            .session_service
+            .session_social_ledger_present(session_id)
+            .await?
+        {
+            return Ok(());
+        }
+        self.save_session_social_ledger(session_id, kheish_types::SessionSocialLedger::default())
+            .await?;
+        Ok(())
     }
 
     /// Applies one agent-authored impression to the caller's OWN social ledger:
@@ -358,8 +393,16 @@ where
     ) -> Result<kheish_types::AffinityEdge> {
         // Ensure the session exists before writing.
         self.agent_id_for_session(session_id).await?;
-        let mut ledger = self.load_session_social_ledger(session_id).await?;
-        let edge = ledger.apply_impression(impression, crate::runs::now_ms());
+        let lock = self.session_social_ledger_lock(session_id).await;
+        let _guard = lock.lock().await;
+        let now = crate::runs::now_ms();
+        let mut ledger = self
+            .load_session_social_ledger(session_id)
+            .await?
+            .normalized_for_storage(now);
+        let edge = ledger.apply_impression(impression, now);
+        let ledger = ledger.normalized_for_storage(now);
+        let edge = ledger.edge_for(&edge.peer_id).cloned().unwrap_or(edge);
         self.save_session_social_ledger(session_id, ledger).await?;
         Ok(edge)
     }

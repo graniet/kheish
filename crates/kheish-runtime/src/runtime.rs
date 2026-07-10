@@ -481,6 +481,11 @@ fn current_unix_millis() -> u64 {
         .unwrap_or(0)
 }
 
+fn session_ledger_for_prompt(ledger: SessionSocialLedger) -> SessionSocialLedger {
+    let now = current_unix_millis();
+    ledger.normalized_for_storage(now).for_prompt(now)
+}
+
 fn build_system_sections<M>(
     deps: &AgentRuntimeDependencies<M>,
     tool_surface: &ToolSurfaceFilter,
@@ -1188,8 +1193,8 @@ where
         let stored_metadata = serde_json::to_value(&stored.metadata)?;
         let session_control = session_control_state_from_metadata(&stored_metadata)?;
         let session_goal = session_goal_from_metadata(&stored_metadata)?;
-        let session_social_ledger = session_social_ledger_from_metadata(&stored_metadata)?
-            .map(|ledger| ledger.for_prompt(current_unix_millis()));
+        let session_social_ledger =
+            session_social_ledger_from_metadata(&stored_metadata)?.map(session_ledger_for_prompt);
         let session_operator = session_operator_config_from_metadata(&stored_metadata)?;
         let session_tool_overrides = session_tool_overrides_from_metadata(&stored_metadata)?;
         let session_output_contract = session_output_contract_from_metadata(&stored_metadata)?;
@@ -1911,8 +1916,8 @@ where
         self.session_persona = session_persona_binding_from_metadata(&metadata)?;
         self.session_control = session_control_state_from_metadata(&metadata)?;
         self.session_goal = session_goal_from_metadata(&metadata)?;
-        self.session_social_ledger = session_social_ledger_from_metadata(&metadata)?
-            .map(|ledger| ledger.for_prompt(current_unix_millis()));
+        self.session_social_ledger =
+            session_social_ledger_from_metadata(&metadata)?.map(session_ledger_for_prompt);
         self.session_operator = session_operator_config_from_metadata(&metadata)?;
         self.session_tool_overrides = session_tool_overrides_from_metadata(&metadata)?;
         self.session_output_contract = session_output_contract_from_metadata(&metadata)?;
@@ -2386,18 +2391,38 @@ where
         // Session tool overrides adjust the profile surface. Applied before
         // the operator gating below so enabling operator tools here can
         // never bypass the session operator policy.
-        for tool_name in &self.session_tool_overrides.enable {
+        for tool_name in self
+            .session_tool_overrides
+            .enable
+            .iter()
+            .map(|tool_name| tool_name.trim())
+            .filter(|tool_name| !tool_name.is_empty())
+        {
             filter.denylist.retain(|entry| entry != tool_name);
             if !filter.allowlist.is_empty()
                 && !filter.allowlist.iter().any(|entry| entry == tool_name)
             {
-                filter.allowlist.push(tool_name.clone());
+                filter.allowlist.push(tool_name.to_string());
             }
         }
-        for tool_name in &self.session_tool_overrides.disable {
+        for tool_name in self
+            .session_tool_overrides
+            .disable
+            .iter()
+            .map(|tool_name| tool_name.trim())
+            .filter(|tool_name| !tool_name.is_empty())
+        {
             if !filter.denylist.iter().any(|entry| entry == tool_name) {
-                filter.denylist.push(tool_name.clone());
+                filter.denylist.push(tool_name.to_string());
             }
+        }
+        if !self.remember_about_tool_available()
+            && !filter
+                .denylist
+                .iter()
+                .any(|entry| entry == "remember_about")
+        {
+            filter.denylist.push("remember_about".to_string());
         }
         if !self.operator_notify_tool_available()
             && !filter
@@ -2413,6 +2438,20 @@ where
             filter.denylist.push("ask_operator".to_string());
         }
         filter
+    }
+
+    fn remember_about_tool_available(&self) -> bool {
+        let tool_surface = self.tool_surface.normalized();
+        self.session_social_ledger.is_some()
+            || self
+                .session_tool_overrides
+                .enable
+                .iter()
+                .any(|tool_name| tool_name.trim() == "remember_about")
+            || tool_surface
+                .allowlist
+                .iter()
+                .any(|tool_name| tool_name == "remember_about")
     }
 
     fn operator_notify_tool_available(&self) -> bool {
@@ -3054,8 +3093,9 @@ mod tests {
         HookEventName, HookInvocation, InputContentPart, InputEnvelope, LearnedContextBundle,
         LearnedContextEntry, MessageRecord, ModelGenerationConfig, RecoveredMemoryBundle,
         ReplyHandle, Role, SESSION_PERSONA_BINDING_METADATA_KEY, SessionControlState, SessionEvent,
-        SessionOperatorConfig, SessionPersonaBinding, SessionToolOverrides, ToolDefinition,
-        ToolResultRecord, ToolSurfaceFilter, asset_storage_uri, hook_runtime_state_from_metadata,
+        SessionOperatorConfig, SessionPersonaBinding, SessionSocialLedger, SessionToolOverrides,
+        ToolDefinition, ToolResultRecord, ToolSurfaceFilter, asset_storage_uri,
+        hook_runtime_state_from_metadata,
     };
 
     struct ScriptedProvider(Mutex<VecDeque<Result<Vec<ModelStreamEvent>, ProviderError>>>);
@@ -3370,6 +3410,41 @@ mod tests {
             .push("ask_operator".to_string());
         let still_gated = runtime.effective_tool_surface();
         assert!(!still_gated.allows("ask_operator"));
+    }
+
+    #[test]
+    fn effective_tool_surface_gates_remember_about_until_social_opt_in() {
+        let session_root = unique_session_root("kheish-runtime-remember-about-surface");
+        let (_sessions, mut runtime) = runtime_with_hook_dispatcher(
+            &session_root,
+            "remember-about-session",
+            Arc::new(NoopHookDispatcher),
+        );
+        runtime.tool_surface = ToolSurfaceFilter::default();
+
+        let default_surface = runtime.effective_tool_surface();
+        assert!(!default_surface.allows("remember_about"));
+
+        runtime.tool_surface = ToolSurfaceFilter {
+            allowlist: vec!["read_file".to_string()],
+            denylist: Vec::new(),
+        };
+        runtime.session_tool_overrides = SessionToolOverrides {
+            enable: vec![" remember_about ".to_string()],
+            disable: Vec::new(),
+        };
+        assert!(runtime.effective_tool_surface().allows("remember_about"));
+
+        runtime.session_tool_overrides = SessionToolOverrides::default();
+        runtime.tool_surface = ToolSurfaceFilter {
+            allowlist: vec![" remember_about ".to_string()],
+            denylist: Vec::new(),
+        };
+        assert!(runtime.effective_tool_surface().allows("remember_about"));
+
+        runtime.tool_surface = ToolSurfaceFilter::default();
+        runtime.session_social_ledger = Some(SessionSocialLedger::default());
+        assert!(runtime.effective_tool_surface().allows("remember_about"));
     }
 
     #[test]

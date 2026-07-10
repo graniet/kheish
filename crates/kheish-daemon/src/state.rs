@@ -286,6 +286,7 @@ pub(crate) struct DaemonState<M> {
     channel_service: ChannelService,
     channel_turn_transition_locks:
         tokio::sync::Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    session_social_ledger_locks: tokio::sync::Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
     derivation_service: DerivationService,
     learning_service: LearningService,
     learning_extraction_service: LearningExtractionService,
@@ -494,6 +495,7 @@ where
                 next_channel_stimulus_id,
             ),
             channel_turn_transition_locks: tokio::sync::Mutex::new(BTreeMap::new()),
+            session_social_ledger_locks: tokio::sync::Mutex::new(BTreeMap::new()),
             derivation_service: DerivationService::new(
                 derivation_store,
                 derivations,

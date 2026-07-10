@@ -648,6 +648,17 @@ impl SessionService {
             .map_err(Into::into)
     }
 
+    /// Returns whether one session ever stored a social ledger. A stored ledger — even an
+    /// empty one — is the session's social opt-in: it makes the runtime surface the
+    /// `remember_about` tool.
+    pub(crate) async fn session_social_ledger_present(&self, session_id: &str) -> Result<bool> {
+        Ok(self
+            .sessions
+            .load_metadata_value(session_id, kheish_types::SESSION_SOCIAL_LEDGER_METADATA_KEY)
+            .await?
+            .is_some_and(|value| !value.is_null()))
+    }
+
     /// Persists the social ledger for one session.
     pub(crate) async fn save_session_social_ledger(
         &self,

@@ -389,6 +389,7 @@ fn read_path_requires_admin(parts: &[&str]) -> bool {
         || matches!(parts, ["", "v1", "runtime", "hooks", ..])
         || matches!(parts, ["", "v1", "runtime", "revisions"])
         || matches!(parts, ["", "v1", "logs"])
+        || matches!(parts, ["", "v1", "sessions", _, "social-ledger"])
         || matches!(parts, ["", "v1", "stacks"])
         || matches!(parts, ["", "v1", "stacks", _, "ledger"])
 }
@@ -1038,6 +1039,7 @@ mod tests {
             .route("/v1/runtime/hooks", get(get_ok))
             .route("/v1/runtime/hooks/dead-letter", get(get_ok))
             .route("/v1/runtime/revisions", get(get_ok))
+            .route("/v1/sessions/{session_id}/social-ledger", get(get_ok))
             .layer(middleware::from_fn_with_state(
                 Arc::new(authorizer),
                 control_plane_auth_middleware,
@@ -1137,6 +1139,7 @@ mod tests {
             "/v1/runtime/hooks",
             "/v1/runtime/hooks/dead-letter",
             "/v1/runtime/revisions",
+            "/v1/sessions/session-1/social-ledger",
         ] {
             let read_only_response = client
                 .get(format!("{base}{path}"))
@@ -1200,6 +1203,10 @@ mod tests {
         );
         assert_eq!(
             required_access_for_request(&Method::GET, "/v1/runtime/revisions"),
+            ControlPlaneAccess::Admin
+        );
+        assert_eq!(
+            required_access_for_request(&Method::GET, "/v1/sessions/session-1/social-ledger"),
             ControlPlaneAccess::Admin
         );
         assert_eq!(

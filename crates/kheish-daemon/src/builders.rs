@@ -1150,6 +1150,7 @@ mod tests {
                 "project_update_task",
                 "read_channel_thread",
                 "read_file",
+                "remember_about",
                 "request_parent_clarification",
                 "schedule_cancel",
                 "schedule_create",

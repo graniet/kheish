@@ -9,6 +9,9 @@ use kheish_types::{
 };
 use serde::{Deserialize, Serialize};
 
+const SOCIAL_LEDGER_PROMPT_NAME_MAX_CHARS: usize = 80;
+const SOCIAL_LEDGER_PROMPT_TEXT_MAX_CHARS: usize = 280;
+
 /// Controls how an agent-specific prompt is merged with the runtime default prompt.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -152,7 +155,6 @@ impl SystemPromptBuilder {
         if let Some(section) = colleagues_section(session_social_ledger, can_remember) {
             sections.push(section);
         }
-
         if let Some(override_prompt) = agent_prompt.filter(|override_prompt| {
             override_prompt.mode == PromptMergeMode::Append
                 && !override_prompt.prompt.trim().is_empty()
@@ -291,7 +293,10 @@ fn social_ledger_bullets(ledger: &SessionSocialLedger) -> Vec<String> {
     // the per-turn prompt across hundreds of agents.
     let mut bullets: Vec<String> = Vec::new();
     for edge in ledger.edges.iter().take(MAX_SOCIAL_LEDGER_EDGES) {
-        let name = edge.display_name.trim();
+        let name = truncate_prompt_chars(
+            edge.display_name.trim(),
+            SOCIAL_LEDGER_PROMPT_NAME_MAX_CHARS,
+        );
         if name.is_empty() {
             continue;
         }
@@ -302,7 +307,10 @@ fn social_ledger_bullets(ledger: &SessionSocialLedger) -> Vec<String> {
             .map(str::trim)
             .filter(|note| !note.is_empty())
         {
-            clauses.push(note.to_string());
+            clauses.push(truncate_prompt_chars(
+                note,
+                SOCIAL_LEDGER_PROMPT_TEXT_MAX_CHARS,
+            ));
         }
         // Non-numeric warmth cue, relative to the peer's baseline (already decayed
         // toward baseline by `for_prompt` at load), so a fresh impression reads and
@@ -325,7 +333,7 @@ fn social_ledger_bullets(ledger: &SessionSocialLedger) -> Vec<String> {
             AffinityStanding::Peer => {}
         }
         if let Some(tab) = edge.open_tab.as_ref() {
-            let text = tab.text.trim();
+            let text = truncate_prompt_chars(tab.text.trim(), SOCIAL_LEDGER_PROMPT_TEXT_MAX_CHARS);
             if !text.is_empty() {
                 match tab.dir {
                     AffinityTabDir::OwedToMe => clauses.push(format!("they owe you ({text})")),
@@ -341,11 +349,17 @@ fn social_ledger_bullets(ledger: &SessionSocialLedger) -> Vec<String> {
     bullets
 }
 
+fn truncate_prompt_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
 /// Renders the durable "# Colleagues" section. When the agent can write its own
 /// ledger (`remember_about` is in its tool surface) the section also carries a
-/// short, generic practice framing, so keeping impressions current is a normal
-/// habit rather than something it must be told to do each turn — and it renders
-/// even before the agent has formed any impression yet.
+/// short, generic closing reflex: on finishing a turn the agent must ask whether
+/// anything shifted with a colleague, and only then record it. The question is
+/// mandatory, acting on it is not, so impression-keeping never competes with the
+/// task and stays silent and non-directive. Renders even before any impression
+/// exists yet.
 fn colleagues_section(
     ledger: Option<&SessionSocialLedger>,
     can_remember: bool,
@@ -360,7 +374,7 @@ fn colleagues_section(
     ];
     if can_remember {
         lines.push(
-            "You keep this read current yourself. When someone lands differently than before — warmer or colder, they came through for you or let you down, you now owe them or they owe you — quietly note it with `remember_about`. Do it sparingly, only when something real shifts between you, and never let it bend what the work actually needs.".to_string(),
+            "You keep this read current yourself. As you finish each turn, take one honest beat and ask whether anything shifted in how you read a colleague you just dealt with. Nearly always nothing did, and you simply move on. When something genuinely did (they came through for you or let you down, they warmed up or got under your skin, you now owe them one or they owe you), note it in your own words with `remember_about`, and keep the bar high, because a ledger full of trivia is worse than an empty one. This reflex stays silent. It never appears in what you say to others and never bends what the work itself needs.".to_string(),
         );
     }
     lines.extend(bullets);
@@ -973,7 +987,7 @@ mod tests {
     }
 
     #[test]
-    fn build_sections_invites_impression_keeping_when_the_tool_is_available() {
+    fn build_sections_frames_an_end_of_turn_impression_check_when_the_tool_is_available() {
         let builder = SystemPromptBuilder::new(
             SystemPromptEnvironment::new("/workspace", "/bin/bash"),
             SystemPromptSettings::default(),
@@ -1000,6 +1014,9 @@ mod tests {
             .find(|section| section.name == "colleagues")
             .expect("colleagues framing missing when remember_about is available");
         assert!(colleagues.content.contains("remember_about"));
+        // The framing must scope the self-check to turn completion (mandatory
+        // question, free answer) rather than leaving it as a vague standing habit.
+        assert!(colleagues.content.to_lowercase().contains("turn"));
 
         // Without the tool and without a ledger, nothing renders.
         let empty = builder.build_sections(
@@ -1012,6 +1029,44 @@ mod tests {
             None,
         );
         assert!(empty.iter().all(|section| section.name != "colleagues"));
+    }
+
+    #[test]
+    fn build_sections_does_not_add_initiative_cue_from_tool_surface_alone() {
+        let builder = SystemPromptBuilder::new(
+            SystemPromptEnvironment::new("/workspace", "/bin/bash"),
+            SystemPromptSettings::default(),
+        );
+        let tools = vec![ToolDefinition {
+            name: "create_goal".to_string(),
+            description: "open a goal".to_string(),
+            input_schema: json!({"type": "object"}),
+            allows_parallel: false,
+        }];
+
+        // create_goal can be used when the user explicitly requests a goal, but
+        // the default prompt must not encourage agent-initiated goals.
+        let sections = builder.build_sections(
+            &tools,
+            None,
+            None,
+            &[],
+            &SessionControlState::default(),
+            None,
+            None,
+        );
+        assert!(sections.iter().all(|section| section.name != "initiative"));
+
+        let without = builder.build_sections(
+            &sample_tools(),
+            None,
+            None,
+            &[],
+            &SessionControlState::default(),
+            None,
+            None,
+        );
+        assert!(without.iter().all(|section| section.name != "initiative"));
     }
 
     #[test]
@@ -1055,6 +1110,49 @@ mod tests {
             .filter(|line| line.starts_with("- "))
             .count();
         assert_eq!(bullets, kheish_types::MAX_SOCIAL_LEDGER_EDGES);
+    }
+
+    #[test]
+    fn build_sections_truncates_oversized_social_ledger_text() {
+        let builder = SystemPromptBuilder::new(
+            SystemPromptEnvironment::new("/workspace", "/bin/bash"),
+            SystemPromptSettings::default(),
+        );
+        let oversized = "x".repeat(2_000);
+        let ledger = SessionSocialLedger {
+            edges: vec![AffinityEdge {
+                peer_id: "agent-x".to_string(),
+                display_name: oversized.clone(),
+                trust: 0.0,
+                warmth: 0.0,
+                standing: AffinityStanding::Peer,
+                note: Some(oversized.clone()),
+                open_tab: Some(kheish_types::AffinityOpenTab {
+                    dir: AffinityTabDir::IOwe,
+                    text: oversized,
+                    expires_at_ms: 0,
+                }),
+                baseline_trust: 0.0,
+                baseline_warmth: 0.0,
+                updated_at_ms: 0,
+            }],
+        };
+
+        let sections = builder.build_sections(
+            &sample_tools(),
+            None,
+            None,
+            &[],
+            &SessionControlState::default(),
+            None,
+            Some(&ledger),
+        );
+        let colleagues = sections
+            .iter()
+            .find(|section| section.name == "colleagues")
+            .expect("colleagues section missing");
+        assert!(!colleagues.content.contains(&"x".repeat(1_000)));
+        assert!(colleagues.content.len() < 1_000);
     }
 
     #[test]

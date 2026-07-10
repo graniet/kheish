@@ -67,9 +67,8 @@ use super::types::{
     SetSessionInputContractRequest, SetSessionOperatorConfigRequest,
     SetSessionOutputContractRequest, SetSessionPermissionModeRequest, SetSessionPersonaRequest,
     SetSessionReplyTargetsRequest, SetSessionRoutePolicyRequest, SetSessionToolOverridesRequest,
-    SetSystemPromptRequest,
-    SetToolRuntimeLimitsRequest, SkillListQuery, SkillSummaryView, SkillView,
-    SpawnSidechainRequest, StackApplyRequest, StackDownRequest, StackImportRequest,
+    SetSystemPromptRequest, SetToolRuntimeLimitsRequest, SkillListQuery, SkillSummaryView,
+    SkillView, SpawnSidechainRequest, StackApplyRequest, StackDownRequest, StackImportRequest,
     StackManifestRequest, StackPlanRequest, StartProjectTaskRequest, StopTaskRequest,
     SubmitInputRequest, SubmitRunRequest, SupersedeLearningRequest, TaskListQuery, TaskOutputQuery,
     UpdateBoardRequest, UpdateChannelRequest, UpdatePersonaRequest, UpdateProjectRequest,
@@ -1150,7 +1149,7 @@ fn is_problem_response(response: &Response) -> bool {
 fn daemon_capabilities() -> DaemonCapabilities {
     DaemonCapabilities {
         control_plane_version: env!("CARGO_PKG_VERSION").to_string(),
-        api_revision: 3,
+        api_revision: 4,
         route_capability_matrix_version: crate::ROUTE_CAPABILITY_MATRIX_VERSION,
         approvals: true,
         sidechains: true,
@@ -1282,7 +1281,7 @@ fn openapi_spec() -> Value {
         "info": {
             "title": "Kheish daemon control-plane API",
             "version": env!("CARGO_PKG_VERSION"),
-            "x-api-revision": 3,
+            "x-api-revision": 4,
             "x-sse-replay": true,
             "x-typed-sse-heartbeat": true
         },
@@ -2046,6 +2045,10 @@ const CONTROL_PLANE_OPENAPI_ROUTES: &[OpenApiRouteSpec] = &[
     OpenApiRouteSpec {
         path: "/v1/sessions/{session_id}/route-policy",
         methods: &["POST", "PUT", "DELETE"],
+    },
+    OpenApiRouteSpec {
+        path: "/v1/sessions/{session_id}/social-ledger",
+        methods: &["GET", "PUT"],
     },
     OpenApiRouteSpec {
         path: "/v1/sessions/{session_id}/tool-overrides",
@@ -5884,6 +5887,18 @@ async fn set_session_social_ledger<M>(
 where
     M: ModelDriver + Send + Sync + 'static,
 {
+    if ledger.edges.len() > kheish_types::MAX_SOCIAL_LEDGER_EDGES {
+        return Err(ApiError::coded(
+            StatusCode::BAD_REQUEST,
+            "sessions",
+            "invalid_social_ledger",
+            format!(
+                "social ledger has {} edges; the maximum is {}",
+                ledger.edges.len(),
+                kheish_types::MAX_SOCIAL_LEDGER_EDGES
+            ),
+        ));
+    }
     state
         .set_session_social_ledger(&session_id, ledger)
         .await
@@ -6033,14 +6048,16 @@ where
     // A `null`/omitted mode clears the session override; a present mode must
     // parse to one of the canonical permission-mode names.
     let mode = match request.mode.as_deref() {
-        Some(raw) => Some(crate::control_tools::parse_permission_mode(raw).ok_or_else(|| {
-            ApiError::coded(
-                StatusCode::BAD_REQUEST,
-                "sessions",
-                "permission_mode_unsupported",
-                format!("unknown permission_mode {raw}"),
-            )
-        })?),
+        Some(raw) => Some(
+            crate::control_tools::parse_permission_mode(raw).ok_or_else(|| {
+                ApiError::coded(
+                    StatusCode::BAD_REQUEST,
+                    "sessions",
+                    "permission_mode_unsupported",
+                    format!("unknown permission_mode {raw}"),
+                )
+            })?,
+        ),
         None => None,
     };
     state
@@ -8285,6 +8302,14 @@ fn internal_error(error: anyhow::Error) -> ApiError {
             message,
         );
     }
+    if message.starts_with("social ledger has ") && message.contains("the maximum is") {
+        return ApiError::coded(
+            StatusCode::BAD_REQUEST,
+            "sessions",
+            "invalid_social_ledger",
+            message,
+        );
+    }
     if message.contains("expects previous revision") {
         return ApiError::coded(
             StatusCode::CONFLICT,
@@ -9355,6 +9380,14 @@ startup_timeout_sec = 1
         assert_eq!(unbound_run.status, StatusCode::BAD_REQUEST);
         assert_eq!(unbound_run.domain, Some("goals"));
         assert_eq!(unbound_run.code, "goal_invalid_request");
+    }
+
+    #[test]
+    fn internal_error_classifies_social_ledger_limits() {
+        let error = internal_error(anyhow!("social ledger has 9 edges; the maximum is 8"));
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.domain, Some("sessions"));
+        assert_eq!(error.code, "invalid_social_ledger");
     }
 
     #[test]

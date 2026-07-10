@@ -822,6 +822,17 @@ where
                 let effective_display_name = self
                     .effective_session_channel_display_name(session_id)
                     .await?;
+                // Joining a channel is the session's social opt-in: make sure it carries a
+                // (possibly empty) social ledger so its runtime surfaces `remember_about`
+                // and the member can start forming impressions of the room. Best-effort —
+                // membership must never fail on ledger plumbing.
+                if let Err(error) = self.seed_session_social_ledger_if_missing(session_id).await {
+                    warn!(
+                        session_id = %session_id,
+                        error = ?error,
+                        "could not seed social ledger for channel member"
+                    );
+                }
                 let display_name_mode = request.display_name_mode.unwrap_or_else(|| {
                     if request.display_name.trim() == effective_display_name {
                         crate::ChannelMemberDisplayNameMode::FollowAgent

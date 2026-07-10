@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -703,9 +703,12 @@ impl SessionSocialLedger {
         self.edges.is_empty()
     }
 
-    /// Returns the edge pointing at `peer_id`, if the holder knows them.
+    /// Returns the edge pointing at `peer_id`, if the holder knows them. Matching is
+    /// case-insensitive because peers are recorded from free-form names.
     pub fn edge_for(&self, peer_id: &str) -> Option<&AffinityEdge> {
-        self.edges.iter().find(|edge| edge.peer_id == peer_id)
+        self.edges
+            .iter()
+            .find(|edge| peer_ids_match(&edge.peer_id, peer_id))
     }
 
     /// Applies one holder impression in place: find-or-insert the peer edge, nudge
@@ -715,13 +718,14 @@ impl SessionSocialLedger {
     /// Returns the resulting edge.
     pub fn apply_impression(
         &mut self,
-        impression: AffinityImpression,
+        mut impression: AffinityImpression,
         now_ms: u64,
     ) -> AffinityEdge {
+        impression.peer_id = truncate_chars(impression.peer_id.trim(), AFFINITY_NAME_MAX_CHARS);
         if let Some(edge) = self
             .edges
             .iter_mut()
-            .find(|edge| edge.peer_id == impression.peer_id)
+            .find(|edge| peer_ids_match(&edge.peer_id, &impression.peer_id))
         {
             apply_impression_to_edge(edge, &impression, now_ms);
             return edge.clone();
@@ -783,6 +787,62 @@ impl SessionSocialLedger {
             .collect();
         SessionSocialLedger { edges }
     }
+
+    /// Returns a storage-safe copy: bounded edge count, trimmed/truncated text,
+    /// finite clamped scores, no duplicate or empty peers (case-insensitive), no
+    /// expired tabs, and no future `updated_at_ms` (a future timestamp would freeze
+    /// decay and make the edge immune to eviction).
+    pub fn normalized_for_storage(&self, now_ms: u64) -> SessionSocialLedger {
+        let mut seen = BTreeSet::new();
+        let mut edges = Vec::new();
+        let mut ordered = self.edges.clone();
+        ordered.sort_by(|left, right| {
+            right
+                .updated_at_ms
+                .cmp(&left.updated_at_ms)
+                .then_with(|| left.peer_id.cmp(&right.peer_id))
+        });
+        for mut edge in ordered {
+            edge.peer_id = truncate_chars(edge.peer_id.trim(), AFFINITY_NAME_MAX_CHARS);
+            if edge.peer_id.is_empty() || !seen.insert(edge.peer_id.to_lowercase()) {
+                continue;
+            }
+            edge.updated_at_ms = edge.updated_at_ms.min(now_ms);
+            edge.display_name = truncate_chars(edge.display_name.trim(), AFFINITY_NAME_MAX_CHARS);
+            if edge.display_name.is_empty() {
+                edge.display_name = edge.peer_id.clone();
+            }
+            edge.trust = finite_clamped_scalar(edge.trust);
+            edge.warmth = finite_clamped_scalar(edge.warmth);
+            edge.baseline_trust = finite_clamped_scalar(edge.baseline_trust);
+            edge.baseline_warmth = finite_clamped_scalar(edge.baseline_warmth);
+            edge.note = edge
+                .note
+                .as_deref()
+                .map(str::trim)
+                .filter(|note| !note.is_empty())
+                .map(|note| truncate_chars(note, AFFINITY_TEXT_MAX_CHARS));
+            edge.open_tab = edge.open_tab.and_then(|mut tab| {
+                if tab.expires_at_ms != 0 && tab.expires_at_ms <= now_ms {
+                    return None;
+                }
+                tab.text = truncate_chars(tab.text.trim(), AFFINITY_TEXT_MAX_CHARS);
+                (!tab.text.is_empty()).then_some(tab)
+            });
+            edges.push(edge);
+            if edges.len() >= MAX_SOCIAL_LEDGER_EDGES {
+                break;
+            }
+        }
+        SessionSocialLedger { edges }
+    }
+}
+
+/// Case-insensitive peer identity: `remember_about` records peers from free-form names,
+/// so "Karim", "karim", and "KARIM" must resolve to one edge instead of burning the
+/// ledger cap on duplicates.
+fn peer_ids_match(left: &str, right: &str) -> bool {
+    left.to_lowercase() == right.to_lowercase()
 }
 
 fn nudge_scalar(value: f32, drift: Option<AffinityDrift>) -> f32 {
@@ -804,6 +864,14 @@ fn decay_toward(value: f32, baseline: f32, updated_at_ms: u64, now_ms: u64) -> f
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
+}
+
+fn finite_clamped_scalar(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 fn apply_impression_to_edge(edge: &mut AffinityEdge, impression: &AffinityImpression, now_ms: u64) {
@@ -1380,6 +1448,105 @@ mod tests {
         // the stored ledger is left untouched by rendering
         assert!((ledger.edges[0].warmth - 0.7).abs() < 1e-6);
         assert!(ledger.edges[0].open_tab.is_some());
+    }
+
+    #[test]
+    fn normalized_social_ledger_bounds_text_scores_and_duplicates() {
+        let long = "x".repeat(400);
+        let ledger = SessionSocialLedger {
+            edges: vec![
+                AffinityEdge {
+                    peer_id: " agent-peer ".to_string(),
+                    display_name: " ".to_string(),
+                    trust: 99.0,
+                    warmth: f32::NAN,
+                    standing: AffinityStanding::Peer,
+                    note: Some(long.clone()),
+                    open_tab: Some(AffinityOpenTab {
+                        text: long,
+                        dir: AffinityTabDir::OwedToMe,
+                        expires_at_ms: fixed_now() + 1,
+                    }),
+                    baseline_trust: -99.0,
+                    baseline_warmth: f32::INFINITY,
+                    updated_at_ms: fixed_now(),
+                },
+                AffinityEdge {
+                    peer_id: "agent-peer".to_string(),
+                    display_name: "Duplicate".to_string(),
+                    trust: 0.0,
+                    warmth: 0.0,
+                    standing: AffinityStanding::Peer,
+                    note: None,
+                    open_tab: None,
+                    baseline_trust: 0.0,
+                    baseline_warmth: 0.0,
+                    updated_at_ms: fixed_now() - 1,
+                },
+            ],
+        };
+
+        let normalized = ledger.normalized_for_storage(fixed_now());
+        assert_eq!(normalized.edges.len(), 1);
+        let edge = &normalized.edges[0];
+        assert_eq!(edge.peer_id, "agent-peer");
+        assert_eq!(edge.display_name, "agent-peer");
+        assert_eq!(edge.trust, 1.0);
+        assert_eq!(edge.warmth, 0.0);
+        assert_eq!(edge.baseline_trust, -1.0);
+        assert_eq!(edge.baseline_warmth, 0.0);
+        assert_eq!(edge.note.as_ref().expect("note").chars().count(), 280);
+        assert_eq!(
+            edge.open_tab.as_ref().expect("tab").text.chars().count(),
+            280
+        );
+    }
+
+    #[test]
+    fn apply_impression_matches_peers_case_insensitively() {
+        let mut ledger = SessionSocialLedger::default();
+        ledger.apply_impression(
+            AffinityImpression {
+                peer_id: "Karim".to_string(),
+                warmth: Some(AffinityDrift::Up),
+                ..AffinityImpression::default()
+            },
+            fixed_now(),
+        );
+        let edge = ledger.apply_impression(
+            AffinityImpression {
+                peer_id: "karim".to_string(),
+                warmth: Some(AffinityDrift::Up),
+                ..AffinityImpression::default()
+            },
+            fixed_now() + 1,
+        );
+
+        assert_eq!(ledger.edges.len(), 1, "same person, one edge");
+        assert!((edge.warmth - 2.0 * AFFINITY_DRIFT_STEP).abs() < 1e-4);
+        assert!(ledger.edge_for("KARIM").is_some());
+    }
+
+    #[test]
+    fn normalized_social_ledger_clamps_future_update_timestamps() {
+        let ledger = SessionSocialLedger {
+            edges: vec![AffinityEdge {
+                peer_id: "agent-future".to_string(),
+                display_name: "Future".to_string(),
+                trust: 1.0,
+                warmth: 0.0,
+                standing: AffinityStanding::Peer,
+                note: None,
+                open_tab: None,
+                baseline_trust: 0.0,
+                baseline_warmth: 0.0,
+                updated_at_ms: fixed_now() + 1_000_000,
+            }],
+        };
+
+        // A future timestamp would freeze decay and dodge stalest-first eviction.
+        let normalized = ledger.normalized_for_storage(fixed_now());
+        assert_eq!(normalized.edges[0].updated_at_ms, fixed_now());
     }
 
     #[test]
