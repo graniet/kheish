@@ -12,15 +12,15 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 dest="${repo_root}/crates/kheish-daemon/console-dist"
 
-# Locate the console source tree. Prefer a sibling checkout, fall back to the
-# absolute development path.
+# Locate the console source tree. Prefer a sibling checkout, then an explicit
+# KHEISH_CONSOLE_SRC override for out-of-tree layouts.
 if [ -d "${repo_root}/../kheish-air" ]; then
   console_src="$(cd "${repo_root}/../kheish-air" && pwd)"
-elif [ -d "/home/graniet/workspaces/kheish-air" ]; then
-  console_src="/home/graniet/workspaces/kheish-air"
+elif [ -n "${KHEISH_CONSOLE_SRC:-}" ] && [ -d "${KHEISH_CONSOLE_SRC}" ]; then
+  console_src="$(cd "${KHEISH_CONSOLE_SRC}" && pwd)"
 else
   echo "error: could not find the kheish-air console source tree" >&2
-  echo "       expected ../kheish-air or /home/graniet/workspaces/kheish-air" >&2
+  echo "       set KHEISH_CONSOLE_SRC or place the checkout at ../kheish-air" >&2
   exit 1
 fi
 
