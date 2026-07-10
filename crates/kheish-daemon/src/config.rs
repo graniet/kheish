@@ -261,6 +261,12 @@ fn default_model_budget_max_total_output_tokens() -> u64 {
     1_000_000
 }
 
+/// Default token budget for goals an agent creates for itself, so the headless
+/// goal-continuation loop is always bounded. Not applied to operator/HTTP goals.
+pub(crate) fn default_agent_goal_token_budget() -> u64 {
+    1_000_000
+}
+
 fn default_model_budget_max_total_cost_usd() -> f64 {
     500.0
 }

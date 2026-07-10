@@ -32,6 +32,11 @@ where
         replace_if_inactive: bool,
     ) -> Result<SessionGoalResponse> {
         self.ensure_goal_session_exists(session_id).await?;
+        // Agent-created goals always carry a budget so the headless
+        // goal-continuation loop is bounded. The operator path
+        // (create_session_goal_from_request) keeps whatever the caller set.
+        let token_budget =
+            token_budget.or_else(|| Some(crate::config::default_agent_goal_token_budget()));
         let goal = if replace_if_inactive {
             self.goal_service
                 .create_or_replace_inactive_session_goal(
