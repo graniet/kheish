@@ -246,11 +246,7 @@ where
     /// tip revision's author, a capped element list, an ASCII occupancy map,
     /// and a free-space hint. A board with no revisions yields an empty scene
     /// on the default 1600x1000 canvas with a friendly note.
-    pub(crate) async fn agent_view_board(
-        &self,
-        session_id: &str,
-        board_id: &str,
-    ) -> Result<Value> {
+    pub(crate) async fn agent_view_board(&self, session_id: &str, board_id: &str) -> Result<Value> {
         use crate::board_render;
 
         let _ = self.agent_id_for_session(session_id).await?;
@@ -355,8 +351,7 @@ where
                 );
             }
             let latest_revision_id = board.summary.latest_revision_id.clone();
-            let (previous_elements, canvas, previous_render) = match latest_revision_id.as_deref()
-            {
+            let (previous_elements, canvas, previous_render) = match latest_revision_id.as_deref() {
                 Some(revision_id) => {
                     let revision = self
                         .board_service
