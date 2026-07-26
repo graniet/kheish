@@ -3,11 +3,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
+use async_trait::async_trait;
 use kheish_auth::{AuthManager, AuthProvider, AuthSlotId};
 use kheish_codec::{digest_serialize, digest_text};
 use kheish_runtime::{
-    McpInstructionBlock, McpRuntimeSurface, RuntimeObserver, ToolExecutionOutput, ToolRuntime,
-    external_action_trace, failed_external_action_outcome, redact_text,
+    McpInstructionBlock, McpRuntimeSurface, McpScopedHydrator, RuntimeObserver,
+    ToolExecutionOutput, ToolRuntime, external_action_trace, failed_external_action_outcome,
+    redact_text,
 };
 use parking_lot::RwLock as SyncRwLock;
 use serde::{Deserialize, Serialize};
@@ -364,86 +366,85 @@ impl McpManager {
             None,
             None,
         ))?;
-        let (connected, instructions, discovered_tools, error) =
-            match client.initialize(workspace_root).await {
-                Ok(info) => {
-                    observer.record_external_action(external_action_trace(
-                        "response",
-                        "mcp",
-                        format!("mcp:initialize:{}", config.name),
-                        None,
-                        Some(digest_serialize(&info).unwrap_or_else(|_| "unknown".to_string())),
-                        Some("ok".to_string()),
-                    ))?;
-                    observer.record_external_action(external_action_trace(
-                        "request",
-                        "mcp",
-                        format!("mcp:list_tools:{}", config.name),
-                        None,
-                        None,
-                        None,
-                    ))?;
-                    let tools_result = client.list_tools().await;
-                    match tools_result {
-                        Ok(list) => {
-                            observer.record_external_action(external_action_trace(
-                                "response",
-                                "mcp",
-                                format!("mcp:list_tools:{}", config.name),
-                                None,
-                                Some(
-                                    digest_serialize(&list)
-                                        .unwrap_or_else(|_| "unknown".to_string()),
-                                ),
-                                Some("ok".to_string()),
-                            ))?;
-                            (
-                                true,
-                                info.instructions,
-                                filter_discovered_tools(&config, list),
-                                None,
-                            )
-                        }
-                        Err(error) => {
-                            observer.record_external_action(external_action_trace(
-                                "response",
-                                "mcp",
-                                format!("mcp:list_tools:{}", config.name),
-                                None,
-                                None,
-                                Some(failed_external_action_outcome(error.to_string())),
-                            ))?;
-                            (
-                                true,
-                                info.instructions,
-                                Vec::new(),
-                                Some(redact_text(&error.to_string())),
-                            )
-                        }
+        let (connected, instructions, discovered_tools, error) = match client
+            .initialize(workspace_root)
+            .await
+        {
+            Ok(info) => {
+                observer.record_external_action(external_action_trace(
+                    "response",
+                    "mcp",
+                    format!("mcp:initialize:{}", config.name),
+                    None,
+                    Some(digest_serialize(&info).unwrap_or_else(|_| "unknown".to_string())),
+                    Some("ok".to_string()),
+                ))?;
+                observer.record_external_action(external_action_trace(
+                    "request",
+                    "mcp",
+                    format!("mcp:list_tools:{}", config.name),
+                    None,
+                    None,
+                    None,
+                ))?;
+                let tools_result = client.list_tools().await;
+                match tools_result {
+                    Ok(list) => {
+                        observer.record_external_action(external_action_trace(
+                            "response",
+                            "mcp",
+                            format!("mcp:list_tools:{}", config.name),
+                            None,
+                            Some(digest_serialize(&list).unwrap_or_else(|_| "unknown".to_string())),
+                            Some("ok".to_string()),
+                        ))?;
+                        (
+                            true,
+                            info.instructions,
+                            filter_discovered_tools(&config, list),
+                            None,
+                        )
+                    }
+                    Err(error) => {
+                        observer.record_external_action(external_action_trace(
+                            "response",
+                            "mcp",
+                            format!("mcp:list_tools:{}", config.name),
+                            None,
+                            None,
+                            Some(failed_external_action_outcome(error.to_string())),
+                        ))?;
+                        (
+                            true,
+                            info.instructions,
+                            Vec::new(),
+                            Some(redact_text(&error.to_string())),
+                        )
                     }
                 }
-                Err(error) => {
-                    observer.record_external_action(external_action_trace(
-                        "response",
-                        "mcp",
-                        format!("mcp:initialize:{}", config.name),
-                        None,
-                        None,
-                        Some(failed_external_action_outcome(error.to_string())),
-                    ))?;
-                    if config.required {
-                        return Err(error).with_context(|| {
-                            format!("failed to initialize required MCP server {}", config.name)
-                        });
-                    }
-                    (
-                        false,
-                        None,
-                        Vec::new(),
-                        Some(redact_text(&error.to_string())),
-                    )
+            }
+            Err(error) => {
+                observer.record_external_action(external_action_trace(
+                    "response",
+                    "mcp",
+                    format!("mcp:initialize:{}", config.name),
+                    None,
+                    None,
+                    Some(failed_external_action_outcome(error.to_string())),
+                ))?;
+                if config.required {
+                    return Err(error).with_context(|| {
+                        format!("failed to initialize required MCP server {}", config.name)
+                    });
                 }
-            };
+                (
+                    false,
+                    None,
+                    Vec::new(),
+                    Some(redact_text(&error.to_string())),
+                )
+            }
+        };
         Ok(ManagedServer {
             config,
             source,
@@ -618,13 +619,22 @@ impl McpManager {
         )
         .await?;
         if !server.connected {
-            let detail = server
-                .error
-                .clone()
-                .unwrap_or_else(|| "server did not connect".to_string());
-            server.client.begin_shutdown();
-            server.client.shutdown().await;
-            bail!("MCP server `{name}` failed to initialize: {detail}");
+            // OAuth-backed HTTP servers legitimately come back disconnected at
+            // add time — they initialize lazily inside a scoped run. Keep them
+            // registered (deferred) instead of failing the hot-add, so operators
+            // can add them from the runtime API / console in one step; they
+            // connect on first scoped use.
+            let lazy_oauth = server.config.requires_scoped_oauth()
+                && server.error.as_deref() == Some(OAUTH_LAZY_STARTUP_ERROR);
+            if !lazy_oauth {
+                let detail = server
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "server did not connect".to_string());
+                server.client.begin_shutdown();
+                server.client.shutdown().await;
+                bail!("MCP server `{name}` failed to initialize: {detail}");
+            }
         }
         let collision = {
             let tools = self.tools.read();
@@ -1250,6 +1260,160 @@ impl McpManager {
         Ok(next)
     }
 
+    /// Initializes one deferred OAuth MCP server inside the caller's execution
+    /// scope, enumerates its tools, and registers the adapters on `runtime` so
+    /// the current turn can see and call them.
+    ///
+    /// Returns `Ok(true)` when the server was hydrated and `Ok(false)` when it
+    /// needed nothing done — not a deferred OAuth server, already connected with
+    /// tools, or tombstoned by a prior fatal error. On a genuine connect/list
+    /// failure it returns the error and leaves the server in its deferred state
+    /// so the next run retries; it never marks the server permanently failed.
+    ///
+    /// Safe to run concurrently for the same server: `McpClient::initialize`
+    /// caches its live connection, `register_dynamic` rejects duplicates, and
+    /// the tool-map and surface updates are idempotent.
+    async fn hydrate_scoped_server(&self, name: &str, runtime: &ToolRuntime) -> Result<bool> {
+        let server = {
+            let servers = self.servers.read().await;
+            let Some(server) = servers.get(name) else {
+                return Ok(false);
+            };
+            if !server.config.requires_scoped_oauth() {
+                return Ok(false);
+            }
+            // A connected OAuth server is already hydrated (its adapters are
+            // registered), so settle here — including the rare server that
+            // connected but exposes zero tools, which would otherwise re-init
+            // and re-list on every run. Before hydration an OAuth server is
+            // always `connected == false` (the lazy path only runs after a tool
+            // is called, which requires hydration to have registered it first).
+            if server.connected {
+                return Ok(false);
+            }
+            if server
+                .error
+                .as_deref()
+                .is_some_and(mcp_server_error_blocks_scoped_oauth_reinitialize)
+            {
+                return Ok(false);
+            }
+            server.clone()
+        };
+
+        self.record_external_action(
+            "request",
+            format!("mcp:initialize:{name}"),
+            None,
+            None,
+            None,
+        )?;
+        let info = match server.client.initialize(&self.workspace_root).await {
+            Ok(info) => {
+                self.record_external_action(
+                    "response",
+                    format!("mcp:initialize:{name}"),
+                    None,
+                    Some(digest_serialize(&info).unwrap_or_else(|_| "unknown".to_string())),
+                    Some("ok".to_string()),
+                )?;
+                info
+            }
+            Err(error) => {
+                self.record_external_action(
+                    "response",
+                    format!("mcp:initialize:{name}"),
+                    None,
+                    None,
+                    Some(failed_external_action_outcome(error.to_string())),
+                )?;
+                return Err(error);
+            }
+        };
+
+        self.record_external_action(
+            "request",
+            format!("mcp:list_tools:{name}"),
+            None,
+            None,
+            None,
+        )?;
+        let discovered = match server.client.list_tools().await {
+            Ok(list) => {
+                self.record_external_action(
+                    "response",
+                    format!("mcp:list_tools:{name}"),
+                    None,
+                    Some(digest_serialize(&list).unwrap_or_else(|_| "unknown".to_string())),
+                    Some("ok".to_string()),
+                )?;
+                filter_discovered_tools(&server.config, list)
+            }
+            Err(error) => {
+                self.record_external_action(
+                    "response",
+                    format!("mcp:list_tools:{name}"),
+                    None,
+                    None,
+                    Some(failed_external_action_outcome(error.to_string())),
+                )?;
+                return Err(error);
+            }
+        };
+
+        // Register adapters and claim tool names, skipping any qualified name
+        // already owned by a *different* server. `add_server` refuses such
+        // collisions outright, but a deferred OAuth server escapes that check at
+        // add time (its tool set is empty then), so we must re-apply it here —
+        // otherwise overwriting the shared tool map would silently reroute
+        // another server's tool onto this credentialed server. A qualified name
+        // already owned by *this* server is a concurrent/idempotent re-hydration,
+        // not a collision.
+        let mut owned: Vec<DiscoveredMcpTool> = Vec::with_capacity(discovered.len());
+        for tool in discovered {
+            let conflict = {
+                let current = self.tools.read();
+                conflicting_tool_owner(&current, &tool)
+            };
+            if let Some(owner) = conflict {
+                tracing::warn!(
+                    target: "kheish.mcp",
+                    mcp_server = %tool.server_name,
+                    tool = %tool.qualified_name,
+                    owner = %owner,
+                    "skipping hydrated MCP tool whose qualified name is owned by another server"
+                );
+                continue;
+            }
+            // Not a cross-server collision. Register the adapter unless this
+            // server's own tool is already present (a concurrent/idempotent
+            // re-hydration), then claim the name.
+            if !self.tools.read().contains_key(&tool.qualified_name) {
+                let adapter =
+                    McpToolAdapter::new(Arc::new(self.clone()), discovered_tool_descriptor(&tool));
+                let _ = runtime.register_dynamic(Arc::new(adapter));
+            }
+            owned.push(tool);
+        }
+        {
+            let mut tools = self.tools.write();
+            for tool in &owned {
+                tools.insert(tool.qualified_name.clone(), tool.clone());
+            }
+        }
+        {
+            let mut servers = self.servers.write().await;
+            if let Some(existing) = servers.get_mut(name) {
+                existing.connected = true;
+                existing.instructions = info.instructions.clone();
+                existing.tools = owned.clone();
+                existing.error = None;
+            }
+        }
+        self.refresh_runtime_surface().await;
+        Ok(true)
+    }
+
     fn record_external_action(
         &self,
         phase: impl Into<String>,
@@ -1266,6 +1430,36 @@ impl McpManager {
             response_digest,
             outcome,
         ))
+    }
+}
+
+#[async_trait]
+impl McpScopedHydrator for McpManager {
+    async fn hydrate_scoped_mcp_tools(
+        &self,
+        runtime: &ToolRuntime,
+        allowed_servers: &BTreeSet<String>,
+    ) {
+        for name in allowed_servers {
+            match self.hydrate_scoped_server(name, runtime).await {
+                Ok(true) => {
+                    tracing::info!(
+                        target: "kheish.mcp",
+                        mcp_server = %name,
+                        "connected scoped OAuth MCP server for run"
+                    );
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::debug!(
+                        target: "kheish.mcp",
+                        mcp_server = %name,
+                        error = %format!("{error:#}"),
+                        "scoped OAuth MCP hydration skipped for run"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -1508,6 +1702,21 @@ fn text_looks_like_credential_material(value: &str) -> bool {
         })
 }
 
+/// Returns the name of the server that already owns `tool`'s qualified name in
+/// `current` when that owner is a *different* server — a genuine cross-server
+/// collision that hydration must not overwrite (doing so would reroute the other
+/// server's tool onto this one). A name owned by the tool's own server is an
+/// idempotent re-hydration, not a collision, and returns `None`.
+fn conflicting_tool_owner(
+    current: &BTreeMap<String, DiscoveredMcpTool>,
+    tool: &DiscoveredMcpTool,
+) -> Option<String> {
+    current
+        .get(&tool.qualified_name)
+        .map(|existing| existing.server_name.clone())
+        .filter(|owner| owner != &tool.server_name)
+}
+
 fn filter_discovered_tools(
     config: &McpServerConfig,
     list: rmcp::model::ListToolsResult,
@@ -1541,14 +1750,14 @@ mod tests {
         AUTH_STORE_MASTER_KEY_ENV, AuthManager, AuthSlotId, McpOAuthAccountRecordInput,
         register_ephemeral_debug_redaction_token,
     };
-    use kheish_runtime::{McpRuntimeSurface, NoopObserver};
+    use kheish_runtime::{McpRuntimeSurface, NoopObserver, ToolRuntime};
     use parking_lot::{Mutex as SyncMutex, RwLock as SyncRwLock};
     use serde_json::json;
     use tokio::sync::RwLock;
 
     use super::{
         DiscoveredMcpTool, MAX_MCP_SERVER_INSTRUCTION_CHARS, ManagedServer, McpManager,
-        OAUTH_LAZY_STARTUP_ERROR, mcp_collection_error_payload,
+        OAUTH_LAZY_STARTUP_ERROR, conflicting_tool_owner, mcp_collection_error_payload,
         mcp_runtime_error_implies_disconnected, read_resource_output_json,
     };
     use crate::client::McpClient;
@@ -2041,6 +2250,151 @@ mod tests {
                 .contains("MCP server oauth-http is disconnected"),
             "unexpected error: {error}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn conflicting_tool_owner_flags_only_cross_server_collisions() {
+        let mk = |server: &str, qualified: &str| DiscoveredMcpTool {
+            qualified_name: qualified.to_string(),
+            server_name: server.to_string(),
+            tool_name: "t".to_string(),
+            description: String::new(),
+            input_schema: json!({"type": "object"}),
+            tool_timeout_ms: 1_000,
+        };
+        let mut current = BTreeMap::new();
+        current.insert(
+            "mcp__foo_bar__search".to_string(),
+            mk("foo-bar", "mcp__foo_bar__search"),
+        );
+
+        // A *different* server whose name sanitizes to the same qualified tool
+        // name is a genuine collision hydration must not overwrite.
+        let intruder = mk("foo.bar", "mcp__foo_bar__search");
+        assert_eq!(
+            conflicting_tool_owner(&current, &intruder),
+            Some("foo-bar".to_string())
+        );
+
+        // The same server re-hydrating its own tool is not a collision.
+        let same = mk("foo-bar", "mcp__foo_bar__search");
+        assert_eq!(conflicting_tool_owner(&current, &same), None);
+
+        // An unclaimed qualified name is free to take.
+        let fresh = mk("foo.bar", "mcp__foo_bar__list");
+        assert_eq!(conflicting_tool_owner(&current, &fresh), None);
+    }
+
+    #[tokio::test]
+    async fn hydrate_scoped_server_skips_non_actionable_servers() -> Result<()> {
+        let workspace_root = std::env::current_dir()?;
+        let runtime = ToolRuntime::new(Arc::new(NoopObserver));
+
+        let stdio_config = McpServerConfig {
+            name: "plain".to_string(),
+            startup_timeout_ms: 10_000,
+            tool_timeout_ms: 120_000,
+            required: false,
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            inherit_env: true,
+            credential_secret_refs: Vec::new(),
+            transport: McpServerTransport::Stdio {
+                command: "true".to_string(),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                cwd: None,
+            },
+        };
+        let stdio_client =
+            Arc::new(McpClient::connect(&stdio_config, &workspace_root, None).await?);
+
+        let slot = AuthSlotId::new("mcp.oauth.oauth-http");
+        let tombstone_config = oauth_http_config(&slot);
+        let tombstone_client =
+            Arc::new(McpClient::connect(&tombstone_config, &workspace_root, None).await?);
+
+        let ready_config = oauth_http_config(&slot);
+        let ready_client =
+            Arc::new(McpClient::connect(&ready_config, &workspace_root, None).await?);
+        let ready_tool = DiscoveredMcpTool {
+            qualified_name: "mcp__oauth__ready".to_string(),
+            server_name: "ready-oauth".to_string(),
+            tool_name: "ready".to_string(),
+            description: "already hydrated".to_string(),
+            input_schema: json!({"type": "object"}),
+            tool_timeout_ms: 120_000,
+        };
+
+        let manager = McpManager {
+            workspace_root,
+            config_path: None,
+            selected_profiles: Vec::new(),
+            observer: Arc::new(NoopObserver),
+            servers: Arc::new(RwLock::new(BTreeMap::from([
+                (
+                    "plain".to_string(),
+                    ManagedServer {
+                        config: stdio_config,
+                        source: McpServerSource::CodexConfig,
+                        client: stdio_client,
+                        instructions: None,
+                        tools: Vec::new(),
+                        error: None,
+                        connected: false,
+                    },
+                ),
+                (
+                    "tombstoned-oauth".to_string(),
+                    ManagedServer {
+                        config: tombstone_config,
+                        source: McpServerSource::CodexConfig,
+                        client: tombstone_client,
+                        instructions: None,
+                        tools: Vec::new(),
+                        error: Some(
+                            "credential secret `mcp.oauth.oauth-http` is invalid".to_string(),
+                        ),
+                        connected: false,
+                    },
+                ),
+                (
+                    "ready-oauth".to_string(),
+                    ManagedServer {
+                        config: ready_config,
+                        source: McpServerSource::CodexConfig,
+                        client: ready_client,
+                        instructions: None,
+                        tools: vec![ready_tool],
+                        error: None,
+                        connected: true,
+                    },
+                ),
+            ]))),
+            tools: Arc::new(SyncRwLock::new(BTreeMap::new())),
+            runtime_surface: Arc::new(SyncRwLock::new(McpRuntimeSurface::default())),
+        };
+
+        // An unknown server is a no-op, never an error.
+        assert!(!manager.hydrate_scoped_server("missing", &runtime).await?);
+        // A non-OAuth server is left to the ambient boot path.
+        assert!(!manager.hydrate_scoped_server("plain", &runtime).await?);
+        // A tombstoned OAuth server (revoked/invalid) is not reinitialized.
+        assert!(
+            !manager
+                .hydrate_scoped_server("tombstoned-oauth", &runtime)
+                .await?
+        );
+        // An OAuth server already connected with tools is an idempotent no-op.
+        assert!(
+            !manager
+                .hydrate_scoped_server("ready-oauth", &runtime)
+                .await?
+        );
+
+        // None of the skipped servers registered adapters as a side effect.
+        assert!(manager.tools.read().is_empty());
         Ok(())
     }
 

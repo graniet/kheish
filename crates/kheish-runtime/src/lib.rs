@@ -71,8 +71,8 @@ pub use system_prompt::{
     SystemPromptSettings,
 };
 pub use tools::{
-    SandboxProfile, Tool, ToolContext, ToolDescriptor, ToolExecutionOutput, ToolHook,
-    ToolInputKind, ToolRuntime, ToolRuntimeLimits, ToolSchema, ToolSchemaField,
+    McpScopedHydrator, SandboxProfile, Tool, ToolContext, ToolDescriptor, ToolExecutionOutput,
+    ToolHook, ToolInputKind, ToolRuntime, ToolRuntimeLimits, ToolSchema, ToolSchemaField,
     normalize_tool_input_numbers,
 };
 pub use workspace::bounded_workspace_root;

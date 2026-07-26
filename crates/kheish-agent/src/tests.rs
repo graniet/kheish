@@ -163,6 +163,7 @@ mod tests {
                 mcp_tool_servers: BTreeMap::new(),
                 mcp_server_instructions: Vec::new(),
                 mcp_surface: Arc::new(parking_lot::RwLock::new(McpRuntimeSurface::default())),
+                mcp_hydrator: None,
             },
             supervisor.clone(),
         );

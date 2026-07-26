@@ -32,3 +32,6 @@ reports/
 .aidesigner/*
 !.aidesigner/.gitkeep
 __pycache__/
+
+# local auth-store master key (never commit)
+.kheish-auth-master.key

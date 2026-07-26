@@ -893,6 +893,7 @@ where
             mcp_tool_servers,
             mcp_server_instructions,
             mcp_surface: mcp_surface.clone(),
+            mcp_hydrator: Some(manager.clone() as Arc<dyn kheish_runtime::McpScopedHydrator>),
         },
         supervisor.clone(),
     );

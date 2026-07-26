@@ -153,6 +153,32 @@ pub trait Tool: Send + Sync {
     async fn execute(&self, ctx: ToolContext, input: Value) -> Result<ToolExecutionOutput>;
 }
 
+/// Connects deferred, scope-bound MCP servers on demand for the current turn.
+///
+/// Some MCP servers (OAuth-backed HTTP servers) cannot be initialized at the
+/// daemon's ambient boot: brokering their credentials requires a per-run
+/// execution scope that only exists once a session run starts. Such servers are
+/// registered but stay disconnected with no tools, so the model never sees
+/// them. This hook lets the runtime ask the MCP layer — which the runtime crate
+/// cannot depend on directly — to initialize those servers, enumerate their
+/// tools, and register the tool adapters on `runtime` while the caller's
+/// execution scope is active, so the tools become visible and callable this
+/// same turn.
+///
+/// Implementations must be idempotent (a server already connected with tools is
+/// left untouched) and best-effort (a server that fails to connect is skipped,
+/// never surfaced as a run failure).
+#[async_trait]
+pub trait McpScopedHydrator: Send + Sync {
+    /// Hydrates any deferred MCP servers among `allowed_servers` into `runtime`,
+    /// running inside the caller's active execution scope.
+    async fn hydrate_scoped_mcp_tools(
+        &self,
+        runtime: &ToolRuntime,
+        allowed_servers: &std::collections::BTreeSet<String>,
+    );
+}
+
 /// A lifecycle hook around tool execution.
 #[async_trait]
 pub trait ToolHook: Send + Sync {

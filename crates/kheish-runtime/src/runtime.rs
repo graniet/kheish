@@ -43,7 +43,7 @@ use crate::observability::{
 };
 use crate::permissions::PermissionEngine;
 use crate::system_prompt::{AgentPromptOverride, SystemPromptBuilder, active_route_section};
-use crate::tools::ToolRuntime;
+use crate::tools::{McpScopedHydrator, ToolRuntime};
 use crate::{
     DebugArtifact, DebugArtifactFormat, DebugCaptureLevel, debug_json_payload_for_level,
     summarize_json_value,
@@ -167,6 +167,9 @@ pub struct AgentRuntimeDependencies<M> {
     pub mcp_server_instructions: Vec<McpInstructionBlock>,
     /// Live MCP surface used by future turns after credential-backed servers change.
     pub mcp_surface: Arc<RwLock<McpRuntimeSurface>>,
+    /// Connects deferred, scope-bound MCP servers (OAuth) at the start of a run,
+    /// so their tools become visible and callable inside that run's scope.
+    pub mcp_hydrator: Option<Arc<dyn McpScopedHydrator>>,
 }
 
 impl<M> Clone for AgentRuntimeDependencies<M> {
@@ -188,6 +191,7 @@ impl<M> Clone for AgentRuntimeDependencies<M> {
             mcp_tool_servers: self.mcp_tool_servers.clone(),
             mcp_server_instructions: self.mcp_server_instructions.clone(),
             mcp_surface: self.mcp_surface.clone(),
+            mcp_hydrator: self.mcp_hydrator.clone(),
         }
     }
 }
@@ -1394,6 +1398,9 @@ where
             "session is waiting for user interaction before accepting new input"
         );
         self.refresh_session_state().await?;
+        // Deferred OAuth MCP servers connect here, in this run's scope, so their
+        // tools land in the surface before the prompt and tool set are built.
+        self.hydrate_scoped_mcp_tools().await;
         // The session contract rides the run's metadata so the engine can
         // enforce it at the completion boundary, whatever the input kind.
         let mut input = input;
@@ -1527,6 +1534,9 @@ where
             .clone()
             .ok_or_else(|| anyhow::anyhow!("missing pending run metadata"))?;
         self.refresh_session_state().await?;
+        // Re-hydrate deferred OAuth MCP tools in case this resume runs on a fresh
+        // process (e.g. after a daemon restart) where boot left them deferred.
+        self.hydrate_scoped_mcp_tools().await;
         debug!(
             session_id = %self.engine.conversation().session_id,
             thread_id = self.engine.conversation().thread_id.as_deref(),
@@ -1704,6 +1714,9 @@ where
             .clone()
             .ok_or_else(|| anyhow::anyhow!("missing pending run metadata"))?;
         self.refresh_session_state().await?;
+        // Re-hydrate deferred OAuth MCP tools in case this resume runs on a fresh
+        // process (e.g. after a daemon restart) where boot left them deferred.
+        self.hydrate_scoped_mcp_tools().await;
         debug!(
             session_id = %self.engine.conversation().session_id,
             thread_id = self.engine.conversation().thread_id.as_deref(),
@@ -2479,6 +2492,41 @@ where
                     "list_mcp_resources" | "list_mcp_resource_templates" | "read_mcp_resource"
                 )
             })
+    }
+
+    /// Connects deferred, scope-bound MCP servers (OAuth) for this run.
+    ///
+    /// OAuth-backed MCP servers cannot initialize at the daemon's ambient boot —
+    /// brokering their credentials needs a per-run execution scope — so they sit
+    /// registered-but-disconnected with no tools and the model never sees them.
+    /// Here, right after the session state is refreshed and before the system
+    /// prompt and tool surface are computed, we hand the MCP layer the servers
+    /// this session may use and let it initialize them, list their tools, and
+    /// register the adapters on the shared tool runtime while this run's scope is
+    /// active. The subsequent `refresh_system_prompt` / `effective_tool_surface`
+    /// then pick the tools up, so they are visible and callable this same turn.
+    ///
+    /// Best-effort: if there is no hydrator, no visible servers, or no active
+    /// cancellation token, this is a no-op; the hydrator itself never fails a run.
+    async fn hydrate_scoped_mcp_tools(&self) {
+        let Some(hydrator) = self.deps.mcp_hydrator.clone() else {
+            return;
+        };
+        let allowed = self.capability_visible_mcp_servers();
+        if allowed.is_empty() {
+            return;
+        }
+        let Some(cancellation) = current_cancellation_token() else {
+            return;
+        };
+        let execution_scope = self.execution_scope_with_capabilities();
+        let tools = self.deps.tools.clone();
+        crate::scope_execution(execution_scope, cancellation, async move {
+            hydrator
+                .hydrate_scoped_mcp_tools(tools.as_ref(), &allowed)
+                .await;
+        })
+        .await;
     }
 
     fn execution_scope_with_capabilities(&self) -> crate::ExecutionScope {
@@ -3302,6 +3350,7 @@ mod tests {
                 mcp_tool_servers: BTreeMap::new(),
                 mcp_server_instructions: Vec::new(),
                 mcp_surface: empty_mcp_surface(),
+                mcp_hydrator: None,
             },
             None,
             ModelGenerationConfig::default(),
@@ -3557,6 +3606,7 @@ mod tests {
                 mcp_tool_servers: BTreeMap::new(),
                 mcp_server_instructions: Vec::new(),
                 mcp_surface: empty_mcp_surface(),
+                mcp_hydrator: None,
             },
             None,
             ModelGenerationConfig::default(),
@@ -3664,6 +3714,7 @@ mod tests {
                 mcp_tool_servers: BTreeMap::new(),
                 mcp_server_instructions: Vec::new(),
                 mcp_surface: empty_mcp_surface(),
+                mcp_hydrator: None,
             },
             None,
             ModelGenerationConfig::default(),
@@ -3841,6 +3892,7 @@ mod tests {
                 mcp_tool_servers: BTreeMap::new(),
                 mcp_server_instructions: Vec::new(),
                 mcp_surface: empty_mcp_surface(),
+                mcp_hydrator: None,
             },
             None,
             ModelGenerationConfig::default(),
@@ -3965,6 +4017,7 @@ mod tests {
                 mcp_tool_servers: BTreeMap::new(),
                 mcp_server_instructions: Vec::new(),
                 mcp_surface: empty_mcp_surface(),
+                mcp_hydrator: None,
             },
         )
         .await?;
@@ -4046,6 +4099,7 @@ mod tests {
                         instructions: "Use search_openai_docs for official docs.".to_string(),
                     }],
                 ),
+                mcp_hydrator: None,
             },
             None,
             ModelGenerationConfig::default(),
@@ -4160,6 +4214,7 @@ mod tests {
                         instructions: "Use GitHub MCP for repository queries.".to_string(),
                     }],
                 ),
+                mcp_hydrator: None,
             },
             None,
             ModelGenerationConfig::default(),
@@ -4234,6 +4289,7 @@ mod tests {
                 mcp_tool_servers: BTreeMap::new(),
                 mcp_server_instructions: Vec::new(),
                 mcp_surface: empty_mcp_surface(),
+                mcp_hydrator: None,
             },
             None,
             ModelGenerationConfig::default(),
@@ -4335,6 +4391,7 @@ mod tests {
                         instructions: "Search official docs.".to_string(),
                     }],
                 ),
+                mcp_hydrator: None,
             },
             None,
             ModelGenerationConfig::default(),
@@ -4440,6 +4497,7 @@ mod tests {
                         instructions: "Search official docs.".to_string(),
                     }],
                 ),
+                mcp_hydrator: None,
             },
             None,
             ModelGenerationConfig::default(),
@@ -4535,6 +4593,7 @@ mod tests {
                         instructions: "Inspect resources on the docs-only server.".to_string(),
                     }],
                 ),
+                mcp_hydrator: None,
             },
             None,
             ModelGenerationConfig::default(),
