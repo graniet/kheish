@@ -53,6 +53,19 @@ class TerminalDeliveryError(RuntimeError):
     pass
 
 
+def classify_delivery_http_error(
+    status: int,
+    detail: str,
+    *,
+    retryable_statuses: Optional[set[int]] = None,
+) -> None:
+    retryable_statuses = retryable_statuses or set()
+    if status >= 500 or status in retryable_statuses:
+        raise RetryableDeliveryError(detail)
+    if status >= 400:
+        raise TerminalDeliveryError(detail)
+
+
 def bool_env(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:

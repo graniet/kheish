@@ -2,7 +2,7 @@
 
 import sys
 
-from platforms import CONNECTOR_FACTORIES
+from registry import CONNECTOR_FACTORIES
 
 
 def main(argv: list[str]) -> int:

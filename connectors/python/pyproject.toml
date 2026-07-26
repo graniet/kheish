@@ -14,4 +14,9 @@ discord = ["discord.py>=2.4,<3"]
 all = ["discord.py>=2.4,<3"]
 
 [tool.setuptools]
-py-modules = ["common", "platforms", "run_connector"]
+py-modules = ["common", "platforms", "registry", "run_connector"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["adapters*"]
+namespaces = false

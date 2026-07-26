@@ -26,6 +26,14 @@ Available sidecars:
 - `whatsapp`
 - `webhook`
 
+Code layout:
+
+- `run_connector.py` is the stable child-process entry point used by the daemon.
+- `registry.py` is the composition root that maps platform names to connector classes.
+- `adapters/` contains one platform adapter per module; adapters do not import each other.
+- `common.py` owns the shared sidecar lifecycle and daemon protocol client.
+- `platforms.py` preserves imports from the original flat module.
+
 Notes:
 
 - `signal` and `whatsapp` are intentionally marked `experimental` in the manifest.
@@ -38,6 +46,20 @@ Run one sidecar manually:
 
 ```bash
 python3 connectors/python/run_connector.py discord
+```
+
+Run the local Python checks from the repository root:
+
+```bash
+python3 -m unittest discover -s connectors/python/tests -v
+ruff check connectors/python
+```
+
+Run the real-daemon E2E coverage after changing sidecar structure or protocol code:
+
+```bash
+cargo test -p kheish-daemon --test routes_file_cli_e2e sidecar
+cargo test -p kheish-daemon --test routes_file_cli_e2e external_connector -- --test-threads=1
 ```
 
 Common test-only env vars used by daemon E2E tests:
