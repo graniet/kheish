@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as _;
 use std::fmt::{Debug, Formatter};
 use std::path::PathBuf;
@@ -28,7 +28,8 @@ use crate::{
 use kheish_auth::{RequestAuthProvider, ResolvedAuthMaterial};
 use kheish_codec::digest_json_value;
 use kheish_types::{
-    InputContentPart, ToolResultRecord, capped_default_max_output_tokens, model_max_output_tokens,
+    InputContentPart, ToolCallRecord, ToolResultRecord, capped_default_max_output_tokens,
+    model_max_output_tokens,
 };
 
 use super::anthropic_models::{
@@ -47,6 +48,9 @@ const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1/messages"
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 const MIN_ANTHROPIC_THINKING_BUDGET_TOKENS: u32 = 1024;
 const ANTHROPIC_INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+/// The beta that lets a request set `thinking.block_binding` and adds
+/// `input_transformations` to the response.
+const ANTHROPIC_THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 /// Configuration for the Anthropic provider adapter.
 #[derive(Clone)]
 pub struct AnthropicProviderConfig {
@@ -232,7 +236,25 @@ impl AnthropicProvider {
             thinking_budget,
             interleaved,
         )?;
-        let thinking = anthropic_thinking_request(profile.thinking, reasoning, thinking_budget);
+        let mut thinking = anthropic_thinking_request(profile.thinking, reasoning, thinking_budget);
+        if profile.preserved_thinking {
+            // Preserved thinking binds each thinking block to the conversation
+            // before it. Kheish edits that prefix in places (compaction, snip,
+            // microcompact, the repair of an orphaned tool call after a
+            // restart), and once an edit is in a session every later request
+            // replays it, so every request to these models asks the API to
+            // drop a block that no longer verifies rather than fail the run.
+            // The field is set explicitly because its default differs by
+            // account age; the dropped blocks come back in
+            // `input_transformations`.
+            let mut value = thinking
+                .thinking
+                .take()
+                .unwrap_or_else(|| json!({ "type": "adaptive" }));
+            value["block_binding"] = json!({ "prefix_mismatch_behavior": "drop_block" });
+            thinking.thinking = Some(value);
+            betas.push(ANTHROPIC_THINKING_BINDING_BETA);
+        }
         let thinking_on = match profile.thinking {
             ThinkingMode::Budget | ThinkingMode::AdaptiveOnRequest => thinking.thinking.is_some(),
             ThinkingMode::AdaptiveByDefault => true,
@@ -713,7 +735,8 @@ impl ModelProvider for AnthropicProvider {
             None,
             response_grant_id.clone(),
         )?;
-        let mut state = AnthropicStreamState::new(requested_model, self.config.pricing.clone());
+        let mut state =
+            AnthropicStreamState::new(&request, requested_model, self.config.pricing.clone());
         // Buffer raw bytes until a full SSE frame arrives so split UTF-8 code points
         // across transport chunks do not fail decoding prematurely.
         let mut buffer = Vec::new();
@@ -796,6 +819,7 @@ impl ModelProvider for AnthropicProvider {
             }
         }
 
+        state.finish(&sink)?;
         Ok(())
     }
 }
@@ -865,7 +889,9 @@ enum AnthropicToolChoice {
 
 #[derive(Clone, Debug)]
 enum PartialContentBlock {
-    Text,
+    Text {
+        text: String,
+    },
     Thinking {
         thinking: String,
         signature: String,
@@ -891,6 +917,23 @@ fn anthropic_prompt_from_items(
     let normalized = normalize_provider_prompt(prompt);
     let mut system = normalized.instructions;
     let mut messages = Vec::new();
+    // Tool calls by the assistant message that made them, so an answer with a
+    // recorded block order can place each tool use where the model wrote it.
+    let mut calls_by_message = BTreeMap::<String, Vec<ToolCallRecord>>::new();
+    for item in &normalized.conversation {
+        if let NormalizedConversationItem::AssistantToolCalls {
+            assistant_message_id: Some(message_id),
+            calls,
+            ..
+        } = item
+        {
+            calls_by_message
+                .entry(message_id.clone())
+                .or_default()
+                .extend(calls.iter().cloned());
+        }
+    }
+    let mut replayed_calls = BTreeSet::<String>::new();
 
     for item in normalized.conversation {
         match item {
@@ -934,17 +977,55 @@ fn anthropic_prompt_from_items(
                 ..
             } => {
                 let kind = MessageBuilderKind::Assistant {
-                    message_id: Some(id),
+                    message_id: Some(id.clone()),
                 };
-                for block in anthropic_preserved_blocks_from_context(provider_context.as_ref()) {
-                    push_message_block(&mut messages, kind.clone(), block);
-                }
-                if !content.is_empty() {
-                    push_message_block(
-                        &mut messages,
-                        kind,
-                        AnthropicContentBlock::Text { text: content },
-                    );
+                let (recorded, ordered) = anthropic_recorded_blocks(provider_context.as_ref());
+                if ordered {
+                    // Replay the answer as the API returned it: thinking blocks
+                    // keep their place between the text and the tool uses, so
+                    // the conversation before each of them is unchanged.
+                    let calls = calls_by_message.get(&id).cloned().unwrap_or_default();
+                    for block in recorded {
+                        let block = match block {
+                            RecordedBlock::Native(block) => block,
+                            RecordedBlock::Text(text) if text.trim().is_empty() => continue,
+                            RecordedBlock::Text(text) => AnthropicContentBlock::Text { text },
+                            RecordedBlock::ToolUse(call_id) => {
+                                let Some(call) = calls.iter().find(|call| call.id == call_id)
+                                else {
+                                    continue;
+                                };
+                                if !replayed_calls.insert(call.id.clone()) {
+                                    continue;
+                                }
+                                anthropic_tool_use_block(call)
+                            }
+                        };
+                        push_message_block(&mut messages, kind.clone(), block);
+                    }
+                    // Calls the record does not name follow in their own order.
+                    for call in &calls {
+                        if replayed_calls.insert(call.id.clone()) {
+                            push_message_block(
+                                &mut messages,
+                                kind.clone(),
+                                anthropic_tool_use_block(call),
+                            );
+                        }
+                    }
+                } else {
+                    for block in recorded {
+                        if let RecordedBlock::Native(block) = block {
+                            push_message_block(&mut messages, kind.clone(), block);
+                        }
+                    }
+                    if !content.is_empty() {
+                        push_message_block(
+                            &mut messages,
+                            kind,
+                            AnthropicContentBlock::Text { text: content },
+                        );
+                    }
                 }
             }
             NormalizedConversationItem::AssistantToolCalls {
@@ -953,16 +1034,15 @@ fn anthropic_prompt_from_items(
                 calls,
             } => {
                 for call in calls {
+                    if replayed_calls.contains(&call.id) {
+                        continue;
+                    }
                     push_message_block(
                         &mut messages,
                         MessageBuilderKind::Assistant {
                             message_id: assistant_message_id.clone(),
                         },
-                        AnthropicContentBlock::ToolUse {
-                            id: call.id.clone(),
-                            name: call.name.clone(),
-                            input: call.input.clone(),
-                        },
+                        anthropic_tool_use_block(&call),
                     );
                 }
             }
@@ -1006,44 +1086,81 @@ fn anthropic_external_action_target(endpoint: &str) -> String {
     format!("anthropic:{}", safe_url_audit_target(endpoint))
 }
 
-fn anthropic_preserved_blocks_from_context(
-    provider_context: Option<&Value>,
-) -> Vec<AnthropicContentBlock> {
+fn anthropic_tool_use_block(call: &ToolCallRecord) -> AnthropicContentBlock {
+    AnthropicContentBlock::ToolUse {
+        id: call.id.clone(),
+        name: call.name.clone(),
+        input: call.input.clone(),
+    }
+}
+
+fn anthropic_provider_context_payload(blocks: &[Value], input_transformations: &[Value]) -> Value {
+    let mut anthropic = serde_json::Map::new();
+    anthropic.insert("content_blocks".to_string(), Value::Array(blocks.to_vec()));
+    if !input_transformations.is_empty() {
+        anthropic.insert(
+            "input_transformations".to_string(),
+            Value::Array(input_transformations.to_vec()),
+        );
+    }
+    json!({ "anthropic": Value::Object(anthropic) })
+}
+
+/// One block of an assistant answer as recorded in its provider context.
+enum RecordedBlock {
+    /// A block replayed verbatim (thinking, redacted thinking).
+    Native(AnthropicContentBlock),
+    /// A text block, by value.
+    Text(String),
+    /// A tool use, by id: its input comes from the turn's tool call.
+    ToolUse(String),
+}
+
+/// Reads the recorded blocks of an assistant answer. `ordered` is true when
+/// the record carries the answer's full block order (text and tool uses
+/// included); older records list only the thinking blocks.
+fn anthropic_recorded_blocks(provider_context: Option<&Value>) -> (Vec<RecordedBlock>, bool) {
     let Some(blocks) = provider_context
         .and_then(|value| value.get("anthropic"))
         .and_then(|value| value.get("content_blocks"))
         .and_then(Value::as_array)
     else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
-    blocks
+    let mut ordered = false;
+    let recorded = blocks
         .iter()
         .filter_map(|block| match block.get("type").and_then(Value::as_str) {
             Some("thinking") => {
                 let thinking = block.get("thinking").and_then(Value::as_str)?;
                 let signature = block.get("signature").and_then(Value::as_str)?;
-                Some(AnthropicContentBlock::Thinking {
+                Some(RecordedBlock::Native(AnthropicContentBlock::Thinking {
                     thinking: thinking.to_string(),
                     signature: signature.to_string(),
-                })
+                }))
             }
             Some("redacted_thinking") => {
                 let data = block.get("data").and_then(Value::as_str)?;
-                Some(AnthropicContentBlock::RedactedThinking {
-                    data: data.to_string(),
-                })
+                Some(RecordedBlock::Native(
+                    AnthropicContentBlock::RedactedThinking {
+                        data: data.to_string(),
+                    },
+                ))
+            }
+            Some("text") => {
+                ordered = true;
+                let text = block.get("text").and_then(Value::as_str)?;
+                Some(RecordedBlock::Text(text.to_string()))
+            }
+            Some("tool_use") => {
+                ordered = true;
+                let id = block.get("id").and_then(Value::as_str)?;
+                Some(RecordedBlock::ToolUse(id.to_string()))
             }
             _ => None,
         })
-        .collect()
-}
-
-fn anthropic_provider_context_payload(blocks: &[Value]) -> Value {
-    json!({
-        "anthropic": {
-            "content_blocks": blocks,
-        }
-    })
+        .collect();
+    (recorded, ordered)
 }
 
 fn provider_audit_error(error: anyhow::Error) -> ProviderError {
@@ -1402,7 +1519,20 @@ fn render_tool_result_content(result: &ToolResultRecord) -> String {
 /// What one streamed Messages API answer has delivered so far.
 struct AnthropicStreamState {
     partial_blocks: BTreeMap<usize, PartialContentBlock>,
-    preserved_context_blocks: Vec<Value>,
+    /// The answer's content blocks in the order the API returned them, kept
+    /// so the assistant turn replays as the API expects it back: thinking and
+    /// redacted thinking verbatim (a thinking block keeps its signature even
+    /// when its text is empty, as under the default `display: "omitted"`),
+    /// text by value, tool uses by id.
+    layout: Vec<Value>,
+    /// Whether the answer carried a block whose bytes and position must be
+    /// replayed (thinking or redacted thinking).
+    has_positioned_blocks: bool,
+    /// The `input_transformations` the API reported for the request: thinking
+    /// blocks it dropped (or would have, on a request it does not enforce).
+    input_transformations: Vec<Value>,
+    /// Whether the turn's provider context was emitted.
+    finished: bool,
     /// The `usage` object as reported so far: `message_start` carries the
     /// prompt counts, `message_delta` the output count (and, on newer API
     /// versions, the prompt counts again), so the reports are merged, never
@@ -1414,17 +1544,28 @@ struct AnthropicStreamState {
     model: String,
     /// The route's price override for the requested model.
     pricing_override: Option<AnthropicPricing>,
+    session_id: String,
+    turn: usize,
 }
 
 impl AnthropicStreamState {
-    fn new(requested_model: String, pricing_override: Option<AnthropicPricing>) -> Self {
+    fn new(
+        request: &ModelRuntimeRequest,
+        requested_model: String,
+        pricing_override: Option<AnthropicPricing>,
+    ) -> Self {
         Self {
             partial_blocks: BTreeMap::new(),
-            preserved_context_blocks: Vec::new(),
+            layout: Vec::new(),
+            has_positioned_blocks: false,
+            input_transformations: Vec::new(),
+            finished: false,
             usage: serde_json::Map::new(),
             model: requested_model.clone(),
             requested_model,
             pricing_override,
+            session_id: request.session_id.clone(),
+            turn: request.turn,
         }
     }
 
@@ -1455,6 +1596,66 @@ impl AnthropicStreamState {
         sink.emit(ModelStreamEvent::Usage { usage: parsed })
             .map_err(map_sink_error)
     }
+
+    /// Records the `input_transformations` of a response and logs each
+    /// thinking block the API dropped or would have dropped.
+    fn record_input_transformations(&mut self, value: Option<&Value>) {
+        let Some(entries) = value.and_then(Value::as_array) else {
+            return;
+        };
+        for entry in entries {
+            if self.input_transformations.contains(entry) {
+                continue;
+            }
+            let field = |key: &str| {
+                entry
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let (transformation, reason, path) = (field("type"), field("reason"), field("path"));
+            warn!(
+                session_id = %self.session_id,
+                turn = self.turn,
+                provider = "anthropic",
+                transformation = %transformation,
+                reason = %reason,
+                path = %path,
+                "Anthropic reported a replayed thinking block it could not use"
+            );
+            self.input_transformations.push(entry.clone());
+        }
+    }
+
+    /// Emits what the turn keeps for its replay once its content is complete.
+    /// Idempotent: the stop event and the end of the stream both call it.
+    fn finish(&mut self, sink: &ModelEventSink) -> Result<(), ProviderError> {
+        if self.finished {
+            return Ok(());
+        }
+        self.finished = true;
+        if !self.has_positioned_blocks && self.input_transformations.is_empty() {
+            return Ok(());
+        }
+        sink.emit(ModelStreamEvent::ProviderContext {
+            value: anthropic_provider_context_payload(&self.layout, &self.input_transformations),
+        })
+        .map_err(map_sink_error)
+    }
+}
+
+fn content_block_index(event: &JsonSseEvent, what: &str) -> Result<usize, ProviderError> {
+    event
+        .payload
+        .get("index")
+        .and_then(Value::as_u64)
+        .map(|index| index as usize)
+        .ok_or_else(|| ProviderError {
+            message: format!("missing content block {what}index"),
+            retryable: true,
+            retry_after_ms: None,
+        })
 }
 
 fn handle_sse_event(
@@ -1462,13 +1663,9 @@ fn handle_sse_event(
     state: &mut AnthropicStreamState,
     sink: &ModelEventSink,
 ) -> Result<(), ProviderError> {
-    let AnthropicStreamState {
-        partial_blocks,
-        preserved_context_blocks,
-        ..
-    } = state;
     match event.event_type.as_str() {
-        "ping" | "message_stop" => Ok(()),
+        "ping" => Ok(()),
+        "message_stop" => state.finish(sink),
         "message_start" => {
             if let Some(message) = event.payload.get("message") {
                 if let Some(id) = message.get("id").and_then(Value::as_str) {
@@ -1480,6 +1677,7 @@ fn handle_sse_event(
                 if let Some(model) = message.get("model").and_then(Value::as_str) {
                     state.model = model.to_string();
                 }
+                state.record_input_transformations(message.get("input_transformations"));
                 if let Some(usage) = message.get("usage") {
                     state.merge_usage(usage, sink)?;
                 }
@@ -1487,15 +1685,7 @@ fn handle_sse_event(
             Ok(())
         }
         "content_block_start" => {
-            let index = event
-                .payload
-                .get("index")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| ProviderError {
-                    message: "missing content block index".to_string(),
-                    retryable: true,
-                    retry_after_ms: None,
-                })? as usize;
+            let index = content_block_index(&event, "")?;
             let block = event
                 .payload
                 .get("content_block")
@@ -1510,15 +1700,16 @@ fn handle_sse_event(
                 .unwrap_or("unknown");
             let partial = match block_type {
                 "text" => {
-                    if let Some(text) = block.get("text").and_then(Value::as_str) {
-                        if !text.is_empty() {
-                            sink.emit(ModelStreamEvent::TextDelta {
-                                text: text.to_string(),
-                            })
+                    let text = block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if !text.is_empty() {
+                        sink.emit(ModelStreamEvent::TextDelta { text: text.clone() })
                             .map_err(map_sink_error)?;
-                        }
                     }
-                    PartialContentBlock::Text
+                    PartialContentBlock::Text { text }
                 }
                 "thinking" => PartialContentBlock::Thinking {
                     thinking: block
@@ -1558,27 +1749,20 @@ fn handle_sse_event(
                 },
                 _ => PartialContentBlock::Ignored,
             };
-            partial_blocks.insert(index, partial);
+            state.partial_blocks.insert(index, partial);
             Ok(())
         }
         "content_block_delta" => {
-            let index = event
-                .payload
-                .get("index")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| ProviderError {
-                    message: "missing content block delta index".to_string(),
-                    retryable: true,
-                    retry_after_ms: None,
-                })? as usize;
+            let index = content_block_index(&event, "delta ")?;
             let delta = event.payload.get("delta").ok_or_else(|| ProviderError {
                 message: "missing content block delta payload".to_string(),
                 retryable: true,
                 retry_after_ms: None,
             })?;
-            match partial_blocks.get_mut(&index) {
-                Some(PartialContentBlock::Text) => {
+            match state.partial_blocks.get_mut(&index) {
+                Some(PartialContentBlock::Text { text: buffer }) => {
                     if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                        buffer.push_str(text);
                         sink.emit(ModelStreamEvent::TextDelta {
                             text: text.to_string(),
                         })
@@ -1611,16 +1795,11 @@ fn handle_sse_event(
             Ok(())
         }
         "content_block_stop" => {
-            let index = event
-                .payload
-                .get("index")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| ProviderError {
-                    message: "missing content block stop index".to_string(),
-                    retryable: true,
-                    retry_after_ms: None,
-                })? as usize;
-            match partial_blocks.remove(&index) {
+            let index = content_block_index(&event, "stop ")?;
+            match state.partial_blocks.remove(&index) {
+                Some(PartialContentBlock::Text { text }) => {
+                    state.layout.push(json!({ "type": "text", "text": text }));
+                }
                 Some(PartialContentBlock::ToolUse {
                     id,
                     name,
@@ -1635,6 +1814,7 @@ fn handle_sse_event(
                             retry_after_ms: None,
                         })?
                     };
+                    state.layout.push(json!({ "type": "tool_use", "id": id }));
                     sink.emit(ModelStreamEvent::ToolCall {
                         call: kheish_types::ToolCallRecord {
                             id,
@@ -1645,52 +1825,58 @@ fn handle_sse_event(
                         },
                     })
                     .map_err(map_sink_error)?;
-                    Ok(())
                 }
+                // The signature carries the reasoning: a block whose text is
+                // empty (the default display) is kept all the same, since
+                // leaving one out of the replay breaks the chain of blocks.
                 Some(PartialContentBlock::Thinking {
                     thinking,
                     signature,
                 }) => {
-                    if !thinking.is_empty() && !signature.is_empty() {
-                        preserved_context_blocks.push(json!({
+                    if !signature.is_empty() {
+                        state.has_positioned_blocks = true;
+                        state.layout.push(json!({
                             "type": "thinking",
                             "thinking": thinking,
                             "signature": signature,
                         }));
-                        sink.emit(ModelStreamEvent::ProviderContext {
-                            value: anthropic_provider_context_payload(preserved_context_blocks),
-                        })
-                        .map_err(map_sink_error)?;
                     }
-                    Ok(())
                 }
                 Some(PartialContentBlock::RedactedThinking { data }) => {
                     if !data.is_empty() {
-                        preserved_context_blocks.push(json!({
+                        state.has_positioned_blocks = true;
+                        state.layout.push(json!({
                             "type": "redacted_thinking",
                             "data": data,
                         }));
-                        sink.emit(ModelStreamEvent::ProviderContext {
-                            value: anthropic_provider_context_payload(preserved_context_blocks),
-                        })
-                        .map_err(map_sink_error)?;
                     }
-                    Ok(())
                 }
-                _ => Ok(()),
+                Some(PartialContentBlock::Ignored) | None => {}
             }
+            Ok(())
         }
         "message_delta" => {
-            if let Some(delta) = event.payload.get("delta") {
-                if let Some(stop_reason) = delta.get("stop_reason").and_then(Value::as_str) {
-                    sink.emit(ModelStreamEvent::Stop {
-                        reason: map_stop_reason(stop_reason),
-                    })
-                    .map_err(map_sink_error)?;
-                }
-            }
             if let Some(usage) = event.payload.get("usage") {
                 state.merge_usage(usage, sink)?;
+            }
+            state.record_input_transformations(
+                event
+                    .payload
+                    .get("input_transformations")
+                    .or_else(|| event.payload.pointer("/delta/input_transformations")),
+            );
+            if let Some(stop_reason) = event
+                .payload
+                .pointer("/delta/stop_reason")
+                .and_then(Value::as_str)
+            {
+                // The runtime settles the turn on the stop event: everything
+                // the turn keeps goes out before it.
+                state.finish(sink)?;
+                sink.emit(ModelStreamEvent::Stop {
+                    reason: map_stop_reason(stop_reason),
+                })
+                .map_err(map_sink_error)?;
             }
             Ok(())
         }
@@ -2178,7 +2364,12 @@ mod tests {
         ] {
             let provider = AnthropicProvider::new(AnthropicProviderConfig::new(model, "key"))?;
             let body = provider.build_request_body(&minimal_request(generation.clone()))?;
-            assert_eq!(&body["thinking"], thinking, "{model} thinking");
+            // The conversation binding control is checked on its own below.
+            let mut sent = body["thinking"].clone();
+            if let Some(sent) = sent.as_object_mut() {
+                sent.remove("block_binding");
+            }
+            assert_eq!(&sent, thinking, "{model} thinking");
             assert_eq!(
                 body.get("output_config")
                     .map(|value| value["effort"].clone()),
@@ -2229,7 +2420,7 @@ mod tests {
                 reasoning: Some(reasoning),
                 ..ModelGenerationConfig::default()
             }))?;
-            assert_eq!(request.body["thinking"], json!({ "type": "adaptive" }));
+            assert_eq!(request.body["thinking"]["type"], "adaptive");
             assert_eq!(request.body["output_config"], json!({ "effort": effort }));
             assert!(!request.body.to_string().contains("budget_tokens"));
             assert!(!request.betas.contains(&ANTHROPIC_INTERLEAVED_THINKING_BETA));
@@ -3200,6 +3391,332 @@ mod tests {
         );
         let consumed = runtime.budget_snapshot().consumed;
         assert_eq!(consumed.cache_read_input_tokens, 500_000);
+        Ok(())
+    }
+
+    /// A streamed answer that interleaves thinking, text and a tool use the
+    /// way Claude Opus 5.5 does under the default `display: "omitted"`:
+    /// thinking blocks with empty text and a signature.
+    const INTERLEAVED_THINKING_STREAM: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-a1\",\"model\":\"claude-opus-5-5\",\"usage\":{\"input_tokens\":40,\"output_tokens\":1}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"EqQBCkYIBxgCKkBsig-one==\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Checking the host. \"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Scan the port first.\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"EqQBCkYIBxgCKkBsig-two==\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_scan\",\"name\":\"mcp__fregate__scan_target\",\"input\":{}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":3,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"target\\\":\\\"example.com\\\"}\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":3}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_details\":null},\"usage\":{\"output_tokens\":90}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+
+    /// The answer above as the API expects it back.
+    fn interleaved_answer_content() -> Value {
+        json!([
+            {"type": "thinking", "thinking": "", "signature": "EqQBCkYIBxgCKkBsig-one=="},
+            {"type": "text", "text": "Checking the host. "},
+            {"type": "thinking", "thinking": "Scan the port first.", "signature": "EqQBCkYIBxgCKkBsig-two=="},
+            {"type": "tool_use", "id": "toolu_scan", "name": "mcp__fregate__scan_target", "input": {"target": "example.com"}},
+        ])
+    }
+
+    fn user_item(id: &str, content: &str) -> ProviderInputItem {
+        ProviderInputItem::Message {
+            id: id.to_string(),
+            role: kheish_types::Role::User,
+            content: content.to_string(),
+            content_parts: Vec::new(),
+            attachments: Vec::new(),
+            provider_response_id: None,
+            provider_context: None,
+        }
+    }
+
+    /// Runs the interleaved answer through the runtime and returns the
+    /// conversation items the engine would store for it.
+    async fn interleaved_answer_items() -> Result<Vec<ProviderInputItem>> {
+        let (url, _recorded) =
+            spawn_recording_mock_server(vec![MockHttpResponse::sse(INTERLEAVED_THINKING_STREAM)])
+                .await?;
+        let provider = AnthropicProvider::new(AnthropicProviderConfig {
+            base_url: url,
+            ..AnthropicProviderConfig::new("claude-opus-5-5", "test-key")
+        })?;
+        let runtime = ModelRuntime::new(
+            provider,
+            ModelRetryPolicy {
+                max_attempts: 1,
+                ..ModelRetryPolicy::default()
+            },
+            ModelBudget::default(),
+            Arc::new(NoopObserver),
+        );
+        let turn = runtime
+            .next_turn(default_model_request("fm-mission"))
+            .await?;
+        let message = turn.assistant_message;
+        let mut items = vec![ProviderInputItem::Message {
+            id: message.id.clone(),
+            role: message.role.clone(),
+            content: message.content.clone(),
+            content_parts: Vec::new(),
+            attachments: Vec::new(),
+            provider_response_id: message.provider_response_id.clone(),
+            provider_context: message.provider_context.clone(),
+        }];
+        for call in turn.tool_calls {
+            items.push(ProviderInputItem::ToolCall {
+                assistant_message_id: Some(message.id.clone()),
+                call,
+            });
+        }
+        Ok(items)
+    }
+
+    fn opus_5_5_request(items: Vec<ProviderInputItem>) -> ModelRuntimeRequest {
+        let mut request = runtime_request("fm-mission", ModelGenerationConfig::default());
+        request.prompt.items = items;
+        request
+    }
+
+    #[tokio::test]
+    async fn thinking_blocks_replay_byte_for_byte_in_their_original_order() -> Result<()> {
+        let mut items = vec![user_item("u1", "Verify the exposure on example.com.")];
+        items.extend(interleaved_answer_items().await?);
+        items.push(ProviderInputItem::ToolResult {
+            result: ToolResultRecord {
+                call_id: "toolu_scan".to_string(),
+                output: json!({"open_ports": [443]}),
+                is_error: false,
+                tool_name: Some("mcp__fregate__scan_target".to_string()),
+                offset: None,
+                timestamp_ms: None,
+                context_updates: Vec::new(),
+                hook_contexts: Vec::new(),
+            },
+        });
+        let provider =
+            AnthropicProvider::new(AnthropicProviderConfig::new("claude-opus-5-5", "test-key"))?;
+        let body = provider.build_request_body(&opus_5_5_request(items))?;
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(messages[1]["role"], "assistant");
+        // Both thinking blocks, the empty-text one included, keep their
+        // signatures and their place between the text and the tool use.
+        assert_eq!(messages[1]["content"], interleaved_answer_content());
+        assert_eq!(messages[2]["content"][0]["type"], "tool_result");
+        assert_eq!(messages[2]["content"][0]["tool_use_id"], "toolu_scan");
+        Ok(())
+    }
+
+    #[test]
+    fn preserved_thinking_models_send_drop_block_under_the_binding_beta() -> Result<()> {
+        for model in [
+            "claude-opus-5-5",
+            "claude-fable-5-1",
+            "claude-mythos-5-1",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "anthropic.claude-opus-5-5",
+        ] {
+            let provider = AnthropicProvider::new(AnthropicProviderConfig::new(model, "key"))?;
+            // With and without a reasoning config: the field is always set.
+            for generation in [
+                ModelGenerationConfig::default(),
+                ModelGenerationConfig {
+                    reasoning: Some(ReasoningConfig {
+                        effort: Some(ReasoningEffort::High),
+                        summary: Some(ReasoningSummary::Auto),
+                        ..ReasoningConfig::default()
+                    }),
+                    ..ModelGenerationConfig::default()
+                },
+            ] {
+                let request = provider.build_request(&minimal_request(generation))?;
+                assert_eq!(request.body["thinking"]["type"], "adaptive", "{model}");
+                assert_eq!(
+                    request.body["thinking"]["block_binding"],
+                    json!({ "prefix_mismatch_behavior": "drop_block" }),
+                    "{model}"
+                );
+                assert!(
+                    request
+                        .betas
+                        .contains(&"thinking-binding-controls-2026-08-01"),
+                    "{model}"
+                );
+            }
+        }
+        for model in ["claude-opus-5", "claude-opus-4-8", "claude-sonnet-5"] {
+            let provider = AnthropicProvider::new(AnthropicProviderConfig::new(model, "key"))?;
+            let request = provider.build_request(&minimal_request(ModelGenerationConfig {
+                reasoning: Some(ReasoningConfig {
+                    effort: Some(ReasoningEffort::High),
+                    ..ReasoningConfig::default()
+                }),
+                ..ModelGenerationConfig::default()
+            }))?;
+            assert!(
+                request.body["thinking"].get("block_binding").is_none(),
+                "{model}"
+            );
+            assert!(request.betas.is_empty(), "{model}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn orphaned_tool_call_recovery_keeps_the_prefix_and_sends_drop_block() -> Result<()> {
+        // The request that produced the answer, before the daemon died with
+        // the tool call in flight.
+        let before = vec![user_item("u1", "Verify the exposure on example.com.")];
+        // After the restart, the next run's prompt: the answer and its tool
+        // call, no result, then the continuation input.
+        let mut after = before.clone();
+        after.extend(interleaved_answer_items().await?);
+        after.push(user_item("u2", "The run was interrupted; continue."));
+
+        let (url, recorded) = spawn_recording_mock_server(vec![
+            MockHttpResponse::sse(&sse_text_stream("msg-before", "ok")),
+            MockHttpResponse::sse(&sse_text_stream("msg-after", "ok")),
+        ])
+        .await?;
+        let provider = AnthropicProvider::new(AnthropicProviderConfig {
+            base_url: url,
+            ..AnthropicProviderConfig::new("claude-opus-5-5", "test-key")
+        })?;
+        for items in [before, after] {
+            let (sender, _receiver) = mpsc::unbounded_channel();
+            provider
+                .stream(opus_5_5_request(items), ModelEventSink::new(sender))
+                .await?;
+        }
+        let recorded = recorded.lock().clone();
+        let before = recorded[0].json();
+        let after = recorded[1].json();
+
+        // The prefix the thinking blocks were minted under is unchanged...
+        assert_eq!(before["system"], after["system"]);
+        assert_eq!(before["tools"], after["tools"]);
+        assert_eq!(before["messages"][0], after["messages"][0]);
+        // ...the answer replays verbatim...
+        assert_eq!(
+            after["messages"][1]["content"],
+            interleaved_answer_content()
+        );
+        // ...the missing result is appended after it as an error...
+        let repaired = &after["messages"][2]["content"][0];
+        assert_eq!(repaired["type"], "tool_result");
+        assert_eq!(repaired["tool_use_id"], "toolu_scan");
+        assert_eq!(repaired["is_error"], true);
+        assert!(
+            repaired["content"][0]["text"]
+                .as_str()
+                .expect("text")
+                .contains("tool result missing")
+        );
+        assert_eq!(
+            after["messages"][3]["content"][0]["text"],
+            "The run was interrupted; continue."
+        );
+        // ...and the request opts into drop_block under the binding beta.
+        assert_eq!(
+            after["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+            "drop_block"
+        );
+        assert!(
+            recorded[1]
+                .header("anthropic-beta")
+                .expect("beta header")
+                .split(',')
+                .any(|beta| beta == "thinking-binding-controls-2026-08-01")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compacted_history_replays_post_boundary_thinking_with_drop_block() -> Result<()> {
+        // After a compaction the window starts with the summary; the turns
+        // kept after the boundary replay their thinking.
+        let mut items = vec![ProviderInputItem::Summary {
+            summary: SummaryBlock {
+                title: "compaction".to_string(),
+                content: "<summary>The agent scanned example.com.</summary>".to_string(),
+            },
+        }];
+        items.extend(interleaved_answer_items().await?);
+        let provider =
+            AnthropicProvider::new(AnthropicProviderConfig::new("claude-opus-5-5", "test-key"))?;
+        let request = provider.build_request(&opus_5_5_request(items))?;
+        let messages = request.body["messages"].as_array().expect("messages");
+        assert_eq!(messages[0]["role"], "user");
+        assert!(
+            messages[0]["content"][0]["text"]
+                .as_str()
+                .expect("summary text")
+                .contains("The agent scanned example.com.")
+        );
+        assert_eq!(messages[1]["content"], interleaved_answer_content());
+        assert_eq!(
+            request.body["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+            "drop_block"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn input_transformations_are_kept_with_the_answer() -> Result<()> {
+        let stream = sse_text_stream("msg-dropped", "ok").replace(
+            "\"usage\":{\"input_tokens\":5",
+            "\"input_transformations\":[{\"type\":\"thinking_dropped\",\"path\":\"messages.1.content.0\",\"reason\":\"prefix_binding_mismatch\"}],\"usage\":{\"input_tokens\":5",
+        );
+        let (url, _recorded) =
+            spawn_recording_mock_server(vec![MockHttpResponse::sse(&stream)]).await?;
+        let provider = AnthropicProvider::new(AnthropicProviderConfig {
+            base_url: url,
+            ..AnthropicProviderConfig::new("claude-opus-5-5", "test-key")
+        })?;
+        let runtime = ModelRuntime::new(
+            provider,
+            ModelRetryPolicy {
+                max_attempts: 1,
+                ..ModelRetryPolicy::default()
+            },
+            ModelBudget::default(),
+            Arc::new(NoopObserver),
+        );
+        let turn = runtime
+            .next_turn(default_model_request("fm-mission"))
+            .await?;
+        let context = turn
+            .assistant_message
+            .provider_context
+            .expect("the transformation is recorded with the answer");
+        assert_eq!(
+            context["anthropic"]["input_transformations"][0]["reason"],
+            "prefix_binding_mismatch"
+        );
         Ok(())
     }
 

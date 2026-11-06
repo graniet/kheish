@@ -119,3 +119,35 @@ and Claude Mythos 5.1 and 0.05 times on Claude Opus 5.5 and Claude Sonnet 5.5; C
 switches to its long-prompt prices above 100,000 prompt tokens). A route's `pricing` override, when
 an embedder sets one, replaces the price of the model the request names. A model without a published
 price is counted at zero cost.
+
+### Preserved thinking
+
+On Claude Fable 5.1, Claude Mythos 5.1, Claude Opus 5.5, Claude Sonnet 5.5 and Claude Haiku 5.5
+(and later 5.x ids) each thinking block's signature binds it to the conversation before it: the
+system prompt, the tools, and every earlier message. The driver keeps that conversation intact:
+
+- **Replay.** An answer's content blocks are recorded in the order the API returned them, in the
+  assistant message's provider context (`anthropic.content_blocks`): thinking and redacted
+  thinking blocks verbatim, signature included even when the thinking text is empty (the default
+  `display: "omitted"`), text by value, tool uses by id. The next request rebuilds the assistant
+  turn in that order, so a thinking block between two tool uses stays there.
+- **Edits.** Kheish edits an earlier part of the history in a few places: compaction, snip and
+  microcompact rewrite or remove earlier turns (the thinking of the turns before the latest
+  boundary is left out as a contiguous leading run, which the API accepts), and after a restart
+  an orphaned tool call gets a synthetic error result. Once an edit is in a session, every later
+  request replays it. Every request to these models therefore sends the binding control:
+
+  ```json
+  "thinking": {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "drop_block"}}
+  ```
+
+  with the `thinking-binding-controls-2026-08-01` beta. The field is set explicitly because its
+  default depends on the account's age (accounts created on or after 2026-08-31 are enforced with
+  `error` by default; older accounts let a stale block through). With `drop_block` a block that no
+  longer verifies is dropped and the request proceeds, instead of the run failing with a 400.
+- **Monitoring.** The response's `input_transformations` (each dropped block, with its `path` and
+  `reason`) is logged as a warning and kept in the assistant message's provider context
+  (`anthropic.input_transformations`).
+
+The models without the conversation check (Claude Opus 5, Claude Fable 5, Claude Sonnet 5, Claude
+Opus 4.8 and earlier) get neither the field nor the beta.
