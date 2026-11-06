@@ -1,6 +1,7 @@
 //! Provider adapters that map semantic Kheish requests onto concrete model APIs.
 
 mod anthropic;
+mod anthropic_models;
 mod attachments;
 mod errors;
 mod execution_headers;

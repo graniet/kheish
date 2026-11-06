@@ -326,6 +326,7 @@ impl From<crate::ReasoningEffortArg> for kheish_runtime::ReasoningEffort {
             crate::ReasoningEffortArg::Medium => Self::Medium,
             crate::ReasoningEffortArg::High => Self::High,
             crate::ReasoningEffortArg::Xhigh => Self::Xhigh,
+            crate::ReasoningEffortArg::Max => Self::Max,
         }
     }
 }

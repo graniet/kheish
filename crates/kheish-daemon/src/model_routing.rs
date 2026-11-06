@@ -236,7 +236,7 @@ fn ensure_high_reasoning_for_generation(generation: &mut ModelGenerationConfig) 
         .get_or_insert_with(ReasoningConfig::default);
     if !matches!(
         reasoning.effort,
-        Some(ReasoningEffort::High | ReasoningEffort::Xhigh)
+        Some(ReasoningEffort::High | ReasoningEffort::Xhigh | ReasoningEffort::Max)
     ) {
         reasoning.effort = Some(ReasoningEffort::High);
     }

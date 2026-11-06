@@ -144,6 +144,7 @@ Fields:
 - `generation.allow_parallel_tool_calls`
 - `generation.max_output_tokens`
 - `generation.temperature`
+- `generation.reasoning`: `effort` (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`), `summary`, `budget_tokens`, `interleaved`; how each driver maps them is in [Model providers and routes](./model-providers#thinking-and-effort). OpenAI routes reject `max` and `budget_tokens`.
 - `generation.response_format`
 
 Route precedence is:

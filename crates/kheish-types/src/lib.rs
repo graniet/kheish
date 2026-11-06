@@ -1,4 +1,5 @@
 mod capabilities;
+mod claude;
 mod compaction;
 mod hooks;
 mod interaction;
@@ -13,6 +14,10 @@ mod tools;
 
 pub use capabilities::{
     CapabilityScope, CredentialScope, PersonaSkillAssignment, allow_list_allows_entry,
+};
+pub use claude::{
+    ClaudeModelFamily, ClaudeModelId, claude_context_window, claude_max_output_tokens,
+    parse_claude_model_id,
 };
 pub use compaction::{
     CompactBoundaryMetadata, CompactionBoundary, CompactionStrategy, CompactionTrigger,
@@ -134,7 +139,13 @@ mod tests {
 
     #[test]
     fn model_context_window_matches_supported_provider_families() {
-        assert_eq!(model_context_window("claude-opus-4-6"), Some(200_000));
+        // Claude 4.6 and later generations serve a 1M-token window.
+        assert_eq!(model_context_window("claude-opus-4-6"), Some(1_000_000));
+        assert_eq!(model_context_window("claude-opus-5-5"), Some(1_000_000));
+        assert_eq!(
+            model_max_output_tokens("claude-opus-5-5").upper_limit,
+            128_000
+        );
         assert_eq!(model_context_window("claude-sonnet-4-5"), Some(200_000));
         assert_eq!(model_context_window("gpt-5.4"), Some(400_000));
         assert_eq!(model_context_window("gpt-4.1"), Some(1_047_576));

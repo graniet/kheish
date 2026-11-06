@@ -31,6 +31,7 @@ use kheish_types::{
     InputContentPart, ToolResultRecord, capped_default_max_output_tokens, model_max_output_tokens,
 };
 
+use super::anthropic_models::{ThinkingMode, anthropic_adaptive_effort, anthropic_model_profile};
 use super::attachments::{
     AttachmentRenderCache, contains_supported_image_attachment, image_edit_attachment_hint_text,
     load_attachment_preview_image, load_document_attachment_text, load_image_attachment,
@@ -137,6 +138,12 @@ impl Debug for AnthropicProviderConfig {
     }
 }
 
+/// One Messages API request: its body and the beta features the body relies on.
+struct AnthropicRequest {
+    body: Value,
+    betas: Vec<&'static str>,
+}
+
 /// Anthropic streaming provider based on the Messages SSE API.
 pub struct AnthropicProvider {
     client: Client,
@@ -167,7 +174,15 @@ impl AnthropicProvider {
         })
     }
 
+    #[cfg(test)]
     fn build_request_body(&self, request: &ModelRuntimeRequest) -> Result<Value, ProviderError> {
+        Ok(self.build_request(request)?.body)
+    }
+
+    fn build_request(
+        &self,
+        request: &ModelRuntimeRequest,
+    ) -> Result<AnthropicRequest, ProviderError> {
         let effective_model = request
             .generation
             .model
@@ -197,49 +212,44 @@ impl AnthropicProvider {
                 .collect()
         };
         let reasoning = request.generation.reasoning.as_ref();
-        let adaptive = anthropic_model_uses_adaptive_thinking(&effective_model);
-        // Current-generation models reject `budget_tokens` and sampling
-        // parameters with HTTP 400; thinking is adaptive-only there and depth
-        // is steered through `output_config.effort`.
-        let thinking_budget = if adaptive {
-            None
-        } else {
+        let profile = anthropic_model_profile(&effective_model);
+        let mut betas = Vec::new();
+        // Adaptive generations reject `budget_tokens` and sampling parameters
+        // with HTTP 400; their depth is steered through `output_config.effort`.
+        let thinking_budget = if profile.thinking == ThinkingMode::Budget {
             anthropic_reasoning_budget(reasoning)?
+        } else {
+            None
         };
+        let interleaved = thinking_budget.is_some()
+            && reasoning
+                .map(|reasoning| reasoning.interleaved)
+                .unwrap_or(false);
+        if interleaved {
+            // Adaptive thinking interleaves on its own, without the beta.
+            betas.push(ANTHROPIC_INTERLEAVED_THINKING_BETA);
+        }
         let max_tokens = anthropic_max_tokens_for_reasoning(
             &effective_model,
             request.generation.max_output_tokens,
             default_max_output_tokens,
             thinking_budget,
-            reasoning
-                .map(|reasoning| reasoning.interleaved)
-                .unwrap_or(false),
+            interleaved,
         )?;
-
-        let adaptive_thinking = if adaptive {
-            anthropic_adaptive_thinking_value(reasoning)
-        } else {
-            None
+        let thinking = anthropic_thinking_request(profile.thinking, reasoning, thinking_budget);
+        let thinking_on = match profile.thinking {
+            ThinkingMode::Budget | ThinkingMode::AdaptiveOnRequest => thinking.thinking.is_some(),
+            ThinkingMode::AdaptiveByDefault => true,
         };
-        let thinking_requested = thinking_budget.is_some() || adaptive_thinking.is_some();
 
         let mut body = serde_json::Map::new();
-        body.insert("model".to_string(), Value::String(effective_model));
+        body.insert("model".to_string(), Value::String(effective_model.clone()));
         body.insert("max_tokens".to_string(), Value::Number(max_tokens.into()));
-        if let Some(budget_tokens) = thinking_budget {
-            body.insert(
-                "thinking".to_string(),
-                json!({
-                    "type": "enabled",
-                    "budget_tokens": budget_tokens,
-                }),
-            );
+        if let Some(value) = thinking.thinking {
+            body.insert("thinking".to_string(), value);
         }
-        if let Some(thinking) = adaptive_thinking {
-            body.insert("thinking".to_string(), thinking);
-            if let Some(effort) = reasoning.and_then(anthropic_effort_for_adaptive) {
-                body.insert("output_config".to_string(), json!({ "effort": effort }));
-            }
+        if let Some(effort) = thinking.effort {
+            body.insert("output_config".to_string(), json!({ "effort": effort }));
         }
         body.insert("stream".to_string(), Value::Bool(true));
         body.insert(
@@ -252,15 +262,21 @@ impl AnthropicProvider {
         if !tools.is_empty() {
             body.insert("tools".to_string(), Value::Array(tools));
         }
-        if thinking_requested
+        if thinking_on
             && matches!(
                 request.generation.tool_choice,
                 ToolChoice::Required | ToolChoice::Specific { .. }
             )
         {
+            let message = if profile.thinking == ThinkingMode::AdaptiveByDefault {
+                format!(
+                    "Anthropic model {effective_model} always thinks, and thinking may not be enabled when tool_choice forces tool use; use tool_choice auto"
+                )
+            } else {
+                "Anthropic thinking may not be enabled when tool_choice forces tool use".to_string()
+            };
             return Err(ProviderError {
-                message: "Anthropic thinking may not be enabled when tool_choice forces tool use"
-                    .to_string(),
+                message,
                 retryable: false,
                 retry_after_ms: None,
             });
@@ -274,7 +290,9 @@ impl AnthropicProvider {
                 serde_json::to_value(tool_choice).expect("tool choice serializes"),
             );
         }
-        if !adaptive && let Some(temperature) = request.generation.temperature {
+        if profile.thinking == ThinkingMode::Budget
+            && let Some(temperature) = request.generation.temperature
+        {
             body.insert(
                 "temperature".to_string(),
                 serde_json::Number::from_f64(temperature as f64)
@@ -282,7 +300,10 @@ impl AnthropicProvider {
                     .unwrap_or(Value::Null),
             );
         }
-        Ok(Value::Object(body))
+        Ok(AnthropicRequest {
+            body: Value::Object(body),
+            betas,
+        })
     }
 
     async fn auth_material(
@@ -336,7 +357,7 @@ impl AnthropicProvider {
     fn headers_from_material(
         &self,
         material: &ResolvedAuthMaterial,
-        reasoning: Option<&ReasoningConfig>,
+        request_betas: &[&'static str],
     ) -> Result<HeaderMap, ProviderError> {
         let mut headers = HeaderMap::new();
         for (name, value) in &material.headers {
@@ -375,15 +396,9 @@ impl AnthropicProvider {
                 beta_values.push(beta.clone());
             }
         }
-        if reasoning
-            .map(|reasoning| reasoning.interleaved)
-            .unwrap_or(false)
-        {
-            if !beta_values
-                .iter()
-                .any(|existing| existing == ANTHROPIC_INTERLEAVED_THINKING_BETA)
-            {
-                beta_values.push(ANTHROPIC_INTERLEAVED_THINKING_BETA.to_string());
+        for beta in request_betas {
+            if !beta_values.iter().any(|existing| existing == beta) {
+                beta_values.push((*beta).to_string());
             }
         }
         headers.insert(
@@ -566,13 +581,15 @@ impl ModelProvider for AnthropicProvider {
         request: ModelRuntimeRequest,
         sink: ModelEventSink,
     ) -> std::result::Result<(), ProviderError> {
-        let body = self.build_request_body(&request)?;
+        let AnthropicRequest {
+            body,
+            betas: request_betas,
+        } = self.build_request(&request)?;
         let mut force_refresh = false;
         let (response, response_target, response_grant_id) = loop {
             let auth_material = self.auth_material(force_refresh).await?;
             let grant_id = auth_material.grant_id.clone();
-            let mut headers =
-                self.headers_from_material(&auth_material, request.generation.reasoning.as_ref())?;
+            let mut headers = self.headers_from_material(&auth_material, &request_betas)?;
             super::insert_execution_context_headers(&mut headers, &request.session_id)?;
             let endpoint = auth_material
                 .base_url_override
@@ -1040,32 +1057,72 @@ fn provider_audit_error(error: anyhow::Error) -> ProviderError {
     }
 }
 
-/// Returns whether the model rejects `budget_tokens` and sampling parameters
-/// in favor of adaptive thinking (`thinking: {type: "adaptive"}` +
-/// `output_config.effort`). One line per model family; extend the list when a
-/// new generation ships.
-fn anthropic_model_uses_adaptive_thinking(model: &str) -> bool {
-    let canonical = model.trim().trim_matches('"').to_ascii_lowercase();
-    ["fable-5", "mythos-5", "opus-4-7", "opus-4-8", "sonnet-5"]
-        .iter()
-        .any(|family| canonical.contains(family))
+/// The `thinking` and `output_config.effort` values of one request.
+struct AnthropicThinkingRequest {
+    thinking: Option<Value>,
+    effort: Option<&'static str>,
 }
 
-/// Builds the `thinking` value for adaptive-only models. Returns `None` when
-/// the request does not ask for reasoning — the parameter is then omitted
-/// entirely, which is the only spelling every adaptive model accepts (an
-/// explicit `disabled` is rejected on some of them).
-fn anthropic_adaptive_thinking_value(reasoning: Option<&ReasoningConfig>) -> Option<Value> {
-    let reasoning = reasoning?;
-    let wants_thinking = reasoning
+/// Builds the thinking fields for a model's thinking mode:
+/// - `budget_tokens` on generations that still take a manual budget;
+/// - on Claude Opus 4.7 and 4.8, adaptive thinking only when the run asks for
+///   reasoning (omitting `thinking` turns it off there);
+/// - on the 5.x generations, which think whether or not `thinking` is sent,
+///   adaptive thinking with the requested effort whenever the run carries a
+///   reasoning config, and nothing otherwise so the model's default applies.
+fn anthropic_thinking_request(
+    mode: ThinkingMode,
+    reasoning: Option<&ReasoningConfig>,
+    budget: Option<u32>,
+) -> AnthropicThinkingRequest {
+    let none = AnthropicThinkingRequest {
+        thinking: None,
+        effort: None,
+    };
+    match mode {
+        ThinkingMode::Budget => AnthropicThinkingRequest {
+            thinking: budget.map(|budget_tokens| {
+                json!({
+                    "type": "enabled",
+                    "budget_tokens": budget_tokens,
+                })
+            }),
+            effort: None,
+        },
+        ThinkingMode::AdaptiveOnRequest => {
+            let Some(reasoning) = reasoning.filter(|reasoning| anthropic_wants_thinking(reasoning))
+            else {
+                return none;
+            };
+            AnthropicThinkingRequest {
+                thinking: Some(anthropic_adaptive_thinking_value(reasoning)),
+                effort: anthropic_adaptive_effort(reasoning, mode),
+            }
+        }
+        ThinkingMode::AdaptiveByDefault => {
+            let Some(reasoning) = reasoning.filter(|reasoning| !reasoning.is_empty()) else {
+                return none;
+            };
+            AnthropicThinkingRequest {
+                thinking: Some(anthropic_adaptive_thinking_value(reasoning)),
+                effort: anthropic_adaptive_effort(reasoning, mode),
+            }
+        }
+    }
+}
+
+fn anthropic_wants_thinking(reasoning: &ReasoningConfig) -> bool {
+    reasoning
         .effort
         .map(|effort| effort != ReasoningEffort::None)
         .unwrap_or(false)
         || reasoning.budget_tokens.is_some()
-        || reasoning.interleaved;
-    if !wants_thinking {
-        return None;
-    }
+        || reasoning.interleaved
+}
+
+/// The adaptive `thinking` value: `{"type": "adaptive"}`, with the readable
+/// summary display when the run asks for a reasoning summary.
+fn anthropic_adaptive_thinking_value(reasoning: &ReasoningConfig) -> Value {
     let mut thinking = serde_json::Map::new();
     thinking.insert("type".to_string(), Value::String("adaptive".to_string()));
     if reasoning
@@ -1073,36 +1130,12 @@ fn anthropic_adaptive_thinking_value(reasoning: Option<&ReasoningConfig>) -> Opt
         .and_then(|summary| summary.as_provider_str())
         .is_some()
     {
-        // Adaptive thinking exposes readable reasoning through the display
-        // knob; the closest match for any requested summary style.
         thinking.insert(
             "display".to_string(),
             Value::String("summarized".to_string()),
         );
     }
-    Some(Value::Object(thinking))
-}
-
-/// Maps the requested reasoning depth onto the adaptive `output_config.effort`
-/// scale. Legacy `budget_tokens` configs are folded onto the nearest tier so
-/// existing routes keep a comparable thinking depth after a model upgrade.
-fn anthropic_effort_for_adaptive(reasoning: &ReasoningConfig) -> Option<&'static str> {
-    if let Some(effort) = reasoning.effort {
-        return match effort {
-            ReasoningEffort::None => None,
-            ReasoningEffort::Minimal | ReasoningEffort::Low => Some("low"),
-            ReasoningEffort::Medium => Some("medium"),
-            ReasoningEffort::High => Some("high"),
-            ReasoningEffort::Xhigh => Some("xhigh"),
-        };
-    }
-    let budget = reasoning.budget_tokens?;
-    Some(match budget {
-        0..=2_048 => "low",
-        2_049..=4_096 => "medium",
-        4_097..=8_192 => "high",
-        _ => "xhigh",
-    })
+    Value::Object(thinking)
 }
 
 fn anthropic_reasoning_budget(
@@ -1154,7 +1187,9 @@ fn anthropic_budget_for_effort(effort: ReasoningEffort) -> Option<u32> {
         ReasoningEffort::Low => Some(2_048),
         ReasoningEffort::Medium => Some(4_096),
         ReasoningEffort::High => Some(8_192),
-        ReasoningEffort::Xhigh => Some(32_768),
+        // The largest manual budget Kheish asks for; the adaptive ladder's
+        // `max` has no budget equivalent.
+        ReasoningEffort::Xhigh | ReasoningEffort::Max => Some(32_768),
     }
 }
 
@@ -2031,32 +2066,116 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_model_capability_table_matches_current_generations() {
-        for model in [
-            "claude-fable-5",
-            "claude-mythos-5",
-            "claude-opus-4-7",
-            "claude-opus-4-8",
-            "claude-sonnet-5",
-            "anthropic.claude-opus-4-8",
+    fn every_current_family_gets_its_documented_thinking_shape() -> Result<()> {
+        let generation = ModelGenerationConfig {
+            reasoning: Some(ReasoningConfig {
+                effort: Some(ReasoningEffort::High),
+                ..ReasoningConfig::default()
+            }),
+            temperature: Some(0.5),
+            ..ModelGenerationConfig::default()
+        };
+        let adaptive = json!({ "type": "adaptive" });
+        let budget = json!({ "type": "enabled", "budget_tokens": 8_192 });
+        for (model, thinking, effort) in [
+            ("claude-opus-5-5", &adaptive, Some("high")),
+            ("anthropic.claude-opus-5-5", &adaptive, Some("high")),
+            ("claude-opus-5", &adaptive, Some("high")),
+            ("claude-fable-5-1", &adaptive, Some("high")),
+            ("claude-fable-5", &adaptive, Some("high")),
+            ("claude-mythos-5-1", &adaptive, Some("high")),
+            ("claude-sonnet-5-5", &adaptive, Some("high")),
+            (
+                "us.anthropic.claude-sonnet-5-5-v1:0",
+                &adaptive,
+                Some("high"),
+            ),
+            ("claude-sonnet-5", &adaptive, Some("high")),
+            ("claude-haiku-5-5", &adaptive, Some("high")),
+            ("anthropic.claude-haiku-5-5", &adaptive, Some("high")),
+            ("claude-opus-4-8", &adaptive, Some("high")),
+            ("anthropic.claude-opus-4-8", &adaptive, Some("high")),
+            ("claude-opus-4-7", &adaptive, Some("high")),
+            ("claude-opus-4-6", &budget, None),
+            ("claude-sonnet-4-6", &budget, None),
+            ("claude-sonnet-4-5-20250929", &budget, None),
+            ("claude-haiku-4-5-20251001", &budget, None),
         ] {
-            assert!(
-                super::anthropic_model_uses_adaptive_thinking(model),
-                "{model} should use adaptive thinking"
+            let provider = AnthropicProvider::new(AnthropicProviderConfig::new(model, "key"))?;
+            let body = provider.build_request_body(&minimal_request(generation.clone()))?;
+            assert_eq!(&body["thinking"], thinking, "{model} thinking");
+            assert_eq!(
+                body.get("output_config")
+                    .map(|value| value["effort"].clone()),
+                effort.map(|effort| json!(effort)),
+                "{model} effort"
+            );
+            // Sampling parameters are a 400 wherever thinking is adaptive-only.
+            assert_eq!(
+                body.get("temperature").is_some(),
+                effort.is_none(),
+                "{model} temperature"
             );
         }
-        for model in [
-            "claude-opus-4-6",
-            "claude-opus-4-5",
-            "claude-sonnet-4-6",
-            "claude-sonnet-4-5",
-            "claude-haiku-4-5",
+        Ok(())
+    }
+
+    #[test]
+    fn claude_opus_5_5_is_never_sent_budget_tokens() -> Result<()> {
+        let provider =
+            AnthropicProvider::new(AnthropicProviderConfig::new("claude-opus-5-5", "test-key"))?;
+        for (reasoning, effort) in [
+            (
+                ReasoningConfig {
+                    budget_tokens: Some(4_096),
+                    ..ReasoningConfig::default()
+                },
+                "medium",
+            ),
+            (
+                ReasoningConfig {
+                    effort: Some(ReasoningEffort::Max),
+                    interleaved: true,
+                    ..ReasoningConfig::default()
+                },
+                "max",
+            ),
+            // Thinking cannot be turned off on Claude Opus 5.5: `none` asks for
+            // the least of it.
+            (
+                ReasoningConfig {
+                    effort: Some(ReasoningEffort::None),
+                    ..ReasoningConfig::default()
+                },
+                "low",
+            ),
         ] {
-            assert!(
-                !super::anthropic_model_uses_adaptive_thinking(model),
-                "{model} should keep the legacy request shape"
-            );
+            let request = provider.build_request(&minimal_request(ModelGenerationConfig {
+                reasoning: Some(reasoning),
+                ..ModelGenerationConfig::default()
+            }))?;
+            assert_eq!(request.body["thinking"], json!({ "type": "adaptive" }));
+            assert_eq!(request.body["output_config"], json!({ "effort": effort }));
+            assert!(!request.body.to_string().contains("budget_tokens"));
+            assert!(!request.betas.contains(&ANTHROPIC_INTERLEAVED_THINKING_BETA));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn opus_4_8_thinks_only_when_asked() -> Result<()> {
+        let provider =
+            AnthropicProvider::new(AnthropicProviderConfig::new("claude-opus-4-8", "test-key"))?;
+        let body = provider.build_request_body(&minimal_request(ModelGenerationConfig {
+            reasoning: Some(ReasoningConfig {
+                effort: Some(ReasoningEffort::None),
+                ..ReasoningConfig::default()
+            }),
+            ..ModelGenerationConfig::default()
+        }))?;
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("output_config").is_none());
+        Ok(())
     }
 
     #[test]
@@ -2645,9 +2764,21 @@ mod tests {
 
     #[test]
     fn anthropic_headers_add_interleaved_thinking_beta_when_requested() {
+        let interleaved = ModelGenerationConfig {
+            reasoning: Some(ReasoningConfig {
+                effort: Some(ReasoningEffort::High),
+                summary: None,
+                budget_tokens: None,
+                interleaved: true,
+            }),
+            ..ModelGenerationConfig::default()
+        };
         let provider =
             AnthropicProvider::new(AnthropicProviderConfig::new("claude-opus-4-6", "test-key"))
                 .expect("provider should build");
+        let request = provider
+            .build_request(&minimal_request(interleaved.clone()))
+            .expect("request should build");
         let headers = provider
             .headers_from_material(
                 &ResolvedAuthMaterial {
@@ -2658,12 +2789,7 @@ mod tests {
                     grant_id: None,
                     lease_id: None,
                 },
-                Some(&ReasoningConfig {
-                    effort: Some(ReasoningEffort::High),
-                    summary: None,
-                    budget_tokens: None,
-                    interleaved: true,
-                }),
+                &request.betas,
             )
             .expect("headers should build");
 
@@ -2673,6 +2799,15 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some(ANTHROPIC_INTERLEAVED_THINKING_BETA)
         );
+
+        // Adaptive thinking interleaves without the beta.
+        let adaptive =
+            AnthropicProvider::new(AnthropicProviderConfig::new("claude-opus-4-8", "test-key"))
+                .expect("provider should build");
+        let request = adaptive
+            .build_request(&minimal_request(interleaved))
+            .expect("request should build");
+        assert!(request.betas.is_empty());
     }
 
     #[test]
@@ -2693,7 +2828,7 @@ mod tests {
                     grant_id: None,
                     lease_id: None,
                 },
-                None,
+                &[],
             )
             .expect("headers should build");
         assert_eq!(

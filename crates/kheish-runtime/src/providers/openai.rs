@@ -784,6 +784,13 @@ fn openai_reasoning_payload(
             retry_after_ms: None,
         });
     }
+    if reasoning.effort == Some(crate::model::ReasoningEffort::Max) {
+        return Err(ProviderError {
+            message: "OpenAI reasoning does not accept effort max; use xhigh instead".to_string(),
+            retryable: false,
+            retry_after_ms: None,
+        });
+    }
 
     let mut payload = serde_json::Map::new();
     if let Some(effort) = reasoning.effort {
@@ -5842,6 +5849,29 @@ mod tests {
             .expect_err("OpenAI should reject Anthropic thinking budget");
 
         assert!(error.message.contains("budget_tokens"));
+
+        let error = provider
+            .build_request_body(
+                &ModelRuntimeRequest {
+                    attempt: 1,
+                    kind: kheish_core::ModelRequestKind::MainLoop,
+                    session_id: "session-openai-max".to_string(),
+                    thread_id: None,
+                    turn: 1,
+                    prompt: ProviderPrompt::default(),
+                    available_tools: Vec::new(),
+                    generation: ModelGenerationConfig {
+                        reasoning: Some(ReasoningConfig {
+                            effort: Some(ReasoningEffort::Max),
+                            ..ReasoningConfig::default()
+                        }),
+                        ..ModelGenerationConfig::default()
+                    },
+                },
+                false,
+            )
+            .expect_err("OpenAI has no max effort");
+        assert!(error.message.contains("effort max"));
     }
 
     #[test]

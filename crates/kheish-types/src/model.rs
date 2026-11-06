@@ -163,6 +163,9 @@ pub struct ModelMaxOutputTokens {
 /// daemon already routes in normal operation. Unknown models return `None` so
 /// callers can fall back to safer runtime heuristics.
 pub fn model_context_window(model: &str) -> Option<usize> {
+    if let Some(window) = crate::claude::claude_context_window(model) {
+        return Some(window);
+    }
     let canonical = model.to_lowercase();
     if canonical.starts_with("claude-") {
         return Some(200_000);
@@ -188,38 +191,41 @@ pub fn model_context_window(model: &str) -> Option<usize> {
 /// Returns native output token defaults and upper bounds for a model identifier.
 pub fn model_max_output_tokens(model: &str) -> ModelMaxOutputTokens {
     let canonical = model.to_lowercase();
-    let (default, upper_limit) = if canonical.contains("opus-4-6") {
-        (64_000, 128_000)
-    } else if canonical.contains("sonnet-4-6") {
-        (32_000, 128_000)
-    } else if canonical.contains("opus-4-5")
-        || canonical.contains("sonnet-4")
-        || canonical.contains("haiku-4")
-    {
-        (32_000, 64_000)
-    } else if canonical.contains("opus-4-1") || canonical.contains("opus-4") {
-        (32_000, 32_000)
-    } else if canonical.contains("claude-3-opus") {
-        (4_096, 4_096)
-    } else if canonical.contains("claude-3-sonnet")
-        || canonical.contains("3-5-sonnet")
-        || canonical.contains("3-5-haiku")
-    {
-        (8_192, 8_192)
-    } else if canonical.contains("claude-3-haiku") {
-        (4_096, 4_096)
-    } else if canonical.contains("3-7-sonnet") {
-        (32_000, 64_000)
-    } else if canonical.starts_with("gemini-2.5-") {
-        (65_536, 65_536)
-    } else if canonical.starts_with("gemini-3") || canonical.contains("image-preview") {
-        (32_768, 32_768)
-    } else {
-        (
-            CAPPED_DEFAULT_MAX_OUTPUT_TOKENS,
-            ESCALATED_MAX_OUTPUT_TOKENS,
-        )
-    };
+    let (default, upper_limit) =
+        if let Some(limits) = crate::claude::claude_max_output_tokens(model) {
+            limits
+        } else if canonical.contains("opus-4-6") {
+            (64_000, 128_000)
+        } else if canonical.contains("sonnet-4-6") {
+            (32_000, 128_000)
+        } else if canonical.contains("opus-4-5")
+            || canonical.contains("sonnet-4")
+            || canonical.contains("haiku-4")
+        {
+            (32_000, 64_000)
+        } else if canonical.contains("opus-4-1") || canonical.contains("opus-4") {
+            (32_000, 32_000)
+        } else if canonical.contains("claude-3-opus") {
+            (4_096, 4_096)
+        } else if canonical.contains("claude-3-sonnet")
+            || canonical.contains("3-5-sonnet")
+            || canonical.contains("3-5-haiku")
+        {
+            (8_192, 8_192)
+        } else if canonical.contains("claude-3-haiku") {
+            (4_096, 4_096)
+        } else if canonical.contains("3-7-sonnet") {
+            (32_000, 64_000)
+        } else if canonical.starts_with("gemini-2.5-") {
+            (65_536, 65_536)
+        } else if canonical.starts_with("gemini-3") || canonical.contains("image-preview") {
+            (32_768, 32_768)
+        } else {
+            (
+                CAPPED_DEFAULT_MAX_OUTPUT_TOKENS,
+                ESCALATED_MAX_OUTPUT_TOKENS,
+            )
+        };
     ModelMaxOutputTokens {
         default,
         upper_limit: upper_limit.max(default),
@@ -688,6 +694,9 @@ pub enum ReasoningEffort {
     Medium,
     High,
     Xhigh,
+    /// The deepest rung of providers whose ladder goes past `xhigh`
+    /// (Anthropic's `max`). Providers without it reject it explicitly.
+    Max,
 }
 
 impl ReasoningEffort {
@@ -699,6 +708,7 @@ impl ReasoningEffort {
             Self::Medium => "medium",
             Self::High => "high",
             Self::Xhigh => "xhigh",
+            Self::Max => "max",
         }
     }
 }

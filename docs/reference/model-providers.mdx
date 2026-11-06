@@ -41,3 +41,44 @@ provider (a model relay that holds the real provider key, for example) can there
 request against the session and run it belongs to, and account for it.
 
 Compaction summaries and every retry of a model attempt carry the same headers as the run's turns.
+
+## Anthropic driver
+
+The `anthropic` driver speaks the Messages API over streaming HTTP. It recognizes a model by its
+family and version through every platform spelling: first-party ids (`claude-opus-5-5`), Amazon
+Bedrock ids (`anthropic.claude-opus-5-5`, `us.anthropic.claude-sonnet-5-5-v1:0`), Google Vertex AI
+snapshots (`claude-opus-4-5@20251101`) and context variants (`claude-opus-4-6[1m]`).
+
+### Thinking and effort
+
+Each generation takes thinking in one of three shapes:
+
+| Generations | Request shape | When the run sets no reasoning |
+|---|---|---|
+| Claude Opus 5.5, Claude Opus 5, Claude Fable 5.1 and 5, Claude Mythos 5.1 and 5, Claude Sonnet 5.5 and 5, Claude Haiku 5.5, and later 5.x releases | `thinking: {"type": "adaptive"}` with `output_config.effort`. `budget_tokens` and sampling parameters (`temperature`) are never sent: these models return a 400 for them. | `thinking` is omitted; the model still thinks, at its default effort (`medium` on Claude Opus 5.5 and Claude Haiku 5.5, `high` elsewhere). |
+| Claude Opus 4.8 and 4.7 | Adaptive thinking with `output_config.effort`, only when the run asks for reasoning. No `budget_tokens`, no sampling parameters. | No thinking. |
+| Claude Opus 4.6, Claude Sonnet 4.6, and earlier | `thinking: {"type": "enabled", "budget_tokens": N}`, sampling parameters allowed. | No thinking. |
+
+`generation.reasoning.effort` maps onto the adaptive ladder:
+
+| `reasoning.effort` | `output_config.effort` |
+|---|---|
+| `none` | `low` on the 5.x generations, whose thinking cannot be turned off; no thinking on Claude Opus 4.8 and 4.7 |
+| `minimal`, `low` | `low` |
+| `medium` | `medium` |
+| `high` | `high` |
+| `xhigh` | `xhigh` |
+| `max` | `max` |
+
+A `reasoning.budget_tokens` sent to an adaptive generation is folded onto the nearest rung (up to
+2,048 `low`, up to 4,096 `medium`, up to 8,192 `high`, up to 32,768 `xhigh`, above that `max`).
+`reasoning.summary` asks for `thinking.display: "summarized"`. On budget generations the effort
+picks a budget (`minimal` 1,024, `low` 2,048, `medium` 4,096, `high` 8,192, `xhigh` and `max`
+32,768), and `reasoning.interleaved` adds the `interleaved-thinking-2025-05-14` beta; adaptive
+thinking interleaves on its own and gets no such header.
+
+Thinking that is always on rules out forced tool use: on the 5.x generations a run whose
+`generation.tool_choice` is `required` or `specific` fails before the request is sent. Use `auto`.
+
+Kheish also knows each current generation's limits: a 1M-token context window and 128K output
+tokens on Claude Opus 4.6 and later, Claude Sonnet 4.6 and later, and every 5.x generation.

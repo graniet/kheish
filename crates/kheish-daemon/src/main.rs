@@ -4282,6 +4282,7 @@ enum ReasoningEffortArg {
     Medium,
     High,
     Xhigh,
+    Max,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
