@@ -324,16 +324,20 @@ It is worth pausing on *why* only `workspace`-scoped procedures may be promoted 
 
 ## Tool overrides per session
 
-Sometimes you need to tweak one session's tool surface without rewriting its persona, its scopes, or the underlying profile. That is what **session tool overrides** are for (`SessionToolOverrides`): two lists, `enable` and `disable`.
+Sometimes you need to tweak one session's tool surface without rewriting its persona, its scopes, or the underlying profile. That is what **session tool overrides** are for (`SessionToolOverrides`): an optional allow-list, `allow`, and two lists, `enable` and `disable`.
 
+- `allow` is the outermost gate: when present, only the exact tool names it lists can ever be visible to the session. Names are exact, built-in (`read_file`) or MCP (`mcp__fregate__scan_target`); there are no wildcards. Everything else is invisible, including tools a later daemon build adds, so an embedder that wants "exactly these tools" stays fail-closed across upgrades. An empty list (`"allow": []`) hides every tool; an absent `allow` leaves the surface unconstrained.
 - `enable` restores tools a profile retired (adds them to the surface).
 - `disable` retires tools a profile allows (removes them from the surface).
 
 The rules:
 
 - A name in **both** `enable` and `disable` is rejected ("cannot be both enabled and disabled").
+- An `enable` entry outside `allow` is rejected: it could never be visible.
+- `allow` only narrows. It never adds a tool the profile, the capability scope, or operator gating hides.
 - Changes are only allowed **while the session is idle** (the same idle guard as persona binding) and take effect on the next run turn.
 - **Operator-contact tools keep their own gating.** Enabling `notify_operator` / `ask_operator` through overrides never bypasses the session's operator config — the operator gate is applied *after* overrides and has the last word.
+- The body is the overrides document itself, and unknown fields are refused, so a misspelled `allow` can never be stored as "no overrides".
 
 Where do overrides sit in the pipeline? Here is the full order the runtime uses to compute the **effective tool surface** for a run:
 
@@ -344,13 +348,22 @@ flowchart TD
     CapScope["3. CAPABILITY SCOPE<br/>narrow to what the session may SEE"]
     Overrides["4. SESSION TOOL OVERRIDES<br/>enable un-denies and adds to allow<br/>disable appends to deny"]
     Operator["5. OPERATOR-CONTACT GATING<br/>operator tools gated LAST, so overrides here cannot bypass operator policy"]
+    Allow["6. SESSION ALLOW-LIST<br/>intersects everything above, so nothing outside it is ever visible"]
     Final["final tool surface handed to the model"]
-    Profile --> Mcp --> CapScope --> Overrides --> Operator --> Final
+    Profile --> Mcp --> CapScope --> Overrides --> Operator --> Allow --> Final
 ```
 
-Read step 4 carefully: an `enable` removes a tool from the denylist and adds it to the allowlist (when the allowlist is non-empty), while a `disable` appends to the denylist. Because operator gating runs at step 5, you cannot use an `enable` to smuggle an operator-contact tool past operator policy — the gate simply re-applies afterward.
+Read step 4 carefully: an `enable` removes a tool from the denylist and adds it to the allowlist (when the allowlist is non-empty), while a `disable` appends to the denylist. Because operator gating runs at step 5, you cannot use an `enable` to smuggle an operator-contact tool past operator policy — the gate simply re-applies afterward. Step 6 is an intersection, so where it sits in the order makes no difference to the result: it is the rule every other rule is applied inside.
 
-The API surface is a small CRUD: `GET`, `POST`/`PUT`, and `DELETE` on `/v1/sessions/{session_id}/tool-overrides` (DELETE clears them). Declarative stack sessions can also carry a `tool_overrides` field, validated the same way (no empty entries, no enable/disable conflict). Note that MCP-level enabled/disabled tools are a *separate*, per-server config — not the per-session override discussed here.
+**Visibility is checked before permission.** When the model calls a tool that was not on its surface for that turn, the engine refuses the call before any permission rule, permission mode, `permission_request` hook, or approval is evaluated. The model gets `{"error":"tool <name> is not available for this agent"}`, no approval request is created, and no permission audit is recorded for that call. A hidden tool can therefore never surface as a spurious approval.
+
+```http
+PUT /v1/sessions/mission-m1/tool-overrides
+{"allow": ["mcp__fregate__scan_target", "mcp__fregate__submit_verdict"]}
+-> 200 SessionView with "tool_overrides": {"allow": ["mcp__fregate__scan_target", "mcp__fregate__submit_verdict"]}
+```
+
+The API surface is a small CRUD: `GET`, `POST`/`PUT`, and `DELETE` on `/v1/sessions/{session_id}/tool-overrides` (DELETE clears them). `GET` returns the stored document and `SessionView.tool_overrides` carries it too. Declarative stack sessions can also carry a `tool_overrides` field, validated the same way (no empty entries, no enable/disable conflict, no `enable` outside `allow`). Note that MCP-level enabled/disabled tools are a *separate*, per-server config — not the per-session override discussed here.
 
 ## Subagents and sidechains
 

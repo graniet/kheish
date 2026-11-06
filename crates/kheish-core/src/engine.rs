@@ -874,7 +874,7 @@ impl AgentEngine {
                 })
                 .collect::<Result<Vec<_>>>()?;
             let pending_decisions = self
-                .evaluate_tool_permissions(permissions, &model_tool_calls)
+                .evaluate_tool_permissions(permissions, &model_tool_calls, &available_tools)
                 .await?;
             for decision in &pending_decisions {
                 if !decision.hook_contexts.is_empty() {
@@ -1108,16 +1108,34 @@ impl AgentEngine {
         bail!("agent loop exceeded max_turns={}", self.policy.max_turns);
     }
 
+    /// Decides every model tool call of one turn.
+    ///
+    /// Visibility comes first: a call to a tool that was not advertised to the
+    /// model this turn is refused outright, before any permission rule, mode,
+    /// hook, or approval is evaluated, so a hidden tool can never surface as
+    /// an approval request or a permission audit.
     async fn evaluate_tool_permissions<P>(
         &self,
         permissions: &P,
         calls: &[ToolCallRecord],
+        available_tools: &[ToolDefinition],
     ) -> Result<Vec<PendingToolDecision>>
     where
         P: PermissionGate + ?Sized,
     {
         let mut decisions = Vec::with_capacity(calls.len());
         for call in calls {
+            if !Self::tool_is_visible(available_tools, &call.name) {
+                decisions.push(PendingToolDecision {
+                    call: call.clone(),
+                    decision: PermissionDecision::Deny {
+                        reason: Self::unavailable_tool_reason(&call.name),
+                    },
+                    hook_contexts: Vec::new(),
+                    retry: false,
+                });
+                continue;
+            }
             let base_decision = permissions.check(call).await?;
             let mut effective_call = call.clone();
             let mut decision = base_decision.clone();
@@ -1229,6 +1247,7 @@ impl AgentEngine {
     where
         T: ToolExecutor + ?Sized,
     {
+        let available_tools = tools.definitions();
         let allowed_calls = decisions
             .iter()
             .filter_map(|decision| {
@@ -1262,6 +1281,11 @@ impl AgentEngine {
                         result.tool_name = Some(decision.call.name.clone());
                     }
                     result
+                }
+                PermissionDecision::Deny { .. }
+                    if !Self::tool_is_visible(&available_tools, &decision.call.name) =>
+                {
+                    Self::unavailable_tool_result(&decision.call)
                 }
                 PermissionDecision::Deny { reason } => Self::denied_tool_result(
                     &decision.call,
@@ -1899,6 +1923,31 @@ impl AgentEngine {
             digest: Self::digest_of(section)?,
             content_digest: digest_text(&section.content),
         })
+    }
+
+    fn tool_is_visible(available_tools: &[ToolDefinition], tool_name: &str) -> bool {
+        available_tools.iter().any(|tool| tool.name == tool_name)
+    }
+
+    fn unavailable_tool_reason(tool_name: &str) -> String {
+        format!("tool {tool_name} is not available for this agent")
+    }
+
+    /// Result for a call to a tool the model was never shown. It carries no
+    /// `permission_denied` flag: no permission was ever evaluated for it.
+    fn unavailable_tool_result(call: &ToolCallRecord) -> ToolResultRecord {
+        ToolResultRecord {
+            call_id: call.id.clone(),
+            output: json!({
+                "error": Self::unavailable_tool_reason(&call.name),
+            }),
+            is_error: true,
+            tool_name: Some(call.name.clone()),
+            offset: None,
+            timestamp_ms: None,
+            context_updates: Vec::new(),
+            hook_contexts: Vec::new(),
+        }
     }
 
     fn denied_tool_result(
@@ -3690,7 +3739,7 @@ mod tests {
 
     impl ToolCatalog for EchoToolExecutor {
         fn definitions(&self) -> Vec<ToolDefinition> {
-            vec![
+            let mut definitions = vec![
                 ToolDefinition {
                     name: "lookup_context".to_string(),
                     description: "Returns test context".to_string(),
@@ -3718,7 +3767,48 @@ mod tests {
                     }),
                     allows_parallel: false,
                 },
-            ]
+            ];
+            // Other tools the scripted turns call; every one is advertised so
+            // the engine's visibility gate lets them reach permissions.
+            definitions.extend(
+                [
+                    "delete_file",
+                    "edit_file",
+                    "fetch_state",
+                    "echo",
+                    "bash",
+                    "machine_report",
+                    "custom_mcp_large_output",
+                ]
+                .into_iter()
+                .map(|name| ToolDefinition {
+                    name: name.to_string(),
+                    description: format!("Scripted test tool {name}."),
+                    input_schema: json!({"type": "object"}),
+                    allows_parallel: false,
+                }),
+            );
+            definitions
+        }
+    }
+
+    /// Advertises only `lookup_context`, so any other call is a hidden tool.
+    struct NarrowToolExecutor;
+
+    impl ToolCatalog for NarrowToolExecutor {
+        fn definitions(&self) -> Vec<ToolDefinition> {
+            EchoToolExecutor
+                .definitions()
+                .into_iter()
+                .filter(|tool| tool.name == "lookup_context")
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl ToolExecutor for NarrowToolExecutor {
+        async fn execute(&self, call: &ToolCallRecord) -> Result<ToolResultRecord> {
+            EchoToolExecutor.execute(call).await
         }
     }
 
@@ -4248,6 +4338,147 @@ mod tests {
             "zero is the public sentinel for an unbounded turn policy"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hidden_tool_calls_are_refused_before_any_permission_is_evaluated() -> Result<()> {
+        let conversation = ConversationKey {
+            session_id: "session-hidden-tool".to_string(),
+            thread_id: None,
+        };
+        let mut engine = AgentEngine::new(conversation, LoopPolicy::default());
+        let hooks = Arc::new(ScriptedHookDispatcher::new(Vec::new()));
+        engine.set_hook_dispatcher(Some(hooks.clone()));
+        let model = ScriptedModel::new(vec![
+            ModelTurn {
+                assistant_message: MessageRecord::new(
+                    "assistant-hidden-1",
+                    Role::Assistant,
+                    "Running a shell command.",
+                ),
+                tool_calls: vec![
+                    ToolCallRecord {
+                        id: "call-hidden".to_string(),
+                        name: "bash".to_string(),
+                        input: json!({"command": "id"}),
+                        assistant_message_id: None,
+                        assistant_provider_response_id: None,
+                    },
+                    ToolCallRecord {
+                        id: "call-visible".to_string(),
+                        name: "lookup_context".to_string(),
+                        input: json!({"query": "scope"}),
+                        assistant_message_id: None,
+                        assistant_provider_response_id: None,
+                    },
+                ],
+                finish_reason: ModelFinishReason::ToolCalls,
+                usage: None,
+            },
+            ModelTurn {
+                assistant_message: MessageRecord::new(
+                    "assistant-hidden-2",
+                    Role::Assistant,
+                    "Done.",
+                ),
+                tool_calls: Vec::new(),
+                finish_reason: ModelFinishReason::Completed,
+                usage: None,
+            },
+        ]);
+        // Every visible call asks for approval, so only the visible call may
+        // become an approval request.
+        let permissions = RecordingPermissionGate::new();
+
+        let outcome = engine
+            .run_input_with_permissions(
+                InputEnvelope::text("daemon", "api", "session-hidden-tool", "user-1", "go"),
+                &model,
+                &NarrowToolExecutor,
+                &permissions,
+            )
+            .await?;
+
+        assert!(matches!(
+            outcome.status,
+            RunStatus::WaitingForApproval { .. }
+        ));
+        let pending = outcome
+            .pending_batch
+            .as_ref()
+            .expect("the visible call waits for approval");
+        let approval_tools = pending
+            .decisions
+            .iter()
+            .filter_map(|decision| match &decision.decision {
+                PermissionDecision::Ask { request } => Some(request.tool_name.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(approval_tools, vec!["lookup_context".to_string()]);
+        let hidden = pending
+            .decisions
+            .iter()
+            .find(|decision| decision.call.id == "call-hidden")
+            .expect("hidden call is decided");
+        assert_eq!(
+            hidden.decision,
+            PermissionDecision::Deny {
+                reason: "tool bash is not available for this agent".to_string(),
+            }
+        );
+        // No permission audit and no permission hook ever saw the hidden call.
+        assert!(
+            permissions
+                .final_decisions()
+                .iter()
+                .all(|(call_id, _, _)| call_id != "call-hidden")
+        );
+        assert!(hooks.invocations().iter().all(|invocation| {
+            invocation.subject.as_deref() != Some("bash")
+                || !matches!(
+                    invocation.event,
+                    HookEventName::PermissionRequest | HookEventName::PermissionDenied
+                )
+        }));
+
+        let pending_batch = outcome.pending_batch.clone().expect("pending batch");
+        let resumed = engine
+            .resume_with_pending_batch(
+                outcome.snapshot.run_meta.clone(),
+                ModelGenerationConfig::default(),
+                pending_batch,
+                &[ApprovalResolution {
+                    request_id: "approval-call-visible".to_string(),
+                    behavior: kheish_types::ApprovalResolutionBehavior::Allow,
+                    updated_input: None,
+                    justification: None,
+                    reason: None,
+                }],
+                &model,
+                &NarrowToolExecutor,
+                &permissions,
+            )
+            .await?;
+        assert_eq!(resumed.status, RunStatus::Completed);
+        let state = engine.replay_from_journal();
+        let hidden_result = state
+            .completed_tool_results
+            .iter()
+            .find(|result| result.call_id == "call-hidden")
+            .expect("hidden call gets a result");
+        assert!(hidden_result.is_error);
+        assert_eq!(
+            hidden_result.output,
+            json!({"error": "tool bash is not available for this agent"})
+        );
+        assert!(
+            state
+                .completed_tool_results
+                .iter()
+                .any(|result| result.call_id == "call-visible" && !result.is_error)
+        );
         Ok(())
     }
 

@@ -41,6 +41,11 @@ Sessions:
 - `POST /v1/sessions/{session_id}/route-policy`
 - `PUT /v1/sessions/{session_id}/route-policy`
 - `DELETE /v1/sessions/{session_id}/route-policy`
+- `GET /v1/sessions/{session_id}/tool-overrides`
+- `POST /v1/sessions/{session_id}/tool-overrides`
+- `PUT /v1/sessions/{session_id}/tool-overrides`
+- `DELETE /v1/sessions/{session_id}/tool-overrides`
+- `GET /v1/sessions/{session_id}/permission-audits`
 - `GET /v1/sessions/{session_id}/events`
 - `GET /v1/sessions/{session_id}/stream`
 - `POST /v1/sessions/{session_id}/input`
@@ -403,6 +408,23 @@ When enabled, the runtime prompt tells the model it may contact the operator at 
 
 `DELETE /v1/sessions/{session_id}/operator` disables model-initiated operator contact. Transport destinations are never accepted on this endpoint; use session `reply_targets` for Telegram, Slack, HTTP, or other delivery plugins.
 
+### Tool overrides
+
+`POST` and `PUT /v1/sessions/{session_id}/tool-overrides` replace the session's native tool surface overrides. The body is the `SessionToolOverrides` document itself, and unknown fields are refused:
+
+```json
+{
+  "allow": ["mcp__fregate__scan_target", "mcp__fregate__submit_verdict"],
+  "enable": [],
+  "disable": []
+}
+```
+
+- `allow` (optional): the exact tool names, built-in or `mcp__<server>__<tool>`, that the session may ever see. It is the outermost gate: a tool outside it is invisible to the model whatever the profile, the capability scope, or `enable` say, and a call to it is refused before any permission is evaluated, so it creates no approval and no permission audit. `[]` hides every tool. Omit it for no allow-list.
+- `enable` and `disable`: adjust the profile surface inside the allow-list.
+
+Names are trimmed and deduplicated. The daemon answers `400` with domain `sessions` and code `invalid_tool_overrides` when a name is in both `enable` and `disable`, when an `enable` entry is outside `allow`, or when `allow` holds the reserved `__dynamic_mcp_tools__` sentinel. Changes are only allowed while the session is idle and apply on the next turn. `GET` returns the stored document and `DELETE` clears it. `SessionView.tool_overrides` carries the same document. See [Agents, personas, and skills](../concepts/agents-personas-skills) for the full surface pipeline.
+
 ### Persona binding
 
 Session persona mutation accepts:
@@ -603,6 +625,7 @@ Supported shape today:
 - `effective_credential_scope`
 - `persona`
 - `reply_targets`
+- `tool_overrides`, omitted when empty
 - `outputs`
 
 `GET /v1/sessions/{session_id}/events` returns `SessionEventLogView`:

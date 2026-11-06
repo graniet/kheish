@@ -58809,3 +58809,5 @@ async fn daemon_logs_endpoint_serves_the_ring_buffer() -> Result<()> {
     wait_for_daemon_shutdown(&client, &base).await?;
     Ok(())
 }
+
+mod fregate_runtime;

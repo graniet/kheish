@@ -1621,9 +1621,13 @@ pub struct SetSessionOperatorConfigRequest {
 }
 
 /// Session tool-overrides update payload.
+///
+/// The body is the overrides document itself. It is transparent rather than
+/// flattened so unknown fields are refused: a misspelled `allow` must never
+/// silently store empty overrides that expose the whole profile surface.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct SetSessionToolOverridesRequest {
-    #[serde(flatten)]
     pub tool_overrides: kheish_types::SessionToolOverrides,
 }
 

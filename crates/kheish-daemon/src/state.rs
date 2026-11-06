@@ -188,6 +188,7 @@ pub(crate) use persistence::{
     prune_run_operation_idempotency_receipts, prune_session_run_idempotency_receipts,
 };
 use persistence::{ResolvedInputPart, import_inline_asset};
+pub(crate) use session_ingress::tool_overrides_problem;
 pub(crate) use tool_control::DaemonToolControlAdapter;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

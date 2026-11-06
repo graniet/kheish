@@ -1308,6 +1308,7 @@ fn validate_session_tool_overrides(document: &StackDocument, validation: &mut St
             .enable
             .iter()
             .chain(overrides.disable.iter())
+            .chain(overrides.allow.iter().flatten())
             .any(|name| name.trim().is_empty())
         {
             validation.errors.push(format!(
@@ -1322,6 +1323,10 @@ fn validate_session_tool_overrides(document: &StackDocument, validation: &mut St
             validation.errors.push(format!(
                 "spec.sessions[{index}].tool_overrides lists `{conflict}` in both enable and disable"
             ));
+        } else if let Some(problem) = crate::state::tool_overrides_problem(overrides) {
+            validation
+                .errors
+                .push(format!("spec.sessions[{index}].tool_overrides: {problem}"));
         }
     }
 }

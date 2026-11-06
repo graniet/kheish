@@ -451,22 +451,26 @@ where
 
     /// Replaces the session's native tool surface overrides.
     ///
-    /// Names are trimmed and deduplicated; a name in both lists is a caller
-    /// bug and is rejected. Applied on the next run turn.
+    /// Names are trimmed and deduplicated; a name in both `enable` and
+    /// `disable`, an `enable` entry outside `allow`, or the reserved
+    /// dynamic-MCP sentinel in `allow` is a caller bug and is rejected.
+    /// Applied on the next run turn.
     pub(crate) async fn set_session_tool_overrides(
         &self,
         session_id: &str,
         overrides: Option<kheish_types::SessionToolOverrides>,
     ) -> Result<SessionView> {
         let mut normalized = overrides.unwrap_or_default();
+        normalized.allow = normalized
+            .allow
+            .as_deref()
+            .map(normalize_tool_override_names);
         normalized.enable = normalize_tool_override_names(&normalized.enable);
         normalized.disable = normalize_tool_override_names(&normalized.disable);
-        if let Some(conflict) = normalized
-            .enable
-            .iter()
-            .find(|name| normalized.disable.contains(name))
-        {
-            bail!("tool `{conflict}` cannot be both enabled and disabled");
+        if let Some(problem) = tool_overrides_problem(&normalized) {
+            return Err(
+                DaemonProblem::bad_request("sessions", "invalid_tool_overrides", problem).into(),
+            );
         }
         self.run_service
             .with_session_idle_guard(session_id, || async {
@@ -1967,6 +1971,44 @@ fn render_mailbox_message_context(index: usize, message: &MailboxMessage) -> Str
         }
     }
     lines.join("\n")
+}
+
+/// Returns why one set of session tool overrides is invalid, if it is.
+///
+/// Shared by the session API and declarative stack validation so both refuse
+/// the same documents.
+pub(crate) fn tool_overrides_problem(
+    overrides: &kheish_types::SessionToolOverrides,
+) -> Option<String> {
+    if let Some(conflict) = overrides.enable.iter().find(|name| {
+        overrides
+            .disable
+            .iter()
+            .any(|entry| entry.trim() == name.trim())
+    }) {
+        return Some(format!(
+            "tool `{conflict}` cannot be both enabled and disabled"
+        ));
+    }
+    let allow = overrides.allow.as_ref()?;
+    if allow
+        .iter()
+        .any(|name| name.trim() == kheish_types::DYNAMIC_MCP_TOOL_ALLOWLIST_SENTINEL)
+    {
+        return Some(format!(
+            "`{}` is reserved and cannot appear in the tool allow-list",
+            kheish_types::DYNAMIC_MCP_TOOL_ALLOWLIST_SENTINEL
+        ));
+    }
+    overrides
+        .enable
+        .iter()
+        .find(|name| !overrides.allow_list_admits(name))
+        .map(|outside| {
+            format!(
+                "tool `{outside}` is enabled but not in the allow-list, so it can never be visible"
+            )
+        })
 }
 
 fn normalize_tool_override_names(values: &[String]) -> Vec<String> {

@@ -406,9 +406,19 @@ impl SessionExecutionIdentity {
 /// stack opt one session into tools the profile denies (`ask_user_question`,
 /// plan mode…) or retire tools it allows. Operator-contact tools keep their
 /// own gating: enabling them here never bypasses the session operator config.
+///
+/// `allow` is the outermost gate: when present, only the exact tool names it
+/// lists (built-in names or `mcp__<server>__<tool>`) can ever be visible to
+/// the session, whatever the profile, the capability scope, or `enable` say.
+/// A tool added by a later build stays invisible until it is listed.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionToolOverrides {
+    /// Exact tool names the session may see; every other tool is invisible.
+    ///
+    /// `None` leaves the surface unconstrained; an empty list hides every tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow: Option<Vec<String>>,
     /// Tool names added to the session's surface.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enable: Vec<String>,
@@ -421,7 +431,16 @@ impl SessionToolOverrides {
     /// True when the overrides change nothing.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.enable.is_empty() && self.disable.is_empty()
+        self.allow.is_none() && self.enable.is_empty() && self.disable.is_empty()
+    }
+
+    /// Returns whether the allow-list, when one is set, admits the named tool.
+    #[must_use]
+    pub fn allow_list_admits(&self, tool_name: &str) -> bool {
+        let tool_name = tool_name.trim();
+        self.allow
+            .as_ref()
+            .is_none_or(|allow| allow.iter().any(|entry| entry.trim() == tool_name))
     }
 }
 

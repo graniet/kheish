@@ -2450,6 +2450,28 @@ where
         {
             filter.denylist.push("ask_operator".to_string());
         }
+        // The session allow-list is the outermost gate. It is applied as a
+        // restriction of everything above, so it can only narrow the surface:
+        // a tool outside it stays invisible whatever the profile, the
+        // capability scope, or `enable` say, including tools a later build
+        // adds. The reserved dynamic-MCP sentinel never widens it.
+        if let Some(allow) = self.session_tool_overrides.allow.as_ref() {
+            let allowlist = allow
+                .iter()
+                .map(|entry| entry.trim())
+                .filter(|entry| !entry.is_empty() && *entry != DYNAMIC_MCP_TOOL_ALLOWLIST_SENTINEL)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>();
+            let session_allow = if allowlist.is_empty() {
+                ToolSurfaceFilter::deny_all()
+            } else {
+                ToolSurfaceFilter {
+                    allowlist,
+                    denylist: Vec::new(),
+                }
+            };
+            filter = filter.restrict_with(&session_allow);
+        }
         filter
     }
 
@@ -3444,6 +3466,7 @@ mod tests {
         assert!(base.allows("bash"));
 
         runtime.session_tool_overrides = SessionToolOverrides {
+            allow: None,
             enable: vec!["ask_user_question".to_string()],
             disable: vec!["bash".to_string()],
         };
@@ -3459,6 +3482,76 @@ mod tests {
             .push("ask_operator".to_string());
         let still_gated = runtime.effective_tool_surface();
         assert!(!still_gated.allows("ask_operator"));
+    }
+
+    #[test]
+    fn effective_tool_surface_session_allow_list_is_the_outermost_gate() {
+        let session_root = unique_session_root("kheish-runtime-tool-allow-surface");
+        let (_sessions, mut runtime) = runtime_with_hook_dispatcher(
+            &session_root,
+            "tool-allow-session",
+            Arc::new(NoopHookDispatcher),
+        );
+        // An unconstrained profile shows every registered tool, including
+        // whatever a future build registers.
+        runtime.tool_surface = ToolSurfaceFilter::default();
+        assert!(runtime.effective_tool_surface().allows("bash"));
+        assert!(
+            runtime
+                .effective_tool_surface()
+                .allows("tool_from_a_future_build")
+        );
+
+        runtime.session_tool_overrides = SessionToolOverrides {
+            allow: Some(vec![
+                " mcp__fregate__scan_target ".to_string(),
+                "read_file".to_string(),
+            ]),
+            enable: vec!["ask_user_question".to_string()],
+            disable: Vec::new(),
+        };
+        let surface = runtime.effective_tool_surface();
+        assert!(surface.allows("mcp__fregate__scan_target"));
+        assert!(surface.allows("read_file"));
+        assert!(!surface.allows("bash"));
+        assert!(!surface.allows("tool_from_a_future_build"));
+        // `enable` never reaches outside the allow-list.
+        assert!(!surface.allows("ask_user_question"));
+
+        // `disable` still narrows inside the allow-list.
+        runtime.session_tool_overrides.disable = vec!["read_file".to_string()];
+        assert!(!runtime.effective_tool_surface().allows("read_file"));
+
+        // The allow-list never widens the profile.
+        runtime.tool_surface = ToolSurfaceFilter {
+            allowlist: vec!["read_file".to_string()],
+            denylist: vec!["write_file".to_string()],
+        };
+        runtime.session_tool_overrides = SessionToolOverrides {
+            allow: Some(vec![
+                "bash".to_string(),
+                "read_file".to_string(),
+                "write_file".to_string(),
+            ]),
+            ..SessionToolOverrides::default()
+        };
+        let narrowed = runtime.effective_tool_surface();
+        assert!(narrowed.allows("read_file"));
+        assert!(!narrowed.allows("bash"));
+        assert!(!narrowed.allows("write_file"));
+
+        // Operator gating still applies to listed operator tools.
+        runtime.session_tool_overrides.allow = Some(vec!["ask_operator".to_string()]);
+        runtime.tool_surface = ToolSurfaceFilter::default();
+        assert!(!runtime.effective_tool_surface().allows("ask_operator"));
+
+        // An empty allow-list, or one holding only the reserved dynamic-MCP
+        // sentinel, hides every tool.
+        runtime.session_tool_overrides.allow = Some(Vec::new());
+        assert!(runtime.effective_tool_surface().is_deny_all());
+        runtime.session_tool_overrides.allow =
+            Some(vec![DYNAMIC_MCP_TOOL_ALLOWLIST_SENTINEL.to_string()]);
+        assert!(runtime.effective_tool_surface().is_deny_all());
     }
 
     #[test]
@@ -3479,6 +3572,7 @@ mod tests {
             denylist: Vec::new(),
         };
         runtime.session_tool_overrides = SessionToolOverrides {
+            allow: None,
             enable: vec![" remember_about ".to_string()],
             disable: Vec::new(),
         };
