@@ -100,6 +100,7 @@
               "reference/tasks-schedules-agents-api",
               "reference/questions-and-approvals-api",
               "reference/runtime-api",
+              "reference/model-providers",
               "reference/connectors-api",
               "reference/external-connectors-protocol",
               "reference/learnings-api",

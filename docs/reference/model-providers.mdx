@@ -1,0 +1,43 @@
+---
+title: Model providers and routes
+description: What Kheish sends to model providers, route settings per driver, and the Anthropic Messages API request shape.
+---
+
+# Model providers and routes
+
+A route names one provider driver (`anthropic`, `openai`, `google`, `openrouter`, `xai`), its
+default model, its credential, and its endpoint. Routes come from the routes file passed to
+`serve --routes-file` or from the runtime route API; runs pick one with the `provider` field of
+their request, the session's route policy, or the daemon's `default_route` (see
+[Sessions and runs API](./sessions-and-runs-api#route-policy)).
+
+```toml
+# routes.toml
+version = 1
+default_route = "anthropic"
+
+[routes.anthropic]
+driver = "anthropic"
+default_model = "claude-opus-5-5"
+auth_ref = "anthropic.prod"
+# Optional: a gateway in front of the Messages API, posted to as-is.
+# base_url = "https://gateway.internal/v1/messages"
+```
+
+## Execution-context headers
+
+Every model request Kheish sends, on every driver, carries two headers that name the execution it
+belongs to:
+
+| Header | Value |
+|---|---|
+| `x-kheish-session-id` | The session whose run issued the request. |
+| `x-kheish-run-id` | The daemon run that issued the request. Absent when the request belongs to no daemon run (a CLI turn). |
+
+Kheish sets both from the runtime's execution scope, never from model output or tool arguments, and
+they replace any header of the same name the route's auth material carries. The values go in
+headers only; the request body, and so the model, never sees them. A gateway in front of the
+provider (a model relay that holds the real provider key, for example) can therefore authorize each
+request against the session and run it belongs to, and account for it.
+
+Compaction summaries and every retry of a model attempt carry the same headers as the run's turns.

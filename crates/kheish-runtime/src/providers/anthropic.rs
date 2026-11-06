@@ -571,8 +571,9 @@ impl ModelProvider for AnthropicProvider {
         let (response, response_target, response_grant_id) = loop {
             let auth_material = self.auth_material(force_refresh).await?;
             let grant_id = auth_material.grant_id.clone();
-            let headers =
+            let mut headers =
                 self.headers_from_material(&auth_material, request.generation.reasoning.as_ref())?;
+            super::insert_execution_context_headers(&mut headers, &request.session_id)?;
             let endpoint = auth_material
                 .base_url_override
                 .clone()
@@ -1758,6 +1759,7 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     use super::{ANTHROPIC_INTERLEAVED_THINKING_BETA, AnthropicProvider, AnthropicProviderConfig};
+    use crate::execution::{ExecutionScope, scope_execution};
     use crate::model::{
         ModelBudget, ModelEventSink, ModelGenerationConfig, ModelProvider, ModelRetryPolicy,
         ModelRuntime, ModelRuntimeRequest, ModelStreamEvent, ReasoningConfig, ReasoningEffort,
@@ -1768,7 +1770,9 @@ mod tests {
         create_fixture_dir, write_document_attachment, write_document_attachment_with_preview,
         write_image_attachment,
     };
-    use crate::providers::testsupport::{spawn_chunked_mock_server, spawn_mock_server};
+    use crate::providers::testsupport::{
+        MockHttpResponse, spawn_chunked_mock_server, spawn_mock_server, spawn_recording_mock_server,
+    };
     use crate::{DebugCaptureLevel, NoopObserver};
     use kheish_core::ModelDriver;
     use kheish_types::capped_default_max_output_tokens;
@@ -1777,6 +1781,7 @@ mod tests {
         ProviderInputItem, ProviderPrompt, SummaryBlock, ToolCallRecord, ToolDefinition,
         ToolResultRecord,
     };
+    use tokio_util::sync::CancellationToken;
 
     struct FixedDebugObserver {
         level: DebugCaptureLevel,
@@ -2764,6 +2769,107 @@ mod tests {
         }
         assert!(saw_tool_call);
         assert!(saw_stop);
+        Ok(())
+    }
+
+    /// A complete Messages SSE stream that answers `text` and ends the turn.
+    fn sse_text_stream(message_id: &str, text: &str) -> String {
+        format!(
+            concat!(
+                "event: message_start\n",
+                "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{id}\",\"model\":\"claude-opus-5-5\",\"usage\":{{\"input_tokens\":5,\"output_tokens\":0}}}}}}\n\n",
+                "event: content_block_start\n",
+                "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n",
+                "event: content_block_delta\n",
+                "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":{text}}}}}\n\n",
+                "event: content_block_stop\n",
+                "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n",
+                "event: message_delta\n",
+                "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\",\"stop_details\":null}},\"usage\":{{\"output_tokens\":3}}}}\n\n",
+                "event: message_stop\n",
+                "data: {{\"type\":\"message_stop\"}}\n\n"
+            ),
+            id = message_id,
+            text = serde_json::to_string(text).expect("text serializes"),
+        )
+    }
+
+    fn runtime_request(session_id: &str, generation: ModelGenerationConfig) -> ModelRuntimeRequest {
+        ModelRuntimeRequest {
+            attempt: 1,
+            kind: kheish_core::ModelRequestKind::MainLoop,
+            session_id: session_id.to_string(),
+            thread_id: None,
+            turn: 1,
+            prompt: ProviderPrompt {
+                instructions: vec!["You verify exposures.".to_string()],
+                force_synthetic_user_prefix: false,
+                items: vec![ProviderInputItem::Message {
+                    id: "u1".to_string(),
+                    role: kheish_types::Role::User,
+                    content: "Say hello".to_string(),
+                    content_parts: Vec::new(),
+                    attachments: Vec::new(),
+                    provider_response_id: None,
+                    provider_context: None,
+                }],
+            },
+            available_tools: Vec::new(),
+            generation,
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_requests_carry_the_execution_scope_session_and_run() -> Result<()> {
+        let (url, recorded) = spawn_recording_mock_server(vec![
+            MockHttpResponse::sse(&sse_text_stream("msg-scope", "hello")),
+            MockHttpResponse::sse(&sse_text_stream("msg-cli", "hello")),
+        ])
+        .await?;
+        let provider = AnthropicProvider::new(AnthropicProviderConfig {
+            base_url: url,
+            ..AnthropicProviderConfig::new("claude-opus-5-5", "test-key")
+        })?;
+        let scope = ExecutionScope {
+            session_id: "fm-mission-1".to_string(),
+            run_id: Some("run-42".to_string()),
+            ..ExecutionScope::default()
+        };
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        scope_execution(
+            scope,
+            CancellationToken::new(),
+            provider.stream(
+                runtime_request("fm-mission-1", ModelGenerationConfig::default()),
+                ModelEventSink::new(sender),
+            ),
+        )
+        .await?;
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        provider
+            .stream(
+                runtime_request("cli-session", ModelGenerationConfig::default()),
+                ModelEventSink::new(sender),
+            )
+            .await?;
+
+        let recorded = recorded.lock().clone();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(
+            recorded[0].header("x-kheish-session-id"),
+            Some("fm-mission-1")
+        );
+        assert_eq!(recorded[0].header("x-kheish-run-id"), Some("run-42"));
+        assert_eq!(recorded[0].header("x-api-key"), Some("test-key"));
+        // The ids travel as headers only: the model never sees them.
+        assert_eq!(recorded[0].json()["model"], "claude-opus-5-5");
+        assert!(!recorded[0].body.contains("run-42"));
+        assert!(!recorded[0].body.contains("fm-mission-1"));
+        assert_eq!(
+            recorded[1].header("x-kheish-session-id"),
+            Some("cli-session")
+        );
+        assert_eq!(recorded[1].header("x-kheish-run-id"), None);
         Ok(())
     }
 

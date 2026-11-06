@@ -605,7 +605,8 @@ impl ModelProvider for GoogleProvider {
         let (response, response_target, response_grant_id) = loop {
             let auth_material = self.auth_material(force_refresh).await?;
             let grant_id = auth_material.grant_id.clone();
-            let headers = self.headers_from_material(&auth_material)?;
+            let mut headers = self.headers_from_material(&auth_material)?;
+            super::insert_execution_context_headers(&mut headers, &request.session_id)?;
             let endpoint = google_generate_content_endpoint(
                 auth_material
                     .base_url_override
@@ -1871,7 +1872,9 @@ mod tests {
     };
     use tokio::sync::mpsc;
 
-    use crate::providers::testsupport::spawn_mock_server;
+    use crate::providers::testsupport::{
+        MockHttpResponse, spawn_mock_server, spawn_recording_mock_server,
+    };
 
     fn has_provider_external_action(
         traces: &[TraceEvent],
@@ -2676,6 +2679,44 @@ mod tests {
             payload["generationConfig"]["maxOutputTokens"],
             json!(kheish_types::model_max_output_tokens("gemini-3-pro-image-preview").default)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn google_requests_carry_the_execution_scope_session_and_run() -> Result<()> {
+        let (base_url, recorded) = spawn_recording_mock_server(vec![MockHttpResponse {
+            status: 200,
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            body: json!({
+                "candidates": [{
+                    "finishReason": "STOP",
+                    "content": {"parts": [{"text": "ok"}]}
+                }]
+            })
+            .to_string(),
+        }])
+        .await?;
+        let mut config = GoogleProviderConfig::new("gemini-2.5-flash", "test-key");
+        config.base_url = base_url;
+        let provider = GoogleProvider::with_observer(config, Arc::new(NoopObserver))?;
+        let scope = crate::execution::ExecutionScope {
+            session_id: "session-google".to_string(),
+            run_id: Some("run-google".to_string()),
+            ..Default::default()
+        };
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        crate::execution::scope_execution(
+            scope,
+            tokio_util::sync::CancellationToken::new(),
+            provider.stream(default_runtime_request(), ModelEventSink::new(sender)),
+        )
+        .await?;
+        let recorded = recorded.lock().clone();
+        assert_eq!(
+            recorded[0].header("x-kheish-session-id"),
+            Some("session-google")
+        );
+        assert_eq!(recorded[0].header("x-kheish-run-id"), Some("run-google"));
         Ok(())
     }
 

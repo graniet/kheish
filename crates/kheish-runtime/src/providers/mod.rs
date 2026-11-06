@@ -3,6 +3,7 @@
 mod anthropic;
 mod attachments;
 mod errors;
+mod execution_headers;
 mod google;
 mod openai;
 mod openrouter;
@@ -16,6 +17,8 @@ mod transcription;
 mod xai;
 
 pub use anthropic::{AnthropicPricing, AnthropicProvider, AnthropicProviderConfig};
+pub(crate) use execution_headers::insert_execution_context_headers;
+pub use execution_headers::{KHEISH_RUN_ID_HEADER, KHEISH_SESSION_ID_HEADER};
 pub use google::{
     GoogleGeneratedImage, GoogleImageEditInput, GoogleImageEditRequest, GoogleImageEditor,
     GoogleImageGenerationRequest, GoogleImageGenerationResponse, GoogleImageGenerator,
