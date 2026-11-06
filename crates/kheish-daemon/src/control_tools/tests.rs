@@ -661,10 +661,11 @@ impl DaemonToolControl for FakeControl {
         elements: Vec<crate::board_render::BoardElement>,
         note: Option<String>,
     ) -> Result<crate::BoardRevisionView> {
-        self.state
-            .lock()
-            .project_task_calls
-            .push(format!("draw:{session_id}:{board_id}:{}:{:?}", elements.len(), note));
+        self.state.lock().project_task_calls.push(format!(
+            "draw:{session_id}:{board_id}:{}:{:?}",
+            elements.len(),
+            note
+        ));
         Ok(crate::BoardRevisionView {
             revision_id: "board-revision-1".to_string(),
             board_id: board_id.to_string(),
@@ -700,10 +701,9 @@ impl DaemonToolControl for FakeControl {
         project_id: &str,
         task_id: &str,
     ) -> Result<crate::ProjectTaskView> {
-        self.state
-            .lock()
-            .project_task_calls
-            .push(format!("claim:{session_id}:{run_id}:{project_id}:{task_id}"));
+        self.state.lock().project_task_calls.push(format!(
+            "claim:{session_id}:{run_id}:{project_id}:{task_id}"
+        ));
         Ok(fixture_project_task(task_id))
     }
 

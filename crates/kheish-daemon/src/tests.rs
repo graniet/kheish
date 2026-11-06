@@ -8542,10 +8542,7 @@ async fn board_draw_tool_appends_authored_revisions_with_rendered_png() -> Resul
     assert_eq!(elements.len(), 3, "state accumulates both batches");
     assert_eq!(elements[2]["kind"], json!("arrow"));
     assert_eq!(elements[2]["author"]["kind"], json!("agent"));
-    assert_eq!(
-        elements[2]["author"]["session_id"],
-        json!("board-artist")
-    );
+    assert_eq!(elements[2]["author"]["session_id"], json!("board-artist"));
     assert!(
         elements[2]["author"]["name"]
             .as_str()
@@ -8693,7 +8690,11 @@ async fn board_view_tool_reports_scene_and_agents_continue_drawing() -> Result<(
         .json::<Value>()
         .await?;
     let elements = state["elements"].as_array().expect("elements array");
-    assert_eq!(elements.len(), 2, "the tip carries the seeded and new element");
+    assert_eq!(
+        elements.len(),
+        2,
+        "the tip carries the seeded and new element"
+    );
     assert_eq!(elements[0]["kind"], json!("rect"));
     assert_eq!(elements[1]["kind"], json!("arrow"));
 
