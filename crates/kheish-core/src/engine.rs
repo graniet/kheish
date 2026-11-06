@@ -2028,6 +2028,7 @@ impl AgentEngine {
         };
         dispatcher
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event,
                 subject,
                 session_id: Some(self.conversation.session_id.clone()),

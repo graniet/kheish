@@ -54261,6 +54261,8 @@ async fn daemon_runtime_hooks_reject_invalid_http_target_without_persisting() ->
                     executor: kheish_types::HookExecutorConfig::Http {
                         url: url.to_string(),
                         timeout_ms: Some(1_000),
+                        allow_private: false,
+                        header_secret_refs: Default::default(),
                     },
                 }],
             ))

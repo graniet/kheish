@@ -925,3 +925,239 @@ async fn mcp_tool_calls_carry_the_execution_context_and_survive_secret_rotation(
     wait_for_daemon_shutdown(&client, &base).await?;
     Ok(())
 }
+
+/// One request received by the HTTP hook stub.
+#[derive(Clone, Debug)]
+struct CapturedHookRequest {
+    headers: BTreeMap<String, String>,
+    body: Value,
+}
+
+/// A permission hook endpoint: it records every request and answers with the
+/// configured status and decision.
+#[derive(Clone)]
+struct HookStub {
+    url: String,
+    requests: Arc<Mutex<Vec<CapturedHookRequest>>>,
+    status: Arc<Mutex<u16>>,
+}
+
+async fn spawn_hook_stub() -> Result<HookStub> {
+    #[derive(Clone)]
+    struct StubState {
+        requests: Arc<Mutex<Vec<CapturedHookRequest>>>,
+        status: Arc<Mutex<u16>>,
+    }
+
+    async fn permission(
+        State(state): State<StubState>,
+        headers: axum::http::HeaderMap,
+        body: Bytes,
+    ) -> axum::response::Response {
+        state.requests.lock().push(CapturedHookRequest {
+            headers: headers
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.as_str().to_ascii_lowercase(),
+                        value.to_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect(),
+            body: serde_json::from_slice(&body).unwrap_or(Value::Null),
+        });
+        let status = *state.status.lock();
+        if status != 200 {
+            return StatusCode::from_u16(status)
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+                .into_response();
+        }
+        Json(json!({"contract_version": 1, "permission": "allow"})).into_response()
+    }
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let status = Arc::new(Mutex::new(200_u16));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let router = Router::new()
+        .route("/hooks/permission", post(permission))
+        .with_state(StubState {
+            requests: requests.clone(),
+            status: status.clone(),
+        });
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    Ok(HookStub {
+        url: format!("http://{address}/hooks/permission"),
+        requests,
+        status,
+    })
+}
+
+fn permission_hook_settings(url: &str, allow_private: bool) -> Value {
+    json!({"settings": {"hooks": {"permission_request": [{
+        "name": "fregate-approval",
+        "failure_policy": {"mode": "closed"},
+        "executor": {
+            "type": "http",
+            "url": url,
+            "timeout_ms": 5000,
+            "allow_private": allow_private,
+            "header_secret_refs": {"x-fregate-callback": "fregate.callback"}
+        }
+    }]}}})
+}
+
+#[tokio::test]
+async fn http_hooks_reach_private_targets_with_secret_headers_and_run_context() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-state");
+    let workspace_root = temp.path().join("workspace");
+    let mock = spawn_anthropic_messages_mock("scan finished").await?;
+    let (mcp_url, mcp_log) = spawn_mcp_stub().await?;
+    let hook = spawn_hook_stub().await?;
+    let (address, shutdown) = anthropic_provider_daemon(
+        &state_root,
+        &workspace_root,
+        &format!("{}/v1/messages", mock.base),
+    )
+    .await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+    put_generic_secret(&client, &base, "fregate.callback", "callback-secret-1").await?;
+    client
+        .post(format!("{base}/v1/runtime/mcp/servers"))
+        .json(&json!({"name": "fregate", "url": mcp_url}))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    // A loopback target is refused unless the hook opts in.
+    let refused = client
+        .post(format!("{base}/v1/runtime/hooks"))
+        .json(&permission_hook_settings(&hook.url, false))
+        .send()
+        .await?;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        refused.json::<ProblemDetails>().await?.code,
+        "invalid_hook_settings"
+    );
+    // A reserved header can never come from a secret.
+    let mut reserved = permission_hook_settings(&hook.url, true);
+    reserved["settings"]["hooks"]["permission_request"][0]["executor"]["header_secret_refs"] =
+        json!({"Idempotency-Key": "fregate.callback"});
+    let reserved = client
+        .post(format!("{base}/v1/runtime/hooks"))
+        .json(&reserved)
+        .send()
+        .await?;
+    assert_eq!(reserved.status(), StatusCode::BAD_REQUEST);
+
+    client
+        .post(format!("{base}/v1/runtime/hooks"))
+        .json(&permission_hook_settings(&hook.url, true))
+        .send()
+        .await?
+        .error_for_status()?;
+    // Settings hold the slot name, never its value.
+    let stored = client
+        .get(format!("{base}/v1/runtime/hooks"))
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    assert!(stored.contains("\"allow_private\":true"), "{stored}");
+    assert!(stored.contains("fregate.callback"), "{stored}");
+    assert!(!stored.contains("callback-secret"), "{stored}");
+
+    // Default permission mode: every MCP call asks, so the hook decides.
+    create_test_session(&client, &base, "mission-hook").await?;
+    let metadata = json!({"mission_id": "m1", "correlation_id": "corr-1"});
+    mock.push(scan_tool_use(
+        "toolu_hook_1",
+        json!({"target": "example.com"}),
+    ));
+    let run = client
+        .post(format!("{base}/v1/sessions/mission-hook/runs"))
+        .json(&json!({"content": "scan", "metadata": metadata}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<RunView>()
+        .await?;
+    wait_for_run_status(&client, &base, &run.run_id, &[DaemonRunStatus::Completed]).await?;
+    assert_eq!(mcp_log.calls.lock().len(), 1, "the hook allowed the call");
+    {
+        let requests = hook.requests.lock();
+        let request = requests.last().expect("the hook was called");
+        assert_eq!(
+            request
+                .headers
+                .get("x-fregate-callback")
+                .map(String::as_str),
+            Some("callback-secret-1")
+        );
+        assert!(request.headers.contains_key("idempotency-key"));
+        assert_eq!(request.body["event"], "permission_request");
+        assert_eq!(request.body["session_id"], "mission-hook");
+        assert_eq!(request.body["run_id"], json!(run.run_id));
+        assert_eq!(request.body["run_metadata"], metadata);
+        assert_eq!(request.body["subject"], "mcp__fregate__scan_target");
+    }
+
+    // The header is read at call time: a rotated secret is sent next time.
+    put_generic_secret(&client, &base, "fregate.callback", "callback-secret-2").await?;
+    mock.push(scan_tool_use(
+        "toolu_hook_2",
+        json!({"target": "example.org"}),
+    ));
+    let second = submit_test_input(&client, &base, "mission-hook", "scan again").await?;
+    wait_for_run_status(
+        &client,
+        &base,
+        &second.run_id,
+        &[DaemonRunStatus::Completed],
+    )
+    .await?;
+    assert_eq!(
+        hook.requests
+            .lock()
+            .last()
+            .and_then(|request| request.headers.get("x-fregate-callback").cloned())
+            .as_deref(),
+        Some("callback-secret-2")
+    );
+    assert_eq!(mcp_log.calls.lock().len(), 2);
+
+    // Fail-closed is unchanged: a failing hook denies the call.
+    *hook.status.lock() = 500;
+    mock.push(scan_tool_use(
+        "toolu_hook_3",
+        json!({"target": "example.net"}),
+    ));
+    let denied = submit_test_input(&client, &base, "mission-hook", "scan once more").await?;
+    wait_for_run_status(
+        &client,
+        &base,
+        &denied.run_id,
+        &[DaemonRunStatus::Completed],
+    )
+    .await?;
+    assert_eq!(mcp_log.calls.lock().len(), 2, "a failing hook must deny");
+    let dead_letters = client
+        .get(format!("{base}/v1/runtime/hooks/dead-letter"))
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    assert!(dead_letters.contains("fregate-approval"), "{dead_letters}");
+    assert!(!dead_letters.contains("callback-secret"), "{dead_letters}");
+
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+    Ok(())
+}

@@ -785,6 +785,7 @@ where
     ) -> Result<kheish_types::HookDispatchOutcome> {
         self.hooks
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event,
                 subject,
                 session_id,

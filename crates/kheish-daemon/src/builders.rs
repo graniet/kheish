@@ -869,16 +869,19 @@ where
     let model = Arc::new(model);
     let model_driver: Arc<dyn ModelDriver> = model.clone();
     let model_control_trait: Arc<dyn DaemonModelControl> = model_control.clone();
-    let hooks = Arc::new(DaemonHookDispatcher::new(
-        &config.state_root,
-        model_driver,
-        Some(model_control_trait.clone()),
-        primary_provider_name,
-        system_prompt.clone(),
-        hook_tools,
-        observer.clone(),
-        config.workspace_root.clone(),
-    )?);
+    let hooks = Arc::new(
+        DaemonHookDispatcher::new(
+            &config.state_root,
+            model_driver,
+            Some(model_control_trait.clone()),
+            primary_provider_name,
+            system_prompt.clone(),
+            hook_tools,
+            observer.clone(),
+            config.workspace_root.clone(),
+        )?
+        .with_secret_store(auth_manager.clone()),
+    );
     let runtime_config_service = crate::services::RuntimeConfigService::new(&config.state_root)?;
     let hook_dispatcher: Arc<dyn HookDispatcher> = hooks.clone();
     tools.set_hook_dispatcher(hook_dispatcher.clone());

@@ -576,6 +576,10 @@ pub struct DaemonHookDispatcher {
     observer: Arc<dyn RuntimeObserver>,
     workspace_root: PathBuf,
     http_resolver: Arc<dyn HookHttpResolver>,
+    /// Generic secret slots read for HTTP hook `header_secret_refs`.
+    secret_store: Option<Arc<kheish_auth::AuthManager>>,
+    /// Caller metadata of runs currently executing, keyed by run id.
+    run_metadata: Arc<RwLock<BTreeMap<String, Value>>>,
     command_permits: Arc<Semaphore>,
     http_permits: Arc<Semaphore>,
     prompt_permits: Arc<Semaphore>,
@@ -622,6 +626,8 @@ impl DaemonHookDispatcher {
             observer,
             workspace_root: workspace_root.into(),
             http_resolver: Arc::new(SystemHookHttpResolver),
+            secret_store: None,
+            run_metadata: Arc::new(RwLock::new(BTreeMap::new())),
             command_permits: Arc::new(Semaphore::new(DEFAULT_COMMAND_HOOK_CONCURRENCY)),
             http_permits: Arc::new(Semaphore::new(DEFAULT_HTTP_HOOK_CONCURRENCY)),
             prompt_permits: Arc::new(Semaphore::new(DEFAULT_PROMPT_HOOK_CONCURRENCY)),
@@ -633,6 +639,96 @@ impl DaemonHookDispatcher {
     #[cfg(test)]
     fn set_http_resolver_for_test(&mut self, resolver: Arc<dyn HookHttpResolver>) {
         self.http_resolver = resolver;
+    }
+
+    /// Lets HTTP hooks read `header_secret_refs` values from the daemon's
+    /// auth store at call time.
+    #[must_use]
+    pub fn with_secret_store(mut self, store: Arc<kheish_auth::AuthManager>) -> Self {
+        self.secret_store = Some(store);
+        self
+    }
+
+    /// Makes one run's caller metadata part of every hook invocation the run
+    /// triggers, until the returned guard drops.
+    pub(crate) fn track_run_metadata(
+        &self,
+        run_id: &str,
+        metadata: Option<&Value>,
+    ) -> HookRunMetadataGuard {
+        if let Some(metadata) = metadata.filter(|metadata| !metadata.is_null()) {
+            self.run_metadata
+                .write()
+                .insert(run_id.to_string(), metadata.clone());
+        }
+        HookRunMetadataGuard {
+            registry: self.run_metadata.clone(),
+            run_id: run_id.to_string(),
+        }
+    }
+
+    /// Completes an invocation with the execution context its emitter may not
+    /// carry: the agent and run ids of the current execution scope, and the
+    /// run's caller metadata.
+    fn contextualize_invocation(&self, mut invocation: HookInvocation) -> HookInvocation {
+        if let Some(scope) = current_execution_scope() {
+            let same_session = invocation
+                .session_id
+                .as_deref()
+                .is_none_or(|session_id| session_id == scope.session_id);
+            if same_session {
+                if invocation.session_id.is_none() && !scope.session_id.is_empty() {
+                    invocation.session_id = Some(scope.session_id.clone());
+                }
+                if invocation.agent_id.is_none() {
+                    invocation.agent_id = scope.agent_id.clone();
+                }
+                if invocation.run_id.is_none() {
+                    invocation.run_id = scope.run_id.clone();
+                }
+            }
+        }
+        if invocation.run_metadata.is_none()
+            && let Some(run_id) = invocation.run_id.as_deref()
+        {
+            invocation.run_metadata = self.run_metadata.read().get(run_id).cloned();
+        }
+        invocation
+    }
+
+    /// Reads the secret-backed request headers of one HTTP hook. Values are
+    /// marked sensitive and never appear in errors or logs.
+    fn resolve_hook_secret_headers(
+        &self,
+        header_secret_refs: &BTreeMap<String, String>,
+    ) -> Result<reqwest::header::HeaderMap> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if header_secret_refs.is_empty() {
+            return Ok(headers);
+        }
+        let store = self
+            .secret_store
+            .as_ref()
+            .ok_or_else(|| anyhow!("hook header secrets need the daemon secret store"))?;
+        for (name, secret_ref) in header_secret_refs {
+            let value = store
+                .secret_value(&kheish_auth::AuthSlotId::new(secret_ref.clone()))
+                .map_err(|_| {
+                    anyhow!("hook header `{name}` secret `{secret_ref}` is not a readable generic secret")
+                })?
+                .ok_or_else(|| anyhow!("hook header `{name}` secret `{secret_ref}` is missing"))?;
+            let header_name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| anyhow!("hook header name `{name}` is invalid"))?;
+            let mut header_value =
+                reqwest::header::HeaderValue::from_str(&value).map_err(|_| {
+                    anyhow!(
+                        "hook header `{name}` secret `{secret_ref}` is not a valid header value"
+                    )
+                })?;
+            header_value.set_sensitive(true);
+            headers.insert(header_name, header_value);
+        }
+        Ok(headers)
     }
 
     /// Returns the current persisted hook settings.
@@ -732,6 +828,7 @@ impl DaemonHookDispatcher {
             .map_err(|_| anyhow!("hook execution semaphore closed"))?;
         let generation = self.resolved_structured_prompt_generation(model, schema)?;
         let invocation = HookInvocation {
+            run_metadata: None,
             event: kheish_types::HookEventName::Notification,
             subject: Some("daemon_structured_prompt".to_string()),
             session_id: session_id.map(ToOwned::to_owned),
@@ -785,9 +882,21 @@ impl DaemonHookDispatcher {
                 )
                 .await
             }
-            HookExecutorConfig::Http { url, timeout_ms } => {
-                self.run_http_hook(&definition.name, &url, timeout_ms, &invocation)
-                    .await
+            HookExecutorConfig::Http {
+                url,
+                timeout_ms,
+                allow_private,
+                header_secret_refs,
+            } => {
+                self.run_http_hook(
+                    &definition.name,
+                    &url,
+                    timeout_ms,
+                    allow_private,
+                    &header_secret_refs,
+                    &invocation,
+                )
+                .await
             }
             HookExecutorConfig::Prompt {
                 template,
@@ -1140,6 +1249,8 @@ impl DaemonHookDispatcher {
         hook_name: &str,
         url: &str,
         timeout_ms: Option<u64>,
+        allow_private: bool,
+        header_secret_refs: &BTreeMap<String, String>,
         invocation: &HookInvocation,
     ) -> Result<HookDispatchOutcome> {
         let audit = HookAuditSpan::start(
@@ -1165,10 +1276,18 @@ impl DaemonHookDispatcher {
                 "hook HTTP executors only support http and https",
             ));
         }
-        let resolved_addrs = match validate_hook_http_url(&url, self.http_resolver.as_ref()).await {
-            Ok(addrs) => addrs,
+        let resolved_addrs =
+            match validate_hook_http_url(&url, self.http_resolver.as_ref(), allow_private).await {
+                Ok(addrs) => addrs,
+                Err(error) => {
+                    audit.record_failure_outcome("failed:rejected_target")?;
+                    return Err(terminal_hook_failure(error.to_string()));
+                }
+            };
+        let secret_headers = match self.resolve_hook_secret_headers(header_secret_refs) {
+            Ok(headers) => headers,
             Err(error) => {
-                audit.record_failure_outcome("failed:rejected_target")?;
+                audit.record_failure_outcome("failed:secret_header")?;
                 return Err(terminal_hook_failure(error.to_string()));
             }
         };
@@ -1176,6 +1295,7 @@ impl DaemonHookDispatcher {
             hook_name,
             url,
             &resolved_addrs,
+            secret_headers,
             timeout_ms.unwrap_or(DEFAULT_HTTP_TIMEOUT_MS),
             invocation,
         )
@@ -1441,9 +1561,22 @@ impl DaemonHookDispatcher {
     }
 }
 
+/// Keeps one run's caller metadata visible to hooks while the run executes.
+pub(crate) struct HookRunMetadataGuard {
+    registry: Arc<RwLock<BTreeMap<String, Value>>>,
+    run_id: String,
+}
+
+impl Drop for HookRunMetadataGuard {
+    fn drop(&mut self) {
+        self.registry.write().remove(&self.run_id);
+    }
+}
+
 #[async_trait]
 impl HookDispatcher for DaemonHookDispatcher {
     async fn dispatch(&self, invocation: HookInvocation) -> Result<HookDispatchOutcome> {
+        let invocation = self.contextualize_invocation(invocation);
         let hooks = self
             .settings
             .read()
@@ -1652,8 +1785,16 @@ pub fn validate_hook_settings(settings: &HookSettings) -> Result<()> {
                         invalid_hook_settings(format!("{hook_id}: command hook shell is empty"))?;
                     }
                 }
-                HookExecutorConfig::Http { url, .. } => {
-                    if let Err(error) = validate_hook_http_target_static(url) {
+                HookExecutorConfig::Http {
+                    url,
+                    allow_private,
+                    header_secret_refs,
+                    ..
+                } => {
+                    if let Err(error) = validate_hook_http_target_static(url, *allow_private) {
+                        invalid_hook_settings(format!("{hook_id}: {error}"))?;
+                    }
+                    if let Err(error) = validate_hook_secret_headers(header_secret_refs) {
                         invalid_hook_settings(format!("{hook_id}: {error}"))?;
                     }
                 }
@@ -1721,7 +1862,54 @@ fn validate_hook_timeout(hook_id: &str, timeout_ms: Option<u64>) -> Result<()> {
     Ok(())
 }
 
-fn validate_hook_http_target_static(url: &str) -> Result<()> {
+/// Header names an HTTP hook may not set from a secret: the daemon owns them.
+const RESERVED_HOOK_HEADER_NAMES: &[&str] = &[
+    "connection",
+    "content-length",
+    "content-type",
+    "expect",
+    "host",
+    "idempotency-key",
+    "keep-alive",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Maximum number of secret-backed headers one HTTP hook may send.
+const MAX_HOOK_SECRET_HEADERS: usize = 16;
+
+fn validate_hook_secret_headers(header_secret_refs: &BTreeMap<String, String>) -> Result<()> {
+    if header_secret_refs.len() > MAX_HOOK_SECRET_HEADERS {
+        invalid_hook_settings(format!(
+            "HTTP hook header_secret_refs must not exceed {MAX_HOOK_SECRET_HEADERS} headers"
+        ))?;
+    }
+    for (name, secret_ref) in header_secret_refs {
+        if reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
+            invalid_hook_settings(format!("HTTP hook header name `{name}` is invalid"))?;
+        }
+        if RESERVED_HOOK_HEADER_NAMES
+            .iter()
+            .any(|reserved| reserved.eq_ignore_ascii_case(name))
+        {
+            invalid_hook_settings(format!(
+                "HTTP hook header `{name}` is set by the daemon and cannot come from a secret"
+            ))?;
+        }
+        if secret_ref.trim().is_empty() {
+            invalid_hook_settings(format!(
+                "HTTP hook header `{name}` needs a non-empty secret ref"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_hook_http_target_static(url: &str, allow_private: bool) -> Result<()> {
     let parsed = reqwest::Url::parse(url)?;
     if !matches!(parsed.scheme(), "http" | "https") {
         invalid_hook_settings("HTTP hook URL must use http or https")?;
@@ -1736,11 +1924,14 @@ fn validate_hook_http_target_static(url: &str) -> Result<()> {
             "HTTP hook URL requires a concrete host",
         )
     })?;
-    if is_localhost_hook_name(host) {
-        invalid_hook_settings("HTTP hook URL must not target localhost")?;
-    }
     if hook_host_has_zone_identifier(host) {
         invalid_hook_settings("HTTP hook URL must not include IPv6 zone identifiers")?;
+    }
+    if allow_private {
+        return Ok(());
+    }
+    if is_localhost_hook_name(host) {
+        invalid_hook_settings("HTTP hook URL must not target localhost")?;
     }
     if let Some(address) = parse_hook_ip_host(host)
         && is_blocked_hook_ip(address)
@@ -2200,6 +2391,7 @@ async fn execute_http_hook_request(
     hook_name: &str,
     url: reqwest::Url,
     resolved_addrs: &[SocketAddr],
+    secret_headers: reqwest::header::HeaderMap,
     request_timeout_ms: u64,
     invocation: &HookInvocation,
 ) -> Result<(Result<HookDispatchOutcome>, String)> {
@@ -2209,6 +2401,7 @@ async fn execute_http_hook_request(
         request_timeout_ms,
         client
             .post(url)
+            .headers(secret_headers)
             .header("Idempotency-Key", idempotency_key)
             .json(&hook_invocation_contract(invocation)?)
             .send(),
@@ -2246,8 +2439,9 @@ async fn execute_http_hook_request(
 async fn validate_hook_http_url(
     url: &reqwest::Url,
     resolver: &dyn HookHttpResolver,
+    allow_private: bool,
 ) -> Result<Vec<SocketAddr>> {
-    validate_hook_http_target_static(url.as_str())?;
+    validate_hook_http_target_static(url.as_str(), allow_private)?;
     let Some(host) = url.host_str() else {
         bail!("hook HTTP executors require a concrete host");
     };
@@ -2255,13 +2449,19 @@ async fn validate_hook_http_url(
         .port_or_known_default()
         .ok_or_else(|| anyhow!("hook HTTP executors require an explicit or default port"))?;
     if let Some(address) = parse_hook_ip_host(host) {
-        if is_blocked_hook_ip(address) {
+        if !allow_private && is_blocked_hook_ip(address) {
             bail!("hook HTTP executors cannot target private or local addresses");
         }
         return Ok(vec![SocketAddr::new(address, port)]);
     }
     let resolved = resolver.resolve(host, port).await?;
-    validate_resolved_hook_http_addresses(&resolved)?;
+    if allow_private {
+        if resolved.is_empty() {
+            bail!("hook HTTP executor hostname resolved no addresses");
+        }
+    } else {
+        validate_resolved_hook_http_addresses(&resolved)?;
+    }
     Ok(resolved)
 }
 
@@ -2687,9 +2887,17 @@ fn redacted_hook_executor(executor: &HookExecutorConfig) -> HookExecutorConfig {
             shell: shell.clone(),
             timeout_ms: *timeout_ms,
         },
-        HookExecutorConfig::Http { url, timeout_ms } => HookExecutorConfig::Http {
+        HookExecutorConfig::Http {
+            url,
+            timeout_ms,
+            allow_private,
+            header_secret_refs,
+        } => HookExecutorConfig::Http {
             url: sanitized_hook_http_target_from_str(url),
             timeout_ms: *timeout_ms,
+            allow_private: *allow_private,
+            // Secret ref names, never secret values.
+            header_secret_refs: header_secret_refs.clone(),
         },
         HookExecutorConfig::Prompt {
             model, timeout_ms, ..
@@ -2871,7 +3079,7 @@ where
 #[cfg(test)]
 mod tests {
     use parking_lot::Mutex;
-    use std::collections::{BTreeSet, VecDeque};
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::net::{IpAddr, SocketAddr};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3033,6 +3241,7 @@ mod tests {
 
         let outcome = dispatcher
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event: kheish_types::HookEventName::PreToolUse,
                 subject: Some("write_file".to_string()),
                 session_id: Some("s".to_string()),
@@ -3088,6 +3297,7 @@ mod tests {
             },
             CancellationToken::new(),
             dispatcher.dispatch(HookInvocation {
+                run_metadata: None,
                 event: kheish_types::HookEventName::UserPromptSubmit,
                 subject: Some("actor".to_string()),
                 session_id: None,
@@ -3147,6 +3357,7 @@ mod tests {
 
         let outcome = dispatcher
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event: kheish_types::HookEventName::UserPromptSubmit,
                 subject: Some("actor".to_string()),
                 session_id: None,
@@ -3227,6 +3438,7 @@ mod tests {
 
         let outcome = dispatcher
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event: kheish_types::HookEventName::Notification,
                 subject: None,
                 session_id: None,
@@ -3269,6 +3481,7 @@ mod tests {
 
         let outcome = dispatcher
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event: kheish_types::HookEventName::Notification,
                 subject: Some("notify".to_string()),
                 session_id: Some("session-hook".to_string()),
@@ -3323,6 +3536,7 @@ mod tests {
 
         let outcome = dispatcher
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event: kheish_types::HookEventName::Notification,
                 subject: Some("notify".to_string()),
                 session_id: Some("session-hook".to_string()),
@@ -3396,6 +3610,7 @@ mod tests {
 
         let open = dispatcher
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event: kheish_types::HookEventName::Notification,
                 subject: Some("open".to_string()),
                 session_id: None,
@@ -3409,6 +3624,7 @@ mod tests {
 
         let closed = dispatcher
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event: kheish_types::HookEventName::Notification,
                 subject: Some("closed".to_string()),
                 session_id: None,
@@ -3462,6 +3678,7 @@ mod tests {
 
         let outcome = dispatcher
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event: kheish_types::HookEventName::Notification,
                 subject: None,
                 session_id: None,
@@ -3504,6 +3721,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         let outcome = dispatcher
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event: kheish_types::HookEventName::Notification,
                 subject: None,
                 session_id: None,
@@ -3549,6 +3767,7 @@ mod tests {
         })?;
         let prompt_outcome = prompt
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event: kheish_types::HookEventName::Notification,
                 subject: Some("prompt".to_string()),
                 session_id: None,
@@ -3595,6 +3814,7 @@ mod tests {
         })?;
         let agent_outcome = agent
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event: kheish_types::HookEventName::Notification,
                 subject: Some("agent".to_string()),
                 session_id: Some("agent-contract-session".to_string()),
@@ -3664,6 +3884,7 @@ mod tests {
 
         let outcome = dispatcher
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event: kheish_types::HookEventName::UserPromptSubmit,
                 subject: Some("actor".to_string()),
                 session_id: None,
@@ -3727,6 +3948,7 @@ mod tests {
 
         let outcome = dispatcher
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event: kheish_types::HookEventName::PreCompact,
                 subject: None,
                 session_id: None,
@@ -3788,6 +4010,7 @@ mod tests {
 
         let outcome = dispatcher
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event: kheish_types::HookEventName::PermissionRequest,
                 subject: Some("write_file".to_string()),
                 session_id: None,
@@ -3848,6 +4071,7 @@ mod tests {
 
         let outcome = dispatcher
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event: kheish_types::HookEventName::PermissionDenied,
                 subject: Some("write_file".to_string()),
                 session_id: None,
@@ -3909,6 +4133,7 @@ mod tests {
 
         let outcome = dispatcher
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event: kheish_types::HookEventName::UserPromptSubmit,
                 subject: Some("actor".to_string()),
                 session_id: None,
@@ -3942,6 +4167,8 @@ mod tests {
                     executor: HookExecutorConfig::Http {
                         url: "https://hooks.example.invalid/hook".to_string(),
                         timeout_ms: Some(1_000),
+                        allow_private: false,
+                        header_secret_refs: BTreeMap::new(),
                     },
                 }],
             ))
@@ -3950,6 +4177,7 @@ mod tests {
 
         let outcome = dispatcher
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event: kheish_types::HookEventName::Notification,
                 subject: None,
                 session_id: None,
@@ -4000,6 +4228,7 @@ mod tests {
 
         let outcome = dispatcher
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event: kheish_types::HookEventName::Notification,
                 subject: None,
                 session_id: None,
@@ -4074,6 +4303,7 @@ mod tests {
 
         let outcome = dispatcher
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event: kheish_types::HookEventName::Notification,
                 subject: None,
                 session_id: None,
@@ -4138,6 +4368,87 @@ mod tests {
     }
 
     #[test]
+    fn http_hooks_reach_private_targets_only_when_allowed_and_guard_secret_headers() {
+        let settings = |url: &str, allow_private: bool, headers: &[(&str, &str)]| HookSettings {
+            hooks: std::iter::once((
+                kheish_types::HookEventName::PermissionRequest,
+                vec![HookDefinition {
+                    name: "fregate-approval".to_string(),
+                    matcher: None,
+                    failure_policy: Default::default(),
+                    executor: HookExecutorConfig::Http {
+                        url: url.to_string(),
+                        timeout_ms: Some(5_000),
+                        allow_private,
+                        header_secret_refs: headers
+                            .iter()
+                            .map(|(name, slot)| (name.to_string(), slot.to_string()))
+                            .collect(),
+                    },
+                }],
+            ))
+            .collect(),
+        };
+        let callback = [("x-fregate-callback", "fregate.callback")];
+        for url in [
+            "http://127.0.0.1:8091/hooks/permission",
+            "http://10.0.0.5/hooks/permission",
+            "http://172.20.0.3:8080/hooks/permission",
+            "http://localhost:8091/hooks/permission",
+        ] {
+            assert!(
+                super::validate_hook_settings(&settings(url, false, &callback)).is_err(),
+                "{url} must be refused by default"
+            );
+            super::validate_hook_settings(&settings(url, true, &callback))
+                .unwrap_or_else(|error| panic!("{url} must be allowed when opted in: {error}"));
+        }
+        // Userinfo and zone identifiers stay refused even when private targets are allowed.
+        assert!(
+            super::validate_hook_settings(&settings("http://user:pw@10.0.0.5/hook", true, &[]))
+                .is_err()
+        );
+        // Daemon-owned and malformed header names cannot come from secrets.
+        for reserved in ["Idempotency-Key", "content-type", "Host", "bad header"] {
+            assert!(
+                super::validate_hook_settings(&settings(
+                    "https://hooks.example.com/hook",
+                    false,
+                    &[(reserved, "fregate.callback")],
+                ))
+                .is_err(),
+                "{reserved} must be refused"
+            );
+        }
+        assert!(
+            super::validate_hook_settings(&settings(
+                "https://hooks.example.com/hook",
+                false,
+                &[("x-fregate-callback", " ")],
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn hook_invocation_contract_carries_run_metadata() -> Result<()> {
+        let invocation = HookInvocation {
+            event: kheish_types::HookEventName::PermissionRequest,
+            subject: Some("mcp__fregate__scan_target".to_string()),
+            session_id: Some("mission-m1".to_string()),
+            agent_id: Some("agent-2".to_string()),
+            run_id: Some("run-4".to_string()),
+            run_metadata: Some(json!({"mission_id": "m1"})),
+            payload: json!({"tool_call": {"id": "toolu_1"}}),
+        };
+        let contract = super::hook_invocation_contract(&invocation)?;
+        assert_eq!(contract["run_id"], "run-4");
+        assert_eq!(contract["run_metadata"], json!({"mission_id": "m1"}));
+        assert_eq!(contract["agent_id"], "agent-2");
+        Ok(())
+    }
+
+    #[test]
     fn hook_settings_validation_rejects_dangerous_http_and_unbounded_timeouts() -> Result<()> {
         let invalid = HookSettings {
             hooks: std::iter::once((
@@ -4149,6 +4460,8 @@ mod tests {
                     executor: HookExecutorConfig::Http {
                         url: "http://localhost:9/hook".to_string(),
                         timeout_ms: Some(1_000),
+                        allow_private: false,
+                        header_secret_refs: BTreeMap::new(),
                     },
                 }],
             ))
@@ -4253,6 +4566,7 @@ mod tests {
     #[test]
     fn hook_invocation_contract_includes_version_and_stable_key() -> Result<()> {
         let invocation = HookInvocation {
+            run_metadata: None,
             event: kheish_types::HookEventName::Notification,
             subject: Some("subject".to_string()),
             session_id: Some("session".to_string()),
@@ -4284,9 +4598,12 @@ mod tests {
                     executor: HookExecutorConfig::Http {
                         url: "not a url with secret-token".to_string(),
                         timeout_ms: Some(1_000),
+                        allow_private: false,
+                        header_secret_refs: BTreeMap::new(),
                     },
                 },
                 HookInvocation {
+                    run_metadata: None,
                     event: kheish_types::HookEventName::Notification,
                     subject: None,
                     session_id: None,
@@ -4349,6 +4666,8 @@ mod tests {
                     executor: HookExecutorConfig::Http {
                         url: format!("http://{address}/"),
                         timeout_ms: Some(2_000),
+                        allow_private: false,
+                        header_secret_refs: BTreeMap::new(),
                     },
                 }],
             ))
@@ -4368,9 +4687,12 @@ mod tests {
                     executor: HookExecutorConfig::Http {
                         url: format!("http://{address}/"),
                         timeout_ms: Some(2_000),
+                        allow_private: false,
+                        header_secret_refs: BTreeMap::new(),
                     },
                 },
                 HookInvocation {
+                    run_metadata: None,
                     event: kheish_types::HookEventName::Notification,
                     subject: None,
                     session_id: None,
@@ -4424,6 +4746,7 @@ mod tests {
         });
 
         let invocation = HookInvocation {
+            run_metadata: None,
             event: kheish_types::HookEventName::Notification,
             subject: Some("notify".to_string()),
             session_id: Some("session-http".to_string()),
@@ -4432,9 +4755,15 @@ mod tests {
             payload: json!({"message": "hello"}),
         };
         let url = reqwest::Url::parse("http://hooks.example.invalid/")?;
-        let (outcome, _digest) =
-            super::execute_http_hook_request("contract", url, &[address], 1_000, &invocation)
-                .await?;
+        let (outcome, _digest) = super::execute_http_hook_request(
+            "contract",
+            url,
+            &[address],
+            reqwest::header::HeaderMap::new(),
+            1_000,
+            &invocation,
+        )
+        .await?;
         assert!(outcome?.continue_execution);
 
         let payload = seen_payload
@@ -4487,8 +4816,10 @@ mod tests {
             "redirect",
             reqwest::Url::parse("http://hooks.example.invalid/")?,
             &[address],
+            reqwest::header::HeaderMap::new(),
             1_000,
             &HookInvocation {
+                run_metadata: None,
                 event: kheish_types::HookEventName::Notification,
                 subject: None,
                 session_id: None,
@@ -4528,6 +4859,7 @@ mod tests {
             axum::serve(listener, app).await.expect("http hook server");
         });
         let invocation = HookInvocation {
+            run_metadata: None,
             event: kheish_types::HookEventName::Notification,
             subject: None,
             session_id: None,
@@ -4540,6 +4872,7 @@ mod tests {
             "client",
             reqwest::Url::parse("http://hooks.example.invalid/client")?,
             &[address],
+            reqwest::header::HeaderMap::new(),
             1_000,
             &invocation,
         )
@@ -4551,6 +4884,7 @@ mod tests {
             "busy",
             reqwest::Url::parse("http://hooks.example.invalid/busy")?,
             &[address],
+            reqwest::header::HeaderMap::new(),
             1_000,
             &invocation,
         )
@@ -4782,6 +5116,8 @@ mod tests {
                         executor: HookExecutorConfig::Http {
                             url: "https://example.com/hook?token=secret".to_string(),
                             timeout_ms: Some(1_000),
+                            allow_private: false,
+                            header_secret_refs: BTreeMap::new(),
                         },
                     },
                 ],
@@ -4864,6 +5200,7 @@ mod tests {
         })?;
         let outcome = dispatcher
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event: kheish_types::HookEventName::SessionStart,
                 subject: Some("session-a".to_string()),
                 session_id: Some("session-a".to_string()),
@@ -4902,6 +5239,7 @@ mod tests {
         })?;
         let outcome = dispatcher
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event: kheish_types::HookEventName::PostCompact,
                 subject: Some("compact".to_string()),
                 session_id: Some("session-b".to_string()),
@@ -4947,6 +5285,7 @@ mod tests {
 
         let outcome = dispatcher
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event: kheish_types::HookEventName::PermissionRequest,
                 subject: Some("write_file".to_string()),
                 session_id: Some("session-a".to_string()),

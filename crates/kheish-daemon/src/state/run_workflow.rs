@@ -2093,6 +2093,10 @@ where
             model: record.view.request.model.clone(),
             ..ExecutionScope::default()
         };
+        // Every hook this execution triggers carries the run's caller metadata.
+        let _hook_run_metadata = self
+            .hooks
+            .track_run_metadata(run_id, record.view.input_metadata.as_ref());
         let result = scope_execution(run_scope, CancellationToken::new(), async {
             match record.payload.clone() {
                 RunRequestPayload::Input { request, .. } => {

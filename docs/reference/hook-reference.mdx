@@ -15,6 +15,29 @@ Hook outcomes may include `contract_version`. Outcomes with a future version are
 
 Persisted hook settings are stored as schema version `1`. The daemon still reads legacy flat `{"hooks": ...}` files for recovery and migration, then writes the versioned envelope on the next successful save.
 
+## Invocation payload
+
+Every invocation that happens while a run executes carries that run's context, whichever component emitted the event. The daemon fills `session_id`, `agent_id`, and `run_id` from the run's execution scope, and `run_metadata` from the `metadata` object of the run request:
+
+```json
+{
+  "contract_version": 1,
+  "invocation_key": "hook-invocation-ed2b1f377c7e89f0d688cb4b5ab1b30c",
+  "event": "permission_request",
+  "subject": "mcp__fregate__scan_target",
+  "session_id": "mission-m1",
+  "agent_id": "agent-2",
+  "run_id": "run-4",
+  "run_metadata": {"mission_id": "m1", "correlation_id": "corr-1", "workspace_id": "ws-1"},
+  "payload": {
+    "approval_request": {"id": "approval-...", "tool_call_id": "toolu_e1f7cf7a73", "tool_name": "mcp__fregate__scan_target", "input": {"target": "example.com"}, "scope": "session", "reason": "..."},
+    "tool_call": {"id": "toolu_e1f7cf7a73", "name": "mcp__fregate__scan_target", "input": {"target": "example.com"}}
+  }
+}
+```
+
+`run_metadata` is omitted when the run request carried no metadata, and `run_id` and `agent_id` are omitted outside a run (for example a daemon-level `config_change`). These ids come from the daemon, never from the model.
+
 ## Hook events
 
 Important hook event families include:
@@ -86,11 +109,33 @@ Command hooks run in a dedicated process group on Unix. When a command hook time
 HTTP hooks are intended for public, explicit integration endpoints. The daemon:
 
 - allows only `http` and `https`
-- rejects userinfo, `localhost`, `.localhost`, private/local/link-local/documentation/benchmark/reserved IP ranges, IPv4-mapped or compatible blocked addresses, NAT64, 6to4, Teredo, and documentation IPv6 ranges
+- rejects userinfo, `localhost`, `.localhost`, private/local/link-local/documentation/benchmark/reserved IP ranges, IPv4-mapped or compatible blocked addresses, NAT64, 6to4, Teredo, and documentation IPv6 ranges, unless the hook sets `allow_private`
 - resolves hostnames before execution and pins the request to the validated addresses
 - disables proxies and redirects
 - applies a bounded total timeout and response-size cap
 - sends a stable `Idempotency-Key` header
+
+## HTTP executor fields
+
+```json
+{
+  "name": "fregate-approval",
+  "failure_policy": {"mode": "closed"},
+  "executor": {
+    "type": "http",
+    "url": "http://fregate-callback.internal:8091/hooks/permission",
+    "timeout_ms": 5000,
+    "allow_private": true,
+    "header_secret_refs": {"x-fregate-callback": "fregate.callback"}
+  }
+}
+```
+
+- `url`, `timeout_ms`: as above.
+- `allow_private` (default `false`): lets the hook reach loopback, RFC 1918, link-local, and other non-public addresses, both at validation and after DNS resolution. Use it for a control plane on a private network, never for a third-party endpoint. Userinfo and IPv6 zone identifiers stay refused, and redirects and proxies stay disabled. Hook settings are only writable through the admin control plane (`POST /v1/runtime/hooks`, stacks, rollback), so only an admin token can set it.
+- `header_secret_refs` (default empty): request headers whose values are read from generic secret slots (`POST /v1/runtime/secrets` with `provider: "generic"`) when the hook is called, keyed by header name. The settings store only the slot names: `GET /v1/runtime/hooks` returns the names, never a value, and values are marked sensitive on the request and never logged or written to dead letters. Rotating the slot takes effect on the next call. At most 16 headers; names must be valid HTTP header names, and the daemon-owned names (`Content-Type`, `Content-Length`, `Host`, `Idempotency-Key`, `Connection`, `Transfer-Encoding`, `TE`, `Trailer`, `Upgrade`, `Expect`, `Keep-Alive`, `Proxy-Authorization`, `Proxy-Connection`) are refused.
+
+A missing or unreadable header secret is a terminal hook failure, so a fail-closed hook denies the action instead of calling the endpoint without its credential.
 
 ## Operational guidance
 

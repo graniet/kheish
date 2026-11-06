@@ -563,6 +563,17 @@ and the destination is trusted. The same transcript-facing bounds that apply to
 MCP output apply here — but as with MCP, these are safety limits, not a
 replacement for network-level egress controls in a hostile environment.
 
+HTTP hooks follow the same default: loopback, private, link-local, and other
+non-public targets are refused at validation and again after DNS resolution.
+A hook that calls a control plane on a private network opts in per hook with
+`allow_private: true`. Hook settings are only writable with an admin token, the
+model has no path to them, and redirects and proxies stay disabled even for an
+opted-in hook. A hook that must authenticate to its endpoint names generic secret
+slots in `header_secret_refs`: the value is read from the encrypted store at call
+time and sent as a sensitive header, while settings, API reads, logs, and dead
+letters only ever hold the slot name. See
+[Hook reference](../reference/hook-reference#http-executor-fields).
+
 ## Signed external-action audit
 
 Every external action — provider requests, connector deliveries, hooks, and other

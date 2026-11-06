@@ -1594,6 +1594,7 @@ async fn dispatch_tool_hook(
     };
     dispatcher
         .dispatch(HookInvocation {
+            run_metadata: None,
             event,
             subject: Some(descriptor.name.clone()),
             session_id: current_execution_scope()

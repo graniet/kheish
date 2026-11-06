@@ -141,6 +141,16 @@ pub enum HookExecutorConfig {
         url: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_ms: Option<u64>,
+        /// Allows loopback, private (RFC 1918), link-local and other
+        /// non-public targets, which are refused by default. Hook settings
+        /// are only writable through the admin control plane.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        allow_private: bool,
+        /// Request headers whose values are read from generic secret slots
+        /// at call time, keyed by header name. Values are never persisted in
+        /// hook settings, returned by the API, or logged.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        header_secret_refs: BTreeMap<String, String>,
     },
     /// Run one lightweight model prompt and parse a structured JSON response.
     Prompt {
@@ -221,6 +231,10 @@ pub struct HookInvocation {
     /// Optional run identifier associated with the invocation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+    /// Caller metadata of the run (`metadata` on the run request), when the
+    /// invocation happens inside a run that carries some.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_metadata: Option<Value>,
     /// Event-specific payload.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub payload: Value,

@@ -351,12 +351,17 @@ fn redacted_doctor_hook_executor(
             shell: shell.clone(),
             timeout_ms: *timeout_ms,
         },
-        kheish_types::HookExecutorConfig::Http { url, timeout_ms } => {
-            kheish_types::HookExecutorConfig::Http {
-                url: redacted_doctor_http_hook_url(url),
-                timeout_ms: *timeout_ms,
-            }
-        }
+        kheish_types::HookExecutorConfig::Http {
+            url,
+            timeout_ms,
+            allow_private,
+            header_secret_refs,
+        } => kheish_types::HookExecutorConfig::Http {
+            url: redacted_doctor_http_hook_url(url),
+            timeout_ms: *timeout_ms,
+            allow_private: *allow_private,
+            header_secret_refs: header_secret_refs.clone(),
+        },
         kheish_types::HookExecutorConfig::Prompt {
             model, timeout_ms, ..
         } => kheish_types::HookExecutorConfig::Prompt {
@@ -1079,11 +1084,16 @@ fn doctor_hook_diagnostics(settings: &kheish_types::HookSettings) -> HookDoctorD
                         errors.push((hook_id.clone(), error));
                     }
                 }
-                kheish_types::HookExecutorConfig::Http { url, timeout_ms } => {
+                kheish_types::HookExecutorConfig::Http {
+                    url,
+                    timeout_ms,
+                    allow_private,
+                    ..
+                } => {
                     if let Some(error) = doctor_validate_hook_timeout("HTTP", *timeout_ms) {
                         errors.push((hook_id.clone(), error));
                     }
-                    if let Some(error) = doctor_validate_http_hook_target(url) {
+                    if let Some(error) = doctor_validate_http_hook_target(url, *allow_private) {
                         errors.push((hook_id.clone(), error));
                     }
                 }
@@ -1185,10 +1195,14 @@ async fn doctor_http_hook_target_diagnostics(
     let mut targets = Vec::new();
     for (event, hooks) in &settings.hooks {
         for hook in hooks {
-            let kheish_types::HookExecutorConfig::Http { url, .. } = &hook.executor else {
+            let kheish_types::HookExecutorConfig::Http {
+                url, allow_private, ..
+            } = &hook.executor
+            else {
                 continue;
             };
-            if doctor_validate_http_hook_target(url).is_some() {
+            // A hook that opted into private targets is meant to resolve to one.
+            if *allow_private || doctor_validate_http_hook_target(url, false).is_some() {
                 continue;
             }
             targets.push((format!("{event:?}:{}", hook.name), url.clone()));
@@ -1359,7 +1373,7 @@ fn doctor_shell_metadata_is_executable(_metadata: &fs::Metadata) -> bool {
     true
 }
 
-fn doctor_validate_http_hook_target(url: &str) -> Option<String> {
+fn doctor_validate_http_hook_target(url: &str, allow_private: bool) -> Option<String> {
     let parsed = match reqwest::Url::parse(url) {
         Ok(parsed) => parsed,
         Err(error) => return Some(format!("HTTP hook URL is invalid: {error}")),
@@ -1373,6 +1387,9 @@ fn doctor_validate_http_hook_target(url: &str) -> Option<String> {
     let Some(host) = parsed.host_str() else {
         return Some("HTTP hook URL requires a concrete host".to_string());
     };
+    if allow_private {
+        return None;
+    }
     let lower_host = host.trim_end_matches('.').to_ascii_lowercase();
     if lower_host == "localhost" || lower_host.ends_with(".localhost") {
         return Some("HTTP hook URL must not target localhost".to_string());
@@ -3319,6 +3336,8 @@ mod tests {
                         executor: kheish_types::HookExecutorConfig::Http {
                             url: "http://localhost:9999/hook".to_string(),
                             timeout_ms: Some(1_000),
+                            allow_private: false,
+                            header_secret_refs: Default::default(),
                         },
                     },
                     kheish_types::HookDefinition {
@@ -3328,6 +3347,8 @@ mod tests {
                         executor: kheish_types::HookExecutorConfig::Http {
                             url: "http://10.0.0.1/hook".to_string(),
                             timeout_ms: Some(1_000),
+                            allow_private: false,
+                            header_secret_refs: Default::default(),
                         },
                     },
                 ],
@@ -3379,6 +3400,8 @@ mod tests {
                     executor: kheish_types::HookExecutorConfig::Http {
                         url: "https://93.184.216.34/hook".to_string(),
                         timeout_ms: Some(1_000),
+                        allow_private: false,
+                        header_secret_refs: Default::default(),
                     },
                 }],
             )]),

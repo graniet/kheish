@@ -1961,6 +1961,7 @@ where
             .deps
             .hooks
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event: HookEventName::SessionStart,
                 subject: Some(trigger.to_string()),
                 session_id: Some(self.engine.conversation().session_id.clone()),
@@ -2008,6 +2009,7 @@ where
             .deps
             .hooks
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event: HookEventName::Setup,
                 subject: Some("init".to_string()),
                 session_id: Some(self.engine.conversation().session_id.clone()),
@@ -2044,6 +2046,7 @@ where
             .deps
             .hooks
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event: HookEventName::UserPromptSubmit,
                 subject: Some(input.actor.id.clone()),
                 session_id: Some(self.engine.conversation().session_id.clone()),
@@ -2077,6 +2080,7 @@ where
             .deps
             .hooks
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event: HookEventName::InstructionsLoaded,
                 subject: Some(self.engine.conversation().session_id.clone()),
                 session_id: Some(self.engine.conversation().session_id.clone()),
@@ -2113,6 +2117,7 @@ where
             .deps
             .hooks
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event: HookEventName::Stop,
                 subject: Some("completed".to_string()),
                 session_id: Some(self.engine.conversation().session_id.clone()),
@@ -2147,6 +2152,7 @@ where
             .deps
             .hooks
             .dispatch(HookInvocation {
+                run_metadata: None,
                 event: HookEventName::StopFailure,
                 subject: Some(input.source.kind.clone()),
                 session_id: Some(self.engine.conversation().session_id.clone()),
