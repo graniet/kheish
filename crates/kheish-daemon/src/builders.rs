@@ -539,15 +539,17 @@ fn agent_loop_policy_from(raw: Option<&str>) -> LoopPolicy {
 }
 
 /// Appends runtime-added model routes (from the state-root overlay) to the boot
-/// inventory, resolving each API key from the encrypted secret store.
+/// inventory, resolving each credential from the daemon's stores.
 ///
 /// Broken or shadowing entries are logged and skipped rather than failing boot,
 /// mirroring how runtime-added MCP servers reconnect: a hot-added resource must
-/// never block startup the way a required startup route does.
+/// never block startup the way a required startup route does. A provider-typed
+/// `auth_ref` is resolved by the broker on every request, so its slot is not
+/// read here: a missing slot shows in route readiness instead.
 pub(crate) fn load_routes_overlay_into(
     route_configs: &mut Vec<ConfiguredModelRoute>,
     state_root: &Path,
-    auth_manager: &AuthManager,
+    auth_manager: &Arc<AuthManager>,
 ) {
     let overlay = crate::services::RoutesOverlayService::new(state_root);
     let mut seen_route_ids = route_configs
@@ -570,32 +572,59 @@ pub(crate) fn load_routes_overlay_into(
             );
             continue;
         };
-        let api_key =
-            match auth_manager.secret_value(&AuthSlotId::new(entry.api_key_secret_ref.clone())) {
-                Ok(Some(value)) => value,
-                Ok(None) => {
-                    tracing::warn!(
-                        route = %entry.route_id,
-                        secret_ref = %entry.api_key_secret_ref,
-                        "runtime-added model route secret is missing; skipped"
-                    );
-                    continue;
+        let (credential, auth_ref) = match (
+            entry.auth_ref.as_deref(),
+            entry.api_key_secret_ref.as_deref(),
+        ) {
+            (Some(auth_ref), None) => (
+                crate::model_routing::RuntimeRouteCredential::Brokered(Arc::new(
+                    crate::ScopedRequestAuthProvider::for_slot(
+                        auth_manager.clone(),
+                        AuthSlotId::new(auth_ref.to_string()),
+                        entry.route_id.clone(),
+                    ),
+                )),
+                auth_ref.to_string(),
+            ),
+            (None, Some(secret_ref)) => {
+                match auth_manager.secret_value(&AuthSlotId::new(secret_ref.to_string())) {
+                    Ok(Some(value)) => (
+                        crate::model_routing::RuntimeRouteCredential::ApiKey(value),
+                        secret_ref.to_string(),
+                    ),
+                    Ok(None) => {
+                        tracing::warn!(
+                            route = %entry.route_id,
+                            secret_ref = %secret_ref,
+                            "runtime-added model route secret is missing; skipped"
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            route = %entry.route_id,
+                            error = %format!("{error:#}"),
+                            "failed to resolve runtime-added model route secret; skipped"
+                        );
+                        continue;
+                    }
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        route = %entry.route_id,
-                        error = %format!("{error:#}"),
-                        "failed to resolve runtime-added model route secret; skipped"
-                    );
-                    continue;
-                }
-            };
-        let route = crate::model_routing::build_inline_api_key_route(
+            }
+            _ => {
+                tracing::warn!(
+                    route = %entry.route_id,
+                    "runtime-added model route needs exactly one of auth_ref or api_key_secret_ref; skipped"
+                );
+                continue;
+            }
+        };
+        let route = crate::model_routing::build_runtime_route(
             &entry.route_id,
             provider,
             &entry.model,
-            &api_key,
-            Some(entry.api_key_secret_ref.clone()),
+            credential,
+            Some(auth_ref),
+            entry.base_url.as_deref(),
         );
         route_configs.push(configured_route_with_asset_root(route, state_root));
     }
@@ -654,11 +683,7 @@ where
     // Rebuild routes added through the runtime API in earlier daemon lives. A
     // broken overlay route logs and skips: it must never block boot the way a
     // required startup route does, and it never shadows a startup route.
-    load_routes_overlay_into(
-        &mut route_configs,
-        &config.state_root,
-        auth_manager.as_ref(),
-    );
+    load_routes_overlay_into(&mut route_configs, &config.state_root, &auth_manager);
     validate_route_capability_overrides(
         &route_configs,
         &extra_image_backends,

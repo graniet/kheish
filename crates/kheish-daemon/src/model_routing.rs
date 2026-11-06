@@ -1206,6 +1206,17 @@ pub(crate) enum RouteProviderKind {
 }
 
 impl RouteProviderKind {
+    /// The auth-store provider a slot must carry to serve this driver.
+    pub(crate) fn auth_provider(self) -> kheish_auth::AuthProvider {
+        match self {
+            Self::Anthropic => kheish_auth::AuthProvider::Anthropic,
+            Self::Google => kheish_auth::AuthProvider::Google,
+            Self::OpenAi => kheish_auth::AuthProvider::OpenAi,
+            Self::OpenRouter => kheish_auth::AuthProvider::OpenRouter,
+            Self::XAi => kheish_auth::AuthProvider::XAi,
+        }
+    }
+
     /// Parses one provider identifier from the runtime route-add request.
     pub(crate) fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
@@ -1219,32 +1230,97 @@ impl RouteProviderKind {
     }
 }
 
-/// Builds one runtime-added route from an inline API key.
+/// How one runtime-added route authenticates its provider requests.
+pub(crate) enum RuntimeRouteCredential {
+    /// A static API key embedded in the provider config.
+    ApiKey(String),
+    /// A request-time provider, typically a provider-typed auth slot resolved
+    /// through the credential broker on every request.
+    Brokered(Arc<dyn kheish_auth::RequestAuthProvider>),
+}
+
+/// Builds one runtime-added route.
 ///
-/// The key is embedded directly in the provider config; the daemon persists it
-/// in the encrypted secret store separately and rebuilds the route from there at
-/// boot. `auth_ref` records the secret slot so `/v1/runtime` surfaces it.
-pub(crate) fn build_inline_api_key_route(
+/// `auth_ref` records the slot behind the credential so `/v1/runtime` and
+/// readiness surface it; `base_url` overrides the provider endpoint with the
+/// same meaning as `base_url` in the routes file.
+pub(crate) fn build_runtime_route(
     route_id: &str,
     provider: RouteProviderKind,
     model: &str,
-    api_key: &str,
+    credential: RuntimeRouteCredential,
     auth_ref: Option<String>,
+    base_url: Option<&str>,
 ) -> ConfiguredModelRoute {
-    let route = match provider {
-        RouteProviderKind::Anthropic => {
-            ModelRouteConfig::Anthropic(AnthropicProviderConfig::new(model, api_key))
+    let route = match (provider, credential) {
+        (RouteProviderKind::Anthropic, credential) => {
+            let mut config = match credential {
+                RuntimeRouteCredential::ApiKey(api_key) => {
+                    AnthropicProviderConfig::new(model, api_key)
+                }
+                RuntimeRouteCredential::Brokered(auth) => {
+                    AnthropicProviderConfig::with_request_auth_provider(model, auth)
+                }
+            };
+            if let Some(base_url) = base_url {
+                config.base_url = base_url.to_string();
+            }
+            ModelRouteConfig::Anthropic(config)
         }
-        RouteProviderKind::Google => {
-            ModelRouteConfig::Google(GoogleProviderConfig::new(model, api_key))
+        (RouteProviderKind::Google, credential) => {
+            let mut config = match credential {
+                RuntimeRouteCredential::ApiKey(api_key) => {
+                    GoogleProviderConfig::new(model, api_key)
+                }
+                RuntimeRouteCredential::Brokered(auth) => {
+                    GoogleProviderConfig::with_request_auth_provider(model, auth)
+                }
+            };
+            if let Some(base_url) = base_url {
+                config.base_url = base_url.to_string();
+            }
+            ModelRouteConfig::Google(config)
         }
-        RouteProviderKind::OpenAi => {
-            ModelRouteConfig::OpenAi(OpenAiProviderConfig::new(model, api_key))
+        (RouteProviderKind::OpenAi, credential) => {
+            let mut config = match credential {
+                RuntimeRouteCredential::ApiKey(api_key) => {
+                    OpenAiProviderConfig::new(model, api_key)
+                }
+                RuntimeRouteCredential::Brokered(auth) => {
+                    OpenAiProviderConfig::with_request_auth_provider(model, auth)
+                }
+            };
+            if let Some(base_url) = base_url {
+                config.base_url = base_url.to_string();
+            }
+            ModelRouteConfig::OpenAi(config)
         }
-        RouteProviderKind::OpenRouter => {
-            ModelRouteConfig::OpenRouter(OpenRouterProviderConfig::new(model, api_key))
+        (RouteProviderKind::OpenRouter, credential) => {
+            let mut config = match credential {
+                RuntimeRouteCredential::ApiKey(api_key) => {
+                    OpenRouterProviderConfig::new(model, api_key)
+                }
+                RuntimeRouteCredential::Brokered(auth) => {
+                    OpenRouterProviderConfig::with_request_auth_provider(model, auth)
+                }
+            };
+            if let Some(base_url) = base_url {
+                config.base_url = base_url.to_string();
+            }
+            ModelRouteConfig::OpenRouter(config)
         }
-        RouteProviderKind::XAi => ModelRouteConfig::XAi(XAiProviderConfig::new(model, api_key)),
+        (RouteProviderKind::XAi, credential) => {
+            let mut config = match credential {
+                RuntimeRouteCredential::ApiKey(api_key) => XAiProviderConfig::new(model, api_key),
+                RuntimeRouteCredential::Brokered(auth) => {
+                    XAiProviderConfig::with_request_auth_provider(model, auth)
+                }
+            };
+            if let Some(base_url) = base_url {
+                config.base_url = base_url.to_string();
+            }
+            ModelRouteConfig::XAi(config)
+        }
     };
     ConfiguredModelRoute::new(route_id.to_string(), route).with_auth_ref(auth_ref)
 }

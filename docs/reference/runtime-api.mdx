@@ -34,6 +34,8 @@ Inspection:
 Mutation:
 
 - `POST /v1/runtime/model`
+- `POST /v1/runtime/routes`
+- `DELETE /v1/runtime/routes/{route_id}`
 - `POST /v1/runtime/learning-policy`
 - `POST /v1/runtime/run-memory-policy`
 - `POST /v1/runtime/tool-limits`
@@ -599,6 +601,33 @@ Terminology note:
 
 - request `provider` selects a configured route id
 - secret-slot `provider` names the underlying auth/backend family
+
+## Add and remove routes at runtime
+
+`POST /v1/runtime/routes` adds one named route to the live inventory and persists it to `<state_root>/routes-overlay.json`, so it rebuilds at every boot next to the routes file, which it never touches. `DELETE /v1/runtime/routes/{route_id}` removes a runtime-added route; startup routes answer `409 route_startup_owned`.
+
+Request body (unknown fields are refused, never dropped):
+
+- `route_id`: 1-64 ascii alphanumerics, `-` or `_`
+- `provider`: `anthropic`, `google`, `openai`, `openrouter`, or `xai`
+- `model`: the route's default model
+- exactly one credential source:
+  - `auth_ref`: a provider-typed auth slot from `POST /v1/runtime/secrets` whose `provider` matches the route's. The broker resolves it on every request under the run's execution scope, exactly like a routes-file `auth_ref`, so rotating the slot takes effect on the next request with no restart. An OpenAI account login slot is refused (`route_auth_ref_unsupported`): declare that route in the routes file.
+  - `api_key`: an inline key, stored in the encrypted secret store as `routes.<route_id>.api_key` and deleted with the route.
+  - `api_key_secret_ref`: an existing generic secret slot holding the key. Its value is read when the route is added and at boot.
+- `base_url` (optional): the provider endpoint, with the same meaning as `base_url` in the routes file. For `anthropic` it is the full Messages endpoint URL, posted to as-is. It must be an absolute `http` or `https` URL without embedded credentials. The process environment (`ANTHROPIC_BASE_URL` and the like) is never applied to runtime-added routes.
+
+```json
+{
+  "route_id": "fregate",
+  "provider": "anthropic",
+  "model": "claude-sonnet-4-5",
+  "auth_ref": "fregate.callback",
+  "base_url": "http://fregate-callback.internal:8091/relay/v1/messages"
+}
+```
+
+The response is the updated `RuntimeSettingsView`; the route appears under `routes` with its `auth_ref`. The overlay records the slot name and the endpoint, never a credential value. Errors are `400` with domain `runtime` and one of `route_id_invalid`, `route_provider_invalid`, `route_model_required`, `route_api_key_ambiguous`, `route_api_key_required`, `route_api_key_empty`, `route_secret_ref_missing`, `route_auth_ref_missing`, `route_auth_ref_provider_mismatch`, `route_auth_ref_unsupported`, or `route_base_url_invalid`; a duplicate id is `409 route_exists`. Removing a route deletes only the secret it minted (`routes.<route_id>.api_key`); a provider slot named by `auth_ref` is left in place.
 
 ## Secret slots
 

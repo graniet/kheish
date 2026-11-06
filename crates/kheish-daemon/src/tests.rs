@@ -58612,11 +58612,7 @@ async fn scripted_routes_daemon(state_root: &Path) -> Result<(SocketAddr, onesho
         ModelRouteConfig::OpenAi(OpenAiProviderConfig::new("gpt-5.4", "boot-key")),
     )];
     let auth_manager = AuthManager::new(state_root.join("auth/global-slots.json"))?;
-    crate::builders::load_routes_overlay_into(
-        &mut route_configs,
-        state_root,
-        auth_manager.as_ref(),
-    );
+    crate::builders::load_routes_overlay_into(&mut route_configs, state_root, &auth_manager);
     let (driver, control) = RoutedModelControl::new(
         route_configs,
         daemon_model_retry_policy(),

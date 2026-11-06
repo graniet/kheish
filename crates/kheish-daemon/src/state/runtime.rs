@@ -306,10 +306,13 @@ where
 
     /// Adds one model route to the live inventory and persists it.
     ///
-    /// The API key lands in the encrypted secret store; the state-root routes
-    /// overlay records only the slot, so the route rebuilds at every boot the
-    /// same way a routes-file entry does. If the inventory was empty (an
-    /// onboarding `up` daemon), the first route added becomes the default.
+    /// An inline API key lands in the encrypted secret store; a provider-typed
+    /// `auth_ref` slot is resolved through the credential broker on every
+    /// request, exactly like a routes-file `auth_ref`. The state-root routes
+    /// overlay records only the slot and the endpoint override, so the route
+    /// rebuilds at every boot the same way a routes-file entry does. If the
+    /// inventory was empty (an onboarding `up` daemon), the first route added
+    /// becomes the default.
     pub(crate) async fn add_model_route(
         &self,
         request: crate::AddModelRouteRequest,
@@ -368,21 +371,33 @@ where
             .into());
         }
 
-        // Resolve the effective key and the secret slot that will hold it. An
-        // inline key is stored fresh; an existing secret ref is reused verbatim.
-        let (api_key, secret_ref, stored_new_secret) = match (
+        let base_url = normalize_route_base_url(request.base_url.as_deref())?;
+        let credential_sources = [
+            request.api_key.is_some(),
+            request.api_key_secret_ref.is_some(),
+            request.auth_ref.is_some(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+        if credential_sources > 1 {
+            return Err(DaemonProblem::bad_request(
+                "runtime",
+                "route_api_key_ambiguous",
+                "provide exactly one of api_key, api_key_secret_ref, or auth_ref",
+            )
+            .into());
+        }
+
+        // Resolve the credential and the slot that holds it. An inline key is
+        // stored fresh; an existing generic secret ref is reused verbatim; a
+        // provider-typed auth slot is resolved by the broker on every request.
+        let (credential, overlay_secret_ref, overlay_auth_ref, stored_new_secret) = match (
             request.api_key.as_deref(),
             request.api_key_secret_ref.as_deref(),
+            request.auth_ref.as_deref(),
         ) {
-            (Some(_), Some(_)) => {
-                return Err(DaemonProblem::bad_request(
-                    "runtime",
-                    "route_api_key_ambiguous",
-                    "provide either api_key or api_key_secret_ref, not both",
-                )
-                .into());
-            }
-            (Some(api_key), None) => {
+            (Some(api_key), None, None) => {
                 let api_key = api_key.trim();
                 if api_key.is_empty() {
                     return Err(DaemonProblem::bad_request(
@@ -395,9 +410,14 @@ where
                 let secret_ref = format!("routes.{route_id}.api_key");
                 self.put_generic_secret_without_reload(&secret_ref, api_key)
                     .await?;
-                (api_key.to_string(), secret_ref, true)
+                (
+                    crate::model_routing::RuntimeRouteCredential::ApiKey(api_key.to_string()),
+                    Some(secret_ref),
+                    None,
+                    true,
+                )
             }
-            (None, Some(secret_ref)) => {
+            (None, Some(secret_ref), None) => {
                 let value = self.generic_secret_value(secret_ref)?.ok_or_else(|| {
                     DaemonProblem::bad_request(
                         "runtime",
@@ -405,28 +425,54 @@ where
                         format!("no secret is stored at `{secret_ref}`"),
                     )
                 })?;
-                (value, secret_ref.to_string(), false)
+                (
+                    crate::model_routing::RuntimeRouteCredential::ApiKey(value),
+                    Some(secret_ref.to_string()),
+                    None,
+                    false,
+                )
             }
-            (None, None) => {
+            (None, None, Some(auth_ref)) => {
+                let slot_id = self.route_auth_slot(&route_id, provider, auth_ref).await?;
+                let auth_ref = slot_id.0.clone();
+                (
+                    crate::model_routing::RuntimeRouteCredential::Brokered(Arc::new(
+                        crate::ScopedRequestAuthProvider::for_slot(
+                            self.auth_manager.clone(),
+                            slot_id,
+                            route_id.clone(),
+                        ),
+                    )),
+                    None,
+                    Some(auth_ref),
+                    false,
+                )
+            }
+            _ => {
                 return Err(DaemonProblem::bad_request(
                     "runtime",
                     "route_api_key_required",
-                    "api_key or api_key_secret_ref is required",
+                    "api_key, api_key_secret_ref, or auth_ref is required",
                 )
                 .into());
             }
         };
+        let route_auth_ref = overlay_auth_ref
+            .clone()
+            .or_else(|| overlay_secret_ref.clone());
 
-        let configured = crate::model_routing::build_inline_api_key_route(
+        let configured = crate::model_routing::build_runtime_route(
             &route_id,
             provider,
             &model,
-            &api_key,
-            Some(secret_ref.clone()),
+            credential,
+            route_auth_ref,
+            base_url.as_deref(),
         );
+        let owned_secret_ref = overlay_secret_ref.clone().filter(|_| stored_new_secret);
         if let Err(error) = control.add_route(configured) {
-            if stored_new_secret {
-                let _ = self.delete_auth_slot_without_reload(&secret_ref).await;
+            if let Some(secret_ref) = owned_secret_ref.as_deref() {
+                let _ = self.delete_auth_slot_without_reload(secret_ref).await;
             }
             return Err(error);
         }
@@ -436,14 +482,16 @@ where
             route_id: route_id.clone(),
             provider: request.provider.trim().to_ascii_lowercase(),
             model,
-            api_key_secret_ref: secret_ref.clone(),
+            api_key_secret_ref: overlay_secret_ref,
+            auth_ref: overlay_auth_ref,
+            base_url,
         });
         if let Err(error) = self.routes_overlay.save(&entries) {
             // The route must not outlive a failed persist: an unrecorded hot-add
             // would silently vanish at the next boot.
             let _ = control.remove_route(&route_id);
-            if stored_new_secret {
-                let _ = self.delete_auth_slot_without_reload(&secret_ref).await;
+            if let Some(secret_ref) = owned_secret_ref.as_deref() {
+                let _ = self.delete_auth_slot_without_reload(secret_ref).await;
             }
             return Err(error);
         }
@@ -496,17 +544,72 @@ where
         control.remove_route(route_id)?;
         self.routes_overlay.save(&entries)?;
         // Drop the route's owned secret slot. A shared/explicit secret ref (one
-        // this route did not mint) is left in place for whatever else uses it.
-        if removed.api_key_secret_ref == format!("routes.{route_id}.api_key") {
-            let _ = self
-                .delete_auth_slot_without_reload(&removed.api_key_secret_ref)
-                .await;
+        // this route did not mint) and a provider auth slot are left in place
+        // for whatever else uses them.
+        if let Some(secret_ref) = removed
+            .api_key_secret_ref
+            .as_deref()
+            .filter(|secret_ref| *secret_ref == format!("routes.{route_id}.api_key"))
+        {
+            let _ = self.delete_auth_slot_without_reload(secret_ref).await;
         }
         let runtime = self.runtime_settings_unlocked();
         self.events.publish(DaemonEvent::RuntimeUpdated {
             runtime: runtime.clone(),
         });
         Ok(runtime)
+    }
+
+    /// Checks that a runtime route's `auth_ref` names an existing auth slot
+    /// typed for the route's provider.
+    async fn route_auth_slot(
+        &self,
+        route_id: &str,
+        provider: crate::model_routing::RouteProviderKind,
+        auth_ref: &str,
+    ) -> Result<kheish_auth::AuthSlotId> {
+        let auth_ref = auth_ref.trim();
+        if auth_ref.is_empty() {
+            return Err(DaemonProblem::bad_request(
+                "runtime",
+                "route_auth_ref_missing",
+                "auth_ref cannot be empty",
+            )
+            .into());
+        }
+        let slot_id = kheish_auth::AuthSlotId::new(auth_ref.to_string());
+        let status = self.auth_manager.status(&slot_id).await?.ok_or_else(|| {
+            DaemonProblem::bad_request(
+                "runtime",
+                "route_auth_ref_missing",
+                format!("route `{route_id}` references missing auth_ref `{auth_ref}`"),
+            )
+        })?;
+        let expected = provider.auth_provider();
+        if status.provider != expected {
+            return Err(DaemonProblem::bad_request(
+                "runtime",
+                "route_auth_ref_provider_mismatch",
+                format!(
+                    "auth_ref `{auth_ref}` is a `{}` slot but route `{route_id}` uses provider `{expected}`",
+                    status.provider
+                ),
+            )
+            .into());
+        }
+        if expected == kheish_auth::AuthProvider::OpenAi
+            && status.mode == kheish_auth::AuthMode::OAuthAccount
+        {
+            return Err(DaemonProblem::bad_request(
+                "runtime",
+                "route_auth_ref_unsupported",
+                format!(
+                    "auth_ref `{auth_ref}` is an OpenAI account login, which serves Responses text only; declare that route in the routes file"
+                ),
+            )
+            .into());
+        }
+        Ok(slot_id)
     }
 
     /// Creates one daemon-managed skill under the state-root skill directory.
@@ -1334,4 +1437,33 @@ where
 fn redacted_runtime_settings(mut runtime: RuntimeSettingsView) -> RuntimeSettingsView {
     runtime.hooks = crate::hooks::redacted_hook_settings(&runtime.hooks);
     runtime
+}
+
+/// Validates a runtime route's endpoint override.
+///
+/// Only absolute `http`/`https` URLs without embedded credentials are accepted:
+/// the overlay that persists it is not a secret store.
+fn normalize_route_base_url(raw: Option<&str>) -> Result<Option<String>> {
+    let Some(raw) = raw.map(str::trim) else {
+        return Ok(None);
+    };
+    let invalid = |detail: String| -> anyhow::Error {
+        DaemonProblem::bad_request("runtime", "route_base_url_invalid", detail).into()
+    };
+    if raw.is_empty() {
+        return Err(invalid("base_url cannot be empty".to_string()));
+    }
+    let url = reqwest::Url::parse(raw)
+        .map_err(|error| invalid(format!("base_url `{raw}` is not a valid URL: {error}")))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(invalid(format!(
+            "base_url `{raw}` must be an absolute http or https URL"
+        )));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(invalid(
+            "base_url must not embed credentials; use auth_ref or api_key".to_string(),
+        ));
+    }
+    Ok(Some(raw.to_string()))
 }

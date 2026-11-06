@@ -640,10 +640,14 @@ Operational semantics that trip people up:
   rollback targets (older history is pruned to `config.history_limit`).
 
 Adding a model route at runtime persists to `routes-overlay.json` (slot ref
-only) via `POST /v1/runtime/routes`; removing one uses
-`DELETE /v1/runtime/routes/{route_id}`. The overlay rebuilds at every boot
-alongside the operator's routes file, which it never touches. Always
-`runtime get` after any mutation to confirm the applied state.
+and `base_url` only, never a credential) via `POST /v1/runtime/routes`;
+removing one uses `DELETE /v1/runtime/routes/{route_id}`. The overlay rebuilds
+at every boot alongside the operator's routes file, which it never touches.
+Prefer `auth_ref` with a provider-typed slot over an inline `api_key`: the
+broker resolves the slot on every request, so rotating it through
+`POST /v1/runtime/secrets` needs no restart, while an inline key is copied into
+the driver when the route is added. Always `runtime get` after any mutation to
+confirm the applied state.
 
 ---
 

@@ -1404,7 +1404,16 @@ fn provider_readiness_from_auth_status(
     );
     let mut action = None;
 
-    if expected_provider.is_some_and(|expected| expected != status.provider) {
+    if status.provider == AuthProvider::Generic {
+        // A runtime-added route keeps its static API key in a generic secret
+        // slot; the key is embedded in the driver, so the slot only has to
+        // exist. Routes-file routes cannot reach this branch: boot refuses an
+        // auth_ref whose provider does not match the driver.
+        message = format!(
+            "route `{}` uses the static API key stored in `{auth_ref}`",
+            route.route_id
+        );
+    } else if expected_provider.is_some_and(|expected| expected != status.provider) {
         state = DaemonStatusProbeState::Error;
         code = "route_auth_provider_mismatch".to_string();
         message = format!(
@@ -2329,6 +2338,23 @@ mod tests {
         assert_eq!(mismatch.state, DaemonStatusProbeState::Error);
         assert_eq!(mismatch.code, "route_auth_provider_mismatch");
         assert_eq!(mismatch.auth_ref.as_deref(), Some("anthropic.primary"));
+
+        // A runtime-added route keeps its static key in a generic slot.
+        let static_key = provider_readiness_from_auth_status(
+            10_000,
+            &route,
+            false,
+            AuthSlotStatus {
+                slot_id: AuthSlotId::new("routes.primary.api_key"),
+                provider: AuthProvider::Generic,
+                mode: AuthMode::OpaqueSecret,
+                summary: "opaque_secret".to_string(),
+                updated_at_ms: 1,
+                details: BTreeMap::new(),
+            },
+        );
+        assert_eq!(static_key.state, DaemonStatusProbeState::Ok);
+        assert_eq!(static_key.code, "route_auth_ready");
     }
 
     #[test]

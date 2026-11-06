@@ -32,6 +32,7 @@ mod playbooks;
 mod problems;
 mod procedural_skills;
 mod projects;
+mod route_auth;
 mod runs;
 mod scheduler;
 mod service;
@@ -211,6 +212,7 @@ pub use projects::{
     ProjectChannelLinkView, ProjectMemberView, ProjectStatus, ProjectSummaryView,
     ProjectTaskDiscussionRef, ProjectTaskView, ProjectView,
 };
+pub use route_auth::ScopedRequestAuthProvider;
 pub use runs::{
     ChannelDeliveryRunRequest, DaemonRunKind, DaemonRunStatus, FileRunStore,
     ParentClarificationRunRequest, RunEvent, RunEventEntry, RunRecord, RunRequestPayload,

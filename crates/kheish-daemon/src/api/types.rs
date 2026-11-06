@@ -4305,10 +4305,17 @@ pub struct AddMcpServerRequest {
 
 /// Runtime model-route registration payload.
 ///
-/// Exactly one credential source is required: an inline `api_key` (stored in the
-/// encrypted secret store under `routes.<route_id>.api_key`) or an
-/// `api_key_secret_ref` pointing at an existing secret slot.
+/// Exactly one credential source is required:
+/// - an inline `api_key`, stored in the encrypted secret store under
+///   `routes.<route_id>.api_key`;
+/// - an `api_key_secret_ref` pointing at an existing generic secret slot;
+/// - an `auth_ref` naming a provider-typed auth slot (for example an
+///   `anthropic` slot), resolved through the credential broker on every
+///   request, so rotating the slot takes effect on the next request.
+///
+/// Unknown fields are refused rather than silently dropped.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AddModelRouteRequest {
     pub route_id: String,
     /// Provider driver: `anthropic`, `google`, `openai`, `openrouter`, or `xai`.
@@ -4318,6 +4325,13 @@ pub struct AddModelRouteRequest {
     pub api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_secret_ref: Option<String>,
+    /// Provider-typed auth slot; its provider must match `provider`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_ref: Option<String>,
+    /// Provider endpoint override, with the same meaning as `base_url` in the
+    /// routes file (for `anthropic`, the full Messages endpoint URL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
 }
 
 /// Runtime permission mode request payload.

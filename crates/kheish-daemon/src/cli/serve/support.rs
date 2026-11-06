@@ -4,26 +4,25 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
-use async_trait::async_trait;
 use clap::ValueEnum;
 use tracing::warn;
 
 use kheish_auth::{
     AnthropicAuthBackend, AuthManager, AuthMode, AuthProvider, AuthSlotId,
     DEFAULT_ANTHROPIC_OAUTH_TOKEN_URL, DEFAULT_CLAUDE_CODE_CLIENT_ID,
-    DEFAULT_OPENAI_CODEX_API_BASE_URL, DEFAULT_ROUTE_LEASE_TTL_MS, ExecutionCredentialContext,
-    FileAuthStore, OpenAiAuthBackend, RequestAuthProvider, ResolvedAuthMaterial,
-    default_claude_code_credentials_path,
+    DEFAULT_OPENAI_CODEX_API_BASE_URL, FileAuthStore, OpenAiAuthBackend, RequestAuthProvider,
+    ResolvedAuthMaterial, default_claude_code_credentials_path,
 };
 use kheish_daemon::{
     AdditionalImageBackendConfig, AdditionalTranscriptionBackendConfig, ConfiguredModelRoute,
     ControlPlaneAuthConfig, ControlPlaneAuthTokenFiles, ControlPlaneCorsConfig, ModelRouteConfig,
-    ModelSupportPolicy, RouteCapabilities, is_loopback_control_plane_origin,
+    ModelSupportPolicy, RouteCapabilities, ScopedRequestAuthProvider,
+    is_loopback_control_plane_origin,
 };
 use kheish_runtime::{
     AnthropicProviderConfig, GoogleProviderConfig, OpenAiProviderConfig, OpenRouterProviderConfig,
-    XAiProviderConfig, current_execution_scope, fetch_openrouter_model_capabilities,
-    resolve_google_image_model, resolve_openai_image_model, resolve_xai_image_model,
+    XAiProviderConfig, fetch_openrouter_model_capabilities, resolve_google_image_model,
+    resolve_openai_image_model, resolve_xai_image_model,
 };
 
 use crate::cli::{
@@ -40,118 +39,12 @@ use crate::{
     ProviderKind, ResolvedAnthropicAuthSource, ResolvedOpenAiAuthSource, ServeArgs,
 };
 
-#[derive(Clone)]
-enum ScopedAuthMaterialSource {
-    Slot(AuthSlotId),
-    Inline(ResolvedAuthMaterial),
-}
-
-#[derive(Clone)]
-struct ScopedRequestAuthProvider {
-    manager: Arc<AuthManager>,
-    route_id: String,
-    source: ScopedAuthMaterialSource,
-}
-
-impl ScopedRequestAuthProvider {
-    fn new_slot(
-        manager: Arc<AuthManager>,
-        slot_id: AuthSlotId,
-        route_id: impl Into<String>,
-    ) -> Self {
-        Self {
-            manager,
-            route_id: route_id.into(),
-            source: ScopedAuthMaterialSource::Slot(slot_id),
-        }
-    }
-
-    fn new_inline(
-        manager: Arc<AuthManager>,
-        route_id: impl Into<String>,
-        material: ResolvedAuthMaterial,
-    ) -> Self {
-        Self {
-            manager,
-            route_id: route_id.into(),
-            source: ScopedAuthMaterialSource::Inline(material),
-        }
-    }
-
-    fn context(&self) -> ExecutionCredentialContext {
-        current_execution_scope()
-            .map(|scope| ExecutionCredentialContext {
-                session_id: Some(scope.session_id).filter(|value| !value.is_empty()),
-                agent_id: scope.agent_id,
-                run_id: scope.run_id,
-                principal_id: scope.principal_id,
-                parent_principal_id: scope.parent_principal_id,
-                delegation_id: scope.delegation_id,
-                credential_scope: scope.credential_scope.normalized(),
-            })
-            .unwrap_or_default()
-    }
-
-    fn authorize_inline_route(&self) -> Result<kheish_auth::CredentialLease> {
-        let synthetic_slot = AuthSlotId::new(format!("inline-route:{}", self.route_id));
-        let grant = self.manager.broker().authorize_route(
-            &synthetic_slot,
-            &self.route_id,
-            &self.context(),
-        )?;
-        self.manager
-            .broker()
-            .issue_route_lease(&grant, DEFAULT_ROUTE_LEASE_TTL_MS)
-    }
-}
-
-#[async_trait]
-impl RequestAuthProvider for ScopedRequestAuthProvider {
-    async fn resolve(&self) -> Result<kheish_auth::ResolvedAuthMaterial> {
-        match &self.source {
-            ScopedAuthMaterialSource::Slot(slot_id) => {
-                self.manager
-                    .resolve_brokered(slot_id, &self.route_id, &self.context(), false)
-                    .await
-            }
-            ScopedAuthMaterialSource::Inline(material) => {
-                let mut material = material.clone();
-                let lease = self.authorize_inline_route()?;
-                material.grant_id = Some(lease.grant_id);
-                material.lease_id = Some(lease.id);
-                Ok(material)
-            }
-        }
-    }
-
-    async fn refresh(&self) -> Result<kheish_auth::ResolvedAuthMaterial> {
-        match &self.source {
-            ScopedAuthMaterialSource::Slot(slot_id) => {
-                self.manager
-                    .resolve_brokered(slot_id, &self.route_id, &self.context(), true)
-                    .await
-            }
-            ScopedAuthMaterialSource::Inline(material) => {
-                let mut material = material.clone();
-                let lease = self.authorize_inline_route()?;
-                material.grant_id = Some(lease.grant_id);
-                material.lease_id = Some(lease.id);
-                Ok(material)
-            }
-        }
-    }
-
-    async fn ensure_active(&self, material: &kheish_auth::ResolvedAuthMaterial) -> Result<()> {
-        self.manager.ensure_resolved_material_active(material)
-    }
-}
-
 fn brokered_request_provider(
     manager: Arc<AuthManager>,
     slot_id: AuthSlotId,
     route_id: impl Into<String>,
 ) -> Arc<dyn RequestAuthProvider> {
-    Arc::new(ScopedRequestAuthProvider::new_slot(
+    Arc::new(ScopedRequestAuthProvider::for_slot(
         manager, slot_id, route_id,
     ))
 }
@@ -161,7 +54,7 @@ fn inline_request_provider(
     route_id: impl Into<String>,
     material: ResolvedAuthMaterial,
 ) -> Arc<dyn RequestAuthProvider> {
-    Arc::new(ScopedRequestAuthProvider::new_inline(
+    Arc::new(ScopedRequestAuthProvider::for_inline(
         manager, route_id, material,
     ))
 }
@@ -197,8 +90,9 @@ mod tests {
     use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
 
-    use super::{ScopedRequestAuthProvider, bearer_auth_material};
+    use super::bearer_auth_material;
     use kheish_auth::{AuthManager, RequestAuthProvider};
+    use kheish_daemon::ScopedRequestAuthProvider;
     use kheish_runtime::{ExecutionScope, scope_execution};
     use kheish_types::CredentialScope;
 
@@ -206,7 +100,7 @@ mod tests {
     async fn inline_route_auth_provider_issues_route_leases_for_subject_status() -> Result<()> {
         let temp = tempdir()?;
         let manager = AuthManager::new(temp.path().join("auth.json"))?;
-        let provider = ScopedRequestAuthProvider::new_inline(
+        let provider = ScopedRequestAuthProvider::for_inline(
             manager.clone(),
             "openai",
             bearer_auth_material("sk-test"),

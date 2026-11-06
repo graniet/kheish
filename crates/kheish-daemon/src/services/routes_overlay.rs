@@ -6,9 +6,11 @@
 //! that was the default when the inventory was empty stays first (and default)
 //! across restarts.
 //!
-//! API keys never land in this document: they live in the encrypted secret
-//! store under `routes.<route_id>.api_key`, and the overlay entry only records
-//! enough to rebuild the driver by resolving that slot at boot.
+//! Credentials never land in this document. An API key lives in the encrypted
+//! secret store (under `routes.<route_id>.api_key` or a caller-named generic
+//! slot) and a provider-typed slot lives in the auth store; the overlay entry
+//! only records which slot to resolve, plus the endpoint override, so the
+//! driver rebuilds identically at boot.
 
 use std::path::{Path, PathBuf};
 
@@ -25,8 +27,16 @@ pub(crate) struct RouteOverlayEntry {
     pub route_id: String,
     pub provider: String,
     pub model: String,
-    /// Secret-store slot holding this route's API key.
-    pub api_key_secret_ref: String,
+    /// Generic secret slot holding this route's API key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_secret_ref: Option<String>,
+    /// Provider-typed auth slot resolved through the credential broker on
+    /// every request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_ref: Option<String>,
+    /// Provider endpoint override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
 }
 
 /// Serialized overlay document.
@@ -102,5 +112,44 @@ impl RoutesOverlayService {
             },
         )
         .with_context(|| format!("failed to persist routes overlay {}", self.path.display()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlay_round_trips_slot_routes_and_reads_legacy_entries() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let overlay = RoutesOverlayService::new(temp.path());
+        // A document written before provider slots and endpoint overrides.
+        std::fs::write(
+            temp.path().join(OVERLAY_FILE),
+            r#"{"version":1,"routes":[{"route_id":"legacy","provider":"openai","model":"gpt-5.4","api_key_secret_ref":"routes.legacy.api_key"}]}"#,
+        )?;
+        let legacy = overlay.entries();
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(
+            legacy[0].api_key_secret_ref.as_deref(),
+            Some("routes.legacy.api_key")
+        );
+        assert!(legacy[0].auth_ref.is_none());
+        assert!(legacy[0].base_url.is_none());
+
+        let mut entries = legacy;
+        entries.push(RouteOverlayEntry {
+            route_id: "fregate".to_string(),
+            provider: "anthropic".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
+            api_key_secret_ref: None,
+            auth_ref: Some("fregate.callback".to_string()),
+            base_url: Some("http://127.0.0.1:4101/relay/v1/messages".to_string()),
+        });
+        overlay.save(&entries)?;
+        assert_eq!(overlay.entries(), entries);
+        let raw = std::fs::read_to_string(temp.path().join(OVERLAY_FILE))?;
+        assert!(!raw.contains("null"), "{raw}");
+        Ok(())
     }
 }
