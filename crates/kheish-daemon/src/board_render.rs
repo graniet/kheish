@@ -34,9 +34,9 @@ const AGENT_PALETTE: [&str; 8] = [
 
 /// Returns the stable drawing color for one agent session.
 pub(crate) fn agent_color_for_session(session_id: &str) -> &'static str {
-    let hash = session_id
-        .bytes()
-        .fold(0usize, |acc, byte| acc.wrapping_mul(31).wrapping_add(byte as usize));
+    let hash = session_id.bytes().fold(0usize, |acc, byte| {
+        acc.wrapping_mul(31).wrapping_add(byte as usize)
+    });
     AGENT_PALETTE[hash % AGENT_PALETTE.len()]
 }
 
@@ -226,13 +226,10 @@ fn parse_color(value: Option<&str>) -> Rgba<u8> {
 
 fn element_color(element: &BoardElement) -> Rgba<u8> {
     parse_color(
-        element
-            .color
-            .as_deref()
-            .or(element
-                .author
-                .as_ref()
-                .and_then(|author| author.color.as_deref())),
+        element.color.as_deref().or(element
+            .author
+            .as_ref()
+            .and_then(|author| author.color.as_deref())),
     )
 }
 
@@ -266,14 +263,15 @@ fn draw_element(image: &mut RgbaImage, element: &BoardElement) {
             if let (Some(x), Some(y), Some(w), Some(h)) =
                 (element.x, element.y, element.w, element.h)
             {
-                let corners = [
-                    [x, y],
-                    [x + w, y],
-                    [x + w, y + h],
-                    [x, y + h],
-                ];
+                let corners = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]];
                 for index in 0..4 {
-                    draw_thick_segment(image, corners[index], corners[(index + 1) % 4], stroke, color);
+                    draw_thick_segment(
+                        image,
+                        corners[index],
+                        corners[(index + 1) % 4],
+                        stroke,
+                        color,
+                    );
                 }
             }
         }
@@ -296,7 +294,8 @@ fn draw_element(image: &mut RgbaImage, element: &BoardElement) {
         BoardElementKind::Text => {
             if let (Some(x), Some(y), Some(text)) = (element.x, element.y, element.text.as_deref())
             {
-                let scale = ab_glyph::PxScale::from(element.font_size.unwrap_or(18.0).clamp(8.0, 96.0));
+                let scale =
+                    ab_glyph::PxScale::from(element.font_size.unwrap_or(18.0).clamp(8.0, 96.0));
                 draw_text_mut(image, color, x as i32, y as i32, scale, font(), text);
             }
         }
@@ -326,12 +325,7 @@ fn draw_thick_segment(
 }
 
 /// Draws the author name tag just above the bounding box of the new batch.
-fn draw_author_tag(
-    image: &mut RgbaImage,
-    elements: &[BoardElement],
-    name: &str,
-    color: Rgba<u8>,
-) {
+fn draw_author_tag(image: &mut RgbaImage, elements: &[BoardElement], name: &str, color: Rgba<u8>) {
     let Some((min_x, min_y)) = batch_anchor(elements) else {
         return;
     };
@@ -459,16 +453,25 @@ fn compact_elements(elements: &[BoardElement]) -> Vec<serde_json::Value> {
             "kind".to_string(),
             serde_json::json!(element_kind_name(element.kind)),
         );
-        row.insert("at".to_string(), serde_json::json!(element_anchor_text(element)));
+        row.insert(
+            "at".to_string(),
+            serde_json::json!(element_anchor_text(element)),
+        );
         if let Some(size) = element_size_text(element) {
             row.insert("size".to_string(), serde_json::json!(size));
         }
         if matches!(element.kind, BoardElementKind::Text)
             && let Some(text) = element.text.as_deref()
         {
-            row.insert("text".to_string(), serde_json::json!(truncate_scene_text(text)));
+            row.insert(
+                "text".to_string(),
+                serde_json::json!(truncate_scene_text(text)),
+            );
         }
-        row.insert("color".to_string(), serde_json::json!(element_color_hex(element)));
+        row.insert(
+            "color".to_string(),
+            serde_json::json!(element_color_hex(element)),
+        );
         row.insert(
             "author".to_string(),
             serde_json::json!(element_author_label(element)),
@@ -728,7 +731,10 @@ fn free_hint(grid: &[Option<char>], canvas: (u32, u32)) -> String {
     let candidates = [
         (
             region_fraction(0..OCCUPANCY_COLS, OCCUPANCY_ROWS / 2..OCCUPANCY_ROWS),
-            format!("the bottom half below y\u{2248}{} is mostly free", height / 2),
+            format!(
+                "the bottom half below y\u{2248}{} is mostly free",
+                height / 2
+            ),
         ),
         (
             region_fraction(0..OCCUPANCY_COLS, 0..OCCUPANCY_ROWS / 2),
@@ -736,11 +742,17 @@ fn free_hint(grid: &[Option<char>], canvas: (u32, u32)) -> String {
         ),
         (
             region_fraction(OCCUPANCY_COLS / 2..OCCUPANCY_COLS, 0..OCCUPANCY_ROWS),
-            format!("the right half right of x\u{2248}{} is mostly free", width / 2),
+            format!(
+                "the right half right of x\u{2248}{} is mostly free",
+                width / 2
+            ),
         ),
         (
             region_fraction(0..OCCUPANCY_COLS / 2, 0..OCCUPANCY_ROWS),
-            format!("the left half left of x\u{2248}{} is mostly free", width / 2),
+            format!(
+                "the left half left of x\u{2248}{} is mostly free",
+                width / 2
+            ),
         ),
     ];
     let best = candidates
@@ -763,7 +775,9 @@ fn free_hint(grid: &[Option<char>], canvas: (u32, u32)) -> String {
 pub(crate) fn ensure_reasonable_text(elements: &[BoardElement]) -> Result<()> {
     for element in elements {
         if let Some(text) = element.text.as_deref()
-            && text.chars().any(|character| character.is_control() && character != '\n')
+            && text
+                .chars()
+                .any(|character| character.is_control() && character != '\n')
         {
             bail!("text elements must not contain control characters");
         }
@@ -885,7 +899,10 @@ mod tests {
         // On a 1600x1000 canvas each cell is 100px wide (1600/16) and 100px
         // tall (1000/10). A rect at x 0..310, y 0..190 stays inside columns
         // 0..=3 and rows 0..=1 without touching the next cell boundary.
-        let summary = scene_summary((1600, 1000), &[authored("Atlas", rect(0.0, 0.0, 310.0, 190.0))]);
+        let summary = scene_summary(
+            (1600, 1000),
+            &[authored("Atlas", rect(0.0, 0.0, 310.0, 190.0))],
+        );
         let rows = occupancy_rows(&summary);
         assert_eq!(rows[0], "AAAA............");
         assert_eq!(rows[1], "AAAA............");
@@ -922,7 +939,10 @@ mod tests {
         assert_eq!(summary["note"], "the board is empty");
         assert_eq!(summary["free_hint"], "the whole board is free");
         assert_eq!(
-            summary["elements"].as_array().expect("elements array").len(),
+            summary["elements"]
+                .as_array()
+                .expect("elements array")
+                .len(),
             0
         );
         assert_eq!(summary["canvas"]["width"], 1600);
@@ -936,7 +956,11 @@ mod tests {
             .collect::<Vec<_>>();
         let summary = scene_summary((1600, 1000), &elements);
         let listed = summary["elements"].as_array().expect("elements array");
-        assert_eq!(listed.len(), SCENE_ELEMENT_CAP + 1, "cap plus truncation row");
+        assert_eq!(
+            listed.len(),
+            SCENE_ELEMENT_CAP + 1,
+            "cap plus truncation row"
+        );
         assert_eq!(listed[SCENE_ELEMENT_CAP]["truncated"], 5);
         assert_eq!(listed[SCENE_ELEMENT_CAP - 1]["n"], SCENE_ELEMENT_CAP);
     }

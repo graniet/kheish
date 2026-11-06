@@ -101,7 +101,9 @@ impl Tool for BoardDrawTool {
             .await?;
         // Return the post-draw scene so the agent immediately sees the updated
         // board and can continue drawing in place without a separate view call.
-        let mut scene = control.agent_view_board(&session_id, &request.board_id).await?;
+        let mut scene = control
+            .agent_view_board(&session_id, &request.board_id)
+            .await?;
         if let Value::Object(map) = &mut scene {
             map.insert("board_id".to_string(), serde_json::json!(revision.board_id));
             map.insert(
