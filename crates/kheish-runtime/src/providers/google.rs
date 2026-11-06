@@ -1288,6 +1288,7 @@ fn google_usage_snapshot(payload: &Value) -> Option<kheish_types::ModelUsage> {
         input_tokens,
         output_tokens,
         cost_usd: 0.0,
+        ..Default::default()
     })
 }
 

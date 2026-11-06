@@ -82,3 +82,40 @@ Thinking that is always on rules out forced tool use: on the 5.x generations a r
 
 Kheish also knows each current generation's limits: a 1M-token context window and 128K output
 tokens on Claude Opus 4.6 and later, Claude Sonnet 4.6 and later, and every 5.x generation.
+
+### Prompt caching
+
+Every Messages API request carries three prompt-cache breakpoints (the default 5-minute cache):
+
+- the system prompt, sent as one text block with `cache_control: {"type": "ephemeral"}`; it caches
+  the tools rendered before it as well;
+- the last tool, so the tool prefix still hits when the system prompt changes;
+- the request's top-level `cache_control`, the API's automatic caching of the conversation tail.
+
+The tools are sorted by name, so the cached prefix renders the same bytes on every turn whatever
+order the runtime lists them in. A prompt shorter than the model's minimum cacheable length (512
+tokens on the 5.x generations) is simply not cached.
+
+### Usage and cost
+
+Model usage (`api_usage` on assistant messages, the runtime's model budget counters) carries the
+Messages API counts:
+
+| Field | Meaning |
+|---|---|
+| `input_tokens` | Prompt tokens billed at the full input rate |
+| `cache_creation_input_tokens` | Prompt tokens written to the prompt cache |
+| `cache_read_input_tokens` | Prompt tokens read from the prompt cache |
+| `output_tokens` | Output tokens, thinking included |
+| `cost_usd` | The request's cost, each count at its own rate |
+
+`message_start` reports the prompt counts and `message_delta` the output count, so the driver
+merges the two. The context the request carried is the sum of the three prompt counts; Kheish's
+compaction threshold and goal token accounting use that sum, not `input_tokens` alone.
+
+Costs use the model's published first-party price (5-minute cache writes at 1.25 times the input
+price, 1-hour writes at twice it, reads at 0.1 times it, except 0.025 times on Claude Fable 5.1
+and Claude Mythos 5.1 and 0.05 times on Claude Opus 5.5 and Claude Sonnet 5.5; Claude Haiku 5.5
+switches to its long-prompt prices above 100,000 prompt tokens). A route's `pricing` override, when
+an embedder sets one, replaces the price of the model the request names. A model without a published
+price is counted at zero cost.

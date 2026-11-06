@@ -1467,6 +1467,7 @@ fn parse_usage(usage: &Value) -> kheish_types::ModelUsage {
         input_tokens,
         output_tokens,
         cost_usd,
+        ..Default::default()
     }
 }
 

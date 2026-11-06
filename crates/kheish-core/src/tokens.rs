@@ -45,7 +45,7 @@ pub fn calibrated_token_count(
 ) -> usize {
     match last_api_usage {
         Some(usage) => {
-            let measured = usage.input_tokens.saturating_add(usage.output_tokens) as usize;
+            let measured = usage.total_tokens() as usize;
             let tail_estimate = messages
                 .iter()
                 .rev()
@@ -142,6 +142,7 @@ mod tests {
                 input_tokens: 20,
                 output_tokens: 5,
                 cost_usd: 0.0,
+                ..Default::default()
             }),
             MessageRecord::new("u2", Role::User, "tail message"),
         ];
@@ -149,6 +150,27 @@ mod tests {
         assert_eq!(
             calibrated_token_count(&messages, latest_api_usage(&messages)),
             25 + rough_token_estimate("tail message")
+        );
+    }
+
+    #[test]
+    fn calibrated_count_includes_prompt_tokens_served_from_the_cache() {
+        // With prompt caching, `input_tokens` is only the uncached tail of
+        // the prompt: the context the request carried includes the cache
+        // reads and writes.
+        let messages = vec![
+            MessageRecord::new("u1", Role::User, "hello there"),
+            MessageRecord::new("a1", Role::Assistant, "measured").with_api_usage(ModelUsage {
+                input_tokens: 20,
+                output_tokens: 5,
+                cache_creation_input_tokens: 1_000,
+                cache_read_input_tokens: 150_000,
+                cost_usd: 0.0,
+            }),
+        ];
+        assert_eq!(
+            calibrated_token_count(&messages, latest_api_usage(&messages)),
+            151_025
         );
     }
 
@@ -257,6 +279,7 @@ mod tests {
                 input_tokens: 150_000,
                 output_tokens: 200,
                 cost_usd: 0.0,
+                ..Default::default()
             }),
             MessageRecord::new("u2", Role::User, "tail"),
         ];

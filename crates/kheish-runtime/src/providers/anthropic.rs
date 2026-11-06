@@ -31,7 +31,10 @@ use kheish_types::{
     InputContentPart, ToolResultRecord, capped_default_max_output_tokens, model_max_output_tokens,
 };
 
-use super::anthropic_models::{ThinkingMode, anthropic_adaptive_effort, anthropic_model_profile};
+use super::anthropic_models::{
+    AnthropicPricing, ThinkingMode, anthropic_adaptive_effort, anthropic_list_pricing,
+    anthropic_model_profile,
+};
 use super::attachments::{
     AttachmentRenderCache, contains_supported_image_attachment, image_edit_attachment_hint_text,
     load_attachment_preview_image, load_document_attachment_text, load_image_attachment,
@@ -44,13 +47,6 @@ const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1/messages"
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 const MIN_ANTHROPIC_THINKING_BUDGET_TOKENS: u32 = 1024;
 const ANTHROPIC_INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
-/// Token pricing used to estimate request cost from usage snapshots.
-#[derive(Clone, Debug, PartialEq)]
-pub struct AnthropicPricing {
-    pub input_per_million_tokens_usd: f64,
-    pub output_per_million_tokens_usd: f64,
-}
-
 /// Configuration for the Anthropic provider adapter.
 #[derive(Clone)]
 pub struct AnthropicProviderConfig {
@@ -61,6 +57,9 @@ pub struct AnthropicProviderConfig {
     pub anthropic_version: String,
     pub beta_headers: Vec<String>,
     pub default_max_output_tokens: u32,
+    /// Prices of the route's requests, overriding the published list price
+    /// of the model a request names. A response served by another model (a
+    /// refusal fallback) is priced at that model's list price.
     pub pricing: Option<AnthropicPricing>,
     pub asset_root: Option<PathBuf>,
     pub(crate) attachment_cache: AttachmentRenderCache,
@@ -142,6 +141,13 @@ impl Debug for AnthropicProviderConfig {
 struct AnthropicRequest {
     body: Value,
     betas: Vec<&'static str>,
+    /// The model the request names.
+    model: String,
+}
+
+/// The prompt-cache breakpoint Kheish places (the default 5-minute cache).
+fn anthropic_cache_breakpoint() -> Value {
+    json!({ "type": "ephemeral" })
 }
 
 /// Anthropic streaming provider based on the Messages SSE API.
@@ -199,17 +205,7 @@ impl AnthropicProvider {
         let tools = if matches!(request.generation.tool_choice, ToolChoice::None) {
             Vec::new()
         } else {
-            request
-                .available_tools
-                .iter()
-                .map(|tool| {
-                    json!({
-                        "name": tool.name,
-                        "description": tool.description,
-                        "input_schema": tool.input_schema,
-                    })
-                })
-                .collect()
+            anthropic_tools(&request.available_tools)
         };
         let reasoning = request.generation.reasoning.as_ref();
         let profile = anthropic_model_profile(&effective_model);
@@ -256,12 +252,26 @@ impl AnthropicProvider {
             "messages".to_string(),
             serde_json::to_value(messages).expect("anthropic messages serialize"),
         );
+        // Prompt caching: one breakpoint on the system prompt (it caches the
+        // tools rendered before it too), one on the last tool so the tool
+        // prefix still hits when the system prompt changes, and automatic
+        // caching of the conversation tail. The system prompt and the tools
+        // render the same bytes on every turn, so each turn reads the prefix
+        // the previous one wrote.
         if !system.is_empty() {
-            body.insert("system".to_string(), Value::String(system.join("\n\n")));
+            body.insert(
+                "system".to_string(),
+                json!([{
+                    "type": "text",
+                    "text": system.join("\n\n"),
+                    "cache_control": anthropic_cache_breakpoint(),
+                }]),
+            );
         }
         if !tools.is_empty() {
             body.insert("tools".to_string(), Value::Array(tools));
         }
+        body.insert("cache_control".to_string(), anthropic_cache_breakpoint());
         if thinking_on
             && matches!(
                 request.generation.tool_choice,
@@ -303,6 +313,7 @@ impl AnthropicProvider {
         Ok(AnthropicRequest {
             body: Value::Object(body),
             betas,
+            model: effective_model,
         })
     }
 
@@ -584,6 +595,7 @@ impl ModelProvider for AnthropicProvider {
         let AnthropicRequest {
             body,
             betas: request_betas,
+            model: requested_model,
         } = self.build_request(&request)?;
         let mut force_refresh = false;
         let (response, response_target, response_grant_id) = loop {
@@ -701,8 +713,7 @@ impl ModelProvider for AnthropicProvider {
             None,
             response_grant_id.clone(),
         )?;
-        let mut partial_blocks = BTreeMap::new();
-        let mut preserved_context_blocks = Vec::new();
+        let mut state = AnthropicStreamState::new(requested_model, self.config.pricing.clone());
         // Buffer raw bytes until a full SSE frame arrives so split UTF-8 code points
         // across transport chunks do not fail decoding prematurely.
         let mut buffer = Vec::new();
@@ -741,14 +752,7 @@ impl ModelProvider for AnthropicProvider {
                 if let Some(event) = parsed {
                     let reached_message_stop = event.event_type == "message_stop";
                     self.record_provider_event(&request, &event);
-                    handle_sse_event(
-                        event,
-                        &mut partial_blocks,
-                        &mut preserved_context_blocks,
-                        &sink,
-                        self.config.pricing.as_ref(),
-                    )
-                    .map_err(|error| {
+                    handle_sse_event(event, &mut state, &sink).map_err(|error| {
                         self.record_provider_failure(
                             &response_target,
                             &error.message,
@@ -777,14 +781,7 @@ impl ModelProvider for AnthropicProvider {
             if let Some(event) = parsed {
                 let reached_message_stop = event.event_type == "message_stop";
                 self.record_provider_event(&request, &event);
-                handle_sse_event(
-                    event,
-                    &mut partial_blocks,
-                    &mut preserved_context_blocks,
-                    &sink,
-                    self.config.pricing.as_ref(),
-                )
-                .map_err(|error| {
+                handle_sse_event(event, &mut state, &sink).map_err(|error| {
                     self.record_provider_failure(
                         &response_target,
                         &error.message,
@@ -1402,13 +1399,74 @@ fn render_tool_result_content(result: &ToolResultRecord) -> String {
     serde_json::to_string(&result.output).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// What one streamed Messages API answer has delivered so far.
+struct AnthropicStreamState {
+    partial_blocks: BTreeMap<usize, PartialContentBlock>,
+    preserved_context_blocks: Vec<Value>,
+    /// The `usage` object as reported so far: `message_start` carries the
+    /// prompt counts, `message_delta` the output count (and, on newer API
+    /// versions, the prompt counts again), so the reports are merged, never
+    /// replaced.
+    usage: serde_json::Map<String, Value>,
+    /// The model the request named.
+    requested_model: String,
+    /// The model producing the message, as `message_start` names it.
+    model: String,
+    /// The route's price override for the requested model.
+    pricing_override: Option<AnthropicPricing>,
+}
+
+impl AnthropicStreamState {
+    fn new(requested_model: String, pricing_override: Option<AnthropicPricing>) -> Self {
+        Self {
+            partial_blocks: BTreeMap::new(),
+            preserved_context_blocks: Vec::new(),
+            usage: serde_json::Map::new(),
+            model: requested_model.clone(),
+            requested_model,
+            pricing_override,
+        }
+    }
+
+    /// Returns the prices of `model` for a request with `prompt_tokens`.
+    fn pricing_for(&self, model: &str, prompt_tokens: u64) -> Option<AnthropicPricing> {
+        if model == self.requested_model
+            && let Some(pricing) = &self.pricing_override
+        {
+            return Some(pricing.clone());
+        }
+        anthropic_list_pricing(model, prompt_tokens)
+    }
+
+    /// Merges one usage report and emits the turn's usage so far.
+    fn merge_usage(&mut self, update: &Value, sink: &ModelEventSink) -> Result<(), ProviderError> {
+        if let Some(update) = update.as_object() {
+            for (key, value) in update {
+                if !value.is_null() {
+                    self.usage.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        let usage = Value::Object(self.usage.clone());
+        let mut parsed = parse_usage(&usage);
+        if let Some(pricing) = self.pricing_for(&self.model, parsed.prompt_tokens()) {
+            parsed.cost_usd = pricing.cost_usd(&parsed, cache_write_1h_tokens(&usage));
+        }
+        sink.emit(ModelStreamEvent::Usage { usage: parsed })
+            .map_err(map_sink_error)
+    }
+}
+
 fn handle_sse_event(
     event: JsonSseEvent,
-    partial_blocks: &mut BTreeMap<usize, PartialContentBlock>,
-    preserved_context_blocks: &mut Vec<Value>,
+    state: &mut AnthropicStreamState,
     sink: &ModelEventSink,
-    pricing: Option<&AnthropicPricing>,
 ) -> Result<(), ProviderError> {
+    let AnthropicStreamState {
+        partial_blocks,
+        preserved_context_blocks,
+        ..
+    } = state;
     match event.event_type.as_str() {
         "ping" | "message_stop" => Ok(()),
         "message_start" => {
@@ -1419,11 +1477,11 @@ fn handle_sse_event(
                     })
                     .map_err(map_sink_error)?;
                 }
+                if let Some(model) = message.get("model").and_then(Value::as_str) {
+                    state.model = model.to_string();
+                }
                 if let Some(usage) = message.get("usage") {
-                    sink.emit(ModelStreamEvent::Usage {
-                        usage: parse_usage(usage, pricing),
-                    })
-                    .map_err(map_sink_error)?;
+                    state.merge_usage(usage, sink)?;
                 }
             }
             Ok(())
@@ -1632,10 +1690,7 @@ fn handle_sse_event(
                 }
             }
             if let Some(usage) = event.payload.get("usage") {
-                sink.emit(ModelStreamEvent::Usage {
-                    usage: parse_usage(usage, pricing),
-                })
-                .map_err(map_sink_error)?;
+                state.merge_usage(usage, sink)?;
             }
             Ok(())
         }
@@ -1670,26 +1725,46 @@ fn handle_sse_event(
     }
 }
 
-fn parse_usage(usage: &Value, pricing: Option<&AnthropicPricing>) -> kheish_types::ModelUsage {
-    let input_tokens = usage
-        .get("input_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or_default();
-    let output_tokens = usage
-        .get("output_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or_default();
-    let cost_usd = pricing
-        .map(|pricing| {
-            (input_tokens as f64 / 1_000_000.0) * pricing.input_per_million_tokens_usd
-                + (output_tokens as f64 / 1_000_000.0) * pricing.output_per_million_tokens_usd
-        })
-        .unwrap_or_default();
+/// Reads the token counts of a Messages API `usage` object (unpriced).
+fn parse_usage(usage: &Value) -> kheish_types::ModelUsage {
+    let count = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or_default();
     kheish_types::ModelUsage {
-        input_tokens,
-        output_tokens,
-        cost_usd,
+        input_tokens: count("input_tokens"),
+        output_tokens: count("output_tokens"),
+        cache_creation_input_tokens: count("cache_creation_input_tokens"),
+        cache_read_input_tokens: count("cache_read_input_tokens"),
+        cost_usd: 0.0,
     }
+}
+
+/// The part of a usage report's cache writes that went to the 1-hour cache.
+fn cache_write_1h_tokens(usage: &Value) -> u64 {
+    usage
+        .pointer("/cache_creation/ephemeral_1h_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+}
+
+/// Encodes the tools sorted by name, so the tool prefix renders the same
+/// bytes on every turn whatever order the runtime lists them in, with a
+/// prompt-cache breakpoint on the last one.
+fn anthropic_tools(tools: &[kheish_types::ToolDefinition]) -> Vec<Value> {
+    let mut sorted = tools.iter().collect::<Vec<_>>();
+    sorted.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut encoded = sorted
+        .into_iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+            })
+        })
+        .collect::<Vec<_>>();
+    if let Some(Value::Object(last)) = encoded.last_mut() {
+        last.insert("cache_control".to_string(), anthropic_cache_breakpoint());
+    }
+    encoded
 }
 
 fn map_stop_reason(stop_reason: &str) -> ModelFinishReason {
@@ -2010,9 +2085,9 @@ mod tests {
         assert_eq!(payload["tool_choice"]["name"], "echo");
         assert_eq!(payload["tool_choice"]["disable_parallel_tool_use"], true);
         assert_eq!(payload["tools"][0]["name"], "echo");
-        let system = payload["system"]
+        let system = payload["system"][0]["text"]
             .as_str()
-            .expect("system should be serialized");
+            .expect("system should be serialized as one text block");
         assert!(system.contains("Return only valid JSON"));
 
         let messages = payload["messages"]
@@ -3005,6 +3080,126 @@ mod tests {
             Some("cli-session")
         );
         assert_eq!(recorded[1].header("x-kheish-run-id"), None);
+        Ok(())
+    }
+
+    fn tool(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: format!("The {name} tool."),
+            input_schema: json!({"type": "object", "properties": {}}),
+            allows_parallel: true,
+        }
+    }
+
+    #[test]
+    fn requests_carry_stable_cache_breakpoints_on_system_and_tools() -> Result<()> {
+        let provider =
+            AnthropicProvider::new(AnthropicProviderConfig::new("claude-opus-5-5", "test-key"))?;
+        let mut first = runtime_request("session-cache", ModelGenerationConfig::default());
+        first.available_tools = vec![tool("submit_verdict"), tool("get_exposure")];
+        let mut second = first.clone();
+        // The runtime may list tools in another order on a later turn.
+        second.available_tools.reverse();
+        second.prompt.items.extend([
+            ProviderInputItem::Message {
+                id: "a1".to_string(),
+                role: kheish_types::Role::Assistant,
+                content: "Hello.".to_string(),
+                content_parts: Vec::new(),
+                attachments: Vec::new(),
+                provider_response_id: Some("msg-1".to_string()),
+                provider_context: None,
+            },
+            ProviderInputItem::Message {
+                id: "u2".to_string(),
+                role: kheish_types::Role::User,
+                content: "Verify the exposure.".to_string(),
+                content_parts: Vec::new(),
+                attachments: Vec::new(),
+                provider_response_id: None,
+                provider_context: None,
+            },
+        ]);
+        let first = provider.build_request_body(&first)?;
+        let second = provider.build_request_body(&second)?;
+
+        let breakpoint = json!({ "type": "ephemeral" });
+        assert_eq!(
+            first["system"],
+            json!([{
+                "type": "text",
+                "text": "You verify exposures.",
+                "cache_control": breakpoint,
+            }])
+        );
+        let tools = first["tools"].as_array().expect("tools");
+        assert_eq!(tools[0]["name"], "get_exposure");
+        assert!(tools[0].get("cache_control").is_none());
+        assert_eq!(tools[1]["name"], "submit_verdict");
+        assert_eq!(tools[1]["cache_control"], breakpoint);
+        // Automatic caching of the conversation tail.
+        assert_eq!(first["cache_control"], breakpoint);
+        // The cached prefix renders the same bytes on the next turn.
+        assert_eq!(first["system"], second["system"]);
+        assert_eq!(first["tools"], second["tools"]);
+        assert_eq!(first["messages"][0], second["messages"][0]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn usage_merges_cache_counts_across_events_and_prices_them() -> Result<()> {
+        let stream = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-cache\",\"model\":\"claude-opus-5-5\",\"usage\":{\"input_tokens\":1000,\"cache_creation_input_tokens\":20000,\"cache_read_input_tokens\":500000,\"output_tokens\":1}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"done\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2000}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let (url, _recorded) =
+            spawn_recording_mock_server(vec![MockHttpResponse::sse(stream)]).await?;
+        let provider = AnthropicProvider::new(AnthropicProviderConfig {
+            base_url: url,
+            ..AnthropicProviderConfig::new("claude-opus-5-5", "test-key")
+        })?;
+        let runtime = ModelRuntime::new(
+            provider,
+            ModelRetryPolicy {
+                max_attempts: 1,
+                ..ModelRetryPolicy::default()
+            },
+            ModelBudget {
+                max_total_output_tokens: 1_000_000,
+                max_total_cost_usd: 1_000.0,
+            },
+            Arc::new(NoopObserver),
+        );
+        let turn = runtime
+            .next_turn(default_model_request("session-cache"))
+            .await?;
+        let usage = turn.usage.expect("usage");
+        assert_eq!(usage.input_tokens, 1_000);
+        assert_eq!(usage.cache_creation_input_tokens, 20_000);
+        assert_eq!(usage.cache_read_input_tokens, 500_000);
+        assert_eq!(usage.output_tokens, 2_000);
+        assert_eq!(usage.prompt_tokens(), 521_000);
+        // Claude Opus 5.5: $4 input, $5 cache write, $0.20 cache read, $20 output.
+        let expected = 1_000.0 * 4.0 / 1e6
+            + 20_000.0 * 5.0 / 1e6
+            + 500_000.0 * 0.20 / 1e6
+            + 2_000.0 * 20.0 / 1e6;
+        assert!(
+            (usage.cost_usd - expected).abs() < 1e-9,
+            "{}",
+            usage.cost_usd
+        );
+        let consumed = runtime.budget_snapshot().consumed;
+        assert_eq!(consumed.cache_read_input_tokens, 500_000);
         Ok(())
     }
 

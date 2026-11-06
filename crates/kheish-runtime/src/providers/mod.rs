@@ -17,7 +17,8 @@ mod testsupport;
 mod transcription;
 mod xai;
 
-pub use anthropic::{AnthropicPricing, AnthropicProvider, AnthropicProviderConfig};
+pub use anthropic::{AnthropicProvider, AnthropicProviderConfig};
+pub use anthropic_models::AnthropicPricing;
 pub(crate) use execution_headers::insert_execution_context_headers;
 pub use execution_headers::{KHEISH_RUN_ID_HEADER, KHEISH_SESSION_ID_HEADER};
 pub use google::{

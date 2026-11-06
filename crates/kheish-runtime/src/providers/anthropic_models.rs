@@ -7,7 +7,9 @@
 //! thinking, effort, preserved thinking, refusals and fallback). One arm per
 //! family; extend the table when a generation ships.
 
-use kheish_types::{ClaudeModelFamily, ReasoningConfig, ReasoningEffort, parse_claude_model_id};
+use kheish_types::{
+    ClaudeModelFamily, ModelUsage, ReasoningConfig, ReasoningEffort, parse_claude_model_id,
+};
 
 /// How a model takes the `thinking` request field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,14 +128,155 @@ pub(crate) fn anthropic_adaptive_effort(
     })
 }
 
+/// Token prices of one model, in US dollars per million tokens.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnthropicPricing {
+    /// Prompt tokens billed at the full input rate.
+    pub input_per_million_tokens_usd: f64,
+    /// Output tokens, thinking included.
+    pub output_per_million_tokens_usd: f64,
+    /// Prompt tokens written to the 5-minute prompt cache.
+    pub cache_write_per_million_tokens_usd: f64,
+    /// Prompt tokens written to the 1-hour prompt cache.
+    pub cache_write_1h_per_million_tokens_usd: f64,
+    /// Prompt tokens read from the prompt cache (hits and refreshes).
+    pub cache_read_per_million_tokens_usd: f64,
+}
+
+impl AnthropicPricing {
+    /// Prices with the standard prompt-cache multipliers: 5-minute writes at
+    /// 1.25 times the input price, 1-hour writes at twice it, reads at 0.1
+    /// times it.
+    pub fn with_standard_cache_rates(input: f64, output: f64) -> Self {
+        Self::with_cache_read(input, output, input * 0.1)
+    }
+
+    fn with_cache_read(input: f64, output: f64, cache_read: f64) -> Self {
+        Self {
+            input_per_million_tokens_usd: input,
+            output_per_million_tokens_usd: output,
+            cache_write_per_million_tokens_usd: input * 1.25,
+            cache_write_1h_per_million_tokens_usd: input * 2.0,
+            cache_read_per_million_tokens_usd: cache_read,
+        }
+    }
+
+    /// Prices one usage report. `cache_write_1h_tokens` is the part of
+    /// `cache_creation_input_tokens` written to the 1-hour cache.
+    pub(crate) fn cost_usd(&self, usage: &ModelUsage, cache_write_1h_tokens: u64) -> f64 {
+        let per_million = |tokens: u64, price: f64| tokens as f64 / 1_000_000.0 * price;
+        let cache_write_1h = cache_write_1h_tokens.min(usage.cache_creation_input_tokens);
+        let cache_write_5m = usage.cache_creation_input_tokens - cache_write_1h;
+        per_million(usage.input_tokens, self.input_per_million_tokens_usd)
+            + per_million(usage.output_tokens, self.output_per_million_tokens_usd)
+            + per_million(cache_write_5m, self.cache_write_per_million_tokens_usd)
+            + per_million(cache_write_1h, self.cache_write_1h_per_million_tokens_usd)
+            + per_million(
+                usage.cache_read_input_tokens,
+                self.cache_read_per_million_tokens_usd,
+            )
+    }
+}
+
+/// Claude Haiku 5.5 bills a request at its higher prices when the prompt,
+/// cache reads and writes included, is over this many tokens.
+const HAIKU_5_5_LONG_PROMPT_TOKENS: u64 = 100_000;
+
+/// Returns a model's first-party list price, or `None` for a model without a
+/// published price. `prompt_tokens` (cache reads and writes included) picks
+/// Claude Haiku 5.5's price tier.
+///
+/// Source: <https://platform.claude.com/docs/en/about-claude/pricing>, read
+/// 2026-11-07. Cache reads are 0.1 times the input price except on Claude
+/// Fable 5.1 and Claude Mythos 5.1 (0.025 times) and Claude Opus 5.5 and
+/// Claude Sonnet 5.5 (0.05 times).
+pub(crate) fn anthropic_list_pricing(model: &str, prompt_tokens: u64) -> Option<AnthropicPricing> {
+    use ClaudeModelFamily::{Fable, Haiku, Mythos, Opus, Sonnet};
+    let id = parse_claude_model_id(model)?;
+    let standard = AnthropicPricing::with_standard_cache_rates;
+    let pricing = match (id.family, id.major, id.minor) {
+        (Fable | Mythos, 5, Some(1)) => AnthropicPricing::with_cache_read(10.0, 50.0, 0.25),
+        (Fable | Mythos, 5, None) => standard(10.0, 50.0),
+        (Opus, 5, Some(5)) => AnthropicPricing::with_cache_read(4.0, 20.0, 0.20),
+        (Opus, 5, None) => standard(5.0, 25.0),
+        (Opus, 4, Some(5..=8)) => standard(5.0, 25.0),
+        (Opus, 4, None | Some(1)) => standard(15.0, 75.0),
+        (Sonnet, 5, Some(5)) => AnthropicPricing::with_cache_read(2.0, 10.0, 0.10),
+        (Sonnet, 5, None) => standard(2.0, 10.0),
+        (Sonnet, 4, None | Some(5) | Some(6)) => standard(3.0, 15.0),
+        (Haiku, 5, Some(5)) if prompt_tokens > HAIKU_5_5_LONG_PROMPT_TOKENS => standard(0.50, 2.50),
+        (Haiku, 5, Some(5)) => standard(0.10, 0.50),
+        (Haiku, 4, Some(5)) => standard(1.0, 5.0),
+        _ => return None,
+    };
+    Some(pricing)
+}
+
 #[cfg(test)]
 mod tests {
-    use kheish_types::{ReasoningConfig, ReasoningEffort};
+    use kheish_types::{ModelUsage, ReasoningConfig, ReasoningEffort};
 
     use super::{
-        AnthropicModelProfile, ThinkingMode, anthropic_adaptive_effort, anthropic_effort,
-        anthropic_model_profile,
+        AnthropicModelProfile, AnthropicPricing, ThinkingMode, anthropic_adaptive_effort,
+        anthropic_effort, anthropic_list_pricing, anthropic_model_profile,
     };
+
+    fn close(left: f64, right: f64) -> bool {
+        (left - right).abs() < 1e-9
+    }
+
+    #[test]
+    fn list_prices_match_the_published_table() {
+        let check = |model: &str, prompt: u64, rates: [f64; 5]| {
+            let pricing = anthropic_list_pricing(model, prompt).expect(model);
+            let actual = [
+                pricing.input_per_million_tokens_usd,
+                pricing.output_per_million_tokens_usd,
+                pricing.cache_write_per_million_tokens_usd,
+                pricing.cache_write_1h_per_million_tokens_usd,
+                pricing.cache_read_per_million_tokens_usd,
+            ];
+            for (actual, expected) in actual.iter().zip(rates) {
+                assert!(close(*actual, expected), "{model}: {actual:?} != {rates:?}");
+            }
+        };
+        // input, output, 5m cache write, 1h cache write, cache read
+        check("claude-fable-5-1", 0, [10.0, 50.0, 12.5, 20.0, 0.25]);
+        check("claude-mythos-5-1", 0, [10.0, 50.0, 12.5, 20.0, 0.25]);
+        check("claude-fable-5", 0, [10.0, 50.0, 12.5, 20.0, 1.0]);
+        check("claude-opus-5-5", 0, [4.0, 20.0, 5.0, 8.0, 0.20]);
+        check("anthropic.claude-opus-5-5", 0, [4.0, 20.0, 5.0, 8.0, 0.20]);
+        check("claude-opus-5", 0, [5.0, 25.0, 6.25, 10.0, 0.50]);
+        check("claude-opus-4-8", 0, [5.0, 25.0, 6.25, 10.0, 0.50]);
+        check("claude-opus-4-5", 0, [5.0, 25.0, 6.25, 10.0, 0.50]);
+        check("claude-opus-4-1", 0, [15.0, 75.0, 18.75, 30.0, 1.50]);
+        check("claude-sonnet-5-5", 0, [2.0, 10.0, 2.5, 4.0, 0.10]);
+        check("claude-sonnet-5", 0, [2.0, 10.0, 2.5, 4.0, 0.20]);
+        check("claude-sonnet-4-6", 0, [3.0, 15.0, 3.75, 6.0, 0.30]);
+        check("claude-haiku-5-5", 100_000, [0.10, 0.50, 0.125, 0.20, 0.01]);
+        check("claude-haiku-5-5", 100_001, [0.50, 2.50, 0.625, 1.0, 0.05]);
+        check("claude-haiku-4-5-20251001", 0, [1.0, 5.0, 1.25, 2.0, 0.10]);
+        assert!(anthropic_list_pricing("claude-test", 0).is_none());
+    }
+
+    #[test]
+    fn cost_prices_each_token_count_at_its_own_rate() {
+        let pricing = anthropic_list_pricing("claude-opus-5-5", 0).expect("priced");
+        let usage = ModelUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cache_creation_input_tokens: 3_000_000,
+            cache_read_input_tokens: 10_000_000,
+            ..ModelUsage::default()
+        };
+        // 4 + 20 + 2M x 5 + 1M x 8 + 10M x 0.20
+        assert!(close(
+            pricing.cost_usd(&usage, 1_000_000),
+            4.0 + 20.0 + 10.0 + 8.0 + 2.0
+        ));
+        let flat = AnthropicPricing::with_standard_cache_rates(1.0, 2.0);
+        assert!(close(flat.cost_usd(&usage, 0), 1.0 + 2.0 + 3.75 + 1.0));
+    }
 
     fn expect(model: &str, thinking: ThinkingMode, preserved: bool, fallback: bool) {
         assert_eq!(

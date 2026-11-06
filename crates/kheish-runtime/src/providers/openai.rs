@@ -2128,6 +2128,7 @@ fn parse_usage(usage: &Value, pricing: Option<&OpenAiPricing>) -> kheish_types::
         input_tokens,
         output_tokens,
         cost_usd,
+        ..Default::default()
     }
 }
 

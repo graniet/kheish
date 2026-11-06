@@ -3550,6 +3550,7 @@ mod tests {
                         input_tokens: 1,
                         output_tokens: 1,
                         cost_usd: 0.1,
+                        ..Default::default()
                     },
                 },
             ])]))),
@@ -3664,6 +3665,7 @@ mod tests {
                         input_tokens: 1,
                         output_tokens: 1,
                         cost_usd: 0.0,
+                        ..Default::default()
                     },
                 },
             ])]))),
@@ -3846,6 +3848,7 @@ mod tests {
                         input_tokens: 1,
                         output_tokens: 1,
                         cost_usd: 0.0,
+                        ..Default::default()
                     },
                 },
             ])]))),

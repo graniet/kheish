@@ -240,11 +240,42 @@ pub fn capped_default_max_output_tokens(model: &str) -> u32 {
 }
 
 /// Captures token and cost usage for one model turn or stream snapshot.
+///
+/// `input_tokens` counts the prompt tokens billed at the full input rate. A
+/// provider with prompt caching reports the prompt tokens it wrote to its cache
+/// in `cache_creation_input_tokens` and those it read from it in
+/// `cache_read_input_tokens`, apart from `input_tokens`; the whole prompt is
+/// [`ModelUsage::prompt_tokens`]. `cost_usd` prices each count at its own rate.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Prompt tokens written to the provider's prompt cache.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_creation_input_tokens: u64,
+    /// Prompt tokens read from the provider's prompt cache.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_read_input_tokens: u64,
     pub cost_usd: f64,
+}
+
+impl ModelUsage {
+    /// Returns every prompt token of the request, cached or not: the measure of
+    /// how much context the request carried.
+    pub fn prompt_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cache_creation_input_tokens)
+            .saturating_add(self.cache_read_input_tokens)
+    }
+
+    /// Returns the prompt and output tokens of the request.
+    pub fn total_tokens(&self) -> u64 {
+        self.prompt_tokens().saturating_add(self.output_tokens)
+    }
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// Provider-reported usage attached to one persisted assistant message.

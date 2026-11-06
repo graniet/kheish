@@ -717,13 +717,13 @@ fn merge_provider_context(target: &mut Option<Value>, update: Value) {
 fn accumulate_usage(target: &mut ModelUsage, delta: &ModelUsage) {
     target.input_tokens += delta.input_tokens;
     target.output_tokens += delta.output_tokens;
+    target.cache_creation_input_tokens += delta.cache_creation_input_tokens;
+    target.cache_read_input_tokens += delta.cache_read_input_tokens;
     target.cost_usd += delta.cost_usd;
 }
 
 fn replace_usage(target: &mut ModelUsage, snapshot: &ModelUsage) {
-    target.input_tokens = snapshot.input_tokens;
-    target.output_tokens = snapshot.output_tokens;
-    target.cost_usd = snapshot.cost_usd;
+    *target = snapshot.clone();
 }
 
 fn parse_max_tokens_context_overflow_adjustment(message: &str) -> Option<u32> {
@@ -885,6 +885,7 @@ mod tests {
                         input_tokens: 1,
                         output_tokens: 2,
                         cost_usd: 0.1,
+                        ..Default::default()
                     },
                 },
             ]),
@@ -1054,6 +1055,7 @@ mod tests {
                             input_tokens: 1,
                             output_tokens: 2,
                             cost_usd: 0.1,
+                            ..Default::default()
                         },
                     },
                 ]),
@@ -1235,6 +1237,7 @@ mod tests {
                         input_tokens: 2,
                         output_tokens: 3,
                         cost_usd: 0.1,
+                        ..Default::default()
                     },
                 },
                 ModelStreamEvent::Usage {
@@ -1242,6 +1245,7 @@ mod tests {
                         input_tokens: 2,
                         output_tokens: 5,
                         cost_usd: 0.2,
+                        ..Default::default()
                     },
                 },
                 ModelStreamEvent::TextDelta {
