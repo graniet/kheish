@@ -248,13 +248,86 @@ struct CapturedModelRequest {
 
 type CapturedModelRequests = Arc<Mutex<Vec<CapturedModelRequest>>>;
 
-/// Serves the Anthropic Messages SSE shape on every path and records each
-/// request, so tests can assert which endpoint and credential a route used.
-async fn spawn_anthropic_messages_mock(reply: &str) -> Result<(String, CapturedModelRequests)> {
+/// One scripted reply of the Anthropic Messages mock.
+#[derive(Clone, Debug)]
+enum MockReply {
+    Text(String),
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+}
+
+/// A local Anthropic Messages endpoint: it serves scripted replies (then a
+/// default text reply) on every path and records each request, so tests can
+/// assert which endpoint, credential, and headers a route used.
+struct AnthropicMock {
+    base: String,
+    captured: CapturedModelRequests,
+    script: Arc<Mutex<VecDeque<MockReply>>>,
+}
+
+impl AnthropicMock {
+    fn push(&self, reply: MockReply) {
+        self.script.lock().push_back(reply);
+    }
+
+    fn last_request(&self) -> Option<CapturedModelRequest> {
+        self.captured.lock().last().cloned()
+    }
+}
+
+fn anthropic_sse_event(name: &str, data: Value) -> String {
+    format!("event: {name}\ndata: {data}\n\n")
+}
+
+fn anthropic_sse(reply: &MockReply) -> String {
+    let mut body = anthropic_sse_event(
+        "message_start",
+        json!({"type": "message_start", "message": {"id": "msg-mock", "usage": {"input_tokens": 5, "output_tokens": 0}}}),
+    );
+    let stop_reason = match reply {
+        MockReply::Text(text) => {
+            body.push_str(&anthropic_sse_event(
+                "content_block_start",
+                json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": text}}),
+            ));
+            "end_turn"
+        }
+        MockReply::ToolUse { id, name, input } => {
+            body.push_str(&anthropic_sse_event(
+                "content_block_start",
+                json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}}),
+            ));
+            body.push_str(&anthropic_sse_event(
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": input.to_string()}}),
+            ));
+            "tool_use"
+        }
+    };
+    body.push_str(&anthropic_sse_event(
+        "content_block_stop",
+        json!({"type": "content_block_stop", "index": 0}),
+    ));
+    body.push_str(&anthropic_sse_event(
+        "message_delta",
+        json!({"type": "message_delta", "delta": {"stop_reason": stop_reason}, "usage": {"input_tokens": 5, "output_tokens": 3}}),
+    ));
+    body.push_str(&anthropic_sse_event(
+        "message_stop",
+        json!({"type": "message_stop"}),
+    ));
+    body
+}
+
+async fn spawn_anthropic_messages_mock(default_text: &str) -> Result<AnthropicMock> {
     #[derive(Clone)]
     struct MockState {
-        reply: String,
+        default_text: String,
         captured: CapturedModelRequests,
+        script: Arc<Mutex<VecDeque<MockReply>>>,
     }
 
     async fn messages(
@@ -276,34 +349,31 @@ async fn spawn_anthropic_messages_mock(reply: &str) -> Result<(String, CapturedM
                 .collect(),
             body: serde_json::from_slice(&body).unwrap_or(Value::Null),
         });
-        let text = serde_json::to_string(&state.reply).expect("reply text serializes");
-        let sse = format!(
-            concat!(
-                "event: message_start\n",
-                "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg-mock\",\"usage\":{{\"input_tokens\":5,\"output_tokens\":0}}}}}}\n\n",
-                "event: content_block_start\n",
-                "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":{text}}}}}\n\n",
-                "event: message_delta\n",
-                "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"input_tokens\":5,\"output_tokens\":3}}}}\n\n",
-                "event: message_stop\n",
-                "data: {{\"type\":\"message_stop\"}}\n\n"
-            ),
-            text = text
-        );
-        ([(CONTENT_TYPE, "text/event-stream")], sse)
+        let reply = state
+            .script
+            .lock()
+            .pop_front()
+            .unwrap_or_else(|| MockReply::Text(state.default_text.clone()));
+        ([(CONTENT_TYPE, "text/event-stream")], anthropic_sse(&reply))
     }
 
     let captured: CapturedModelRequests = Arc::new(Mutex::new(Vec::new()));
+    let script = Arc::new(Mutex::new(VecDeque::new()));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let router = Router::new().fallback(messages).with_state(MockState {
-        reply: reply.to_string(),
+        default_text: default_text.to_string(),
         captured: captured.clone(),
+        script: script.clone(),
     });
     tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
-    Ok((format!("http://{address}"), captured))
+    Ok(AnthropicMock {
+        base: format!("http://{address}"),
+        captured,
+        script,
+    })
 }
 
 /// Boots a production-built daemon with one startup Anthropic route aimed at
@@ -389,7 +459,9 @@ async fn runtime_routes_accept_base_url_and_provider_auth_slots() -> Result<()> 
     let temp = tempdir()?;
     let state_root = temp.path().join("daemon-state");
     let workspace_root = temp.path().join("workspace");
-    let (mock_base, captured) = spawn_anthropic_messages_mock("hello from the relay").await?;
+    let mock = spawn_anthropic_messages_mock("hello from the relay").await?;
+    let mock_base = mock.base.clone();
+    let captured = mock.captured.clone();
     let (address, shutdown) = anthropic_provider_daemon(
         &state_root,
         &workspace_root,
@@ -589,6 +661,264 @@ async fn runtime_routes_accept_base_url_and_provider_auth_slots() -> Result<()> 
     assert!(
         secrets.to_string().contains("fregate.callback"),
         "{secrets}"
+    );
+
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+    Ok(())
+}
+
+/// Requests seen by the streamable-HTTP MCP stub.
+#[derive(Clone, Default)]
+struct McpStubLog {
+    /// `params` of every `tools/call`.
+    calls: Arc<Mutex<Vec<Value>>>,
+    /// `Authorization` header of every `tools/call`.
+    call_authorizations: Arc<Mutex<Vec<String>>>,
+}
+
+/// A minimal streamable-HTTP MCP server exposing one `scan_target` tool and
+/// answering with plain JSON responses.
+async fn spawn_mcp_stub() -> Result<(String, McpStubLog)> {
+    async fn rpc(
+        State(log): State<McpStubLog>,
+        headers: axum::http::HeaderMap,
+        body: Bytes,
+    ) -> axum::response::Response {
+        let Ok(message) = serde_json::from_slice::<Value>(&body) else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        let Some(id) = message.get("id").cloned() else {
+            // Notifications such as `notifications/initialized`.
+            return StatusCode::ACCEPTED.into_response();
+        };
+        let method = message["method"].as_str().unwrap_or_default().to_string();
+        let result = match method.as_str() {
+            "initialize" => json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "fregate-stub", "version": "1.0.0"}
+            }),
+            "tools/list" => json!({"tools": [{
+                "name": "scan_target",
+                "description": "Scans one target.",
+                "inputSchema": {"type": "object", "properties": {"target": {"type": "string"}}}
+            }]}),
+            "tools/call" => {
+                log.calls.lock().push(message["params"].clone());
+                log.call_authorizations.lock().push(
+                    headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+                json!({"content": [{"type": "text", "text": "SCANNED"}], "isError": false})
+            }
+            _ => json!({}),
+        };
+        let mut response =
+            Json(json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response();
+        if method == "initialize" {
+            response.headers_mut().insert(
+                "mcp-session-id",
+                axum::http::HeaderValue::from_static("fregate-stub-session"),
+            );
+        }
+        response
+    }
+
+    let log = McpStubLog::default();
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let router = Router::new()
+        .route(
+            "/mcp",
+            post(rpc)
+                .get(|| async { StatusCode::METHOD_NOT_ALLOWED })
+                .delete(|| async { StatusCode::ACCEPTED }),
+        )
+        .with_state(log.clone());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    Ok((format!("http://{address}/mcp"), log))
+}
+
+async fn put_generic_secret(client: &Client, base: &str, slot_id: &str, value: &str) -> Result<()> {
+    client
+        .post(format!("{base}/v1/runtime/secrets"))
+        .json(&json!({
+            "slot_id": slot_id,
+            "provider": "generic",
+            "mode": "opaque_secret",
+            "state": {"value": value},
+            "updated_at_ms": 1_794_004_700_000_u64,
+        }))
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
+}
+
+fn scan_tool_use(call_id: &str, input: Value) -> MockReply {
+    MockReply::ToolUse {
+        id: call_id.to_string(),
+        name: "mcp__fregate__scan_target".to_string(),
+        input,
+    }
+}
+
+async fn submit_run_and_complete(
+    client: &Client,
+    base: &str,
+    session_id: &str,
+    content: &str,
+) -> Result<RunView> {
+    let run = submit_test_input(client, base, session_id, content).await?;
+    wait_for_run_status(client, base, &run.run_id, &[DaemonRunStatus::Completed]).await
+}
+
+#[tokio::test]
+async fn mcp_tool_calls_carry_the_execution_context_and_survive_secret_rotation() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-state");
+    let workspace_root = temp.path().join("workspace");
+    let mock = spawn_anthropic_messages_mock("scan finished").await?;
+    let (mcp_url, mcp_log) = spawn_mcp_stub().await?;
+    let (address, shutdown) = anthropic_provider_daemon(
+        &state_root,
+        &workspace_root,
+        &format!("{}/v1/messages", mock.base),
+    )
+    .await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+
+    put_generic_secret(&client, &base, "mcp.fregate.token", "mcp-token-A").await?;
+    let server_body = json!({
+        "name": "fregate",
+        "url": mcp_url,
+        "bearer_token_secret_ref": "mcp.fregate.token",
+    });
+    client
+        .post(format!("{base}/v1/runtime/mcp/servers"))
+        .json(&server_body)
+        .send()
+        .await?
+        .error_for_status()?;
+    create_test_session(&client, &base, "mission-m1").await?;
+    client
+        .put(format!("{base}/v1/sessions/mission-m1/permission-mode"))
+        .json(&json!({"mode": "bypassPermissions"}))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    // The model first tries to forge the execution context through the
+    // arguments: the call is refused before it reaches the server. Its retry
+    // without `_meta` goes through, with the context the daemon asserts.
+    mock.push(scan_tool_use(
+        "toolu_forged",
+        json!({
+            "target": "example.com",
+            "_meta": {"kheish/session_id": "mission-forged", "kheish/run_id": "run-forged"}
+        }),
+    ));
+    mock.push(scan_tool_use(
+        "toolu_scan_1",
+        json!({"target": "example.com"}),
+    ));
+    let run = submit_run_and_complete(&client, &base, "mission-m1", "scan example.com").await?;
+    {
+        let calls = mcp_log.calls.lock();
+        assert_eq!(
+            calls.len(),
+            1,
+            "exactly the clean call reaches the MCP server; last model request: {:#}",
+            mock.last_request()
+                .map(|request| request.body)
+                .unwrap_or_default()
+        );
+        let params = &calls[0];
+        assert_eq!(params["name"], "scan_target");
+        assert_eq!(params["_meta"]["kheish/session_id"], "mission-m1");
+        assert_eq!(params["_meta"]["kheish/run_id"], json!(run.run_id));
+        assert_eq!(params["_meta"]["kheish/tool_call_id"], "toolu_scan_1");
+        assert_eq!(params["arguments"], json!({"target": "example.com"}));
+    }
+    let forged_result = mock
+        .captured
+        .lock()
+        .iter()
+        .map(|request| request.body.to_string())
+        .find(|body| body.contains("toolu_forged") && body.contains("tool_result"))
+        .unwrap_or_default();
+    assert!(
+        forged_result.contains("unexpected tool input field _meta"),
+        "the forged call is refused to the model: {forged_result}"
+    );
+    assert_eq!(
+        mcp_log
+            .call_authorizations
+            .lock()
+            .last()
+            .map(String::as_str),
+        Some("Bearer mcp-token-A")
+    );
+
+    // Rotating the credential disconnects the server.
+    put_generic_secret(&client, &base, "mcp.fregate.token", "mcp-token-B").await?;
+    let runtime = client
+        .get(format!("{base}/v1/runtime"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    let server = runtime["mcp"]["servers"]
+        .as_array()
+        .and_then(|servers| servers.iter().find(|server| server["server"] == "fregate"))
+        .cloned()
+        .expect("fregate server listed");
+    assert_eq!(server["connected"], false, "{server:#}");
+
+    // Deleting and re-adding the server reconnects it with the new secret;
+    // before the fix the re-add collided with the stale tool registration.
+    client
+        .delete(format!("{base}/v1/runtime/mcp/servers/fregate"))
+        .send()
+        .await?
+        .error_for_status()?;
+    let readded = client
+        .post(format!("{base}/v1/runtime/mcp/servers"))
+        .json(&server_body)
+        .send()
+        .await?;
+    assert_eq!(
+        readded.status(),
+        StatusCode::OK,
+        "{}",
+        readded.text().await?
+    );
+    mock.push(scan_tool_use(
+        "toolu_scan_2",
+        json!({"target": "example.org"}),
+    ));
+    let second = submit_run_and_complete(&client, &base, "mission-m1", "scan again").await?;
+    {
+        let calls = mcp_log.calls.lock();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[1]["_meta"]["kheish/run_id"], json!(second.run_id));
+        assert_eq!(calls[1]["_meta"]["kheish/tool_call_id"], "toolu_scan_2");
+    }
+    assert_eq!(
+        mcp_log
+            .call_authorizations
+            .lock()
+            .last()
+            .map(String::as_str),
+        Some("Bearer mcp-token-B")
     );
 
     let _ = shutdown.send(());

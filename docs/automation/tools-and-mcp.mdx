@@ -660,9 +660,45 @@ explicit config, and which depend on upstream OAuth — see the
 [MCP catalog](/operators/mcp-catalog) reference.
 
 A hot-added server is persisted in a state-root overlay and reconnected at the
-next boot. If a rotating secret or a changed config needs to take effect on an
-*already loaded* server, restart the daemon so it reconnects with the new
-material — MCP inventory is resolved at startup, not re-read live.
+next boot. Static credentials (`bearer_token_secret_ref`,
+`http_header_secret_refs`, `env_secret_refs`) are resolved when the server
+connects. Rotating or revoking one of those slots disconnects every server that
+references it: the runtime snapshot shows `connected: false` with
+`credential secret ... changed or was revoked`, and its calls fail closed. To
+pick up the new value without a restart, remove and re-add a runtime-added
+server (`DELETE /v1/runtime/mcp/servers/{name}`, then
+`POST /v1/runtime/mcp/servers` with the same body): the removal retires every
+tool the server registered, so the re-add connects cleanly with the rotated
+secret. A server from the startup config file needs a daemon restart.
+
+### Execution context on `tools/call`
+
+Every MCP server sees one shared connection per server, so the daemon tells it
+which execution a call belongs to. Each `tools/call` request carries a protocol
+`_meta` object with:
+
+| Key | Value |
+|---|---|
+| `kheish/session_id` | the calling session |
+| `kheish/run_id` | the daemon run being executed |
+| `kheish/tool_call_id` | the model's tool call id, stable across a transport retry |
+
+```json
+{"method": "tools/call", "params": {
+  "name": "scan_target",
+  "arguments": {"target": "example.com"},
+  "_meta": {"kheish/session_id": "mission-m1", "kheish/run_id": "run-4",
+            "kheish/tool_call_id": "toolu_ca1c624cd5", "progressToken": 1}}}
+```
+
+These values come only from the daemon's execution scope, never from the
+model. The model writes `arguments`, not `_meta`: a call whose arguments carry
+a top-level `_meta` is refused by input validation before it reaches the
+server (`unexpected tool input field _meta`), and the MCP layer drops such a key
+as a second line of defense. A server can therefore key authorization,
+idempotency, and auditing on `_meta` and treat `arguments` as model-written
+input. A key whose value is unknown is omitted, for example `kheish/run_id` on a
+direct `POST /v1/runtime/mcp/tools/{tool_name}/call` outside a run.
 
 ### MCP output is untrusted
 

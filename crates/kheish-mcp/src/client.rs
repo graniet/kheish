@@ -808,10 +808,13 @@ impl McpClient {
         .await
     }
 
+    /// Sends one `tools/call`. `meta` becomes the request's protocol `_meta`;
+    /// it is daemon-owned and never derived from `arguments`.
     pub(crate) async fn call_tool(
         &self,
         name: &str,
         arguments: serde_json::Value,
+        meta: Option<rmcp::model::Meta>,
     ) -> Result<CallToolResult> {
         let service = self.service().await?;
         let arguments = match arguments {
@@ -822,7 +825,8 @@ impl McpClient {
                 ));
             }
         };
-        let params = CallToolRequestParams::new(name.to_string()).with_arguments(arguments);
+        let mut params = CallToolRequestParams::new(name.to_string()).with_arguments(arguments);
+        params.meta = meta;
         run_with_timeout(service.call_tool(params), self.tool_timeout, "tools/call").await
     }
 
