@@ -125,7 +125,8 @@ async fn serve_daemon(args: crate::ServeArgs, options: ServeOptions) -> Result<(
         connectors_config = config.connectors_config_path.as_ref().map(|path| path.display().to_string()).as_deref(),
         "starting kheish daemon",
     );
-    let _state_root_lock = StateRootLock::acquire(&args.state_root)?;
+    let _state_root_lock =
+        StateRootLock::acquire_waiting(&args.state_root, args.state_lock_wait).await?;
     config.state_root_lock_held = true;
     let auth_manager =
         kheish_auth::AuthManager::new(crate::cli::global_auth_store_path(&args.state_root))?;

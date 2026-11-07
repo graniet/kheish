@@ -699,6 +699,33 @@ Mitigations:
   backoff so the retry lands after the lock releases.
 - Prefer `/readyz` and process-exit as your "safe to start replacement" signal,
   not "the port closed."
+- Or start the replacement with `--state-lock-wait 30s`: it waits for the lock
+  instead of exiting, so the race closes itself.
+
+### Active/standby with `--state-lock-wait`
+
+By default a second `serve` on a locked state root exits at once. With
+`--state-lock-wait <duration|forever>` (env `KHEISH_STATE_LOCK_WAIT`) it
+becomes a warm standby instead: it polls the lock with backoff (100 ms up to
+2 s), logs `state root is locked by another daemon; waiting as a standby` with
+the holder's pid every 30 s, and takes over the moment the active daemon dies,
+because the kernel releases a flock with its holder. Only then does it bind its
+port and boot, so a standby never serves requests or touches state.
+
+```bash
+# active
+kheish-daemon serve --state-root /srv/kheish --bind 10.0.0.5:4100 ...
+# standby on the same volume, a second host or container
+kheish-daemon serve --state-root /srv/kheish --bind 10.0.0.6:4100 --state-lock-wait forever ...
+```
+
+Values: `forever`; `0`, the default, to exit at once; or a duration such as
+`1500ms`, `30s`, `5m`, `1h` (a bare number is milliseconds). With a bounded
+wait, the daemon exits with an error naming the holder pid once it runs out.
+Requirements: both daemons must see the same lock, so the state root must be
+on a local or block volume (flock over NFS is not reliable), and they share the
+same auth-store master key. Clients must follow the active address, for example
+through a service that routes only to a ready instance (`/readyz`).
 
 ### Standard upgrade runbook
 

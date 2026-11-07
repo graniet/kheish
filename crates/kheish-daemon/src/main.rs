@@ -384,6 +384,14 @@ struct ServeArgs {
         default_value_t = kheish_daemon::LearningReadScopes::default()
     )]
     learning_read_scopes: kheish_daemon::LearningReadScopes,
+    /// How long to wait for a state root another daemon holds: `forever`, `0`
+    /// (exit at once, the default), or a duration such as `30s` or `5m`.
+    #[arg(
+        long,
+        env = "KHEISH_STATE_LOCK_WAIT",
+        default_value_t = crate::cli::state_lock::StateLockWait::default()
+    )]
+    state_lock_wait: crate::cli::state_lock::StateLockWait,
     #[arg(
         long,
         env = "KHEISH_HTTP_AUTH_MODE",
@@ -7373,6 +7381,7 @@ auth_ref = "openrouter.primary"
             log_level: LogLevelArg::Info,
             event_history_capacity: DEFAULT_EVENT_HISTORY_CAPACITY,
             learning_read_scopes: kheish_daemon::LearningReadScopes::default(),
+            state_lock_wait: crate::cli::state_lock::StateLockWait::default(),
             http_auth_mode: HttpAuthModeArg::Auto,
             http_admin_token: None,
             http_admin_token_file: None,
