@@ -30,9 +30,9 @@ pub use redaction::{
     replace_auth_store_debug_redaction_tokens,
 };
 pub use store::{
-    AUTH_STORE_MASTER_KEY_ENV, AUTH_STORE_MASTER_KEY_FILE_ENV, FileAuthStore,
-    generate_auth_store_master_key_base64, load_auth_store_master_key_from_env,
-    parse_auth_store_master_key,
+    AUTH_STORE_MASTER_KEY_ENV, AUTH_STORE_MASTER_KEY_FILE_ENV, AUTH_STORE_REQUIRE_ENCRYPTED_ENV,
+    FileAuthStore, auth_store_requires_encryption_from_env, generate_auth_store_master_key_base64,
+    load_auth_store_master_key_from_env, parse_auth_store_master_key,
 };
 pub use types::{
     AuthMode, AuthProvider, AuthSlotId, AuthSlotRecord, AuthSlotStatus, AuthStoreSnapshot,

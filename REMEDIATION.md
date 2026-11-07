@@ -16,7 +16,7 @@ Legend: `[x]` done · `[~]` partially done · `[ ]` not started. Effort: XS/S/M/
 | **P1.1** | Anthropic request-shape 400 on current models | High (core path broken) | S–M | `[x]` done + 6 unit tests (2026-07-03) |
 | **P1.2** | OutputHost empty-target fan-out → cross-transport leak | High | S–M | `[ ]` designed |
 | **P1.3** | Lock-poison cascade (79 sites) → abort | High (availability) | M | `[x]` done — full workspace swap to parking_lot (~700 sites, 2026-07-03) |
-| **P1.4** | Auth-store: no AAD + silently accepts plaintext | High (security) | M | `[ ]` designed |
+| **P1.4** | Auth-store: no AAD + silently accepts plaintext | High (security) | M | `[x]` done + 4 unit tests (2026-11-07) |
 | **P1.5** | Audit-key co-located: honesty + relocate flag | High (security) | S then M | `[~]` S part done (warning + docs); relocate flag (M) pending |
 | **P2.1** | Mid-run durability **Phase 0** (incremental journal, torn-line, O(Δ)) | High (the thesis gap) | S–M | `[x]` done + 8 tests (2026-07-03) |
 | **P2.2** | Google provider non-streaming → >90s timeout | Medium (correctness) | M | `[ ]` designed |
@@ -105,9 +105,16 @@ Live provider tests (`*_live.rs`) live in `tests/` (excluded by `--lib`) and sel
 79 production `std::sync::Mutex/RwLock .lock().expect("poisoned")` sites (kheish-runtime 31, kheish-daemon 23, kheish-agent 23 all in `supervisor.rs`, kheish-mcp 1, kheish-auth 1). A panic while any guard is held poisons the lock; every later `.expect()` aborts.
 **Fix:** swap those **sync** sites to `parking_lot::{Mutex, RwLock}` (non-poisoning, returns guard directly; compiler rejects a leftover `.expect()` on a non-`Result` guard). `parking_lot 0.12.5` is **already vendored** transitively (via `string_cache`), so promoting it to a direct dep adds **zero** new crates. Leave all 325 `tokio::sync::Mutex .await` sites alone. Start with `supervisor.rs` (23 sites) + runtime hot paths. Effort M. Risk low (mechanical, behavior-preserving, compiler-checked). Fallback with no new dep: a `lock_recover()` extension trait over `PoisonError::into_inner`.
 
-### P1.4 — Auth-store at-rest weaknesses `[ ]`
+### P1.4 — Auth-store at-rest weaknesses `[x]`
 `store.rs` uses AES-256-GCM-SIV with **no AAD** (encrypt 189, decrypt 224) and a `load()` that **silently accepts plaintext** credentials (`contains_key "ciphertext"` at 131).
 **Fix:** envelope **v2** binding AAD over version+label (explicitly **not** path); warn + auto-migrate plaintext with opt-in `KHEISH_AUTH_STORE_REQUIRE_ENCRYPTED` to hard-fail. **Critical constraints:** the v1 decrypt branch stays byte-for-byte untouched, and `RawKey` stays raw-byte-identical → no decryption lockout for existing stores. Effort M. Risk medium-gated by the no-lockout constraints + the existing migration framework.
+
+**Done (2026-11-07, branch `feat/fregate-runtime`):**
+- Every save writes envelope v2: `{"version":2,"label":"kheish.auth-store","nonce","ciphertext"}`. The AEAD associated data is a fixed domain prefix, the big-endian version, and the length-prefixed label; the path is not bound. A v2 file whose `version` is rewritten to `1` fails authentication in the v1 reader, and a missing or foreign label is refused.
+- The v1 reader is the previous `decrypt_snapshot`, moved unchanged into `decrypt_snapshot_v1` (same key lookup, nonce and ciphertext decoding, AEAD call without AAD). Master-key parsing is untouched. A v1 store loads, and the next save rewrites it as v2.
+- A plaintext store loads with a warning and, when a master key is configured, is rewritten encrypted on the spot (atomic, `0600`); a failed rewrite is logged and the credentials stay usable. `KHEISH_AUTH_STORE_REQUIRE_ENCRYPTED=true` makes a plaintext store a hard error and leaves the file untouched.
+- Tests (`kheish-auth` `store.rs`): v2 round trip + version downgrade + label tampering, a v1 store written by the old writer opens and upgrades on save, plaintext auto-migration with and without a key, and the require-encrypted refusal and flag parsing.
+- Docs: `docs/operations/security.mdx`, "The master key".
 
 ### P1.5 — Audit-signing-key honesty `[ ]`
 The Ed25519 hash-chained external-action audit's signing key is co-located with the state it protects (`audit-signing.key` under `state_root`, `external_action.rs:624`). Co-location weakens tamper-evidence (an attacker with state-root write can forge + re-sign).

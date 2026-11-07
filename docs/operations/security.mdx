@@ -271,10 +271,24 @@ Routes reference secrets by a stable `auth_ref` slot id rather than inlining key
 so one slot can back many routes, the daemon refuses to start when a referenced
 slot is missing, and `secrets set` on an existing ref is the standard rotation
 path. Built-in MCP catalog credentials use `mcp.<entry>.<CREDENTIAL>` slots;
-OAuth accounts use `mcp.oauth.<id>` slots. The one loader concession to history:
-older plaintext store files are still accepted for backward compatibility, so do
-not assume an existing state root is encrypted until it has been rewritten
-through the current store path.
+OAuth accounts use `mcp.oauth.<id>` slots.
+
+The store file is an AEAD envelope, AES-256-GCM-SIV under the master key:
+
+- **Envelope v2** (written by every save) carries `version: 2` and
+  `label: "kheish.auth-store"`, and binds both as associated data. Changing
+  either field, for example rewriting `version` to `1` to send the ciphertext
+  through the older reader, fails authentication instead of decrypting. The
+  file path is deliberately not bound, so a state root can be moved or restored
+  elsewhere.
+- **Envelope v1** (no associated data) is still read exactly as before, so an
+  existing store never locks out; the next save rewrites it as v2.
+- **Plaintext store files** from old builds are still read for backward
+  compatibility. Loading one logs a warning and, when a master key is set,
+  rewrites it encrypted on the spot. Set `KHEISH_AUTH_STORE_REQUIRE_ENCRYPTED=true`
+  to make a plaintext store a hard error instead (accepted values: `true`/`false`,
+  `1`/`0`, `yes`/`no`, `on`/`off`); use it in production once every store has been
+  rewritten.
 
 ### Bootstrapping route secrets
 

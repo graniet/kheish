@@ -1,4 +1,4 @@
-use aes_gcm_siv::aead::{Aead, KeyInit};
+use aes_gcm_siv::aead::{Aead, KeyInit, Payload};
 use aes_gcm_siv::{Aes256GcmSiv, Nonce};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -21,9 +21,48 @@ use crate::{AuthSlotRecord, AuthStoreSnapshot};
 pub const AUTH_STORE_MASTER_KEY_ENV: &str = "KHEISH_AUTH_STORE_MASTER_KEY";
 /// Environment variable containing a file path whose contents hold the auth-store master key.
 pub const AUTH_STORE_MASTER_KEY_FILE_ENV: &str = "KHEISH_AUTH_STORE_MASTER_KEY_FILE";
+/// Environment variable that, when truthy, makes loading a plaintext auth
+/// store a hard error instead of a warning followed by an encrypted rewrite.
+pub const AUTH_STORE_REQUIRE_ENCRYPTED_ENV: &str = "KHEISH_AUTH_STORE_REQUIRE_ENCRYPTED";
 
-const AUTH_STORE_ENVELOPE_VERSION: u32 = 1;
+/// The original envelope: AES-256-GCM-SIV without associated data. Still
+/// read, never written.
+const AUTH_STORE_ENVELOPE_VERSION_V1: u32 = 1;
+/// The current envelope: AES-256-GCM-SIV whose associated data binds the
+/// envelope version and label, so neither can be swapped without failing
+/// authentication. The file path is deliberately not bound: a store must
+/// stay readable after the state root moves.
+const AUTH_STORE_ENVELOPE_VERSION_V2: u32 = 2;
+/// The label of the global auth store envelope.
+const AUTH_STORE_ENVELOPE_LABEL: &str = "kheish.auth-store";
 const AUTH_STORE_NONCE_LEN: usize = 12;
+
+/// Associated data of one v2 envelope: a fixed domain prefix, the version,
+/// and the label, length-prefixed so no two (version, label) pairs collide.
+fn auth_store_envelope_aad(version: u32, label: &str) -> Vec<u8> {
+    let mut aad = b"kheish-auth-store-envelope".to_vec();
+    aad.extend_from_slice(&version.to_be_bytes());
+    aad.extend_from_slice(&(label.len() as u64).to_be_bytes());
+    aad.extend_from_slice(label.as_bytes());
+    aad
+}
+
+/// Reads `KHEISH_AUTH_STORE_REQUIRE_ENCRYPTED`. Unset or empty means `false`.
+pub fn auth_store_requires_encryption_from_env() -> Result<bool> {
+    let Some(raw) = std::env::var_os(AUTH_STORE_REQUIRE_ENCRYPTED_ENV) else {
+        return Ok(false);
+    };
+    let raw = raw
+        .into_string()
+        .map_err(|_| anyhow!("{AUTH_STORE_REQUIRE_ENCRYPTED_ENV} must be valid UTF-8"))?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "no" | "off" => Ok(false),
+        "1" | "true" | "yes" | "on" => Ok(true),
+        other => bail!(
+            "{AUTH_STORE_REQUIRE_ENCRYPTED_ENV} must be true or false (1/0, yes/no, on/off), got `{other}`"
+        ),
+    }
+}
 
 fn decode_auth_store_master_key_bytes(raw: &str) -> Result<[u8; 32]> {
     let trimmed = raw.trim();
@@ -99,6 +138,9 @@ pub(crate) fn auth_store_env_lock() -> &'static parking_lot::Mutex<()> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct EncryptedAuthStoreEnvelope {
     version: u32,
+    /// Present from v2 on, and bound into the associated data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
     nonce: String,
     ciphertext: String,
 }
@@ -138,8 +180,55 @@ impl FileAuthStore {
                 })?;
             return self.decrypt_snapshot(&envelope);
         }
-        serde_json::from_value(serde_json::Value::Object(object.clone()))
-            .with_context(|| format!("failed to decode auth store {}", self.path.display()))
+        if auth_store_requires_encryption_from_env()? {
+            bail!(
+                "auth store {} holds plaintext credentials and {} is set; encrypt it with {} before starting",
+                self.path.display(),
+                AUTH_STORE_REQUIRE_ENCRYPTED_ENV,
+                AUTH_STORE_MASTER_KEY_ENV
+            );
+        }
+        let snapshot: AuthStoreSnapshot =
+            serde_json::from_value(serde_json::Value::Object(object.clone()))
+                .with_context(|| format!("failed to decode auth store {}", self.path.display()))?;
+        self.migrate_plaintext(&snapshot);
+        Ok(snapshot)
+    }
+
+    /// Rewrites a plaintext store encrypted when a master key is available,
+    /// and warns either way. A failed rewrite leaves the plaintext file in
+    /// place and is reported, never fatal: the credentials stay usable.
+    fn migrate_plaintext(&self, snapshot: &AuthStoreSnapshot) {
+        match self.master_key() {
+            Ok(Some(key)) => {
+                let written = self.encrypt_snapshot(snapshot, &key).and_then(|envelope| {
+                    let content = serde_json::to_string_pretty(&envelope)?;
+                    atomic_write_private(&self.path, content.as_bytes())
+                });
+                match written {
+                    Ok(()) => tracing::warn!(
+                        path = %self.path.display(),
+                        "auth store held plaintext credentials; rewrote it encrypted"
+                    ),
+                    Err(error) => tracing::warn!(
+                        path = %self.path.display(),
+                        error = %format!("{error:#}"),
+                        "auth store holds plaintext credentials and could not be rewritten encrypted"
+                    ),
+                }
+            }
+            Ok(None) => tracing::warn!(
+                path = %self.path.display(),
+                "auth store holds plaintext credentials; set {} to encrypt it, or {} to refuse plaintext",
+                AUTH_STORE_MASTER_KEY_ENV,
+                AUTH_STORE_REQUIRE_ENCRYPTED_ENV
+            ),
+            Err(error) => tracing::warn!(
+                path = %self.path.display(),
+                error = %format!("{error:#}"),
+                "auth store holds plaintext credentials and the master key could not be read"
+            ),
+        }
     }
 
     pub fn save(&self, snapshot: &AuthStoreSnapshot) -> Result<()> {
@@ -176,6 +265,7 @@ impl FileAuthStore {
         })
     }
 
+    /// Encrypts one snapshot into a v2 envelope.
     fn encrypt_snapshot(
         &self,
         snapshot: &AuthStoreSnapshot,
@@ -186,18 +276,103 @@ impl FileAuthStore {
         let mut nonce_bytes = [0_u8; AUTH_STORE_NONCE_LEN];
         rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
+        let aad =
+            auth_store_envelope_aad(AUTH_STORE_ENVELOPE_VERSION_V2, AUTH_STORE_ENVELOPE_LABEL);
         let ciphertext = cipher
-            .encrypt(nonce, plaintext.as_ref())
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: plaintext.as_ref(),
+                    aad: &aad,
+                },
+            )
             .map_err(|error| anyhow!("failed to encrypt auth store: {error}"))?;
         Ok(EncryptedAuthStoreEnvelope {
-            version: AUTH_STORE_ENVELOPE_VERSION,
+            version: AUTH_STORE_ENVELOPE_VERSION_V2,
+            label: Some(AUTH_STORE_ENVELOPE_LABEL.to_string()),
             nonce: BASE64_STANDARD.encode(nonce_bytes),
             ciphertext: BASE64_STANDARD.encode(ciphertext),
         })
     }
 
     fn decrypt_snapshot(&self, envelope: &EncryptedAuthStoreEnvelope) -> Result<AuthStoreSnapshot> {
-        if envelope.version != AUTH_STORE_ENVELOPE_VERSION {
+        match envelope.version {
+            AUTH_STORE_ENVELOPE_VERSION_V1 => self.decrypt_snapshot_v1(envelope),
+            AUTH_STORE_ENVELOPE_VERSION_V2 => self.decrypt_snapshot_v2(envelope),
+            version => bail!(
+                "unsupported encrypted auth store version {} in {}",
+                version,
+                self.path.display()
+            ),
+        }
+    }
+
+    /// Decrypts a v2 envelope; its version and label are authenticated as
+    /// associated data.
+    fn decrypt_snapshot_v2(
+        &self,
+        envelope: &EncryptedAuthStoreEnvelope,
+    ) -> Result<AuthStoreSnapshot> {
+        let label = envelope.label.as_deref().ok_or_else(|| {
+            anyhow!(
+                "encrypted auth store {} is missing its envelope label",
+                self.path.display()
+            )
+        })?;
+        if label != AUTH_STORE_ENVELOPE_LABEL {
+            bail!(
+                "encrypted auth store {} has envelope label `{label}`, expected `{AUTH_STORE_ENVELOPE_LABEL}`",
+                self.path.display()
+            );
+        }
+        let key = self.master_key()?.ok_or_else(|| {
+            anyhow!(
+                "auth store {} is encrypted; set {} or {} before loading it",
+                self.path.display(),
+                AUTH_STORE_MASTER_KEY_ENV,
+                AUTH_STORE_MASTER_KEY_FILE_ENV
+            )
+        })?;
+        let nonce = BASE64_STANDARD
+            .decode(&envelope.nonce)
+            .with_context(|| format!("invalid auth store nonce in {}", self.path.display()))?;
+        if nonce.len() != AUTH_STORE_NONCE_LEN {
+            bail!("invalid auth store nonce length in {}", self.path.display());
+        }
+        let ciphertext = BASE64_STANDARD
+            .decode(&envelope.ciphertext)
+            .with_context(|| format!("invalid auth store ciphertext in {}", self.path.display()))?;
+        let cipher = Aes256GcmSiv::new_from_slice(&key).expect("32-byte key should be valid");
+        let aad = auth_store_envelope_aad(envelope.version, label);
+        let plaintext = cipher
+            .decrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: ciphertext.as_ref(),
+                    aad: &aad,
+                },
+            )
+            .map_err(|error| {
+                anyhow!(
+                    "failed to decrypt auth store {}: {error}",
+                    self.path.display()
+                )
+            })?;
+        serde_json::from_slice(&plaintext).with_context(|| {
+            format!(
+                "failed to decode decrypted auth store {}",
+                self.path.display()
+            )
+        })
+    }
+
+    /// Decrypts a v1 envelope (no associated data). Kept exactly as the v1
+    /// reader was so stores written before v2 always open.
+    fn decrypt_snapshot_v1(
+        &self,
+        envelope: &EncryptedAuthStoreEnvelope,
+    ) -> Result<AuthStoreSnapshot> {
+        if envelope.version != AUTH_STORE_ENVELOPE_VERSION_V1 {
             bail!(
                 "unsupported encrypted auth store version {} in {}",
                 envelope.version,
@@ -321,7 +496,183 @@ mod tests {
         unsafe {
             std::env::remove_var(AUTH_STORE_MASTER_KEY_ENV);
             std::env::remove_var(AUTH_STORE_MASTER_KEY_FILE_ENV);
+            std::env::remove_var(AUTH_STORE_REQUIRE_ENCRYPTED_ENV);
         }
+    }
+
+    const TEST_MASTER_KEY: &str = "0123456789abcdef0123456789abcdef";
+
+    fn set_test_master_key() {
+        unsafe {
+            std::env::set_var(AUTH_STORE_MASTER_KEY_ENV, TEST_MASTER_KEY);
+        }
+    }
+
+    fn sample_snapshot() -> AuthStoreSnapshot {
+        AuthStoreSnapshot {
+            slots: BTreeMap::from([(
+                "fregate.callback".to_string(),
+                AuthSlotRecord {
+                    slot_id: AuthSlotId::new("fregate.callback"),
+                    provider: AuthProvider::Anthropic,
+                    mode: AuthMode::ApiKey,
+                    state: serde_json::json!({"kind": "api_key", "api_key": "relay-secret-v2"}),
+                    updated_at_ms: 7,
+                },
+            )]),
+        }
+    }
+
+    /// Writes a store the way the v1 writer did: AES-256-GCM-SIV, no
+    /// associated data, `{"version":1,"nonce":..,"ciphertext":..}`.
+    fn write_v1_store(path: &Path, snapshot: &AuthStoreSnapshot) -> Result<()> {
+        let key = parse_auth_store_master_key(TEST_MASTER_KEY)?;
+        let cipher = Aes256GcmSiv::new_from_slice(&key).expect("32-byte key");
+        let nonce_bytes = [7_u8; AUTH_STORE_NONCE_LEN];
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce_bytes),
+                serde_json::to_vec(snapshot)?.as_ref(),
+            )
+            .map_err(|error| anyhow!("{error}"))?;
+        let envelope = serde_json::json!({
+            "version": 1,
+            "nonce": BASE64_STANDARD.encode(nonce_bytes),
+            "ciphertext": BASE64_STANDARD.encode(ciphertext),
+        });
+        std::fs::write(path, serde_json::to_string_pretty(&envelope)?)?;
+        Ok(())
+    }
+
+    #[test]
+    fn saves_write_v2_envelopes_whose_version_and_label_are_authenticated() -> Result<()> {
+        let _guard = auth_store_env_lock().lock();
+        clear_auth_store_master_key_env();
+        set_test_master_key();
+        let temp = tempdir()?;
+        let path = temp.path().join("auth-store.json");
+        let store = FileAuthStore::new(&path);
+        store.save(&sample_snapshot())?;
+        let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+        assert_eq!(raw["version"], 2);
+        assert_eq!(raw["label"], AUTH_STORE_ENVELOPE_LABEL);
+        assert!(!raw.to_string().contains("relay-secret-v2"));
+        assert_eq!(store.load()?, sample_snapshot());
+
+        // Downgrading the version to the AAD-less v1 reader fails to decrypt.
+        let mut downgraded = raw.clone();
+        downgraded["version"] = serde_json::json!(1);
+        std::fs::write(&path, downgraded.to_string())?;
+        assert!(store.load().is_err(), "a v2 ciphertext must not open as v1");
+
+        // A different label is refused, and a forged matching label still
+        // cannot change the authenticated bytes.
+        let mut relabeled = raw.clone();
+        relabeled["label"] = serde_json::json!("kheish.other-store");
+        std::fs::write(&path, relabeled.to_string())?;
+        assert!(store.load().is_err());
+        let mut unlabeled = raw.clone();
+        unlabeled.as_object_mut().expect("object").remove("label");
+        std::fs::write(&path, unlabeled.to_string())?;
+        assert!(store.load().is_err());
+
+        std::fs::write(&path, raw.to_string())?;
+        assert_eq!(store.load()?, sample_snapshot());
+        clear_auth_store_master_key_env();
+        Ok(())
+    }
+
+    #[test]
+    fn v1_stores_still_open_and_are_rewritten_as_v2_on_the_next_save() -> Result<()> {
+        let _guard = auth_store_env_lock().lock();
+        clear_auth_store_master_key_env();
+        set_test_master_key();
+        let temp = tempdir()?;
+        let path = temp.path().join("auth-store.json");
+        write_v1_store(&path, &sample_snapshot())?;
+        let store = FileAuthStore::new(&path);
+        assert_eq!(store.load()?, sample_snapshot());
+
+        store.save(&store.load()?)?;
+        let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+        assert_eq!(raw["version"], 2);
+        assert_eq!(store.load()?, sample_snapshot());
+        clear_auth_store_master_key_env();
+        Ok(())
+    }
+
+    #[test]
+    fn plaintext_stores_are_encrypted_on_load_when_a_key_is_available() -> Result<()> {
+        let _guard = auth_store_env_lock().lock();
+        clear_auth_store_master_key_env();
+        let temp = tempdir()?;
+        let path = temp.path().join("auth-store.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&sample_snapshot())?)?;
+        let store = FileAuthStore::new(&path);
+
+        // Without a master key the plaintext store still loads, unchanged.
+        assert_eq!(store.load()?, sample_snapshot());
+        assert!(std::fs::read_to_string(&path)?.contains("relay-secret-v2"));
+
+        // With one, loading rewrites it as a v2 envelope.
+        set_test_master_key();
+        assert_eq!(store.load()?, sample_snapshot());
+        let raw = std::fs::read_to_string(&path)?;
+        assert!(!raw.contains("relay-secret-v2"), "{raw}");
+        let envelope: serde_json::Value = serde_json::from_str(&raw)?;
+        assert_eq!(envelope["version"], 2);
+        assert_eq!(store.load()?, sample_snapshot());
+        clear_auth_store_master_key_env();
+        Ok(())
+    }
+
+    #[test]
+    fn require_encrypted_refuses_plaintext_stores() -> Result<()> {
+        let _guard = auth_store_env_lock().lock();
+        clear_auth_store_master_key_env();
+        let temp = tempdir()?;
+        let path = temp.path().join("auth-store.json");
+        let plaintext = serde_json::to_string_pretty(&sample_snapshot())?;
+        std::fs::write(&path, &plaintext)?;
+        let store = FileAuthStore::new(&path);
+        set_test_master_key();
+        unsafe {
+            std::env::set_var(AUTH_STORE_REQUIRE_ENCRYPTED_ENV, "true");
+        }
+        let error = store.load().expect_err("plaintext must be refused");
+        assert!(
+            error.to_string().contains(AUTH_STORE_REQUIRE_ENCRYPTED_ENV),
+            "{error}"
+        );
+        // Nothing was rewritten.
+        assert_eq!(std::fs::read_to_string(&path)?, plaintext);
+
+        // Encrypted stores load normally under the same setting.
+        store.save(&sample_snapshot())?;
+        assert_eq!(store.load()?, sample_snapshot());
+
+        unsafe {
+            std::env::set_var(AUTH_STORE_REQUIRE_ENCRYPTED_ENV, "sometimes");
+        }
+        assert!(auth_store_requires_encryption_from_env().is_err());
+        for (raw, expected) in [
+            ("1", true),
+            ("on", true),
+            ("0", false),
+            ("no", false),
+            ("", false),
+        ] {
+            unsafe {
+                std::env::set_var(AUTH_STORE_REQUIRE_ENCRYPTED_ENV, raw);
+            }
+            assert_eq!(
+                auth_store_requires_encryption_from_env()?,
+                expected,
+                "{raw}"
+            );
+        }
+        clear_auth_store_master_key_env();
+        Ok(())
     }
 
     #[test]
