@@ -597,3 +597,81 @@ failure being the pre-existing `daemon_stop_task_kills_orphaned_pipe_holder_and_
 the clock unit tests on `RunLimits`, the fingerprint test, and four HTTP tests (an approval held past the budget then
 completed; a deadline that runs out after a resume; a restart while paused; a restart while running, where the direct
 run ends `interrupted` and a replayed run is cancelled at its persisted deadline rather than a new budget).
+
+### K14 to K17: what a verification sends Claude
+
+A real verification on Kheish took 9 turns and $0.28, against 4 steps and $0.12 on Fregate's legacy loop. A probe
+(`/tmp/kprobe`, `server/cmd/kprobe`) drives one verification through both runtimes against a scripted Messages API,
+with Fregate's own code: the legacy Anthropic adapter for the legacy loop, and for Kheish the callback listener (relay,
+MCP server, permission hook) and the `kheishrt` client provisioning the daemon as `missions_provision.go` does. It saves
+every request body. The scripted model makes the same calls in both runtimes: `get_exposure`, then `get_fact` and
+`services_on` in one turn, then `submit_verdict`. The bodies showed where Kheish spent more:
+
+- each MCP `inputSchema` was rebuilt: enums and nested descriptions dropped, `integer` read as `number`, no `strict`;
+- every tool and field description carried the untrusted-description prefix;
+- a tool error reached the model as `is_error: false`, the error only inside the JSON wrapper;
+- each result was a JSON wrapper (`untrusted`, a 170-byte `security_notice`, `content[]` with metadata,
+  `structured_content`, `_meta`) around Fregate's JSON document, escaped;
+- the run asked the model once more after `submit_verdict`;
+- the standing reminder Fregate's loop sends after each batch had no place in a Kheish run;
+- the system prompt was 11,486 bytes: Kheish's generic sections, an `Available Tools` list repeating the descriptions,
+  a `Web Research` section asking for `Sources:` because a description said "HTTP", the persona framing and an
+  `Active Route` section, around Fregate's 4,952-byte prompt.
+
+| Change | What a caller sets |
+|---|---|
+| K14 MCP tool fidelity | Nothing for the schemas: every MCP tool goes out with the server's `inputSchema` as written, `strict: true` on Anthropic when the schema is in the enforced subset; the other drivers get the subset they take. On the MCP server registration (`POST /v1/runtime/mcp/servers`, or the MCP config file): `trusted: true` (no untrusted prefix) and `result_format: "text"` (trusted servers only: text items as plain text, no wrapper). A result's `isError` reaches the model as `is_error: true`. |
+| K15 stop after the report | `stop_after_tool: "mcp__fregate__submit_verdict"` on `POST /v1/sessions/{id}/runs`; shown as `RunView.limits.stop_after_tool`. |
+| K16 a reminder after each batch | `generation.tool_batch_reminder` on the run, or in the session's `route_policy.generation`: a `role: "system"` message after each tool-result message, as Fregate's legacy adapter renders `RoleSystem`. |
+| K17 a lean system prompt | `preamble: "minimal"` on the persona (`POST`/`PUT /v1/personas`). Capability sections now follow Kheish's own tools only. |
+
+#### Measured
+
+The probe was rerun on 2026-11-07 against `cargo build --workspace --locked` (debug) at `d1dd856`, on a daemon of mine
+on `127.0.0.1:4290` (`deploy/kheish/kheishd.sh`, `env -i`, private `HOME`, state under `/tmp/kprobe/kstate-after`).
+`-lean` sets `trusted: true` and `result_format: "text"` on the `fregate` server, `preamble: "minimal"` on the persona,
+and `stop_after_tool` and `generation.tool_batch_reminder` (Fregate's `StandingReminder`) on the run; without it the
+probe provisions exactly as Fregate does today. "Before" is the capture at `228b413` (`/tmp/kprobe/out`; `out2` is the
+same with a daemon-wide `custom_prompt`, 5,567 bytes of system prompt). Bytes are UTF-8 bytes of the request body parts.
+
+| | Legacy loop | Kheish before | Kheish after, no options | Kheish after, lean |
+|---|---|---|---|---|
+| Model calls | 3 | 4 | 4 | **3** |
+| System prompt | 4,952 | 11,486 | 11,008 | **4,952** (byte-identical to legacy) |
+| Tools (8) | 5,670 | 6,584 | 7,787 | 5,819 |
+| `strict` tools | 8 | 0 | 8 | 8 |
+| Result `get_exposure` | 3,900 | 5,061 | 5,061 | 4,111 |
+| Result `get_fact` | 1,445 | 2,344 | 2,344 | 1,656 |
+| Result `services_on` | 2,388 | 3,411 | 3,411 | 2,599 |
+| Result `submit_verdict` | (none) | 724 | 724 | (none) |
+| Reminders (system messages) | 2 | 0 | 0 | 2, same text and place |
+| Request bodies, all calls | 49,042 | 111,207 | 114,079 | 50,510 |
+
+- Lean: every schema and description is identical to legacy's and all 8 tools are strict. The tools are 149 bytes
+  larger only by the `mcp__fregate__` prefix of their names and the cache breakpoint on the last one.
+- Lean results are each 211 bytes larger than legacy's for one reason: Fregate's MCP server still appends its
+  standing reminder to every result (`\nReminder from Fregate: …`). With `tool_batch_reminder` on the run, Fregate can
+  drop that suffix; the results are then legacy's bytes exactly, and the bodies 49,666 bytes.
+- The run ends `completed` after `submit_verdict` with no fourth call and no empty `output` event
+  (`accepted, started, completed`).
+- Without options, K14 already makes every tool strict and its schema exact, but an untrusted server's nested
+  descriptions now carry the prefix too (tools 7,787 bytes), and K17 drops the `Web Research` section
+  (11,008 bytes).
+
+#### Tests and checks
+
+- `cargo fmt --all -- --check` clean; `cargo build --workspace --locked` passes with no warning.
+- Lib tests: kheish-types 64, kheish-core 74, kheish-runtime 357, kheish-mcp 69 pass. kheish-mcp's
+  `mcp_tool_schema_import_preserves_closed_nested_shapes`, failing since `844f080`, now checks what providers get (the
+  server's schema as written) and passes. kheish-daemon passes 1446 of 1448 in a full run, 1447 counting a load flake that passes alone: `daemon_stop_task_kills_orphaned_pipe_holder_and_is_session_scoped` fails as on `844f080`, and `daemon_http_runs_require_explicit_ids_when_multiple_images_are_attached` failed once with the same debug-redaction error as the known flake `daemon_http_runs_reject_non_image_edit_assets` and passes alone (another full run had only the pipe-holder failure).
+- New tests. K14: the passthrough of a trusted and of an untrusted schema (every nested description marked, nothing
+  else), the size and depth fallback, `is_error` and the text framing, trust validation in config and runtime API, the
+  strict subset and per-request limits, the exact body schema on Anthropic, the OpenAI and Gemini conversions, and a
+  daemon test with a Fregate-shaped MCP stub (exact `input_schema`, `strict`, `is_error: true`, plain-text results,
+  `400 mcp_server_trust_invalid`). K15: engine tests (the report turn's other calls run, a failed report keeps the run
+  going, an approved report ends the run on resume, an output contract is refused), the metadata and fingerprint
+  tests, and a daemon test (one model call, `RunView.limits.stop_after_tool`, no output, `400 run_limits_invalid`).
+  K16: system messages after each batch, byte-stable prefixes from one request to the next, the text-block fallback,
+  a user turn after a batch, the merge and validation, the other drivers' refusal, and a daemon test through the
+  session `route_policy`. K17: the exact system prompt bytes of a session with Fregate's verify tools under `minimal`,
+  what `minimal` keeps, no capability from MCP descriptions, and a daemon test of the request's `system` block.
