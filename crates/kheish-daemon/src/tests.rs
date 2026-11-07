@@ -2601,6 +2601,7 @@ where
         crate::ControlPlaneAuthTokenFiles::default(),
         crate::ControlPlaneCorsConfig::loopback(),
         false,
+        crate::LearningReadScopes::default(),
     )
     .await?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();

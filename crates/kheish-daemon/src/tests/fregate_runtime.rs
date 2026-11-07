@@ -391,16 +391,27 @@ async fn anthropic_provider_daemon(
     workspace_root: &Path,
     boot_endpoint: &str,
 ) -> Result<(SocketAddr, oneshot::Sender<()>)> {
+    anthropic_provider_daemon_with_config(state_root, workspace_root, boot_endpoint, |_| {}).await
+}
+
+/// Same as [`anthropic_provider_daemon`], with daemon options adjusted first.
+async fn anthropic_provider_daemon_with_config(
+    state_root: &Path,
+    workspace_root: &Path,
+    boot_endpoint: &str,
+    configure: impl FnOnce(&mut DaemonConfig),
+) -> Result<(SocketAddr, oneshot::Sender<()>)> {
     ensure_auth_store_master_key();
     let auth_manager = AuthManager::new(state_root.join("auth/global-slots.json"))?;
     let mut boot = AnthropicProviderConfig::new("claude-boot", "boot-key");
     boot.base_url = boot_endpoint.to_string();
     let route = ConfiguredModelRoute::new("boot", ModelRouteConfig::Anthropic(boot));
-    let config = DaemonConfig::new(
+    let mut config = DaemonConfig::new(
         "127.0.0.1:0".parse::<SocketAddr>()?,
         state_root,
         workspace_root,
     );
+    configure(&mut config);
     let (service, listener) =
         build_provider_daemon(config, vec![route], Vec::new(), Vec::new(), auth_manager).await?;
     let address = listener.local_addr()?;
@@ -1386,6 +1397,158 @@ async fn run_limits_cap_turns_and_wall_clock_with_distinct_error_codes() -> Resu
     let settled = updates.last().cloned().expect("terminal update");
     assert_eq!(settled.status, DaemonRunStatus::Cancelled);
     assert_eq!(settled.error_code.as_deref(), Some("deadline_exceeded"));
+
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+    Ok(())
+}
+
+async fn publish_fact(
+    client: &Client,
+    base: &str,
+    kind: kheish_types::LearningScopeKind,
+    scope_id: &str,
+    content: &str,
+) -> Result<LearningView> {
+    let candidate = client
+        .post(format!("{base}/v1/learning-candidates"))
+        .json(&CreateLearningCandidateRequest {
+            scope: kheish_types::LearningScope {
+                kind,
+                id: scope_id.to_string(),
+            },
+            kind: kheish_types::LearningKind::Fact,
+            sensitivity: kheish_types::LearningSensitivity::Scoped,
+            content: content.to_string(),
+            confidence: 95,
+            source: kheish_types::LearningSourceRef::default(),
+            evidence_refs: Vec::new(),
+            expires_at_ms: None,
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<LearningCandidateView>()
+        .await?;
+    client
+        .post(format!(
+            "{base}/v1/learning-candidates/{}/publish",
+            candidate.candidate_id
+        ))
+        .json(&PublishLearningCandidateRequest::default())
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<LearningView>()
+        .await
+        .map_err(Into::into)
+}
+
+#[tokio::test]
+async fn learning_read_scopes_keep_runs_to_session_and_project_learnings() -> Result<()> {
+    use kheish_types::LearningScopeKind;
+
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-state");
+    let workspace_root = temp.path().join("workspace");
+    let mock = spawn_anthropic_messages_mock("noted").await?;
+    let (address, shutdown) = anthropic_provider_daemon_with_config(
+        &state_root,
+        &workspace_root,
+        &format!("{}/v1/messages", mock.base),
+        |config| {
+            config.learning_read_scopes = "session,project".parse().expect("valid scopes");
+        },
+    )
+    .await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+    create_test_persona(
+        &client,
+        &base,
+        "fp-ws1-verify",
+        "Verifier",
+        "You verify exposures.",
+    )
+    .await?;
+    create_test_session_with_persona(&client, &base, "mission-learn", Some("fp-ws1-verify"))
+        .await?;
+    client
+        .post(format!("{base}/v1/projects"))
+        .json(&json!({"project_id": "fe-1", "display_name": "Engagement 1"}))
+        .send()
+        .await?
+        .error_for_status()?;
+    client
+        .post(format!("{base}/v1/projects/fe-1/members"))
+        .json(
+            &json!({"member_id": "mission-learn", "member_kind": "session",
+                      "display_name": "Mission", "session_id": "mission-learn"}),
+        )
+        .send()
+        .await?
+        .error_for_status()?;
+    let markers = [
+        (
+            LearningScopeKind::Session,
+            "mission-learn",
+            "SESSION-MARKER-7Q",
+        ),
+        (LearningScopeKind::Project, "fe-1", "PROJECT-MARKER-3K"),
+        (
+            LearningScopeKind::Persona,
+            "fp-ws1-verify",
+            "PERSONA-MARKER-9X",
+        ),
+        (
+            LearningScopeKind::Workspace,
+            kheish_types::DEFAULT_WORKSPACE_LEARNING_SCOPE_ID,
+            "WORKSPACE-MARKER-2B",
+        ),
+    ];
+    for (kind, scope_id, marker) in markers {
+        publish_fact(
+            &client,
+            &base,
+            kind,
+            scope_id,
+            &format!("Exposure triage note {marker}."),
+        )
+        .await?;
+    }
+
+    let context = client
+        .get(format!("{base}/v1/sessions/mission-learn/memory-context"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionMemoryContextView>()
+        .await?;
+    assert_eq!(
+        context
+            .learning_scopes
+            .iter()
+            .map(|scope| scope.kind.clone())
+            .collect::<Vec<_>>(),
+        vec![LearningScopeKind::Session, LearningScopeKind::Project]
+    );
+    let projected = serde_json::to_string(&context.learned_context)?;
+    assert!(projected.contains("SESSION-MARKER-7Q"), "{projected}");
+    assert!(projected.contains("PROJECT-MARKER-3K"), "{projected}");
+    assert!(!projected.contains("PERSONA-MARKER-9X"), "{projected}");
+    assert!(!projected.contains("WORKSPACE-MARKER-2B"), "{projected}");
+
+    // What reaches the model follows the same scopes.
+    let run = submit_test_input(&client, &base, "mission-learn", "exposure triage").await?;
+    wait_for_run_status(&client, &base, &run.run_id, &[DaemonRunStatus::Completed]).await?;
+    let prompt = mock
+        .last_request()
+        .map(|request| request.body.to_string())
+        .unwrap_or_default();
+    assert!(prompt.contains("SESSION-MARKER-7Q"), "{prompt}");
+    assert!(prompt.contains("PROJECT-MARKER-3K"), "{prompt}");
+    assert!(!prompt.contains("PERSONA-MARKER-9X"), "{prompt}");
+    assert!(!prompt.contains("WORKSPACE-MARKER-2B"), "{prompt}");
 
     let _ = shutdown.send(());
     wait_for_daemon_shutdown(&client, &base).await?;

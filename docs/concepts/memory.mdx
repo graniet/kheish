@@ -299,6 +299,23 @@ Read the ladder as concentric rings of trust. A `session`-scoped preference is a
 
 The direction of resolution (session → persona → project → workspace) is also the direction of increasing blast radius. That is why, as we will see, `workspace` scope is the *only* scope from which a procedure may be promoted into a shared skill: promotion is the highest-trust operation, so it demands the widest, most deliberately-managed scope.
 
+### Limiting the scopes runs read
+
+By default every session reads all four rings. An embedder that serves several tenants from one daemon cannot let the daemon-wide `workspace` ring, or a persona shared across tenants, carry one tenant's knowledge into another's prompts. The daemon option `--learning-read-scopes` (env `KHEISH_LEARNING_READ_SCOPES`) takes a comma list of `session`, `persona`, `project`, and `workspace`, or `all` (the default):
+
+```bash
+kheish-daemon serve --learning-read-scopes session,project ...
+```
+
+The filter applies inside `learning_scopes_for_session`, the one place every read path takes its scopes from, so a scope kind left out is invisible everywhere a run reads learnings:
+
+- the `learned_context` section injected into prompts;
+- `GET /v1/sessions/{session_id}/memory-context` and `memory-search` (`learning_scopes` lists only the readable rings);
+- the scope keys recorded on new recovered run memories, so `search_visibility=learning_scopes` cannot widen through them;
+- the promoted procedural skills a session can see, which live at `workspace` scope: with `workspace` left out, no promoted skill is visible.
+
+Learnings in other scopes are still stored, listed, reviewed, and revoked through `/v1/learnings` and `/v1/learning-candidates`; no run reads them while the option excludes their scope. The option is read at boot and is not changeable through the runtime API, so a compromised API client cannot widen it. Pair it with a learning policy that never publishes on its own (`manual_only`, capture off) when tenants must stay apart.
+
 ### The semantic learning pipeline
 
 Now the heart of Plane 3: how a candidate becomes prompt-visible durable memory. This is a pipeline with several gates, and each gate exists to keep the daemon — not arbitrary run output — in charge of long-term behavior.

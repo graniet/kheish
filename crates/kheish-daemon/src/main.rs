@@ -376,6 +376,14 @@ struct ServeArgs {
         default_value_t = DEFAULT_EVENT_HISTORY_CAPACITY
     )]
     event_history_capacity: usize,
+    /// Learning scopes runs read: a comma list of session, persona, project,
+    /// and workspace, or `all`.
+    #[arg(
+        long,
+        env = "KHEISH_LEARNING_READ_SCOPES",
+        default_value_t = kheish_daemon::LearningReadScopes::default()
+    )]
+    learning_read_scopes: kheish_daemon::LearningReadScopes,
     #[arg(
         long,
         env = "KHEISH_HTTP_AUTH_MODE",
@@ -7364,6 +7372,7 @@ auth_ref = "openrouter.primary"
             log_format: LogFormatArg::Auto,
             log_level: LogLevelArg::Info,
             event_history_capacity: DEFAULT_EVENT_HISTORY_CAPACITY,
+            learning_read_scopes: kheish_daemon::LearningReadScopes::default(),
             http_auth_mode: HttpAuthModeArg::Auto,
             http_admin_token: None,
             http_admin_token_file: None,

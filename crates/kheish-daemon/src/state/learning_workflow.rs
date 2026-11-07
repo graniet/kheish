@@ -38,7 +38,26 @@ where
         Ok(())
     }
 
+    /// Returns the learning scopes one session reads, in retrieval order.
+    ///
+    /// Only the scope kinds the daemon was started to read
+    /// (`--learning-read-scopes`) are returned; this is the single place
+    /// every learning read path (prompt context, memory projection, run
+    /// memory scope keys, promoted skills) takes its scopes from.
     pub(crate) async fn learning_scopes_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<kheish_types::LearningScope>> {
+        let scopes = self
+            .candidate_learning_scopes_for_session(session_id)
+            .await?;
+        Ok(scopes
+            .into_iter()
+            .filter(|scope| self.learning_read_scopes.allows(&scope.kind))
+            .collect())
+    }
+
+    async fn candidate_learning_scopes_for_session(
         &self,
         session_id: &str,
     ) -> Result<Vec<kheish_types::LearningScope>> {

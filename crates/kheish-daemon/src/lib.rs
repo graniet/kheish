@@ -134,10 +134,10 @@ pub use channels::{
 pub use config::{
     ControlPlaneAuthConfig, ControlPlaneAuthTokenFiles, ControlPlaneCorsConfig,
     DEFAULT_EVENT_HISTORY_CAPACITY, DaemonConfig, DaemonOutputRecord, DaemonOutputSourceKind,
-    SubagentPolicyConfig, SubagentPolicyDecisionView, SubagentPolicyEstimateView,
-    SubagentPolicyLimitPatch, SubagentPolicyLimits, SubagentPolicyRule, SubagentPolicyScopeView,
-    SubagentPolicySelector, SubagentPolicyStatusView, SubagentPolicyUsageView,
-    SubagentReservationStatusView, is_loopback_control_plane_origin,
+    LearningReadScopes, SubagentPolicyConfig, SubagentPolicyDecisionView,
+    SubagentPolicyEstimateView, SubagentPolicyLimitPatch, SubagentPolicyLimits, SubagentPolicyRule,
+    SubagentPolicyScopeView, SubagentPolicySelector, SubagentPolicyStatusView,
+    SubagentPolicyUsageView, SubagentReservationStatusView, is_loopback_control_plane_origin,
 };
 pub use connectors::{
     ConnectorKind, ConnectorSessionPolicy, ConnectorSettings, ExternalChildProcessConfig,

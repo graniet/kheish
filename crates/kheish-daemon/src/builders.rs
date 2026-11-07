@@ -974,6 +974,7 @@ where
         config.control_plane_auth_token_files.clone(),
         config.control_plane_cors.clone(),
         config.state_root_lock_held,
+        config.learning_read_scopes.clone(),
     )
     .await?;
     Ok((service, listener))

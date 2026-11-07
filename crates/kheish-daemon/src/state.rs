@@ -337,6 +337,8 @@ pub(crate) struct DaemonState<M> {
     readiness: Arc<AtomicBool>,
     /// Runs whose `max_duration_ms` timer is armed in this process.
     armed_run_deadlines: Mutex<BTreeSet<String>>,
+    /// The learning scopes runs read (`--learning-read-scopes`).
+    learning_read_scopes: crate::LearningReadScopes,
 }
 
 impl<M> DaemonState<M>
@@ -445,6 +447,7 @@ where
         next_project_id: AtomicU64,
         next_project_task_id: AtomicU64,
         next_flow_id: AtomicU64,
+        learning_read_scopes: crate::LearningReadScopes,
     ) -> Self {
         let run_events = events.clone();
         Self {
@@ -597,6 +600,7 @@ where
             playbook_service: PlaybookService::new(playbook_store, playbooks, flows, next_flow_id),
             readiness: Arc::new(AtomicBool::new(true)),
             armed_run_deadlines: Mutex::new(BTreeSet::new()),
+            learning_read_scopes,
         }
     }
 

@@ -1,11 +1,11 @@
 //! Daemon configuration and output record types.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
-use kheish_types::{AttachmentRef, ContentPart};
+use kheish_types::{AttachmentRef, ContentPart, LearningScopeKind};
 use serde::{Deserialize, Serialize};
 
 use crate::SchedulerPolicyConfig;
@@ -257,6 +257,95 @@ fn default_spawn_rate_window_ms() -> u64 {
 fn default_max_spawns_per_session_window() -> usize {
     60
 }
+/// The learning scopes runs read (`--learning-read-scopes`).
+///
+/// Every learning has one scope: a session, a persona, a project, or the
+/// daemon-wide workspace. By default a session reads all four kinds; an
+/// embedder that serves several tenants from one daemon narrows reads to the
+/// scopes that cannot cross tenants, for example `session,project`. Learnings
+/// in other scopes stay stored but no run reads them: they are kept out of
+/// prompts, memory projections, run-memory scope keys, and the promoted skills
+/// a session can see.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct LearningReadScopes(BTreeSet<LearningScopeKind>);
+
+impl Default for LearningReadScopes {
+    fn default() -> Self {
+        Self(
+            [
+                LearningScopeKind::Session,
+                LearningScopeKind::Persona,
+                LearningScopeKind::Project,
+                LearningScopeKind::Workspace,
+            ]
+            .into_iter()
+            .collect(),
+        )
+    }
+}
+
+impl LearningReadScopes {
+    /// Returns whether runs read learnings of this scope kind.
+    #[must_use]
+    pub fn allows(&self, kind: &LearningScopeKind) -> bool {
+        self.0.contains(kind)
+    }
+
+    /// Returns the readable scope kinds in stable order.
+    pub fn kinds(&self) -> impl Iterator<Item = LearningScopeKind> + '_ {
+        self.0.iter().cloned()
+    }
+}
+
+impl std::str::FromStr for LearningReadScopes {
+    type Err = String;
+
+    /// Parses a comma-separated list of `session`, `persona`, `project`, and
+    /// `workspace`, or `all`.
+    fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
+        let mut kinds = BTreeSet::new();
+        for entry in raw
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+        {
+            match entry.to_ascii_lowercase().as_str() {
+                "all" => return Ok(Self::default()),
+                "session" => kinds.insert(LearningScopeKind::Session),
+                "persona" => kinds.insert(LearningScopeKind::Persona),
+                "project" => kinds.insert(LearningScopeKind::Project),
+                "workspace" => kinds.insert(LearningScopeKind::Workspace),
+                other => {
+                    return Err(format!(
+                        "unknown learning scope `{other}`: use session, persona, project, workspace, or all"
+                    ));
+                }
+            };
+        }
+        if kinds.is_empty() {
+            return Err("learning read scopes cannot be empty".to_string());
+        }
+        Ok(Self(kinds))
+    }
+}
+
+impl std::fmt::Display for LearningReadScopes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names = self
+            .0
+            .iter()
+            .map(|kind| match kind {
+                LearningScopeKind::Session => "session",
+                LearningScopeKind::Persona => "persona",
+                LearningScopeKind::Project => "project",
+                LearningScopeKind::Workspace => "workspace",
+            })
+            .collect::<Vec<_>>();
+        formatter.write_str(&names.join(","))
+    }
+}
+
 fn default_model_budget_max_total_output_tokens() -> u64 {
     1_000_000
 }
@@ -652,6 +741,9 @@ pub struct DaemonConfig {
     /// Maximum cumulative model cost in USD one model runtime may incur.
     #[serde(default = "default_model_budget_max_total_cost_usd")]
     pub model_budget_max_total_cost_usd: f64,
+    /// The learning scopes runs read.
+    #[serde(default)]
+    pub learning_read_scopes: LearningReadScopes,
 }
 
 impl DaemonConfig {
@@ -681,6 +773,7 @@ impl DaemonConfig {
             event_history_capacity: default_event_history_capacity(),
             model_budget_max_total_output_tokens: default_model_budget_max_total_output_tokens(),
             model_budget_max_total_cost_usd: default_model_budget_max_total_cost_usd(),
+            learning_read_scopes: LearningReadScopes::default(),
         }
     }
 
@@ -855,4 +948,29 @@ pub struct DaemonOutputRecord {
     pub plugin: Option<String>,
     /// The optional routing address.
     pub address: Option<String>,
+}
+
+#[cfg(test)]
+mod learning_read_scope_tests {
+    use super::LearningReadScopes;
+    use kheish_types::LearningScopeKind;
+
+    #[test]
+    fn learning_read_scopes_parse_lists_and_default_to_every_scope() {
+        let all = LearningReadScopes::default();
+        assert_eq!(all.to_string(), "session,persona,project,workspace");
+        assert_eq!("all".parse::<LearningReadScopes>(), Ok(all));
+
+        let tenant_safe = " session , Project "
+            .parse::<LearningReadScopes>()
+            .expect("valid");
+        assert!(tenant_safe.allows(&LearningScopeKind::Session));
+        assert!(tenant_safe.allows(&LearningScopeKind::Project));
+        assert!(!tenant_safe.allows(&LearningScopeKind::Persona));
+        assert!(!tenant_safe.allows(&LearningScopeKind::Workspace));
+        assert_eq!(tenant_safe.to_string(), "session,project");
+
+        assert!("".parse::<LearningReadScopes>().is_err());
+        assert!("session,tenant".parse::<LearningReadScopes>().is_err());
+    }
 }

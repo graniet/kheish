@@ -649,6 +649,18 @@ broker resolves the slot on every request, so rotating it through
 the driver when the route is added. Always `runtime get` after any mutation to
 confirm the applied state.
 
+### Boot-time options the runtime API cannot change
+
+Some isolation settings are daemon options on purpose: an API client, even an
+admin one, cannot widen them.
+
+- `--learning-read-scopes` (env `KHEISH_LEARNING_READ_SCOPES`): the learning
+  scopes runs read, a comma list of `session`, `persona`, `project`, and
+  `workspace`, or `all` (the default). A daemon that serves several tenants
+  should run with `session,project` so the daemon-wide `workspace` ring and
+  shared personas cannot carry one tenant's learnings into another's prompts.
+  See [Limiting the scopes runs read](../concepts/memory#limiting-the-scopes-runs-read).
+
 ---
 
 ## Upgrade procedure

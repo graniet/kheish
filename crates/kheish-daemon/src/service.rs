@@ -536,6 +536,7 @@ impl DaemonService {
         control_plane_auth_token_files: ControlPlaneAuthTokenFiles,
         control_plane_cors: ControlPlaneCorsConfig,
         state_root_lock_held: bool,
+        learning_read_scopes: crate::LearningReadScopes,
     ) -> Result<Self>
     where
         M: kheish_core::ModelDriver + Send + Sync + 'static,
@@ -939,6 +940,7 @@ impl DaemonService {
             next_project_id,
             next_project_task_id,
             next_flow_id,
+            learning_read_scopes,
         ));
         if let Some(revision) = runtime_config_service.current() {
             state
