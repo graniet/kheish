@@ -336,8 +336,8 @@ pub(crate) struct DaemonState<M> {
     project_service: ProjectService,
     playbook_service: PlaybookService,
     readiness: Arc<AtomicBool>,
-    /// Runs whose `max_duration_ms` timer is armed in this process.
-    armed_run_deadlines: Mutex<BTreeSet<String>>,
+    /// The `max_duration_ms` timers armed in this process, by run id.
+    armed_run_deadlines: Mutex<BTreeMap<String, run_workflow::ArmedRunDeadline>>,
     /// The learning scopes runs read (`--learning-read-scopes`).
     learning_read_scopes: crate::LearningReadScopes,
     /// Serializes session purges.
@@ -602,7 +602,7 @@ where
             ),
             playbook_service: PlaybookService::new(playbook_store, playbooks, flows, next_flow_id),
             readiness: Arc::new(AtomicBool::new(true)),
-            armed_run_deadlines: Mutex::new(BTreeSet::new()),
+            armed_run_deadlines: Mutex::new(BTreeMap::new()),
             learning_read_scopes,
             session_purge_lock: tokio::sync::Mutex::new(()),
         }

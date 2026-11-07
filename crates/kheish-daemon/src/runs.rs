@@ -422,20 +422,31 @@ pub struct RunView {
     pub limits: Option<RunLimits>,
 }
 
-/// Caller-set limits of one run.
+/// Caller-set limits of one run, with the state of its deadline clock.
+///
+/// The `max_duration_ms` clock counts only the time the run is active. It
+/// starts on the run's first start and stops while the run waits for an
+/// approval or an answer. Exactly one of `deadline_at_ms` (the clock runs)
+/// and `remaining_ms` (the clock is stopped) is set once the run has started;
+/// neither is set before.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunLimits {
     /// Turn cap for this run, applied below the daemon `max_turns` ceiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<usize>,
-    /// Wall-clock budget of this run in milliseconds, counted from its first
-    /// start and including time spent waiting for approvals or answers.
+    /// Active-time budget of this run in milliseconds. The clock runs while
+    /// the run executes and stops while it waits for an approval or an answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_duration_ms: Option<u64>,
     /// When the run is ended for exceeding `max_duration_ms`, in milliseconds
-    /// since the Unix epoch. Set once the run first starts.
+    /// since the Unix epoch. Set while the clock runs: on the first start, and
+    /// again on every resume from the budget left. Unset while the run waits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline_at_ms: Option<u64>,
+    /// Budget left in milliseconds while the clock is stopped. Set when the
+    /// run starts waiting for an approval or an answer; unset while it runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_ms: Option<u64>,
 }
 
 impl RunLimits {
@@ -443,6 +454,49 @@ impl RunLimits {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.max_turns.is_none() && self.max_duration_ms.is_none()
+    }
+
+    /// The limits as the caller asked for them, without the deadline clock.
+    #[must_use]
+    pub fn requested(&self) -> Self {
+        Self {
+            max_turns: self.max_turns,
+            max_duration_ms: self.max_duration_ms,
+            ..Self::default()
+        }
+    }
+
+    /// Stops the deadline clock at `now_ms` and keeps the budget left as
+    /// `remaining_ms` (zero once the deadline has passed). Returns `false`
+    /// when the clock was not running.
+    pub(crate) fn pause_deadline(&mut self, now_ms: u64) -> bool {
+        if self.max_duration_ms.is_none() {
+            return false;
+        }
+        let Some(deadline_at_ms) = self.deadline_at_ms.take() else {
+            return false;
+        };
+        self.remaining_ms = Some(deadline_at_ms.saturating_sub(now_ms));
+        true
+    }
+
+    /// Starts the deadline clock. After a pause, the deadline is `now_ms`
+    /// plus the budget left; on the run's first start it is
+    /// `first_started_at_ms` plus the whole budget. Returns `false` when the
+    /// run has no duration limit or the clock already runs.
+    pub(crate) fn start_deadline(&mut self, first_started_at_ms: u64, now_ms: u64) -> bool {
+        let Some(max_duration_ms) = self.max_duration_ms else {
+            return false;
+        };
+        if self.deadline_at_ms.is_some() {
+            return false;
+        }
+        let deadline_at_ms = match self.remaining_ms.take() {
+            Some(remaining_ms) => now_ms.saturating_add(remaining_ms),
+            None => first_started_at_ms.saturating_add(max_duration_ms),
+        };
+        self.deadline_at_ms = Some(deadline_at_ms);
+        true
     }
 }
 
@@ -929,6 +983,70 @@ mod tests {
                 idempotency: None,
             },
         }
+    }
+
+    #[test]
+    fn run_deadline_clock_stops_while_waiting_and_resumes_with_the_budget_left() {
+        let mut limits = RunLimits {
+            max_duration_ms: Some(1_000),
+            ..RunLimits::default()
+        };
+        // First start: the whole budget from the start time.
+        assert!(limits.start_deadline(10_000, 10_050));
+        assert_eq!(limits.deadline_at_ms, Some(11_000));
+        assert_eq!(limits.remaining_ms, None);
+        assert!(
+            !limits.start_deadline(10_000, 10_100),
+            "the clock already runs"
+        );
+
+        // 300 ms in, the run waits: the clock stops with 700 ms left.
+        assert!(limits.pause_deadline(10_300));
+        assert_eq!(limits.deadline_at_ms, None);
+        assert_eq!(limits.remaining_ms, Some(700));
+        assert!(
+            !limits.pause_deadline(10_400),
+            "the clock is already stopped"
+        );
+
+        // An hour later the run resumes with the 700 ms it had left.
+        assert!(limits.start_deadline(10_000, 3_610_300));
+        assert_eq!(limits.deadline_at_ms, Some(3_611_000));
+        assert_eq!(limits.remaining_ms, None);
+
+        // A pause after the deadline keeps no budget.
+        assert!(limits.pause_deadline(3_611_500));
+        assert_eq!(limits.remaining_ms, Some(0));
+
+        // The caller-set part ignores the clock.
+        assert_eq!(
+            limits.requested(),
+            RunLimits {
+                max_duration_ms: Some(1_000),
+                ..RunLimits::default()
+            }
+        );
+    }
+
+    #[test]
+    fn run_deadline_clock_ignores_runs_without_a_duration_limit() {
+        let mut limits = RunLimits {
+            max_turns: Some(3),
+            ..RunLimits::default()
+        };
+        assert!(!limits.start_deadline(1, 2));
+        assert!(!limits.pause_deadline(3));
+        assert_eq!(
+            limits,
+            RunLimits {
+                max_turns: Some(3),
+                ..RunLimits::default()
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&limits).expect("limits serialize"),
+            json!({"max_turns": 3})
+        );
     }
 
     fn sample_approval_request() -> ApprovalRequest {

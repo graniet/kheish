@@ -198,7 +198,11 @@ current Claude models:
   `max_output_tokens` gets ([output limit](./sessions-and-runs-api#output-limit)).
 
 `POST /v1/sessions/{session_id}/runs` also takes run limits, `max_turns` and `max_duration_ms`
-([run limits](./sessions-and-runs-api#run-limits)).
+([run limits](./sessions-and-runs-api#run-limits)). `max_duration_ms` counts only the time the run is
+active: its clock stops while the run waits for an approval or an answer, and runs again with the
+budget left when the run resumes. `RunView.limits` shows `deadline_at_ms` while the run runs and
+`remaining_ms` while it waits. A run paused when the daemon stops is still paused after the restart
+([run deadline](./sessions-and-runs-api#run-deadline)).
 
 A run that ends on a model condition or past one of its limits carries a machine-readable
 `RunView.error_code`: `model_refusal` (with `RunView.refusal`), `output_limit_exceeded` and

@@ -564,3 +564,36 @@ The provider check (`scripts/fregate-provider-check/run.sh`, daemon on `:4101`) 
 Tests on the merged tree: kheish-types 63, kheish-core 70, kheish-runtime 340, kheish-coding-tools 26 and
 kheish-auth 44 pass; kheish-daemon passes 1435 of 1436 and its binary tests 242 of 242; kheish-mcp passes 59 of 60.
 The two failures are the pre-existing ones above, with the same assertion as on `844f080`.
+
+### K13: the run deadline counts only active time
+
+K5 counted approval waits against `max_duration_ms`: a mission whose analyst approved a step after the deadline was
+cancelled while it waited. K13 stops the clock while a run waits for an approval or an answer:
+
+- When the run starts waiting, the daemon keeps the budget left as `limits.remaining_ms`, clears
+  `limits.deadline_at_ms`, and stops the run's timer. A run that starts waiting with no budget left is cancelled.
+- When an approval or an answer resumes it, `deadline_at_ms` is the resume time plus `remaining_ms`,
+  `remaining_ms` is cleared, and the timer is armed again.
+- Both fields are persisted with the status change. After a restart, a paused run stays paused with the same
+  `remaining_ms`; a run whose clock runs is re-armed with the time left to its `deadline_at_ms`. A waiting run written
+  by a K5 daemon (clock still running) is paused at boot with the time left to its deadline.
+- The idempotency fingerprint covers only `max_turns` and `max_duration_ms`, in the K5 format; `max_turns` and runs
+  without `max_duration_ms` are unchanged.
+
+Live check on 2026-11-07, `cargo build --workspace --locked` (debug). Daemon on `127.0.0.1:4110` started with
+`env -i`, a private `HOME` and its own state root (`/tmp/kheish-k13-check/state`); routes file pointing at a model stub
+on `:4111`; MCP stub on `:4112` added as `fregate`. Sessions in `default` mode, so the MCP call asks for approval.
+The driver (`/tmp/kheish-k13-check/driver.py`, also under `env -i`) records every value in `results.json`;
+13 of 13 checks passed.
+
+| Scenario | Observed |
+|---|---|
+| Approval held past the deadline, then approved (`max_duration_ms: 5000`) | Waiting: `deadline_at_ms: null`, `remaining_ms: 4980` (first deadline minus the pause time). After 8 s, still `waiting_for_approval` with identical limits. Approved at `…46628`; the resumed view has `deadline_at_ms: …51609` = resume `updated_at_ms` (`…46629`) + 4980, `remaining_ms: null`. `completed`, no `error_code`, 8085 ms of wall clock. Events: `accepted, started, waiting_for_approval, started, approval_resolved, output, completed`. Re-posting the same `idempotency_key` and body returns `202` with the same `run-1`. |
+| Restart while paused (`5000`) | `remaining_ms: 4983`, then `SIGTERM`, 6 s down, restart on the same state root. After boot, and again 6 s later: `waiting_for_approval`, `deadline_at_ms: null`, `remaining_ms: 4983`. Approved: `deadline_at_ms` = resume time + 4983, then `completed`. |
+| Deadline runs out after the resume (`4000`, the turn after the tool stalls 30 s) | Held 6 s with `remaining_ms: 3980` unchanged. Approved; the tool ran (MCP stub saw the call), then the run ended `cancelled` 3982 ms after the approval, `error_code: deadline_exceeded`, `error: deadline_exceeded: run exceeded max_duration_ms=4000`, `deadline_at_ms` = resume time + 3980. Last run event: `{"type":"cancelled","code":"deadline_exceeded"}`. |
+
+Tests: kheish-types 63, kheish-core 70 and kheish-runtime 340 pass; kheish-daemon passes 1442 of 1443, the one
+failure being the pre-existing `daemon_stop_task_kills_orphaned_pipe_holder_and_is_session_scoped`. New daemon tests:
+the clock unit tests on `RunLimits`, the fingerprint test, and four HTTP tests (an approval held past the budget then
+completed; a deadline that runs out after a resume; a restart while paused; a restart while running, where the direct
+run ends `interrupted` and a replayed run is cancelled at its persisted deadline rather than a new budget).

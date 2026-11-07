@@ -495,9 +495,9 @@ Attachment inputs use the same daemon-owned asset model documented in [Assets AP
 
 `POST /v1/sessions/{session_id}/runs` (`SubmitRunRequest`) accepts every `SubmitInputRequest` field plus:
 
-- `idempotency_key`: deduplicates the submission per session, durably across restarts. The same key with a different body returns `409 idempotency_conflict`; the comparison covers every field, all `generation` options (`retry_max_tokens`, `refusal_fallbacks` and `reasoning` among them) and the limits below.
+- `idempotency_key`: deduplicates the submission per session, durably across restarts. The same key with a different body returns `409 idempotency_conflict`; the comparison covers every field, all `generation` options (`retry_max_tokens`, `refusal_fallbacks` and `reasoning` among them) and the limits below (the values you sent, never the deadline clock).
 - `max_turns` (integer, at least 1): the run's turn cap. It only lowers the daemon ceiling (`KHEISH_AGENT_MAX_TURNS`), never raises it. A run that uses every turn fails with `error_code: "max_turns_exceeded"` ([Run error codes](#run-error-codes)).
-- `max_duration_ms` (integer, at least 1): the run's wall-clock budget, counted from its first start (`started_at_ms`) and including time spent waiting for approvals or user answers. When it runs out the daemon cancels the run, whether it is executing or waiting, with `status: "cancelled"` and `error_code: "deadline_exceeded"` ([Run error codes](#run-error-codes)). The deadline is fixed on first start as `limits.deadline_at_ms` and survives daemon restarts: a waiting run whose deadline passed while the daemon was down is cancelled at boot.
+- `max_duration_ms` (integer, at least 1): the run's active-time budget. The clock starts when the run first starts (`started_at_ms`) and counts only the time the run is active: it stops while the run waits for an approval (`waiting_for_approval`) or an answer (`waiting_for_user_question`), and runs again, with the budget that was left, when the run resumes. When the budget runs out the daemon cancels the run with `status: "cancelled"` and `error_code: "deadline_exceeded"` ([Run error codes](#run-error-codes)). [Run deadline](#run-deadline) describes the clock and restarts.
 
 ```json
 {
@@ -509,7 +509,32 @@ Attachment inputs use the same daemon-owned asset model documented in [Assets AP
 }
 ```
 
-A zero limit returns `400` with domain `runs` and code `run_limits_invalid`. The limits are persisted with the run and returned as `RunView.limits` (`max_turns`, `max_duration_ms`, `deadline_at_ms`) by `GET /v1/runs/{run_id}`, the run lists, and every `run_updated` event. `/input` does not take limits.
+A zero limit returns `400` with domain `runs` and code `run_limits_invalid`. The limits are persisted with the run and returned as `RunView.limits` (`max_turns`, `max_duration_ms`, and the clock's `deadline_at_ms` and `remaining_ms`) by `GET /v1/runs/{run_id}`, the run lists, and every `run_updated` event. `/input` does not take limits.
+
+#### Run deadline
+
+`RunView.limits` shows the `max_duration_ms` clock. Once the run has started, exactly one of `deadline_at_ms` and `remaining_ms` is set:
+
+| Run status | `deadline_at_ms` | `remaining_ms` |
+|---|---|---|
+| `queued`, never started | absent | absent |
+| `running` | when the deadline ends the run, in milliseconds since the Unix epoch | absent |
+| `waiting_for_approval`, `waiting_for_user_question` | absent | the budget left, in milliseconds; it does not change while the run waits |
+| terminal | as it was when the run ended | as it was when the run ended |
+
+- On the first start, `deadline_at_ms` is `started_at_ms + max_duration_ms`.
+- When the run starts waiting, the clock stops: `remaining_ms` is `deadline_at_ms` minus that moment, and `deadline_at_ms` is cleared. A run that starts waiting with no budget left is cancelled with `deadline_exceeded`.
+- When an approval or an answer resumes the run, the clock runs again: `deadline_at_ms` is the resume time plus `remaining_ms`, and `remaining_ms` is cleared.
+- While the run runs, its time left is `deadline_at_ms` minus now.
+- Each change reaches callers as a `run_updated` event.
+
+For example, a run with `max_duration_ms: 600000` asks for an approval after 4 minutes, and the approval comes two hours later. While it waits, `remaining_ms` is `360000`. Once approved, `deadline_at_ms` is the approval time plus 6 minutes.
+
+The clock survives daemon restarts:
+
+- A run that waits for an approval or an answer when the daemon stops stays paused. After the restart it still waits, with the same `remaining_ms`, however long the daemon was down; its clock runs again only when it resumes.
+- A run whose clock runs when the daemon stops keeps its `deadline_at_ms`, so the downtime counts. A run the daemon replays after the restart is re-armed with the time left to its deadline, and cancelled with `deadline_exceeded` at boot when the deadline has passed. A run submitted with `POST /v1/sessions/{session_id}/runs` that is executing when the daemon stops ends `interrupted` on restart and is not resumed, so its deadline no longer applies.
+- A waiting run persisted by an older daemon, whose deadline counted waits, still has a running clock. At boot it is paused with the time left to its deadline, or cancelled with `deadline_exceeded` when the deadline has passed.
 
 ### Generic input/output schema
 
@@ -785,7 +810,7 @@ input runs are interrupted instead of replaying stale user/provider state.
 - `error`
 - `error_code`: the machine-readable code of a classified run ending (see [Run error codes](#run-error-codes)); omitted otherwise, with `error` keeping the human-readable text
 - `refusal`: for `error_code: "model_refusal"`, the refusal's `category`, `explanation` and `model`
-- `limits`: the caller-set run limits (`max_turns`, `max_duration_ms`, `deadline_at_ms`), omitted when the run has none
+- `limits`: the caller-set run limits (`max_turns`, `max_duration_ms`) and the deadline clock (`deadline_at_ms` while the run runs, `remaining_ms` while it waits; see [Run deadline](#run-deadline)), omitted when the run has none
 
 `RunView.request` is a compact `RunRequestSummary`:
 
@@ -816,7 +841,7 @@ code, never on the `error` text. The code travels the same way whatever set it:
 | `model_refusal` | `failed` | The model declined the request and no refusal fallback served it. `refusal.category` is the policy area (`cyber`, `bio`, ...), absent when the refusal maps to no named category. |
 | `output_limit_exceeded` | `failed` | The model's answer was cut off at the output limit, then again when asked once more with `generation.retry_max_tokens` (see [Output limit](#output-limit)). |
 | `max_turns_exceeded` | `failed` | The run used every turn its `max_turns` (or the daemon ceiling `KHEISH_AGENT_MAX_TURNS`) allowed. |
-| `deadline_exceeded` | `cancelled` | The run outlived its `max_duration_ms`, while executing or while waiting for an approval or an answer. |
+| `deadline_exceeded` | `cancelled` | The run was active for its whole `max_duration_ms`. Time spent waiting for an approval or an answer does not count ([Run deadline](#run-deadline)). |
 
 A classified run's `error` reads `<error_code>: <detail>`, for example
 `max_turns_exceeded: agent loop exceeded max_turns=12` or

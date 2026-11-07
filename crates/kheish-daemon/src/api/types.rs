@@ -2300,9 +2300,9 @@ pub struct SubmitRunRequest {
     /// A run that uses every turn fails with `error_code: "max_turns_exceeded"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<usize>,
-    /// Wall-clock budget of this run in milliseconds, from its first start and
-    /// including approval waits. When it runs out the run is cancelled with
-    /// `error_code: "deadline_exceeded"`.
+    /// Active-time budget of this run in milliseconds. The clock starts with
+    /// the run and stops while it waits for an approval or an answer. When it
+    /// runs out the run is cancelled with `error_code: "deadline_exceeded"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_duration_ms: Option<u64>,
     /// The actual input request fields.
@@ -2332,7 +2332,7 @@ impl SubmitRunRequest {
         let limits = crate::RunLimits {
             max_turns: self.max_turns,
             max_duration_ms: self.max_duration_ms,
-            deadline_at_ms: None,
+            ..crate::RunLimits::default()
         };
         Ok((!limits.is_empty()).then_some(limits))
     }

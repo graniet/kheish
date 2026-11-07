@@ -2123,10 +2123,12 @@ where
             model: record.view.request.model.clone(),
             ..ExecutionScope::default()
         };
-        if !self.arm_run_deadline(&record).await? {
-            // The run's wall-clock budget ran out before this execution began.
-            return Ok(());
-        }
+        let armed_deadline_at_ms = match self.arm_run_deadline(&record).await? {
+            // The run's budget ran out before this execution began.
+            RunDeadlineArm::Expired => return Ok(()),
+            RunDeadlineArm::Armed(deadline_at_ms) => Some(deadline_at_ms),
+            RunDeadlineArm::Unlimited => None,
+        };
         // Every hook this execution triggers carries the run's caller metadata.
         let _hook_run_metadata = self
             .hooks
@@ -2256,6 +2258,10 @@ where
                 }
             }
         };
+        if let Some(deadline_at_ms) = armed_deadline_at_ms {
+            self.settle_run_deadline_after_execution(run_id, deadline_at_ms)
+                .await;
+        }
         outcome
     }
 
@@ -4187,75 +4193,161 @@ where
         self.run_service.publish_run(run);
     }
 
-    /// Fixes a run's `max_duration_ms` deadline on its first start and arms
-    /// the timer that ends it, once per run per daemon process.
+    /// Starts a run's `max_duration_ms` clock if it is stopped (on the first
+    /// start) and arms the timer that ends the run at its deadline. A resumed
+    /// run's clock was already restarted, with the budget its wait left, when
+    /// the approval or answer resumed it.
     ///
-    /// Returns `false` when the deadline has already passed: the run is then
-    /// cancelled with `deadline_exceeded` and must not execute.
-    pub(super) async fn arm_run_deadline(self: &Arc<Self>, record: &RunRecord) -> Result<bool> {
+    /// When the deadline has already passed, the run is cancelled with
+    /// `deadline_exceeded` and must not execute.
+    pub(super) async fn arm_run_deadline(
+        self: &Arc<Self>,
+        record: &RunRecord,
+    ) -> Result<RunDeadlineArm> {
         let Some(limits) = record.view.limits.as_ref() else {
-            return Ok(true);
+            return Ok(RunDeadlineArm::Unlimited);
         };
         let Some(max_duration_ms) = limits.max_duration_ms else {
-            return Ok(true);
+            return Ok(RunDeadlineArm::Unlimited);
         };
         let run_id = record.view.run_id.as_str();
         let deadline_at_ms = match limits.deadline_at_ms {
             Some(deadline_at_ms) => deadline_at_ms,
-            None => {
-                let started_at_ms = record.view.started_at_ms.unwrap_or_else(now_ms);
-                let deadline_at_ms = started_at_ms.saturating_add(max_duration_ms);
-                if let Some(view) = self
-                    .run_service
-                    .record_run_deadline(run_id, deadline_at_ms)
-                    .await?
-                {
-                    self.publish_run(&view);
-                }
-                deadline_at_ms
-            }
+            None => match self.run_service.start_run_deadline(run_id).await? {
+                Some(deadline_at_ms) => deadline_at_ms,
+                None => return Ok(RunDeadlineArm::Unlimited),
+            },
         };
         if deadline_at_ms <= now_ms() {
             self.cancel_run_for_deadline(run_id, max_duration_ms)
                 .await?;
-            return Ok(false);
+            return Ok(RunDeadlineArm::Expired);
         }
         self.spawn_run_deadline_timer(run_id, deadline_at_ms, max_duration_ms);
-        Ok(true)
+        Ok(RunDeadlineArm::Armed(deadline_at_ms))
     }
 
+    /// Arms the timer that ends a run at `deadline_at_ms`, once per deadline
+    /// per daemon process. A timer armed for another deadline of the same run
+    /// is stopped.
     fn spawn_run_deadline_timer(
         self: &Arc<Self>,
         run_id: &str,
         deadline_at_ms: u64,
         max_duration_ms: u64,
     ) {
-        if !self.armed_run_deadlines.lock().insert(run_id.to_string()) {
+        let mut armed = self.armed_run_deadlines.lock();
+        if armed
+            .get(run_id)
+            .is_some_and(|timer| timer.deadline_at_ms == deadline_at_ms)
+        {
             return;
         }
         let state = Arc::clone(self);
-        let run_id = run_id.to_string();
-        tokio::spawn(async move {
+        let timer_run_id = run_id.to_string();
+        let timer = tokio::spawn(async move {
             let wait_ms = deadline_at_ms.saturating_sub(now_ms());
             tokio::time::sleep(Duration::from_millis(wait_ms)).await;
-            state.armed_run_deadlines.lock().remove(&run_id);
-            let still_running = match state.run_service.run_record(&run_id).await {
-                Ok(record) => !record.view.status.is_terminal(),
-                // A purged or unknown run has nothing left to stop.
-                Err(_) => false,
-            };
-            if still_running
-                && let Err(error) = state
-                    .cancel_run_for_deadline(&run_id, max_duration_ms)
-                    .await
-            {
-                warn!(
-                    run_id = %run_id,
-                    error = %error,
-                    "failed to end a run past its max_duration_ms deadline"
-                );
-            }
+            state
+                .end_run_at_deadline(&timer_run_id, deadline_at_ms, max_duration_ms)
+                .await;
         });
+        if let Some(replaced) = armed.insert(
+            run_id.to_string(),
+            ArmedRunDeadline {
+                deadline_at_ms,
+                timer: timer.abort_handle(),
+            },
+        ) {
+            replaced.timer.abort();
+        }
+    }
+
+    /// Ends a run whose timer fired, unless its clock stopped (the run waits
+    /// for an approval or an answer) or moved (it resumed) since the timer
+    /// was armed.
+    async fn end_run_at_deadline(
+        self: &Arc<Self>,
+        run_id: &str,
+        deadline_at_ms: u64,
+        max_duration_ms: u64,
+    ) {
+        {
+            let mut armed = self.armed_run_deadlines.lock();
+            if armed
+                .get(run_id)
+                .is_some_and(|timer| timer.deadline_at_ms == deadline_at_ms)
+            {
+                armed.remove(run_id);
+            }
+        }
+        let due = match self.run_service.run_record(run_id).await {
+            Ok(record) => {
+                !record.view.status.is_terminal()
+                    && record
+                        .view
+                        .limits
+                        .as_ref()
+                        .and_then(|limits| limits.deadline_at_ms)
+                        == Some(deadline_at_ms)
+            }
+            // A purged or unknown run has nothing left to stop.
+            Err(_) => false,
+        };
+        if due && let Err(error) = self.cancel_run_for_deadline(run_id, max_duration_ms).await {
+            warn!(
+                run_id = %run_id,
+                error = %error,
+                "failed to end a run past its max_duration_ms deadline"
+            );
+        }
+    }
+
+    /// Stops the timer armed for `deadline_at_ms`, if it is still the run's.
+    fn disarm_run_deadline(&self, run_id: &str, deadline_at_ms: u64) {
+        let mut armed = self.armed_run_deadlines.lock();
+        if armed
+            .get(run_id)
+            .is_some_and(|timer| timer.deadline_at_ms == deadline_at_ms)
+            && let Some(timer) = armed.remove(run_id)
+        {
+            timer.timer.abort();
+        }
+    }
+
+    /// Brings a run's deadline timer in line with its clock once one
+    /// execution settles. When the run ended, or now waits for an approval or
+    /// an answer (its clock stopped), the timer this execution armed stops.
+    /// A run that starts waiting with no budget left is cancelled.
+    async fn settle_run_deadline_after_execution(
+        self: &Arc<Self>,
+        run_id: &str,
+        armed_deadline_at_ms: u64,
+    ) {
+        let Ok(record) = self.run_service.run_record(run_id).await else {
+            self.disarm_run_deadline(run_id, armed_deadline_at_ms);
+            return;
+        };
+        let Some(limits) = record.view.limits.as_ref() else {
+            self.disarm_run_deadline(run_id, armed_deadline_at_ms);
+            return;
+        };
+        let terminal = record.view.status.is_terminal();
+        if terminal || limits.deadline_at_ms != Some(armed_deadline_at_ms) {
+            self.disarm_run_deadline(run_id, armed_deadline_at_ms);
+        }
+        let out_of_budget =
+            !terminal && limits.deadline_at_ms.is_none() && limits.remaining_ms == Some(0);
+        if out_of_budget
+            && let Some(max_duration_ms) = limits.max_duration_ms
+            && let Err(error) = self.cancel_run_for_deadline(run_id, max_duration_ms).await
+        {
+            warn!(
+                run_id = %run_id,
+                error = %error,
+                "failed to end a run that started waiting past its max_duration_ms deadline"
+            );
+        }
     }
 
     async fn cancel_run_for_deadline(
@@ -4270,8 +4362,14 @@ where
             .map(|_| ())
     }
 
-    /// Re-arms the deadline timers of runs that survived a daemon restart
-    /// while waiting for an approval or an answer.
+    /// Restores the deadline clocks of runs that survived a daemon restart.
+    ///
+    /// A run waiting for an approval or an answer stays paused: no timer runs
+    /// for it until it resumes. A record written while waits still counted
+    /// keeps a running clock; it is paused here with the time left to its
+    /// deadline. A run whose clock runs (running, or re-queued to replay) is
+    /// re-armed with the time left to its deadline. A run with no budget left
+    /// is cancelled with `deadline_exceeded`.
     pub(crate) async fn rearm_run_deadlines_on_boot(self: &Arc<Self>) -> Result<()> {
         let records = self.run_service.run_records_snapshot().await;
         for record in records.values() {
@@ -4281,20 +4379,55 @@ where
             let Some(limits) = record.view.limits.as_ref() else {
                 continue;
             };
-            let (Some(max_duration_ms), Some(deadline_at_ms)) =
-                (limits.max_duration_ms, limits.deadline_at_ms)
-            else {
+            let Some(max_duration_ms) = limits.max_duration_ms else {
+                continue;
+            };
+            let run_id = record.view.run_id.as_str();
+            if matches!(
+                record.view.status,
+                DaemonRunStatus::WaitingForApproval | DaemonRunStatus::WaitingForUserQuestion
+            ) {
+                let remaining_ms = match limits.deadline_at_ms {
+                    Some(_) => self.run_service.pause_waiting_run_deadline(run_id).await?,
+                    None => limits.remaining_ms,
+                };
+                if remaining_ms == Some(0) {
+                    self.cancel_run_for_deadline(run_id, max_duration_ms)
+                        .await?;
+                }
+                continue;
+            }
+            let Some(deadline_at_ms) = limits.deadline_at_ms else {
+                // Not started yet: the clock starts with the run.
                 continue;
             };
             if deadline_at_ms <= now_ms() {
-                self.cancel_run_for_deadline(&record.view.run_id, max_duration_ms)
+                self.cancel_run_for_deadline(run_id, max_duration_ms)
                     .await?;
             } else {
-                self.spawn_run_deadline_timer(&record.view.run_id, deadline_at_ms, max_duration_ms);
+                self.spawn_run_deadline_timer(run_id, deadline_at_ms, max_duration_ms);
             }
         }
         Ok(())
     }
+}
+
+/// What arming a run's `max_duration_ms` deadline found.
+pub(super) enum RunDeadlineArm {
+    /// The run has no duration limit, or is no longer running.
+    Unlimited,
+    /// The timer is armed for this deadline, in milliseconds since the epoch.
+    Armed(u64),
+    /// The budget had run out: the run was cancelled with `deadline_exceeded`.
+    Expired,
+}
+
+/// One `max_duration_ms` timer armed in this daemon process.
+pub(super) struct ArmedRunDeadline {
+    /// The deadline the timer ends the run at.
+    deadline_at_ms: u64,
+    /// Stops the timer when the run's clock stops or moves.
+    timer: tokio::task::AbortHandle,
 }
 
 fn normalize_session_run_idempotency_key(key: &str) -> Result<String> {
@@ -4333,13 +4466,14 @@ fn run_operation_idempotency_receipt_key(
     format!("run-op:{operation}:{session_id}:{key_hash}")
 }
 
-/// Fingerprints one direct run submission for idempotency. Limits are part of
-/// the request; a request without limits keeps its historical fingerprint.
+/// Fingerprints one direct run submission for idempotency. The caller-set
+/// limits are part of the request, never the run's deadline clock; a request
+/// without limits keeps its historical fingerprint.
 fn submit_run_request_fingerprint(
     request: &SubmitInputRequest,
     limits: Option<&RunLimits>,
 ) -> Result<String> {
-    let payload = match limits {
+    let payload = match limits.map(RunLimits::requested) {
         None => serde_json::json!({
             "version": 1,
             "request": request,
@@ -4626,6 +4760,42 @@ mod submit_run_fingerprint_tests {
                     "variant {index} must differ from the others"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn fingerprint_ignores_the_deadline_clock() {
+        use sha2::{Digest, Sha256};
+
+        let requested = RunLimits {
+            max_turns: Some(8),
+            max_duration_ms: Some(600_000),
+            ..RunLimits::default()
+        };
+        let generation = json!({"max_output_tokens": 4096});
+        let expected = fingerprint(generation.clone(), Some(&requested));
+        // The format submissions were fingerprinted with before the clock
+        // could pause: replays of earlier keys still match.
+        let historical = hex::encode(Sha256::digest(
+            serde_json::to_vec(&json!({
+                "version": 1,
+                "request": request(generation.clone()),
+                "limits": {"max_turns": 8, "max_duration_ms": 600_000},
+            }))
+            .expect("payload encodes"),
+        ));
+        assert_eq!(expected, historical);
+        for clock in [
+            RunLimits {
+                deadline_at_ms: Some(1_794_000_000_000),
+                ..requested.clone()
+            },
+            RunLimits {
+                remaining_ms: Some(42_000),
+                ..requested.clone()
+            },
+        ] {
+            assert_eq!(fingerprint(generation.clone(), Some(&clock)), expected);
         }
     }
 }

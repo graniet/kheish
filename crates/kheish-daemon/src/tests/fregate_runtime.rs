@@ -1394,34 +1394,7 @@ async fn run_limits_cap_turns_and_wall_clock_with_distinct_error_codes() -> Resu
         deadline_at_ms,
         settled.started_at_ms.expect("run started") + 400
     );
-
-    // max_duration_ms counts approval waits: an MCP call that asks for
-    // approval is cancelled at the deadline while it waits.
-    create_test_session(&client, &base, "limits-wait").await?;
-    mock.push(scan_tool_use(
-        "toolu_wait",
-        json!({"target": "example.com"}),
-    ));
-    let waiting = submit_limited_run(
-        &client,
-        &base,
-        "limits-wait",
-        json!({"content": "scan", "max_duration_ms": 600}),
-    )
-    .await?
-    .error_for_status()?
-    .json::<RunView>()
-    .await?;
-    let updates = collect_run_updates(&client, &base, &waiting.run_id).await?;
-    assert!(
-        updates
-            .iter()
-            .any(|update| update.status == DaemonRunStatus::WaitingForApproval),
-        "{updates:#?}"
-    );
-    let settled = updates.last().cloned().expect("terminal update");
-    assert_eq!(settled.status, DaemonRunStatus::Cancelled);
-    assert_eq!(settled.error_code, Some(RunErrorCode::DeadlineExceeded));
+    assert_eq!(limits.remaining_ms, None, "the clock ran to the end");
 
     let _ = shutdown.send(());
     wait_for_daemon_shutdown(&client, &base).await?;
@@ -1442,6 +1415,447 @@ async fn terminal_run_event(client: &Client, base: &str, run_id: &str) -> Result
         .expect("a settled run has events")
         .event
         .clone())
+}
+
+/// The `max_duration_ms` the deadline tests give their runs. Every approval
+/// they hold, and every restart they wait through, lasts longer.
+const DEADLINE_TEST_BUDGET_MS: u64 = 2_000;
+
+/// A provider daemon rig that boots again on the same state root: a model
+/// mock, and an MCP stub whose `scan_target` calls ask for approval in the
+/// sessions' `default` permission mode.
+struct DeadlineRig {
+    _temp: tempfile::TempDir,
+    state_root: PathBuf,
+    workspace_root: PathBuf,
+    mock: AnthropicMock,
+    mcp_url: String,
+    mcp_log: McpStubLog,
+    client: Client,
+}
+
+impl DeadlineRig {
+    async fn new() -> Result<Self> {
+        let temp = tempdir()?;
+        let state_root = temp.path().join("daemon-state");
+        let workspace_root = temp.path().join("workspace");
+        let mock = spawn_anthropic_messages_mock("done").await?;
+        let (mcp_url, mcp_log) = spawn_mcp_stub().await?;
+        Ok(Self {
+            _temp: temp,
+            state_root,
+            workspace_root,
+            mock,
+            mcp_url,
+            mcp_log,
+            client: Client::new(),
+        })
+    }
+
+    /// Boots a daemon on the rig's state root and returns its base URL.
+    async fn boot(&self) -> Result<(String, oneshot::Sender<()>)> {
+        let (address, shutdown) = anthropic_provider_daemon(
+            &self.state_root,
+            &self.workspace_root,
+            &format!("{}/v1/messages", self.mock.base),
+        )
+        .await?;
+        Ok((format!("http://{address}"), shutdown))
+    }
+
+    /// Adds the MCP stub; the daemon reloads it from its overlay on restart.
+    async fn add_scan_server(&self, base: &str) -> Result<()> {
+        self.client
+            .post(format!("{base}/v1/runtime/mcp/servers"))
+            .json(&json!({"name": "fregate", "url": self.mcp_url}))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    async fn stop(&self, base: &str, shutdown: oneshot::Sender<()>) -> Result<()> {
+        let _ = shutdown.send(());
+        wait_for_daemon_shutdown(&self.client, base).await
+    }
+
+    /// Submits a run limited to [`DEADLINE_TEST_BUDGET_MS`].
+    async fn submit(&self, base: &str, session_id: &str, content: &str) -> Result<RunView> {
+        Ok(submit_limited_run(
+            &self.client,
+            base,
+            session_id,
+            json!({"content": content, "max_duration_ms": DEADLINE_TEST_BUDGET_MS}),
+        )
+        .await?
+        .error_for_status()?
+        .json::<RunView>()
+        .await?)
+    }
+
+    async fn fetch(&self, base: &str, run_id: &str) -> Result<RunView> {
+        Ok(self
+            .client
+            .get(format!("{base}/v1/runs/{run_id}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<RunView>()
+            .await?)
+    }
+
+    /// Allows every approval the run waits for.
+    async fn approve(&self, base: &str, run: &RunView) -> Result<()> {
+        let resolutions = run
+            .pending_approval_ids
+            .iter()
+            .map(|request_id| json!({"request_id": request_id, "behavior": "allow"}))
+            .collect::<Vec<_>>();
+        self.client
+            .post(format!("{base}/v1/runs/{}/approvals", run.run_id))
+            .json(&json!({"resolutions": resolutions}))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Waits until the model mock has received `count` requests.
+    async fn wait_for_model_requests(&self, count: usize) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while self.mock.captured.lock().len() < count {
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "the model mock did not receive {count} requests"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok(())
+    }
+}
+
+/// The deadline clock of a run: `(deadline_at_ms, remaining_ms)`.
+fn deadline_clock(run: &RunView) -> (Option<u64>, Option<u64>) {
+    run.limits.as_ref().map_or((None, None), |limits| {
+        (limits.deadline_at_ms, limits.remaining_ms)
+    })
+}
+
+#[tokio::test]
+async fn run_deadline_clock_stops_while_the_run_waits_for_an_approval() -> Result<()> {
+    let rig = DeadlineRig::new().await?;
+    let (base, shutdown) = rig.boot().await?;
+    rig.add_scan_server(&base).await?;
+    create_test_session(&rig.client, &base, "deadline-held").await?;
+
+    // The approval is held longer than the whole budget; the run still
+    // completes once approved.
+    rig.mock.push(scan_tool_use(
+        "toolu_held",
+        json!({"target": "example.com"}),
+    ));
+    let run = rig.submit(&base, "deadline-held", "scan").await?;
+    let waiting = wait_for_pending_approval_run(&rig.client, &base, &run.run_id).await?;
+    let (deadline_at_ms, remaining_ms) = deadline_clock(&waiting);
+    assert_eq!(deadline_at_ms, None, "no deadline while the run waits");
+    let remaining_ms = remaining_ms.expect("the budget left is kept");
+    assert!(
+        remaining_ms > 0 && remaining_ms <= DEADLINE_TEST_BUDGET_MS,
+        "{remaining_ms}"
+    );
+    tokio::time::sleep(Duration::from_millis(DEADLINE_TEST_BUDGET_MS + 500)).await;
+    let held = rig.fetch(&base, &run.run_id).await?;
+    assert_eq!(held.status, DaemonRunStatus::WaitingForApproval);
+    assert_eq!(
+        held.limits, waiting.limits,
+        "nothing counts down while waiting"
+    );
+
+    let approved_at_ms = now_ms();
+    rig.approve(&base, &held).await?;
+    let completed = wait_for_run_status(
+        &rig.client,
+        &base,
+        &run.run_id,
+        &[DaemonRunStatus::Completed],
+    )
+    .await?;
+    assert_eq!(completed.error_code, None);
+    assert_eq!(rig.mcp_log.calls.lock().len(), 1, "the approved tool ran");
+    let started_at_ms = completed.started_at_ms.expect("run started");
+    let finished_at_ms = completed.finished_at_ms.expect("run finished");
+    assert!(
+        finished_at_ms - started_at_ms > DEADLINE_TEST_BUDGET_MS,
+        "the run outlived its budget in wall-clock time"
+    );
+    let (deadline_at_ms, remaining_ms_after) = deadline_clock(&completed);
+    assert_eq!(
+        remaining_ms_after, None,
+        "the clock ran again after the approval"
+    );
+    assert!(deadline_at_ms.expect("the clock ran again") >= approved_at_ms + remaining_ms);
+
+    // The run stream shows the clock: running to a deadline, stopped with the
+    // budget left, then running again from that budget.
+    let updates = collect_run_updates(&rig.client, &base, &run.run_id).await?;
+    let paused_index = updates
+        .iter()
+        .position(|update| update.status == DaemonRunStatus::WaitingForApproval)
+        .expect("a waiting update");
+    let first_deadline = updates[..paused_index]
+        .iter()
+        .find_map(|update| deadline_clock(update).0)
+        .expect("a running update carries the first deadline");
+    assert_eq!(first_deadline, started_at_ms + DEADLINE_TEST_BUDGET_MS);
+    let paused = &updates[paused_index];
+    assert_eq!(
+        deadline_clock(paused),
+        (None, Some(first_deadline - paused.updated_at_ms)),
+        "the wait stops the clock at the budget left"
+    );
+    let resumed = updates[paused_index..]
+        .iter()
+        .find(|update| update.status == DaemonRunStatus::Running)
+        .expect("a resumed update");
+    assert_eq!(
+        deadline_clock(resumed),
+        (Some(resumed.updated_at_ms + remaining_ms), None),
+        "the resume restarts the clock with the budget left"
+    );
+
+    rig.stop(&base, shutdown).await
+}
+
+#[tokio::test]
+async fn run_deadline_runs_out_while_running_after_a_resume() -> Result<()> {
+    let rig = DeadlineRig::new().await?;
+    let (base, shutdown) = rig.boot().await?;
+    rig.add_scan_server(&base).await?;
+    create_test_session(&rig.client, &base, "deadline-resumed").await?;
+
+    // The turn after the approved tool call stalls past the budget left.
+    rig.mock.push(scan_tool_use(
+        "toolu_resumed",
+        json!({"target": "example.com"}),
+    ));
+    rig.mock.push(MockReply::Stall {
+        delay_ms: 30_000,
+        text: "too late".to_string(),
+    });
+    let run = rig.submit(&base, "deadline-resumed", "scan").await?;
+    let waiting = wait_for_pending_approval_run(&rig.client, &base, &run.run_id).await?;
+    let remaining_ms = deadline_clock(&waiting).1.expect("the budget left is kept");
+    tokio::time::sleep(Duration::from_millis(DEADLINE_TEST_BUDGET_MS + 500)).await;
+    let held = rig.fetch(&base, &run.run_id).await?;
+    assert_eq!(held.status, DaemonRunStatus::WaitingForApproval);
+
+    let approved_at_ms = now_ms();
+    rig.approve(&base, &held).await?;
+    let cancelled = wait_for_run_status(
+        &rig.client,
+        &base,
+        &run.run_id,
+        &[DaemonRunStatus::Cancelled],
+    )
+    .await?;
+    assert_eq!(cancelled.error_code, Some(RunErrorCode::DeadlineExceeded));
+    assert_eq!(
+        cancelled.error,
+        Some(format!(
+            "deadline_exceeded: run exceeded max_duration_ms={DEADLINE_TEST_BUDGET_MS}"
+        ))
+    );
+    assert_eq!(
+        terminal_run_event(&rig.client, &base, &run.run_id).await?,
+        RunEvent::Cancelled {
+            code: Some(RunErrorCode::DeadlineExceeded),
+        }
+    );
+    assert_eq!(rig.mcp_log.calls.lock().len(), 1, "the approved tool ran");
+    let (deadline_at_ms, remaining_after) = deadline_clock(&cancelled);
+    assert_eq!(remaining_after, None, "the clock was running");
+    let deadline_at_ms = deadline_at_ms.expect("the resume restarted the clock");
+    assert!(
+        deadline_at_ms >= approved_at_ms + remaining_ms,
+        "the clock resumed with the budget left, not from the first start"
+    );
+    let finished_at_ms = cancelled.finished_at_ms.expect("run finished");
+    assert!(finished_at_ms >= deadline_at_ms);
+    assert!(
+        finished_at_ms < deadline_at_ms + 3_000,
+        "the deadline cut the stalled turn short"
+    );
+
+    rig.stop(&base, shutdown).await
+}
+
+#[tokio::test]
+async fn run_deadline_stays_paused_across_a_restart() -> Result<()> {
+    let rig = DeadlineRig::new().await?;
+    let (base, shutdown) = rig.boot().await?;
+    rig.add_scan_server(&base).await?;
+    create_test_session(&rig.client, &base, "deadline-restart-paused").await?;
+    rig.mock.push(scan_tool_use(
+        "toolu_restart_paused",
+        json!({"target": "example.com"}),
+    ));
+    let run = rig.submit(&base, "deadline-restart-paused", "scan").await?;
+    let waiting = wait_for_pending_approval_run(&rig.client, &base, &run.run_id).await?;
+    let remaining_ms = deadline_clock(&waiting).1.expect("the budget left is kept");
+
+    // The daemon stays down longer than the whole budget.
+    rig.stop(&base, shutdown).await?;
+    tokio::time::sleep(Duration::from_millis(DEADLINE_TEST_BUDGET_MS + 500)).await;
+    let (base, shutdown) = rig.boot().await?;
+    let restored = rig.fetch(&base, &run.run_id).await?;
+    assert_eq!(restored.status, DaemonRunStatus::WaitingForApproval);
+    assert_eq!(
+        restored.limits, waiting.limits,
+        "the restart keeps the run paused with the same budget"
+    );
+
+    // No timer runs for the paused run after boot either.
+    tokio::time::sleep(Duration::from_millis(DEADLINE_TEST_BUDGET_MS + 500)).await;
+    let held = rig.fetch(&base, &run.run_id).await?;
+    assert_eq!(held.status, DaemonRunStatus::WaitingForApproval);
+    assert_eq!(held.limits, waiting.limits);
+
+    let approved_at_ms = now_ms();
+    rig.approve(&base, &held).await?;
+    let completed = wait_for_run_status(
+        &rig.client,
+        &base,
+        &run.run_id,
+        &[DaemonRunStatus::Completed],
+    )
+    .await?;
+    assert_eq!(completed.error_code, None);
+    assert_eq!(rig.mcp_log.calls.lock().len(), 1, "the approved tool ran");
+    let (deadline_at_ms, remaining_after) = deadline_clock(&completed);
+    assert_eq!(remaining_after, None);
+    assert!(deadline_at_ms.expect("the clock ran again") >= approved_at_ms + remaining_ms);
+
+    rig.stop(&base, shutdown).await
+}
+
+#[tokio::test]
+async fn run_deadline_rearms_a_running_run_after_a_restart() -> Result<()> {
+    let rig = DeadlineRig::new().await?;
+    let (base, shutdown) = rig.boot().await?;
+
+    // A direct run executing when the daemon stops.
+    create_test_session(&rig.client, &base, "deadline-direct").await?;
+    rig.mock.push(MockReply::Stall {
+        delay_ms: 30_000,
+        text: "never".to_string(),
+    });
+    let direct = submit_limited_run(
+        &rig.client,
+        &base,
+        "deadline-direct",
+        json!({"content": "think", "max_duration_ms": 60_000}),
+    )
+    .await?
+    .error_for_status()?
+    .json::<RunView>()
+    .await?;
+    rig.wait_for_model_requests(1).await?;
+    let direct_deadline_at_ms = deadline_clock(&rig.fetch(&base, &direct.run_id).await?)
+        .0
+        .expect("the clock runs");
+
+    // A scheduled run executing when the daemon stops; the scheduler replays
+    // it after the restart.
+    let replay_session = create_test_session(&rig.client, &base, "deadline-replay").await?;
+    rig.mock.push(MockReply::Stall {
+        delay_ms: 30_000,
+        text: "never".to_string(),
+    });
+    create_test_schedule(
+        &rig.client,
+        &base,
+        CreateScheduleRequest {
+            name: "deadline-replay".to_string(),
+            target_session_id: "deadline-replay".to_string(),
+            target_agent_id: None,
+            owner_session_id: Some("deadline-replay".to_string()),
+            owner_agent_id: Some(replay_session.agent_id.clone()),
+            created_by_run_id: None,
+            cadence: ScheduleCadence::Once {
+                fire_at_ms: now_ms() + 100,
+            },
+            max_executions: None,
+            overlap_policy: ScheduleOverlapPolicy::Skip,
+            misfire_policy: ScheduleMisfirePolicy::CoalesceOnce,
+            request: Some(serde_json::from_value(json!({"content": "replay me"}))?),
+            observation_materialization: None,
+            flow_start: None,
+        },
+    )
+    .await?;
+    let replay_id = wait_for_session_run_count(&rig.client, &base, "deadline-replay", 1).await?[0]
+        .run_id
+        .clone();
+    wait_for_run_status(&rig.client, &base, &replay_id, &[DaemonRunStatus::Running]).await?;
+    rig.wait_for_model_requests(2).await?;
+    rig.stop(&base, shutdown).await?;
+
+    // Give the replayed run a running clock with 2 s left of a 60 s budget,
+    // as a limited run that survives a restart would have.
+    let run_store = FileRunStore::new(&rig.state_root);
+    let mut record = run_store
+        .load_run(&replay_id)?
+        .expect("the scheduled run is persisted");
+    let replay_deadline_at_ms = now_ms() + 2_000;
+    record.view.limits = Some(crate::RunLimits {
+        max_duration_ms: Some(60_000),
+        deadline_at_ms: Some(replay_deadline_at_ms),
+        ..crate::RunLimits::default()
+    });
+    run_store.save_run(&record)?;
+    rig.mock.push(MockReply::Stall {
+        delay_ms: 30_000,
+        text: "never".to_string(),
+    });
+    let (base, shutdown) = rig.boot().await?;
+
+    // The direct run is interrupted by the restart, never resumed, so its
+    // deadline no longer applies.
+    let interrupted = wait_for_run_status(
+        &rig.client,
+        &base,
+        &direct.run_id,
+        &[DaemonRunStatus::Interrupted],
+    )
+    .await?;
+    assert_eq!(interrupted.error_code, None);
+    assert_eq!(
+        deadline_clock(&interrupted),
+        (Some(direct_deadline_at_ms), None)
+    );
+
+    // The replayed run runs again with the time left to its deadline, not a
+    // fresh budget, and the deadline ends it.
+    let cancelled = wait_for_run_status(
+        &rig.client,
+        &base,
+        &replay_id,
+        &[DaemonRunStatus::Cancelled],
+    )
+    .await?;
+    assert_eq!(cancelled.error_code, Some(RunErrorCode::DeadlineExceeded));
+    assert_eq!(
+        deadline_clock(&cancelled),
+        (Some(replay_deadline_at_ms), None)
+    );
+    let finished_at_ms = cancelled.finished_at_ms.expect("run finished");
+    assert!(finished_at_ms >= replay_deadline_at_ms);
+    assert!(
+        finished_at_ms < replay_deadline_at_ms + 3_000,
+        "re-armed with the time left, not the whole budget"
+    );
+
+    rig.stop(&base, shutdown).await
 }
 
 async fn publish_fact(

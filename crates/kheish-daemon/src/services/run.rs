@@ -1733,6 +1733,8 @@ impl RunService {
             record.view.updated_at_ms = now_ms();
             let next_session_id = if !snapshot.pending_questions.is_empty() {
                 transition_run_status(&mut record.view, DaemonRunStatus::WaitingForUserQuestion)?;
+                let paused_at_ms = record.view.updated_at_ms;
+                pause_run_deadline_clock(&mut record.view, paused_at_ms);
                 record.view.pending_question_ids = snapshot
                     .pending_questions
                     .iter()
@@ -1745,6 +1747,8 @@ impl RunService {
                 None
             } else if !snapshot.pending_approvals.is_empty() {
                 transition_run_status(&mut record.view, DaemonRunStatus::WaitingForApproval)?;
+                let paused_at_ms = record.view.updated_at_ms;
+                pause_run_deadline_clock(&mut record.view, paused_at_ms);
                 record.view.pending_approval_ids = snapshot
                     .pending_approvals
                     .iter()
@@ -1888,6 +1892,8 @@ impl RunService {
                 }
                 transition_run_status(&mut record.view, DaemonRunStatus::WaitingForUserQuestion)?;
                 record.view.updated_at_ms = now_ms();
+                let paused_at_ms = record.view.updated_at_ms;
+                pause_run_deadline_clock(&mut record.view, paused_at_ms);
                 record.view.pending_approval_ids.clear();
                 record.view.pending_approvals.clear();
                 record.view.pending_question_ids = vec![request.id.clone()];
@@ -2078,30 +2084,75 @@ impl RunService {
         self.run_store.raise_seed_floor(run_ids)
     }
 
-    /// Records the `max_duration_ms` deadline of one run on its first start.
+    /// Starts the `max_duration_ms` clock of one running run if it is
+    /// stopped: on the run's first start, or when a restart re-queued it
+    /// while paused. An approval or an answer restarts the clock itself when
+    /// it resumes the run. The view is published when the clock starts.
     ///
-    /// Returns the updated view, or `None` when the run is terminal, has no
-    /// duration limit, or already carries a deadline.
-    pub(crate) async fn record_run_deadline(
-        &self,
-        run_id: &str,
-        deadline_at_ms: u64,
-    ) -> Result<Option<RunView>> {
-        self.update_run_record(run_id, |record| {
-            if record.view.status.is_terminal() {
-                return Ok((None, false));
-            }
-            let Some(limits) = record.view.limits.as_mut() else {
-                return Ok((None, false));
-            };
-            if limits.max_duration_ms.is_none() || limits.deadline_at_ms.is_some() {
-                return Ok((None, false));
-            }
-            limits.deadline_at_ms = Some(deadline_at_ms);
-            record.view.updated_at_ms = now_ms();
-            Ok((Some(record.view.clone()), true))
-        })
-        .await
+    /// Returns the deadline the clock runs to, or `None` when the run is not
+    /// running or has no duration limit.
+    pub(crate) async fn start_run_deadline(&self, run_id: &str) -> Result<Option<u64>> {
+        let (deadline_at_ms, started) = self
+            .update_run_record(run_id, |record| {
+                if record.view.status != DaemonRunStatus::Running {
+                    return Ok(((None, None), false));
+                }
+                let now = now_ms();
+                let started = start_run_deadline_clock(&mut record.view, now);
+                if started {
+                    record.view.updated_at_ms = now;
+                }
+                let deadline_at_ms = record
+                    .view
+                    .limits
+                    .as_ref()
+                    .and_then(|limits| limits.deadline_at_ms);
+                Ok((
+                    (deadline_at_ms, started.then(|| record.view.clone())),
+                    started,
+                ))
+            })
+            .await?;
+        if let Some(view) = started {
+            self.publish_run(&view);
+        }
+        Ok(deadline_at_ms)
+    }
+
+    /// Stops the `max_duration_ms` clock of one run that waits for an
+    /// approval or an answer while its clock still runs, as a record written
+    /// before waits stopped the clock does. The view is published when the
+    /// clock stops.
+    ///
+    /// Returns the budget left, or `None` when the run is not waiting or has
+    /// no duration limit.
+    pub(crate) async fn pause_waiting_run_deadline(&self, run_id: &str) -> Result<Option<u64>> {
+        let (remaining_ms, paused) = self
+            .update_run_record(run_id, |record| {
+                if !matches!(
+                    record.view.status,
+                    DaemonRunStatus::WaitingForApproval | DaemonRunStatus::WaitingForUserQuestion
+                ) {
+                    return Ok(((None, None), false));
+                }
+                let now = now_ms();
+                let paused = pause_run_deadline_clock(&mut record.view, now);
+                if paused {
+                    record.view.updated_at_ms = now;
+                }
+                let remaining_ms = record
+                    .view
+                    .limits
+                    .as_ref()
+                    .filter(|limits| limits.max_duration_ms.is_some())
+                    .and_then(|limits| limits.remaining_ms);
+                Ok(((remaining_ms, paused.then(|| record.view.clone())), paused))
+            })
+            .await?;
+        if let Some(view) = paused {
+            self.publish_run(&view);
+        }
+        Ok(remaining_ms)
     }
 
     /// Cancels one active or queued run and records an optional terminal error
@@ -2416,6 +2467,9 @@ impl RunService {
             record.view.kind = next_kind;
             transition_run_status(&mut record.view, DaemonRunStatus::Running)?;
             record.view.updated_at_ms = now_ms();
+            // The deadline clock resumes with the budget the wait left.
+            let resumed_at_ms = record.view.updated_at_ms;
+            start_run_deadline_clock(&mut record.view, resumed_at_ms);
             record.view.error = None;
             record.view.queued_position = None;
             record.view.pending_approval_ids.clear();
@@ -2841,6 +2895,23 @@ fn clear_pending_state(view: &mut RunView) {
     clear_pending_questions(view);
 }
 
+/// Stops the `max_duration_ms` clock of a run that starts waiting for an
+/// approval or an answer at `now_ms`. Returns `false` when it was not running.
+fn pause_run_deadline_clock(view: &mut RunView, now_ms: u64) -> bool {
+    view.limits
+        .as_mut()
+        .is_some_and(|limits| limits.pause_deadline(now_ms))
+}
+
+/// Starts the `max_duration_ms` clock of a run that starts or resumes at
+/// `now_ms`. Returns `false` when it has no duration limit or already runs.
+fn start_run_deadline_clock(view: &mut RunView, now_ms: u64) -> bool {
+    let first_started_at_ms = view.started_at_ms.unwrap_or(now_ms);
+    view.limits
+        .as_mut()
+        .is_some_and(|limits| limits.start_deadline(first_started_at_ms, now_ms))
+}
+
 fn recover_running_record(
     record: &mut RunRecord,
     snapshot: Option<&ManagedAgentSnapshot>,
@@ -2849,6 +2920,8 @@ fn recover_running_record(
     if let Some(snapshot) = snapshot {
         if !snapshot.pending_questions.is_empty() {
             transition_run_status(&mut record.view, DaemonRunStatus::WaitingForUserQuestion)?;
+            let paused_at_ms = record.view.updated_at_ms;
+            pause_run_deadline_clock(&mut record.view, paused_at_ms);
             record.view.pending_question_ids = snapshot
                 .pending_questions
                 .iter()
@@ -2865,6 +2938,8 @@ fn recover_running_record(
         }
         if !snapshot.pending_approvals.is_empty() {
             transition_run_status(&mut record.view, DaemonRunStatus::WaitingForApproval)?;
+            let paused_at_ms = record.view.updated_at_ms;
+            pause_run_deadline_clock(&mut record.view, paused_at_ms);
             record.view.pending_approval_ids = snapshot
                 .pending_approvals
                 .iter()
