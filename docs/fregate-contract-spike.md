@@ -492,3 +492,57 @@ POST /v1/runtime/learning-policy {"policy":{"mode":"manual_only","capture":{"run
     reject an envelope without a reply (`delivery.rs:1416-1419`), so nothing is delivered externally.
   - The resulting error would fail the output dispatch.
 - Fregate is safe as long as it never sets session `reply-targets`.
+
+---
+
+## After the changes
+
+Branch `feat/fregate-runtime`, commits K1 to K10 (`b172ab0` .. `bdf91a0`), `cargo build -p kheish-daemon` (debug).
+Live check run on 2026-11-07 against a daemon on `127.0.0.1:4100` with its own temp state root
+(`/tmp/kheish-live-check/state`), the spike stubs (model `:4101`, MCP `:4102`, hook `:4103`) and a
+standby on `127.0.0.1:4105`. The driver is a Python script that records every observation in
+`/tmp/kheish-live-check/results.json`.
+
+### Rig
+
+- Started with `env -i`, a **private `HOME`**, and a routes file holding one stub route (`boot`). The daemon
+  options: `--learning-read-scopes session,project`, `--model-budget-max-total-output-tokens off`,
+  `--model-budget-max-total-cost-usd off`, `--mcp-discovery disabled`, bearer auth, and
+  `KHEISH_AUTH_STORE_REQUIRE_ENCRYPTED=true`.
+- Slots: `fregate.relay` (anthropic, `api_key`) for the relay route, and `mcp.fregate.callback` (generic) for the
+  MCP bearer and the hook header.
+- Finding: a first attempt with `--allow-empty-routes`, no routes file, and the real `HOME` resolved
+  `anthropic` and `openai` routes from the account credentials under `~/.claude` and `~/.codex`. Its first runs went
+  to the real Anthropic API (4 short test prompts, all answered `429`) instead of the stub. A Fregate deployment
+  must give the daemon a routes file (or `--allow-empty-routes`) **and** a HOME without provider credentials.
+- Finding: MCP `bearer_token_secret_ref` and `http_header_secret_refs` only resolve slots named `mcp.*`; a
+  `fregate.callback` slot is rejected (`500` on add). Combined with K2 needing a provider-typed slot, Fregate keeps the
+  callback secret in two slots with the same value: an anthropic slot for the relay route and an `mcp.*` generic slot
+  for MCP and the hook.
+
+### Results
+
+| Change | What was exercised | Observed |
+|---|---|---|
+| K1 | `PUT /v1/sessions/mission-m1/tool-overrides {"allow":["mcp__fregate__scan_target"]}`, then `CALL_BASH` in `default` mode | `200`, view `tool_overrides = {"allow":[…]}`. Every model request advertised exactly `["mcp__fregate__scan_target"]`. The run **completed** with no `waiting_for_approval` event and no `bash` permission audit; the tool result was `tool bash is not available for this agent`. A misspelled field (`{"alow":…}`) returns `422`. |
+| K2 | `POST /v1/runtime/routes {"route_id":"fregate","provider":"anthropic","model":"claude-sonnet-4-5","auth_ref":"fregate.relay","base_url":"http://127.0.0.1:4101/v1/messages"}` | `200`, route listed with `auth_ref: fregate.relay`. The same body with `base_uri` returns `422`. `routes-overlay.json` holds `auth_ref` and `base_url`, no credential. Runs on the route reached `/v1/messages` on the stub with `x-api-key: relay-token-A` (no `route_not_ready`). |
+| K3 | `CALL_TOOL` on `mcp__fregate__scan_target` | `tools/call` params: `"_meta": {"kheish/session_id":"mission-m1","kheish/run_id":"run-2","kheish/tool_call_id":"toolu_41b23f2af7","progressToken":1}`, `arguments: {"target":"example.com"}`, `authorization: Bearer callback-secret-1`. |
+| K3 rotation | Rotate `mcp.fregate.callback`, then `DELETE` and re-add the server | After the rotation the server shows `connected: false` with ``credential secret `mcp.fregate.callback` changed or was revoked``. `DELETE` returns `200` and the re-add `200` (it was `502 tool name collides`). The next call sent `Bearer callback-secret-2`. |
+| K4 | `permission_request` HTTP hook on `http://127.0.0.1:4103/hook`, fail-closed, `header_secret_refs {"x-fregate-callback":"mcp.fregate.callback"}` | Without `allow_private`: `400 invalid_hook_settings`. With it: `200`. `GET /v1/runtime/hooks` shows the slot name, never the value. The hook received `x-fregate-callback: callback-secret-1` (then `-2` after rotation), `event: permission_request`, `run_id: run-2`, and `run_metadata: {"mission_id":"m1","correlation_id":"corr-1","workspace_id":"ws-1"}`. |
+| K5 max_turns | `CALL_TOOL` with `"max_turns": 1` | `failed`, `error_code: max_turns_exceeded`, `error: agent loop exceeded max_turns=1`, `limits: {"max_turns":1}`. |
+| K5 max_duration_ms | MCP tool sleeping 6 s, run with `"max_duration_ms": 1500` | `cancelled` after 1.54 s, `error_code: deadline_exceeded`, `error: run exceeded max_duration_ms=1500`, `limits: {"max_duration_ms":1500,"deadline_at_ms":…}`. |
+| K6 | `GET /v1/sessions/mission-m1/memory-context` | `learning_scopes: ["session:mission-m1"]`: no `workspace:default` (the session has no persona and no project). |
+| K7 | Second daemon on `:4105`, same state root, `--state-lock-wait forever`; then `kill -9` the primary | The standby was not ready while the primary lived and logged `state root is locked by another daemon; waiting as a standby`. It was ready **1.81 s** after the kill and listed `mission-m1`. |
+| K8 | `auth/global-slots.json` | `{"version":2,"label":"kheish.auth-store",…}`; no secret in clear. The daemon booted with `KHEISH_AUTH_STORE_REQUIRE_ENCRYPTED=true`. |
+| K9 | On the new active daemon: `DELETE /v1/sessions/mission-m1` before and after `POST …/end` | Before: `409 session_not_ended`. After: `200` with `run_ids: run-1 … run-5` and `learning_candidate_ids: learning-candidate-1 … 5` (the run-summary candidates). Then `GET /v1/sessions/mission-m1` and `GET /v1/runs/run-1 … run-5` return `404`. No file is left under `sessions/`, `runs/`, `run-events/`, `run-memories/` or `outputs/`, and no purge plan remains. `GET /v1/agents/audit` shows `session_purged` (reason `retention`), then `removed`. The 6 signed external-action ledger files are kept. |
+| K10 | Both budgets `off` | Accepted at boot; no budget error over the whole check. |
+
+### Tests and checks
+
+- `cargo fmt --all -- --check` is clean. `cargo build --workspace --locked` passes with no warning.
+- Lib tests: kheish-types 55, kheish-core 66, kheish-runtime 312, kheish-coding-tools 26 and kheish-auth 44 all pass.
+  kheish-daemon passes 1432 of 1434, and its binary tests pass 241 of 241. The two daemon failures are pre-existing:
+  - `daemon_stop_task_kills_orphaned_pipe_holder_and_is_session_scoped` also fails on `844f080` in this environment.
+  - `daemon_http_runs_reject_non_image_edit_assets` is a load flake already listed in `REMEDIATION.md`; it passes alone.
+- kheish-mcp passes 59 of 60. `mcp_tool_schema_import_preserves_closed_nested_shapes` fails identically on `844f080`.
+- Clippy (stable, the 7 touched crates, `--lib --bins --tests`) reports no warning on any line these commits changed.
