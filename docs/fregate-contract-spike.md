@@ -675,3 +675,77 @@ same with a daemon-wide `custom_prompt`, 5,567 bytes of system prompt). Bytes ar
   a user turn after a batch, the merge and validation, the other drivers' refusal, and a daemon test through the
   session `route_policy`. K17: the exact system prompt bytes of a session with Fregate's verify tools under `minimal`,
   what `minimal` keeps, no capability from MCP descriptions, and a daemon test of the request's `system` block.
+
+### K18: the server chooses which tools stay strict
+
+K14 sends `strict: true` to at most 20 tools per request (the Messages API's limit, with 24 optional and 16
+union-typed parameters across them), taken in tool-name order. Fregate's investigation missions offer 24 tools. In name
+order the six id-only reads (`get_*`) took six of the twenty places and the act and report tools late in the alphabet
+(`start_scan`, `submit_verdict`) went out without `strict`, though their enums and nested objects gain the most from it.
+
+- **The hint.** In each tool's `_meta` in the `tools/list` result, under Kheish's prefix:
+  `"kheish/strict_preferred": false` (a boolean, `true` when absent) says the tool can do without strict input;
+  `"kheish/strict_priority": <integer>` (within the `i32` range, negative allowed, `0` when absent) ranks it. `_meta`
+  is where MCP puts implementation-specific metadata, and rmcp keeps it as the server sent it; tool annotations are the
+  specification's fixed set (`readOnlyHint`, ...), and rmcp drops any other key there. A value of the wrong type counts
+  as absent and the daemon logs a warning (`kheish.mcp`).
+- **Trust.** Only a server registered with `trusted: true` is heard. An untrusted server's hints are dropped when its
+  tools are discovered (logged at debug level), and the provider definition checks the trust again, so its tools keep
+  K14's name order. Trust is set on a registration; changing it means a new registration, which lists the tools again.
+- **The order.** When every tool asking for strict input (with a schema in the enforced subset) fits, all are strict,
+  the marked ones included. When they do not: every tool marked `kheish/strict_preferred: false` loses `strict`; the
+  others are ranked by `kheish/strict_priority`, highest first, then by qualified name (`mcp__<server>__<tool>`); in
+  that order each keeps `strict` when it still fits what the ones before it left. A tool never loses strict input to one ranked below it; a smaller one ranked
+  lower can still use what is left. The same tools get the same answer on every turn, so the cached tool prefix holds.
+- **In the code.** `ToolDefinition.strict_rank` (`ToolStrictRank { preferred, priority }`, serialized only when not the
+  default) carries the hint from `kheish-mcp` to the Anthropic driver, which alone has a per-request budget.
+
+| Change | What a caller sets |
+|---|---|
+| K18 strict hints | On its tools in `tools/list`, with the server registered `trusted: true`: `"_meta": {"kheish/strict_preferred": false}` on the id-only reads, and `"_meta": {"kheish/strict_priority": 10}` (any integer above the others') on the act and report tools that must stay strict. |
+
+#### Live check
+
+Run on 2026-11-07 against `cargo build --workspace --locked` (debug) of the K18 tree on `e4b2fe7`. A daemon of mine
+on `127.0.0.1:4180`, started through `deploy/kheish/kheishd.sh` (`env -i`, private `HOME`, state under
+`/tmp/kheish-k18-check.uevTBl/d`); a runtime route `verify` (`anthropic`, `claude-opus-5-5`) to a Messages stub on
+`:4181`; a streamable-HTTP MCP stub on `:4182` registered as `fregate`, deleted and re-registered between scenarios.
+The driver (`driver.py`, also under `env -i`) runs one turn per scenario, reads the strict set out of the captured
+request body and records it in `results.json`: 16 of 16 checks passed. Each body also carried Kheish's 56 own tools,
+none of them strict, and `strict` was only ever `true` or absent.
+
+| Scenario | `fregate` tools | Strict | Sent without `strict` |
+|---|---|---|---|
+| A. Trusted. The six `get_*` reads carry `kheish/strict_preferred: false`; `run_template`, `start_scan` and `submit_verdict` carry `kheish/strict_priority: 10` | 24 | 18 | the six reads |
+| B. The same server re-registered untrusted | 24 | 20, the first by name | `start_scan`, `submit_verdict`, `tag_asset`, `update_exposure` |
+| C. Trusted, with four more list tools (`list_hosts`, `list_ports`, `list_services`, `list_vulns`): 22 tools prefer strict input | 28 | 20 | the six reads, `tag_asset`, `update_exposure` |
+
+- In C the three tools at priority 10 keep `strict` although late in name order; the other 17 places go to the
+  priority-0 tools by name.
+- `list_scans` carries `"kheish/strict_priority": "high"`. It ranks at 0, and the daemon logged one `WARN`
+  (`target: kheish.mcp`, `keys: ["kheish/strict_priority"]`) for each trusted registration, none for the untrusted
+  one.
+
+#### Tests and checks
+
+- `cargo fmt --all -- --check` clean (the stable toolchain's rustfmt; the pinned 1.98.1 ships none);
+  `cargo build --workspace --locked` passes with no warning. Clippy (stable; kheish-types, kheish-runtime, kheish-mcp,
+  kheish-daemon; `--lib --tests`) reports no warning on a changed line.
+- Lib tests: kheish-types 65, kheish-core 74, kheish-runtime 360 and kheish-mcp 72 pass. kheish-daemon passes 1448 of
+  1449 in one full run, the failure being `daemon_stop_task_kills_orphaned_pipe_holder_and_is_session_scoped` with the
+  same assertion (`tests.rs:56239`) as on `844f080`. A second full run on the final tree also hit the known load flake
+  `daemon_http_runs_require_explicit_ids_when_multiple_images_are_attached` (the same debug-redaction error as under
+  K14), which passes alone.
+- New tests. Anthropic driver: 24 tools with the six id-only reads marked not preferred give exactly the other 18
+  strict, and without hints the first 20 by name (`start_scan` left out); when every tool fits, the marked ones stay
+  strict; priorities keep `submit_verdict`, `run_template` and `start_scan` and drop the two tools at -1, then the last
+  two at 0 by name; under priorities the 24 optional and 16 union-typed parameters still hold, a smaller tool ranked
+  lower uses what is left, and without ranks the order is the name. kheish-mcp: reading both keys (the `i32` bounds,
+  wrong types ignored and reported), the trust check on the provider definition and on a fallback schema, and a
+  `tools/list` JSON through rmcp and discovery for a trusted and an untrusted server. kheish-types: `strict_rank`
+  round-trips and leaves a default definition's JSON unchanged. kheish-daemon:
+  `a_trusted_mcp_server_chooses_which_tools_stay_strict` (the request body's strict set with the server trusted, then
+  re-registered untrusted).
+- An xhigh Fable review found no correctness or security bug. From its notes: an untrusted server's hints are now
+  dropped at discovery as well as checked at the provider definition, ties are documented as broken on the qualified
+  name, and the types crate no longer spells out Anthropic's limits.

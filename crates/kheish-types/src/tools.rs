@@ -118,6 +118,61 @@ pub struct ToolDefinition {
     /// schema is in the subset it can enforce, and within its limits.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub strict: bool,
+    /// Which tools keep `strict` when a provider cannot give it to every
+    /// tool that asks in one request. Only a trusted MCP server's hints set
+    /// it; every other tool keeps the default, which ranks by name alone.
+    #[serde(default, skip_serializing_if = "ToolStrictRank::is_default")]
+    pub strict_rank: ToolStrictRank,
+}
+
+/// Where a tool that asks for strict input stands when a provider cannot
+/// make every such tool strict in one request (the Anthropic driver's
+/// per-request limits on strict tools and on the parameters of their
+/// schemas). Once the tools that ask do not all fit, those that do not
+/// prefer strict input lose it, all of them; the others keep it by priority,
+/// highest first, then by name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolStrictRank {
+    /// `false` when the tool can do without strict input. It stays strict
+    /// while every tool that asks fits the provider's limits, and is the
+    /// first to lose it when they do not.
+    #[serde(
+        default = "ToolStrictRank::default_preferred",
+        skip_serializing_if = "ToolStrictRank::is_preferred"
+    )]
+    pub preferred: bool,
+    /// Among the tools that prefer strict input, a higher priority keeps it
+    /// longer. Equal priorities fall back to name order.
+    #[serde(default, skip_serializing_if = "ToolStrictRank::is_zero")]
+    pub priority: i32,
+}
+
+impl Default for ToolStrictRank {
+    fn default() -> Self {
+        Self {
+            preferred: true,
+            priority: 0,
+        }
+    }
+}
+
+impl ToolStrictRank {
+    /// Returns whether the rank is the default one: preferred, priority 0.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    fn default_preferred() -> bool {
+        true
+    }
+
+    fn is_preferred(preferred: &bool) -> bool {
+        *preferred
+    }
+
+    fn is_zero(priority: &i32) -> bool {
+        *priority == 0
+    }
 }
 
 /// Declares one allow/deny filter applied to an agent-specific tool surface.
@@ -288,7 +343,48 @@ pub struct ToolResultRecord {
 
 #[cfg(test)]
 mod tests {
-    use super::{DYNAMIC_MCP_TOOL_ALLOWLIST_SENTINEL, ToolSurfaceFilter};
+    use serde_json::json;
+
+    use super::{
+        DYNAMIC_MCP_TOOL_ALLOWLIST_SENTINEL, ToolDefinition, ToolStrictRank, ToolSurfaceFilter,
+    };
+
+    #[test]
+    fn a_default_strict_rank_leaves_the_serialized_definition_unchanged() {
+        let mut definition = ToolDefinition {
+            name: "mcp__fregate__start_scan".to_string(),
+            description: "Start a scan.".to_string(),
+            input_schema: json!({"type": "object"}),
+            allows_parallel: true,
+            strict: true,
+            strict_rank: ToolStrictRank::default(),
+        };
+        let encoded = serde_json::to_value(&definition).expect("encode");
+        assert!(encoded.get("strict_rank").is_none(), "{encoded}");
+        let decoded: ToolDefinition = serde_json::from_value(encoded).expect("decode");
+        assert_eq!(decoded.strict_rank, ToolStrictRank::default());
+
+        definition.strict_rank = ToolStrictRank {
+            preferred: false,
+            priority: -3,
+        };
+        let encoded = serde_json::to_value(&definition).expect("encode");
+        assert_eq!(
+            encoded["strict_rank"],
+            json!({"preferred": false, "priority": -3})
+        );
+        let decoded: ToolDefinition = serde_json::from_value(encoded).expect("decode");
+        assert_eq!(decoded, definition);
+        // Each part defaults on its own.
+        let rank: ToolStrictRank = serde_json::from_value(json!({"priority": 4})).expect("rank");
+        assert_eq!(
+            rank,
+            ToolStrictRank {
+                preferred: true,
+                priority: 4
+            }
+        );
+    }
 
     #[test]
     fn tool_surface_filter_restricts_by_intersection_and_union() {

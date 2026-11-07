@@ -2234,26 +2234,27 @@ fn cache_write_1h_tokens(usage: &Value) -> u64 {
 /// bytes on every turn whatever order the runtime lists them in, with a
 /// prompt-cache breakpoint on the last one. Each `input_schema` goes out as
 /// the tool defines it. A tool that asks for strict input gets
-/// `strict: true` when the model takes it and its schema is in the subset
-/// strict tool use enforces, within the per-request limits (taken in name
-/// order, so the same tools always get the same answer).
+/// `strict: true` when the model takes it, its schema is in the subset
+/// strict tool use enforces, and [`anthropic_strict_selection`] keeps it
+/// within the per-request limits.
 fn anthropic_tools(tools: &[kheish_types::ToolDefinition], strict_tools: bool) -> Vec<Value> {
     let mut sorted = tools.iter().collect::<Vec<_>>();
     sorted.sort_by(|left, right| left.name.cmp(&right.name));
-    let mut budget = AnthropicStrictBudget::default();
+    let strict = if strict_tools {
+        anthropic_strict_selection(&sorted)
+    } else {
+        vec![false; sorted.len()]
+    };
     let mut encoded = sorted
         .into_iter()
-        .map(|tool| {
+        .zip(strict)
+        .map(|(tool, strict)| {
             let mut encoded = json!({
                 "name": tool.name,
                 "description": tool.description,
                 "input_schema": tool.input_schema,
             });
-            if strict_tools
-                && tool.strict
-                && anthropic_strict_schema_cost(&tool.input_schema)
-                    .is_some_and(|cost| budget.admit(cost))
-            {
+            if strict {
                 encoded["strict"] = Value::Bool(true);
             }
             encoded
@@ -2263,6 +2264,47 @@ fn anthropic_tools(tools: &[kheish_types::ToolDefinition], strict_tools: bool) -
         last.insert("cache_control".to_string(), anthropic_cache_breakpoint());
     }
     encoded
+}
+
+/// Chooses the tools that go out with `strict: true`: one flag per tool of
+/// `tools`, which are sorted by name. The candidates are the tools that ask
+/// for strict input with a schema strict tool use enforces. When they all
+/// fit the per-request limits, every candidate is strict. Otherwise the
+/// candidates whose [`ToolStrictRank`](kheish_types::ToolStrictRank) does not
+/// prefer strict input all lose it, and the others are taken by priority,
+/// highest first, then by name: each is strict when it still fits what the
+/// ones before it left, so a tool never loses strict input to one ranked
+/// below it. Without ranks (every tool but a trusted MCP server's) this is
+/// name order. The same tools always get the same answer, so the tool prefix
+/// stays byte-stable from one turn to the next.
+fn anthropic_strict_selection(tools: &[&kheish_types::ToolDefinition]) -> Vec<bool> {
+    let candidates = tools
+        .iter()
+        .enumerate()
+        .filter(|(_, tool)| tool.strict)
+        .filter_map(|(index, tool)| {
+            anthropic_strict_schema_cost(&tool.input_schema)
+                .map(|cost| (index, tool.strict_rank, cost))
+        })
+        .collect::<Vec<_>>();
+    let mut everyone = AnthropicStrictBudget::default();
+    let ranked = if candidates.iter().all(|(_, _, cost)| everyone.admit(*cost)) {
+        candidates
+    } else {
+        let mut ranked = candidates
+            .into_iter()
+            .filter(|(_, rank, _)| rank.preferred)
+            .collect::<Vec<_>>();
+        // A stable sort: equal priorities keep name order.
+        ranked.sort_by_key(|(_, rank, _)| std::cmp::Reverse(rank.priority));
+        ranked
+    };
+    let mut selected = vec![false; tools.len()];
+    let mut budget = AnthropicStrictBudget::default();
+    for (index, _, cost) in ranked {
+        selected[index] = budget.admit(cost);
+    }
+    selected
 }
 
 /// The schema complexity limits of strict tool use, per request: the strict
@@ -2597,6 +2639,7 @@ mod tests {
         CAPPED_DEFAULT_MAX_OUTPUT_TOKENS, ConversationKey, InputContentPart, ModelRefusal,
         PromptProjection, ProviderInputItem, ProviderPrompt, RefusalFallbackModel,
         RefusalFallbacks, SummaryBlock, ToolCallRecord, ToolDefinition, ToolResultRecord,
+        ToolStrictRank,
     };
     use tokio_util::sync::CancellationToken;
 
@@ -2761,6 +2804,7 @@ mod tests {
                         }),
                         allows_parallel: true,
                         strict: false,
+                        strict_rank: Default::default(),
                     }],
                     generation: ModelGenerationConfig {
                         model: None,
@@ -3399,6 +3443,7 @@ mod tests {
                     input_schema: json!({"type": "object"}),
                     allows_parallel: true,
                     strict: false,
+                    strict_rank: Default::default(),
                 }],
                 generation: ModelGenerationConfig {
                     reasoning: Some(ReasoningConfig {
@@ -3435,6 +3480,7 @@ mod tests {
                     input_schema: json!({"type": "object"}),
                     allows_parallel: true,
                     strict: false,
+                    strict_rank: Default::default(),
                 }],
                 generation: ModelGenerationConfig {
                     reasoning: Some(ReasoningConfig {
@@ -3533,6 +3579,7 @@ mod tests {
                     input_schema: json!({"type": "object"}),
                     allows_parallel: true,
                     strict: false,
+                    strict_rank: Default::default(),
                 }],
                 generation: ModelGenerationConfig::default(),
             })
@@ -3809,6 +3856,7 @@ mod tests {
             input_schema: json!({"type": "object", "properties": {}}),
             allows_parallel: true,
             strict: false,
+            strict_rank: Default::default(),
         }
     }
 
@@ -5304,6 +5352,7 @@ mod tests {
             input_schema,
             allows_parallel: true,
             strict: true,
+            strict_rank: Default::default(),
         }
     }
 
@@ -5416,6 +5465,271 @@ mod tests {
             .map(|tool| tool.get("strict").is_some())
             .collect::<Vec<_>>();
         assert_eq!(strict, vec![true, true, false]);
+        Ok(())
+    }
+
+    /// The six id-only reads of a Fregate-shaped investigation surface.
+    const FREGATE_READS: [&str; 6] = [
+        "get_asset",
+        "get_exposure",
+        "get_finding",
+        "get_scan",
+        "get_service",
+        "get_template",
+    ];
+
+    /// The other eighteen tools of that surface: lists, searches, act and
+    /// report tools.
+    const FREGATE_OTHERS: [&str; 18] = [
+        "add_note",
+        "annotate_finding",
+        "compare_scans",
+        "list_assets",
+        "list_exposures",
+        "list_facts",
+        "list_findings",
+        "list_scans",
+        "list_templates",
+        "report_progress",
+        "request_review",
+        "run_template",
+        "search_facts",
+        "services_on",
+        "start_scan",
+        "submit_verdict",
+        "tag_asset",
+        "update_exposure",
+    ];
+
+    fn fregate_tool_name(name: &str) -> String {
+        format!("mcp__fregate__{name}")
+    }
+
+    fn id_only_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {"id": {"type": "string", "description": "The record's id."}},
+            "required": ["id"],
+            "additionalProperties": false
+        })
+    }
+
+    /// A closed object schema with `optional` optional string parameters and
+    /// `unions` optional parameters typed `["string", "null"]`.
+    fn parameters_schema(optional: usize, unions: usize) -> Value {
+        let mut schema = json!({"type": "object", "properties": {}, "additionalProperties": false});
+        for index in 0..optional {
+            schema["properties"][format!("o{index:02}")] = json!({"type": "string"});
+        }
+        for index in 0..unions {
+            schema["properties"][format!("u{index:02}")] = json!({"type": ["string", "null"]});
+        }
+        schema
+    }
+
+    fn ranked_tool(
+        name: &str,
+        input_schema: Value,
+        preferred: bool,
+        priority: i32,
+    ) -> ToolDefinition {
+        ToolDefinition {
+            strict_rank: ToolStrictRank {
+                preferred,
+                priority,
+            },
+            ..mcp_tool(name, input_schema)
+        }
+    }
+
+    /// The tools of a request body that go out with `strict: true`, in body
+    /// order (by name).
+    fn strict_tool_names(body: &Value) -> Vec<String> {
+        body["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .filter(|tool| match tool.get("strict") {
+                None => false,
+                Some(strict) => {
+                    assert_eq!(strict, &json!(true), "strict is sent only as true");
+                    true
+                }
+            })
+            .map(|tool| tool["name"].as_str().expect("name").to_string())
+            .collect()
+    }
+
+    fn sorted_names(names: impl IntoIterator<Item = String>) -> Vec<String> {
+        let mut names = names.into_iter().collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn tools_that_do_not_prefer_strict_input_lose_it_first() -> Result<()> {
+        let fregate_surface = |reads_prefer_strict: bool| {
+            FREGATE_READS
+                .iter()
+                .map(|name| {
+                    ranked_tool(
+                        &fregate_tool_name(name),
+                        id_only_schema(),
+                        reads_prefer_strict,
+                        0,
+                    )
+                })
+                .chain(
+                    FREGATE_OTHERS
+                        .iter()
+                        .map(|name| mcp_tool(&fregate_tool_name(name), submit_verdict_schema())),
+                )
+                .collect::<Vec<_>>()
+        };
+
+        // Without hints, the first twenty by name are strict: the id-only
+        // reads take six of them, and start_scan, submit_verdict, tag_asset
+        // and update_exposure go out without strict.
+        let body = body_with_tools("claude-opus-5-5", fregate_surface(true))?;
+        let by_name = sorted_names(
+            FREGATE_READS
+                .iter()
+                .chain(FREGATE_OTHERS.iter())
+                .map(|name| fregate_tool_name(name)),
+        );
+        assert_eq!(strict_tool_names(&body), by_name[..20].to_vec());
+        assert!(!strict_tool_names(&body).contains(&fregate_tool_name("start_scan")));
+
+        // With the six reads marked as not preferring strict input, exactly
+        // the other eighteen are strict.
+        let body = body_with_tools("claude-opus-5-5", fregate_surface(false))?;
+        let others = sorted_names(FREGATE_OTHERS.iter().map(|name| fregate_tool_name(name)));
+        assert_eq!(strict_tool_names(&body), others);
+        assert_eq!(body["tools"].as_array().expect("tools").len(), 24);
+
+        // When every tool asking for strict input fits, the reads keep it.
+        let tools = fregate_surface(false)
+            .into_iter()
+            .filter(|tool| {
+                FREGATE_READS
+                    .iter()
+                    .any(|name| tool.name == fregate_tool_name(name))
+                    || tool.name < fregate_tool_name("list_findings")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tools.len(), 12);
+        let names = sorted_names(tools.iter().map(|tool| tool.name.clone()));
+        let body = body_with_tools("claude-opus-5-5", tools)?;
+        assert_eq!(strict_tool_names(&body), names);
+        Ok(())
+    }
+
+    #[test]
+    fn higher_strict_priorities_keep_strict_input() -> Result<()> {
+        let priority = |name: &str| match name {
+            "submit_verdict" => 20,
+            "run_template" | "start_scan" => 10,
+            "get_asset" | "get_exposure" => -1,
+            _ => 0,
+        };
+        let tools = FREGATE_READS
+            .iter()
+            .chain(FREGATE_OTHERS.iter())
+            .map(|name| {
+                ranked_tool(
+                    &fregate_tool_name(name),
+                    submit_verdict_schema(),
+                    true,
+                    priority(name),
+                )
+            })
+            .collect::<Vec<_>>();
+        let body = body_with_tools("claude-opus-5-5", tools)?;
+        let strict = strict_tool_names(&body);
+        assert_eq!(strict.len(), 20);
+        for kept in ["submit_verdict", "run_template", "start_scan"] {
+            assert!(strict.contains(&fregate_tool_name(kept)), "{kept}");
+        }
+        // The two at -1 lose it first, then the last two of priority 0 by
+        // name.
+        let all = sorted_names(
+            FREGATE_READS
+                .iter()
+                .chain(FREGATE_OTHERS.iter())
+                .map(|name| fregate_tool_name(name)),
+        );
+        let dropped = all
+            .into_iter()
+            .filter(|name| !strict.contains(name))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dropped,
+            ["get_asset", "get_exposure", "tag_asset", "update_exposure"]
+                .map(fregate_tool_name)
+                .to_vec()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ranked_strict_tools_stay_within_the_optional_and_union_limits() -> Result<()> {
+        use super::anthropic_strict_schema_cost as cost;
+        let within_limits = |tools: &[ToolDefinition], strict: &[String]| {
+            let (optional, unions) = tools
+                .iter()
+                .filter(|tool| strict.contains(&tool.name))
+                .map(|tool| cost(&tool.input_schema).expect("strict schema"))
+                .fold((0, 0), |(optional, unions), cost| {
+                    (
+                        optional + cost.optional_parameters,
+                        unions + cost.union_parameters,
+                    )
+                });
+            assert!(optional <= 24, "{optional} optional parameters");
+            assert!(unions <= 16, "{unions} union parameters");
+        };
+
+        // Optional parameters: 24 per request. The two ranked highest take
+        // 20; `a_opt` (10 more) no longer fits, `d_small` (3 more), ranked
+        // below it, still does. A tool that does not prefer strict input
+        // loses it although it would fit too.
+        let tools = vec![
+            ranked_tool("a_opt", parameters_schema(10, 0), true, 0),
+            ranked_tool("b_opt", parameters_schema(10, 0), true, 5),
+            ranked_tool("c_opt", parameters_schema(10, 0), true, 9),
+            ranked_tool("d_small", parameters_schema(3, 0), true, -5),
+            ranked_tool("e_tiny", parameters_schema(1, 0), false, 50),
+        ];
+        let body = body_with_tools("claude-opus-5-5", tools.clone())?;
+        let strict = strict_tool_names(&body);
+        assert_eq!(strict, ["b_opt", "c_opt", "d_small"].map(String::from));
+        within_limits(&tools, &strict);
+
+        // Union-typed parameters: 16 per request (each is optional too, so
+        // the optional budget of 24 holds as well).
+        let tools = vec![
+            ranked_tool("x_union", parameters_schema(0, 6), true, 0),
+            ranked_tool("y_union", parameters_schema(0, 6), true, 1),
+            ranked_tool("z_union", parameters_schema(0, 6), true, 2),
+        ];
+        let body = body_with_tools("claude-opus-5-5", tools.clone())?;
+        let strict = strict_tool_names(&body);
+        assert_eq!(strict, ["y_union", "z_union"].map(String::from));
+        within_limits(&tools, &strict);
+
+        // The same tools without ranks keep the name order.
+        let tools = tools
+            .into_iter()
+            .map(|tool| ToolDefinition {
+                strict_rank: ToolStrictRank::default(),
+                ..tool
+            })
+            .collect::<Vec<_>>();
+        let body = body_with_tools("claude-opus-5-5", tools)?;
+        assert_eq!(
+            strict_tool_names(&body),
+            ["x_union", "y_union"].map(String::from)
+        );
         Ok(())
     }
 

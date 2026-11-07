@@ -135,9 +135,16 @@ limits). An MCP tool also asks for strict input: the driver sends `strict: true`
 takes strict tool use (every 5.x generation, Claude Opus 4.8, Claude Haiku 4.5, Claude Opus 4.5 and
 4.1) and the schema is in the subset it enforces (every object closed with
 `additionalProperties: false`; no length, range or pattern limits; supported string formats only;
-no recursive references). The first 20 such tools by name get it, within 24 optional and 16
-union-typed parameters across them. A tool result the tool reported as failed (an MCP `isError`)
-is sent with `is_error: true`.
+no recursive references). One request holds at most 20 strict tools, with 24 optional and 16
+union-typed parameters across them. When the tools asking for strict input all fit, they all get
+it. When they do not, a trusted MCP server's hints choose: the tools it marks
+`kheish/strict_preferred: false` in their `_meta` lose `strict` first, the others are ranked by
+`kheish/strict_priority` (highest first, then by qualified tool name), and in that order each tool
+keeps `strict` when it still fits what the tools before it left. Without hints (Kheish's own tools,
+an untrusted server's) the order is the tool name. The same tools get the same answer on every turn,
+so the cached tool prefix holds. See
+[Choosing which MCP tools stay strict](/automation/tools-and-mcp#choosing-which-mcp-tools-stay-strict).
+A tool result the tool reported as failed (an MCP `isError`) is sent with `is_error: true`.
 
 The other drivers take a subset of JSON Schema. OpenAI, OpenRouter and xAI get the structural
 keywords (`type` including `integer`, `description`, `properties`, `required`,

@@ -11,6 +11,7 @@ use kheish_runtime::{
     ToolExecutionOutput, ToolRuntime, external_action_trace, failed_external_action_outcome,
     redact_text,
 };
+use kheish_types::ToolStrictRank;
 use parking_lot::RwLock as SyncRwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -24,8 +25,8 @@ use crate::config::{
 };
 use crate::tools::{
     MCP_UNTRUSTED_NOTICE, McpListResourceTemplatesTool, McpListResourcesTool, McpReadResourceTool,
-    McpToolAdapter, qualify_tool_name, resource_contents_json, sanitize_mcp_value,
-    tool_result_output,
+    McpToolAdapter, McpToolStrictHint, qualify_tool_name, resource_contents_json,
+    sanitize_mcp_value, tool_result_output,
 };
 
 /// `tools/call` `_meta` key carrying the calling Kheish session id.
@@ -34,6 +35,18 @@ pub const MCP_META_SESSION_ID: &str = "kheish/session_id";
 pub const MCP_META_RUN_ID: &str = "kheish/run_id";
 /// `tools/call` `_meta` key carrying the model tool call id being executed.
 pub const MCP_META_TOOL_CALL_ID: &str = "kheish/tool_call_id";
+/// Tool `_meta` key (`tools/list`) by which a trusted server says whether the
+/// tool prefers strict input: a boolean, `true` when absent. With `false`
+/// the tool stays strict while every tool asking for strict input fits the
+/// provider's per-request limits, and is the first to lose it when they do
+/// not. An untrusted server's is ignored.
+pub const MCP_TOOL_META_STRICT_PREFERRED: &str = "kheish/strict_preferred";
+/// Tool `_meta` key (`tools/list`) by which a trusted server ranks the tool
+/// for strict input: an integer within the `i32` range, `0` when absent.
+/// Among the tools that prefer strict input, the higher keeps it longer;
+/// equal priorities fall back to name order. An untrusted server's is
+/// ignored.
+pub const MCP_TOOL_META_STRICT_PRIORITY: &str = "kheish/strict_priority";
 /// Reserved argument key a model may not use to smuggle protocol metadata.
 const MCP_META_ARGUMENT_KEY: &str = "_meta";
 
@@ -230,6 +243,10 @@ pub(crate) struct DiscoveredMcpTool {
     /// The owning server's trust, which shapes the tool's description,
     /// schema and results as the model sees them.
     pub(crate) trust: McpServerTrust,
+    /// The strict-input rank the tool's `_meta` asks for when its server is
+    /// trusted; the default for an untrusted server's tool. The provider
+    /// definition checks the trust again before using it.
+    pub(crate) strict_hint: ToolStrictRank,
 }
 
 #[derive(Clone)]
@@ -1802,16 +1819,49 @@ fn filter_discovered_tools(
                 || config.enabled_tools.iter().any(|name| name == tool_name))
                 && !config.disabled_tools.iter().any(|name| name == tool_name)
         })
-        .map(|tool| DiscoveredMcpTool {
-            qualified_name: qualify_tool_name(&config.name, tool.name.as_ref()),
-            server_name: config.name.clone(),
-            tool_name: tool.name.to_string(),
-            description: tool.description.as_deref().unwrap_or_default().to_string(),
-            input_schema: Value::Object((*tool.input_schema).clone()),
-            tool_timeout_ms: config.tool_timeout_ms,
-            trust: config.trust,
+        .map(|tool| {
+            let strict_hint = discovered_strict_hint(config, &tool);
+            DiscoveredMcpTool {
+                qualified_name: qualify_tool_name(&config.name, tool.name.as_ref()),
+                server_name: config.name.clone(),
+                tool_name: tool.name.to_string(),
+                description: tool.description.as_deref().unwrap_or_default().to_string(),
+                input_schema: Value::Object((*tool.input_schema).clone()),
+                tool_timeout_ms: config.tool_timeout_ms,
+                trust: config.trust,
+                strict_hint,
+            }
         })
         .collect()
+}
+
+/// Reads the strict-input hints of one listed tool when its server is
+/// trusted; an untrusted server's tool gets the default rank, whatever its
+/// `_meta` says. Logs the hints that are not honoured: an untrusted
+/// server's, and a trusted server's of the wrong type.
+fn discovered_strict_hint(config: &McpServerConfig, tool: &rmcp::model::Tool) -> ToolStrictRank {
+    let hint = McpToolStrictHint::from_meta(tool.meta.as_ref().map(|meta| &meta.0));
+    if !config.trust.trusted {
+        if hint.present {
+            tracing::debug!(
+                target: "kheish.mcp",
+                mcp_server = %config.name,
+                tool = %tool.name,
+                "ignoring the strict hints of a tool from an untrusted MCP server"
+            );
+        }
+        return ToolStrictRank::default();
+    }
+    if !hint.malformed.is_empty() {
+        tracing::warn!(
+            target: "kheish.mcp",
+            mcp_server = %config.name,
+            tool = %tool.name,
+            keys = ?hint.malformed,
+            "ignoring MCP tool strict hints of the wrong type: {MCP_TOOL_META_STRICT_PREFERRED} takes a boolean and {MCP_TOOL_META_STRICT_PRIORITY} an integer within the i32 range"
+        );
+    }
+    hint.rank
 }
 
 #[cfg(test)]
@@ -1824,19 +1874,23 @@ mod tests {
         AUTH_STORE_MASTER_KEY_ENV, AuthManager, AuthSlotId, McpOAuthAccountRecordInput,
         register_ephemeral_debug_redaction_token,
     };
-    use kheish_runtime::{McpRuntimeSurface, NoopObserver, ToolRuntime};
+    use kheish_runtime::{McpRuntimeSurface, NoopObserver, Tool, ToolRuntime};
     use parking_lot::{Mutex as SyncMutex, RwLock as SyncRwLock};
     use serde_json::json;
     use tokio::sync::RwLock;
 
+    use kheish_types::ToolStrictRank;
+
     use super::{
         DiscoveredMcpTool, MAX_MCP_SERVER_INSTRUCTION_CHARS, ManagedServer, McpManager,
-        OAUTH_LAZY_STARTUP_ERROR, conflicting_tool_owner, mcp_collection_error_payload,
-        mcp_runtime_error_implies_disconnected, read_resource_output_json,
+        OAUTH_LAZY_STARTUP_ERROR, conflicting_tool_owner, filter_discovered_tools,
+        mcp_collection_error_payload, mcp_runtime_error_implies_disconnected,
+        read_resource_output_json,
     };
     use crate::client::McpClient;
     use crate::config::{
         LoadedMcpServerConfig, McpHttpAuth, McpServerConfig, McpServerSource, McpServerTransport,
+        McpServerTrust,
     };
     use crate::tools::McpToolAdapter;
 
@@ -2126,6 +2180,7 @@ mod tests {
                         input_schema: json!({"type":"object"}),
                         tool_timeout_ms: 120_000,
                         trust: Default::default(),
+                        strict_hint: Default::default(),
                     }],
                     error: None,
                     connected: true,
@@ -2416,6 +2471,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
             tool_timeout_ms: 1_000,
             trust: Default::default(),
+            strict_hint: Default::default(),
         };
         let mut current = BTreeMap::new();
         current.insert(
@@ -2481,6 +2537,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
             tool_timeout_ms: 120_000,
             trust: Default::default(),
+            strict_hint: Default::default(),
         };
 
         let manager = McpManager {
@@ -2810,6 +2867,108 @@ mod tests {
             Some("oauth_requires_scoped_runtime_initialization")
         );
         assert!(server.uses_credentials);
+        Ok(())
+    }
+
+    /// A streamable-HTTP server registration named `fregate`.
+    fn fregate_http_config(trusted: bool) -> McpServerConfig {
+        McpServerConfig {
+            name: "fregate".to_string(),
+            startup_timeout_ms: 10_000,
+            tool_timeout_ms: 120_000,
+            required: false,
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            inherit_env: false,
+            credential_secret_refs: Vec::new(),
+            transport: McpServerTransport::StreamableHttp {
+                url: "http://127.0.0.1:9/mcp".to_string(),
+                headers: BTreeMap::new(),
+                auth: McpHttpAuth::None,
+            },
+            trust: McpServerTrust {
+                trusted,
+                ..McpServerTrust::default()
+            },
+        }
+    }
+
+    /// A `tools/list` result as a server sends it: strict hints in each
+    /// tool's `_meta`, next to a key Kheish does not read.
+    fn hinted_tools_list() -> Result<rmcp::model::ListToolsResult> {
+        Ok(serde_json::from_value(json!({"tools": [
+            {
+                "name": "get_scan",
+                "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}},
+                "_meta": {"kheish/strict_preferred": false, "fregate/kind": "read"}
+            },
+            {
+                "name": "start_scan",
+                "inputSchema": {"type": "object", "properties": {"target": {"type": "string"}}},
+                "_meta": {"kheish/strict_priority": 10}
+            },
+            {
+                "name": "run_template",
+                "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}},
+                "_meta": {"kheish/strict_priority": "high", "kheish/strict_preferred": true}
+            },
+            {
+                "name": "list_scans",
+                "inputSchema": {"type": "object", "properties": {}}
+            }
+        ]}))?)
+    }
+
+    /// The name and strict rank of each listed tool as providers see it.
+    fn advertised_strict_ranks(trusted: bool) -> Result<Vec<(String, ToolStrictRank)>> {
+        Ok(
+            filter_discovered_tools(&fregate_http_config(trusted), hinted_tools_list()?)
+                .iter()
+                .map(|tool| {
+                    let definition =
+                        McpToolAdapter::for_tool(McpManager::empty_for_tests(), tool).definition();
+                    assert!(definition.strict, "{}", definition.name);
+                    (definition.name, definition.strict_rank)
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn listed_tool_meta_ranks_a_trusted_server_tools_for_strict_input() -> Result<()> {
+        let not_preferred = ToolStrictRank {
+            preferred: false,
+            priority: 0,
+        };
+        let priority = |priority| ToolStrictRank {
+            preferred: true,
+            priority,
+        };
+        assert_eq!(
+            advertised_strict_ranks(true)?,
+            vec![
+                ("mcp__fregate__get_scan".to_string(), not_preferred),
+                ("mcp__fregate__start_scan".to_string(), priority(10)),
+                // A priority that is not an integer is ignored, the
+                // preference next to it is read.
+                ("mcp__fregate__run_template".to_string(), priority(0)),
+                ("mcp__fregate__list_scans".to_string(), priority(0)),
+            ]
+        );
+
+        // An untrusted server's hints are dropped at discovery and never
+        // reach providers.
+        let untrusted = filter_discovered_tools(&fregate_http_config(false), hinted_tools_list()?);
+        assert!(
+            untrusted
+                .iter()
+                .all(|tool| tool.strict_hint == ToolStrictRank::default())
+        );
+        assert!(
+            advertised_strict_ranks(false)?
+                .iter()
+                .all(|(_, rank)| *rank == ToolStrictRank::default())
+        );
         Ok(())
     }
 }

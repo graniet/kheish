@@ -111,7 +111,7 @@ pub use skills::{
 };
 pub use tools::{
     ContextUpdate, DYNAMIC_MCP_TOOL_ALLOWLIST_SENTINEL, MessageRecord, Role, ToolCallRecord,
-    ToolDefinition, ToolResultRecord, ToolSurfaceFilter, is_dynamic_mcp_tool_entry,
+    ToolDefinition, ToolResultRecord, ToolStrictRank, ToolSurfaceFilter, is_dynamic_mcp_tool_entry,
 };
 
 #[cfg(test)]

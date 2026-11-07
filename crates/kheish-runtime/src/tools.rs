@@ -8,7 +8,7 @@ use kheish_core::{HookDispatcher, ToolCatalog, ToolExecutor};
 use kheish_types::{
     ContextUpdate, HookDecision, HookDispatchOutcome, HookEventName, HookInvocation,
     StructuredFieldSchema, StructuredValueKind, ToolCallRecord, ToolDefinition, ToolResultRecord,
-    ToolSurfaceFilter,
+    ToolStrictRank, ToolSurfaceFilter,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1696,6 +1696,7 @@ impl ToolDescriptor {
             input_schema: self.schema.json_schema(),
             allows_parallel: self.allows_parallel,
             strict: false,
+            strict_rank: ToolStrictRank::default(),
         }
     }
 }

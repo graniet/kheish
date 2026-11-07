@@ -2398,6 +2398,7 @@ mod tests {
             }),
             allows_parallel: false,
             strict: false,
+            strict_rank: Default::default(),
         }];
         request.generation.response_format = ResponseFormat::StructuredJson {
             schema: StructuredFieldSchema {
@@ -2480,6 +2481,7 @@ mod tests {
             }),
             allows_parallel: false,
             strict: false,
+            strict_rank: Default::default(),
         }];
         request.generation.tool_choice = ToolChoice::Specific {
             name: "generate_audio".to_string(),
@@ -2765,6 +2767,7 @@ mod tests {
             }),
             allows_parallel: false,
             strict: false,
+            strict_rank: Default::default(),
         }];
         let (sender, mut receiver) = mpsc::unbounded_channel();
         provider

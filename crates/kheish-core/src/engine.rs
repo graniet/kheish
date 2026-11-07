@@ -3815,6 +3815,7 @@ mod tests {
                     }),
                     allows_parallel: true,
                     strict: false,
+                    strict_rank: Default::default(),
                 },
                 ToolDefinition {
                     name: "write_file".to_string(),
@@ -3830,6 +3831,7 @@ mod tests {
                     }),
                     allows_parallel: false,
                     strict: false,
+                    strict_rank: Default::default(),
                 },
             ];
             // Other tools the scripted turns call; every one is advertised so
@@ -3851,6 +3853,7 @@ mod tests {
                     input_schema: json!({"type": "object"}),
                     allows_parallel: false,
                     strict: false,
+                    strict_rank: Default::default(),
                 }),
             );
             definitions
@@ -6316,6 +6319,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 allows_parallel: false,
                 strict: false,
+                strict_rank: Default::default(),
             }],
             active_skills: vec![kheish_types::ActiveSkillSnapshot {
                 name: "machine_report".to_string(),

@@ -998,6 +998,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
             allows_parallel: false,
             strict: false,
+            strict_rank: Default::default(),
         }];
 
         // No ledger yet, but the tool is present -> a generic framing still renders.
@@ -1044,6 +1045,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
             allows_parallel: false,
             strict: false,
+            strict_rank: Default::default(),
         }];
 
         // create_goal can be used when the user explicitly requests a goal, but
@@ -1230,6 +1232,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
             allows_parallel: true,
             strict: false,
+            strict_rank: Default::default(),
         }]
     }
 
@@ -1339,6 +1342,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 allows_parallel: true,
                 strict: false,
+                strict_rank: Default::default(),
             }],
             None,
             None,
@@ -1381,6 +1385,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 allows_parallel: false,
                 strict: false,
+                strict_rank: Default::default(),
             }],
             None,
             None,
@@ -1579,6 +1584,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
             allows_parallel: true,
             strict: true,
+            strict_rank: Default::default(),
         })
         .collect()
     }
@@ -1735,6 +1741,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
             allows_parallel: true,
             strict: false,
+            strict_rank: Default::default(),
         });
         tools.push(ToolDefinition {
             name: "apply_patch".to_string(),
@@ -1742,6 +1749,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
             allows_parallel: false,
             strict: false,
+            strict_rank: Default::default(),
         });
         let with_builtins = names(&tools);
         assert!(with_builtins.iter().any(|name| name == "web_research"));

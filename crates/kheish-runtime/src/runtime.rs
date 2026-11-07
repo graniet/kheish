@@ -3221,6 +3221,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
             allows_parallel: false,
             strict: false,
+            strict_rank: Default::default(),
         }
     }
 

@@ -7,11 +7,13 @@ use kheish_runtime::{
     SandboxProfile, Tool, ToolContext, ToolDescriptor, ToolExecutionOutput, ToolInputKind,
     ToolSchema, ToolSchemaField, redact_text, tool_context_string_allowlist,
 };
-use kheish_types::{StructuredFieldSchema, StructuredValueKind, ToolDefinition};
+use kheish_types::{StructuredFieldSchema, StructuredValueKind, ToolDefinition, ToolStrictRank};
 use serde_json::{Map, Value, json};
 
 use crate::config::McpResultFormat;
-use crate::manager::{DiscoveredMcpTool, McpManager};
+use crate::manager::{
+    DiscoveredMcpTool, MCP_TOOL_META_STRICT_PREFERRED, MCP_TOOL_META_STRICT_PRIORITY, McpManager,
+};
 
 const MAX_DESCRIPTION_CHARS: usize = 2_048;
 const MAX_SCHEMA_FIELD_DESCRIPTION_CHARS: usize = 1_024;
@@ -75,8 +77,10 @@ pub(crate) fn discovered_tool_descriptor(tool: &DiscoveredMcpTool) -> ToolDescri
 /// `required`, `additionalProperties`, length and range limits), marked
 /// `strict` so a provider that can enforce it does. Only the descriptions
 /// change: each is redacted and bounded, and an untrusted server's carry the
-/// untrusted-description prefix. A schema too large or too deep to pass
-/// through falls back to the descriptor's rendering.
+/// untrusted-description prefix. A trusted server's strict hints rank the
+/// tool for strict input; an untrusted server's are ignored, so its tools
+/// rank by name. A schema too large or too deep to pass through falls back
+/// to the descriptor's rendering.
 pub(crate) fn discovered_tool_definition(
     tool: &DiscoveredMcpTool,
     descriptor: &ToolDescriptor,
@@ -88,8 +92,55 @@ pub(crate) fn discovered_tool_definition(
             input_schema,
             allows_parallel: descriptor.allows_parallel,
             strict: true,
+            strict_rank: if tool.trust.trusted {
+                tool.strict_hint
+            } else {
+                ToolStrictRank::default()
+            },
         },
         None => descriptor.definition(),
+    }
+}
+
+/// What one MCP tool's `_meta` asks for strict input, read from
+/// [`MCP_TOOL_META_STRICT_PREFERRED`] and [`MCP_TOOL_META_STRICT_PRIORITY`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct McpToolStrictHint {
+    /// The rank asked for. A key that is absent, or set to a value of the
+    /// wrong type, keeps its default.
+    pub(crate) rank: ToolStrictRank,
+    /// Whether the tool sets either key.
+    pub(crate) present: bool,
+    /// The keys set to a value of the wrong type.
+    pub(crate) malformed: Vec<&'static str>,
+}
+
+impl McpToolStrictHint {
+    /// Reads the hint from a tool's `_meta`: a boolean preference and an
+    /// integer priority within the `i32` range.
+    pub(crate) fn from_meta(meta: Option<&Map<String, Value>>) -> Self {
+        let mut hint = Self::default();
+        let Some(meta) = meta else {
+            return hint;
+        };
+        if let Some(value) = meta.get(MCP_TOOL_META_STRICT_PREFERRED) {
+            hint.present = true;
+            match value.as_bool() {
+                Some(preferred) => hint.rank.preferred = preferred,
+                None => hint.malformed.push(MCP_TOOL_META_STRICT_PREFERRED),
+            }
+        }
+        if let Some(value) = meta.get(MCP_TOOL_META_STRICT_PRIORITY) {
+            hint.present = true;
+            match value
+                .as_i64()
+                .and_then(|priority| i32::try_from(priority).ok())
+            {
+                Some(priority) => hint.rank.priority = priority,
+                None => hint.malformed.push(MCP_TOOL_META_STRICT_PRIORITY),
+            }
+        }
+        hint
     }
 }
 
@@ -1118,6 +1169,7 @@ mod tests {
                 trusted,
                 ..McpServerTrust::default()
             },
+            strict_hint: Default::default(),
         }
     }
 
@@ -1240,6 +1292,113 @@ mod tests {
             assert!(!definition.strict, "a fallback schema is not strict");
             assert_eq!(definition, discovered_tool_descriptor(&tool).definition());
         }
+    }
+
+    #[test]
+    fn mcp_strict_hints_are_read_from_the_tool_meta() {
+        let read = |meta: Value| McpToolStrictHint::from_meta(meta.as_object());
+        assert_eq!(
+            read(json!({
+                "kheish/strict_preferred": false,
+                "kheish/strict_priority": -7,
+                "fregate/kind": "read"
+            })),
+            McpToolStrictHint {
+                rank: ToolStrictRank {
+                    preferred: false,
+                    priority: -7
+                },
+                present: true,
+                malformed: Vec::new(),
+            }
+        );
+        assert_eq!(
+            read(json!({"kheish/strict_priority": i32::MAX})).rank,
+            ToolStrictRank {
+                preferred: true,
+                priority: i32::MAX
+            }
+        );
+        assert_eq!(
+            read(json!({"kheish/strict_priority": i32::MIN}))
+                .rank
+                .priority,
+            i32::MIN
+        );
+        assert_eq!(
+            McpToolStrictHint::from_meta(None),
+            McpToolStrictHint::default()
+        );
+        assert!(!read(json!({"progressToken": 1, "kheish/strict": false})).present);
+
+        // A value of the wrong type counts as absent, and is reported.
+        for (meta, malformed) in [
+            (
+                json!({"kheish/strict_preferred": "false"}),
+                vec![MCP_TOOL_META_STRICT_PREFERRED],
+            ),
+            (
+                json!({"kheish/strict_preferred": 0}),
+                vec![MCP_TOOL_META_STRICT_PREFERRED],
+            ),
+            (
+                json!({"kheish/strict_priority": 1.5}),
+                vec![MCP_TOOL_META_STRICT_PRIORITY],
+            ),
+            (
+                json!({"kheish/strict_priority": "10"}),
+                vec![MCP_TOOL_META_STRICT_PRIORITY],
+            ),
+            (
+                json!({"kheish/strict_priority": i64::from(i32::MAX) + 1}),
+                vec![MCP_TOOL_META_STRICT_PRIORITY],
+            ),
+            (
+                json!({"kheish/strict_preferred": null, "kheish/strict_priority": null}),
+                vec![
+                    MCP_TOOL_META_STRICT_PREFERRED,
+                    MCP_TOOL_META_STRICT_PRIORITY,
+                ],
+            ),
+        ] {
+            let hint = read(meta.clone());
+            assert!(hint.present, "{meta}");
+            assert_eq!(hint.rank, ToolStrictRank::default(), "{meta}");
+            assert_eq!(hint.malformed, malformed, "{meta}");
+        }
+    }
+
+    #[test]
+    fn only_a_trusted_server_ranks_its_tools_for_strict_input() {
+        let hint = McpToolStrictHint::from_meta(
+            json!({"kheish/strict_preferred": false, "kheish/strict_priority": 12}).as_object(),
+        )
+        .rank;
+        let mut trusted = discovered(rich_schema(), true);
+        trusted.strict_hint = hint;
+        let definition = definition_of(&trusted);
+        assert!(definition.strict);
+        assert_eq!(
+            definition.strict_rank,
+            ToolStrictRank {
+                preferred: false,
+                priority: 12
+            }
+        );
+
+        let mut untrusted = discovered(rich_schema(), false);
+        untrusted.strict_hint = hint;
+        let definition = definition_of(&untrusted);
+        assert!(definition.strict);
+        assert_eq!(definition.strict_rank, ToolStrictRank::default());
+
+        // A schema that falls back to Kheish's reading is not strict, and
+        // carries no rank.
+        let mut fallback = discovered(json!("not an object"), true);
+        fallback.strict_hint = hint;
+        let definition = definition_of(&fallback);
+        assert!(!definition.strict);
+        assert_eq!(definition.strict_rank, ToolStrictRank::default());
     }
 
     #[test]
@@ -1440,6 +1599,7 @@ mod tests {
             }),
             tool_timeout_ms: 1_000,
             trust: Default::default(),
+            strict_hint: Default::default(),
         });
 
         assert!(
@@ -1610,6 +1770,7 @@ mod tests {
                 trusted: true,
                 ..McpServerTrust::default()
             },
+            strict_hint: Default::default(),
         };
         let definition = definition_of(&tool);
         assert_eq!(definition.input_schema, server_schema);

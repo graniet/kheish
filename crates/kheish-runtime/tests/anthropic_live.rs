@@ -596,6 +596,7 @@ fn echo_tool_definition() -> ToolDefinition {
         }),
         allows_parallel: false,
         strict: false,
+        strict_rank: Default::default(),
     }
 }
 

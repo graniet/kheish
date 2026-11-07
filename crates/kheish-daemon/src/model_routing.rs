@@ -1370,6 +1370,7 @@ mod tests {
             input_schema: serde_json::Value::Null,
             allows_parallel: false,
             strict: false,
+            strict_rank: Default::default(),
         }
     }
 

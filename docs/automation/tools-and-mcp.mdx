@@ -739,8 +739,9 @@ embeds Kheish; leave third-party servers untrusted.
   formats), `minItems` (0 or 1) and non-recursive local `$ref`/`$defs`. A schema
   with length or range limits is sent as written, without `strict`. At most 20
   strict tools, 24 optional parameters and 16 union-typed parameters go into one
-  request, taken in tool-name order; the tools past them are sent without
-  `strict`.
+  request. When the tools asking for strict input do not all fit, a trusted
+  server's hints choose which keep it (next section); without hints they are
+  taken in tool-name order. The tools left out are sent without `strict`.
 - **Other providers.** OpenAI, OpenRouter and xAI routes get the structural
   subset (`type` with `integer`, `description`, `properties`, `required`,
   `additionalProperties`, `items`, `enum`, `const`, `anyOf`, with `oneOf` read as
@@ -752,6 +753,64 @@ embeds Kheish; leave third-party servers untrusted.
 - **Validation.** Kheish still validates the model's input against its own
   reading of the schema (field names, types, required fields) before the call
   reaches the server.
+
+### Choosing which MCP tools stay strict
+
+A request holds at most 20 strict tools on Anthropic. Name order is a poor
+judge of which ones matter: an id-only read gains little from strict input,
+while an act or report tool with enums and nested objects gains the most. A
+trusted server (`trusted: true` on its registration) says which, per tool, in
+the `_meta` of the tool in its `tools/list` result:
+
+```json
+{
+  "tools": [
+    {
+      "name": "get_scan",
+      "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"], "additionalProperties": false},
+      "_meta": {"kheish/strict_preferred": false}
+    },
+    {
+      "name": "start_scan",
+      "inputSchema": {"type": "object", "properties": {"target": {"type": "string"}, "profile": {"type": "string", "enum": ["quick", "deep"]}}, "required": ["profile", "target"], "additionalProperties": false},
+      "_meta": {"kheish/strict_priority": 10}
+    }
+  ]
+}
+```
+
+| `_meta` key | Value | Absent | Meaning |
+| --- | --- | --- | --- |
+| `kheish/strict_preferred` | boolean | `true` | `false`: the tool can do without strict input. It stays strict while every tool asking for strict input fits, and is the first to lose it when they do not. |
+| `kheish/strict_priority` | integer in the `i32` range, negative allowed | `0` | Among the tools that prefer strict input, a higher priority keeps it longer. |
+
+When the tools asking for strict input, with a schema in the enforced subset, do
+not all fit one request, the Anthropic driver:
+
+1. takes `strict` from every tool marked `kheish/strict_preferred: false`;
+2. ranks the others by `kheish/strict_priority`, highest first;
+3. breaks ties by qualified tool name (`mcp__<server>__<tool>`, so between two
+   trusted servers the server name comes first).
+
+Taken in that order, each tool keeps `strict` when it still fits the 20 tools, 24
+optional and 16 union-typed parameters the tools before it left. A tool never
+loses strict input to one ranked below it, though a smaller tool ranked lower can
+still use what is left. With 24 tools of which 6 are marked
+`kheish/strict_preferred: false`, exactly the other 18 are strict. When every
+tool fits, they are all strict, the marked ones included. The same tools get
+the same answer on every turn, so the cached tool prefix holds.
+
+The hints live in `_meta` because that is where MCP puts implementation-specific
+metadata, under a prefix (Kheish already writes `kheish/session_id` and the like
+on `tools/call`). Tool annotations are a fixed set of hints the specification
+defines, and rmcp drops any other annotation key.
+
+Only a trusted server's hints count. An untrusted server's tools keep tool-name
+order whatever their `_meta` says (the daemon logs that it ignored them at debug
+level, target `kheish.mcp`). A trusted server's key holding a value of the wrong
+type counts as absent and is logged as a warning. Kheish's own tools carry no
+hints. The other drivers decide strict input tool by tool, with no per-request
+budget, so only the Anthropic driver reads them.
 
 ### Hooks as dynamic policy
 

@@ -19,6 +19,7 @@ pub use config::{
     load_codex_mcp_servers, load_mcp_servers,
 };
 pub use manager::{
-    MCP_META_RUN_ID, MCP_META_SESSION_ID, MCP_META_TOOL_CALL_ID, McpManager, McpRuntimeSnapshot,
-    McpServerInstruction, McpServerSnapshot,
+    MCP_META_RUN_ID, MCP_META_SESSION_ID, MCP_META_TOOL_CALL_ID, MCP_TOOL_META_STRICT_PREFERRED,
+    MCP_TOOL_META_STRICT_PRIORITY, McpManager, McpRuntimeSnapshot, McpServerInstruction,
+    McpServerSnapshot,
 };

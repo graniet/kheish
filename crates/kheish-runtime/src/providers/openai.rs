@@ -3685,6 +3685,7 @@ mod tests {
                         }),
                         allows_parallel: true,
                         strict: false,
+                        strict_rank: Default::default(),
                     }],
                     generation: ModelGenerationConfig {
                         model: None,
@@ -4402,6 +4403,7 @@ mod tests {
                         }),
                         allows_parallel: true,
                         strict: false,
+                        strict_rank: Default::default(),
                     }],
                     generation: ModelGenerationConfig::default(),
                 },
@@ -4441,6 +4443,7 @@ mod tests {
                         }),
                         allows_parallel: false,
                         strict: false,
+                        strict_rank: Default::default(),
                     }],
                     generation: ModelGenerationConfig::default(),
                 },
@@ -4505,6 +4508,7 @@ mod tests {
                         }),
                         allows_parallel: false,
                         strict: false,
+                        strict_rank: Default::default(),
                     }],
                     generation: ModelGenerationConfig::default(),
                 },
@@ -4685,6 +4689,7 @@ mod tests {
                         }),
                         allows_parallel: true,
                         strict: false,
+                        strict_rank: Default::default(),
                     }],
                     generation: ModelGenerationConfig::default(),
                 },
@@ -5705,6 +5710,7 @@ mod tests {
                         }),
                         allows_parallel: true,
                         strict: false,
+                        strict_rank: Default::default(),
                     }],
                     generation: ModelGenerationConfig {
                         tool_choice: ToolChoice::Specific {
@@ -6063,6 +6069,7 @@ mod tests {
                         }),
                         allows_parallel: true,
                         strict: false,
+                        strict_rank: Default::default(),
                     }],
                     generation: ModelGenerationConfig {
                         response_format: ResponseFormat::StructuredJson {

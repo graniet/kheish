@@ -3681,6 +3681,7 @@ mod tests {
                     }),
                     allows_parallel: false,
                     strict: false,
+                    strict_rank: Default::default(),
                 }],
                 generation: ModelGenerationConfig::default(),
             })
@@ -3863,6 +3864,7 @@ mod tests {
                     }),
                     allows_parallel: false,
                     strict: false,
+                    strict_rank: Default::default(),
                 }],
                 generation: ModelGenerationConfig::default(),
             })
@@ -3907,6 +3909,7 @@ mod tests {
                     }),
                     allows_parallel: false,
                     strict: false,
+                    strict_rank: Default::default(),
                 }],
                 generation,
             })

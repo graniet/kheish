@@ -1255,6 +1255,176 @@ async fn trusted_mcp_servers_reach_the_model_as_written() -> Result<()> {
     Ok(())
 }
 
+/// The six id-only reads of Fregate's investigation surface.
+const INVESTIGATION_READS: [&str; 6] = [
+    "get_asset",
+    "get_exposure",
+    "get_finding",
+    "get_scan",
+    "get_service",
+    "get_template",
+];
+
+/// The other eighteen tools of that surface: lists, searches, act and report
+/// tools.
+const INVESTIGATION_OTHERS: [&str; 18] = [
+    "add_note",
+    "annotate_finding",
+    "compare_scans",
+    "list_assets",
+    "list_exposures",
+    "list_facts",
+    "list_findings",
+    "list_scans",
+    "list_templates",
+    "report_progress",
+    "request_review",
+    "run_template",
+    "search_facts",
+    "services_on",
+    "start_scan",
+    "submit_verdict",
+    "tag_asset",
+    "update_exposure",
+];
+
+/// Fregate's investigation surface as its `tools/list` gives it: twenty-four
+/// tools whose schemas strict tool use enforces, four more than one request
+/// may make strict. The reads say they can do without strict input; the act
+/// and report tools rank above the rest.
+fn investigation_tools() -> Value {
+    let read_schema = json!({
+        "type": "object",
+        "properties": {"id": {"type": "string", "description": "The record's id."}},
+        "required": ["id"],
+        "additionalProperties": false
+    });
+    let other_schema = json!({
+        "type": "object",
+        "properties": {
+            "target": {"type": "string", "description": "An asset id or a hostname."},
+            "profile": {"type": "string", "enum": ["quick", "standard", "deep"]}
+        },
+        "required": ["profile", "target"],
+        "additionalProperties": false
+    });
+    let reads = INVESTIGATION_READS.iter().map(|name| {
+        json!({
+            "name": name,
+            "description": format!("Fregate's {name}."),
+            "inputSchema": read_schema,
+            "_meta": {"kheish/strict_preferred": false}
+        })
+    });
+    let others = INVESTIGATION_OTHERS.iter().map(|name| {
+        let mut tool = json!({
+            "name": name,
+            "description": format!("Fregate's {name}."),
+            "inputSchema": other_schema
+        });
+        if matches!(*name, "run_template" | "start_scan" | "submit_verdict") {
+            tool["_meta"] = json!({"kheish/strict_priority": 10});
+        }
+        tool
+    });
+    Value::Array(reads.chain(others).collect())
+}
+
+/// The `fregate` tools a request body advertises, by name, and those of them
+/// that go out with `strict: true`.
+fn fregate_tools_and_strict(body: &Value) -> (Vec<String>, Vec<String>) {
+    let tools = body["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .filter(|tool| {
+            tool["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("mcp__fregate__"))
+        })
+        .collect::<Vec<_>>();
+    let names = tools
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("name").to_string())
+        .collect();
+    let strict = tools
+        .iter()
+        .filter(|tool| tool.get("strict") == Some(&json!(true)))
+        .map(|tool| tool["name"].as_str().expect("name").to_string())
+        .collect();
+    (names, strict)
+}
+
+/// The qualified names of `fregate` tools, sorted.
+fn qualified_fregate_names<'a>(names: impl IntoIterator<Item = &'a &'a str>) -> Vec<String> {
+    let mut names = names
+        .into_iter()
+        .map(|name| format!("mcp__fregate__{name}"))
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn a_trusted_mcp_server_chooses_which_tools_stay_strict() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-state");
+    let workspace_root = temp.path().join("workspace");
+    let mock = spawn_anthropic_messages_mock("Done.").await?;
+    let (mcp_url, _mcp_log) = spawn_mcp_stub_serving(
+        investigation_tools(),
+        |_| json!({"content": [{"type": "text", "text": "ok"}]}),
+    )
+    .await?;
+    let (base, shutdown) = verify_daemon(
+        &state_root,
+        &workspace_root,
+        &mock,
+        json!({"name": "fregate", "url": mcp_url, "trusted": true}),
+    )
+    .await?;
+    let client = Client::new();
+    let every_tool = qualified_fregate_names(
+        INVESTIGATION_READS
+            .iter()
+            .chain(INVESTIGATION_OTHERS.iter()),
+    );
+
+    // Trusted: the six reads give strict input up, the other eighteen keep
+    // it, start_scan, run_template and submit_verdict among them.
+    create_test_session(&client, &base, "mission-s1").await?;
+    complete_verify_run(&client, &base, "mission-s1", json!({})).await?;
+    let body = mock.last_request().expect("a model request").body;
+    let (names, strict) = fregate_tools_and_strict(&body);
+    assert_eq!(names, every_tool);
+    assert_eq!(strict, qualified_fregate_names(INVESTIGATION_OTHERS.iter()));
+
+    // The same server untrusted: its hints are ignored, and the first twenty
+    // tools by name are strict, the reads among them and start_scan not.
+    client
+        .delete(format!("{base}/v1/runtime/mcp/servers/fregate"))
+        .send()
+        .await?
+        .error_for_status()?;
+    client
+        .post(format!("{base}/v1/runtime/mcp/servers"))
+        .json(&json!({"name": "fregate", "url": mcp_url}))
+        .send()
+        .await?
+        .error_for_status()?;
+    create_test_session(&client, &base, "mission-s2").await?;
+    complete_verify_run(&client, &base, "mission-s2", json!({})).await?;
+    let body = mock.last_request().expect("a model request").body;
+    let (names, strict) = fregate_tools_and_strict(&body);
+    assert_eq!(names, every_tool);
+    assert_eq!(strict, every_tool[..20].to_vec());
+    assert!(!strict.contains(&"mcp__fregate__start_scan".to_string()));
+
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+    Ok(())
+}
+
 /// A `submit_verdict` input its schema accepts.
 fn verify_verdict_input() -> Value {
     json!({
