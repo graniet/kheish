@@ -2015,6 +2015,61 @@ impl RunService {
         self.cancel_run_with_error(run_id, None, None).await
     }
 
+    /// Removes every run of one idle session from the live run maps and
+    /// returns them, for a session purge.
+    ///
+    /// Fails when the session still has an active, queued, or pending run, or
+    /// any run that is not terminal, so a purge never drops live work.
+    pub(crate) async fn detach_session_runs(&self, session_id: &str) -> Result<Vec<RunRecord>> {
+        let mut runs = self.runs.lock().await;
+        let mut session_runs = self.session_runs.lock().await;
+        if session_runs
+            .get(session_id)
+            .is_some_and(|state| state.active_run_id.is_some() || !state.queued_run_ids.is_empty())
+        {
+            anyhow::bail!("session {session_id} has active or queued runs");
+        }
+        if let Some(live) = runs.values().find(|record| {
+            record.view.session_id == session_id && !record.view.status.is_terminal()
+        }) {
+            anyhow::bail!(
+                "session {session_id} has active or queued runs ({} is {:?})",
+                live.view.run_id,
+                live.view.status
+            );
+        }
+        let run_ids = runs
+            .values()
+            .filter(|record| record.view.session_id == session_id)
+            .map(|record| record.view.run_id.clone())
+            .collect::<Vec<_>>();
+        let detached = run_ids
+            .iter()
+            .filter_map(|run_id| runs.remove(run_id))
+            .collect::<Vec<_>>();
+        session_runs.remove(session_id);
+        *self.indexes.lock() = build_run_indexes(&runs);
+        self.pending_questions
+            .lock()
+            .retain(|_, question| question.session_id != session_id);
+        Ok(detached)
+    }
+
+    /// Deletes everything one detached run left on disk: its record, event
+    /// log, recovered run memory, and debug artifacts. The signed
+    /// external-action ledger is append-only and kept.
+    pub(crate) fn delete_run_artifacts(&self, run_id: &str) -> Result<()> {
+        self.run_store.delete_run_files(run_id)?;
+        self.run_memory_store.delete_run_memory(run_id)?;
+        self.debug_store.delete_run(run_id)?;
+        Ok(())
+    }
+
+    /// Keeps purged run ids from ever being issued again.
+    pub(crate) fn retire_run_ids(&self, run_ids: &[String]) -> Result<()> {
+        self.run_store.raise_seed_floor(run_ids)
+    }
+
     /// Records the `max_duration_ms` deadline of one run on its first start.
     ///
     /// Returns the updated view, or `None` when the run is terminal, has no

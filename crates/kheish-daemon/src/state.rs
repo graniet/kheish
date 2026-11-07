@@ -19,6 +19,7 @@ mod scheduler_workflow;
 mod session_actions;
 mod session_ingress;
 mod session_lifecycle;
+mod session_purge;
 mod session_state;
 mod status;
 mod subagent_lifecycle;
@@ -339,6 +340,8 @@ pub(crate) struct DaemonState<M> {
     armed_run_deadlines: Mutex<BTreeSet<String>>,
     /// The learning scopes runs read (`--learning-read-scopes`).
     learning_read_scopes: crate::LearningReadScopes,
+    /// Serializes session purges.
+    session_purge_lock: tokio::sync::Mutex<()>,
 }
 
 impl<M> DaemonState<M>
@@ -601,6 +604,7 @@ where
             readiness: Arc::new(AtomicBool::new(true)),
             armed_run_deadlines: Mutex::new(BTreeSet::new()),
             learning_read_scopes,
+            session_purge_lock: tokio::sync::Mutex::new(()),
         }
     }
 

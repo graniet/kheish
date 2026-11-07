@@ -1554,3 +1554,260 @@ async fn learning_read_scopes_keep_runs_to_session_and_project_learnings() -> Re
     wait_for_daemon_shutdown(&client, &base).await?;
     Ok(())
 }
+
+fn run_number(run_id: &str) -> u64 {
+    run_id
+        .strip_prefix("run-")
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or_default()
+}
+
+async fn delete_session(client: &Client, base: &str, query: &str) -> Result<reqwest::Response> {
+    Ok(client
+        .delete(format!("{base}/v1/sessions/{query}"))
+        .send()
+        .await?)
+}
+
+async fn end_session(client: &Client, base: &str, session_id: &str) -> Result<()> {
+    client
+        .post(format!("{base}/v1/sessions/{session_id}/end"))
+        .json(&json!({"reason": "mission done"}))
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn ended_sessions_purge_every_trace_and_survive_a_crash_midway() -> Result<()> {
+    use kheish_types::LearningScopeKind;
+
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-state");
+    let workspace_root = temp.path().join("workspace");
+    let mock = spawn_anthropic_messages_mock("done").await?;
+    let (mcp_url, _mcp_log) = spawn_mcp_stub().await?;
+    let endpoint = format!("{}/v1/messages", mock.base);
+    let (address, shutdown) =
+        anthropic_provider_daemon(&state_root, &workspace_root, &endpoint).await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+    client
+        .post(format!("{base}/v1/runtime/mcp/servers"))
+        .json(&json!({"name": "fregate", "url": mcp_url}))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    // A neighbour session whose data must survive the purge.
+    create_test_session(&client, &base, "mission-keep").await?;
+    let kept_run = submit_run_and_complete(&client, &base, "mission-keep", "hello").await?;
+    let kept_learning = publish_fact(
+        &client,
+        &base,
+        LearningScopeKind::Session,
+        "mission-keep",
+        "Keep this note.",
+    )
+    .await?;
+
+    create_test_session(&client, &base, "mission-purge").await?;
+    let first = submit_run_and_complete(&client, &base, "mission-purge", "hello").await?;
+    let purged_learning = publish_fact(
+        &client,
+        &base,
+        LearningScopeKind::Session,
+        "mission-purge",
+        "Purge this note.",
+    )
+    .await?;
+
+    // Only an ended session can be purged.
+    let not_ended = delete_session(&client, &base, "mission-purge").await?;
+    assert_eq!(not_ended.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        not_ended.json::<ProblemDetails>().await?.code,
+        "session_not_ended"
+    );
+    end_session(&client, &base, "mission-purge").await?;
+
+    // A run still waiting for an approval blocks the purge.
+    mock.push(scan_tool_use(
+        "toolu_purge_wait",
+        json!({"target": "example.com"}),
+    ));
+    let waiting = submit_test_input(&client, &base, "mission-purge", "scan").await?;
+    wait_for_pending_approval_run(&client, &base, &waiting.run_id).await?;
+    let busy = delete_session(&client, &base, "mission-purge").await?;
+    assert_eq!(busy.status(), StatusCode::CONFLICT);
+    assert_eq!(busy.json::<ProblemDetails>().await?.code, "session_busy");
+    client
+        .post(format!("{base}/v1/runs/{}/cancel", waiting.run_id))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let purged = delete_session(&client, &base, "mission-purge?reason=retention")
+        .await?
+        .error_for_status()?
+        .json::<SessionPurgeView>()
+        .await?;
+    assert_eq!(purged.session_id, "mission-purge");
+    let mut purged_runs = purged.run_ids.clone();
+    purged_runs.sort();
+    let mut expected_runs = vec![first.run_id.clone(), waiting.run_id.clone()];
+    expected_runs.sort();
+    assert_eq!(purged_runs, expected_runs);
+    assert_eq!(
+        purged.learning_ids,
+        vec![purged_learning.learning_id.clone()]
+    );
+
+    // Every surface forgets the session.
+    let missing = client
+        .get(format!("{base}/v1/sessions/mission-purge"))
+        .send()
+        .await?;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    let sessions = client
+        .get(format!("{base}/v1/sessions"))
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    assert!(!sessions.contains("mission-purge"), "{sessions}");
+    assert!(sessions.contains("mission-keep"), "{sessions}");
+    for run_id in &purged.run_ids {
+        let gone = client
+            .get(format!("{base}/v1/runs/{run_id}"))
+            .send()
+            .await?;
+        assert_eq!(gone.status(), StatusCode::NOT_FOUND, "{run_id}");
+        assert!(!resolve_storage_path_for_read(&state_root.join("runs"), run_id, "json").exists());
+        assert!(
+            !resolve_storage_path_for_read(&state_root.join("run-events"), run_id, "jsonl")
+                .exists()
+        );
+    }
+    assert!(
+        !resolve_storage_path_for_read(&state_root.join("sessions"), "mission-purge", "jsonl")
+            .exists()
+    );
+    assert!(
+        !resolve_storage_path_for_read(&state_root.join("outputs"), "mission-purge", "jsonl")
+            .exists(),
+        "the session's persisted outputs are deleted"
+    );
+    assert!(
+        resolve_storage_path_for_read(&state_root.join("outputs"), "mission-keep", "jsonl")
+            .exists()
+    );
+    assert!(
+        !state_root
+            .join("learnings")
+            .join(format!("{}.json", purged_learning.learning_id))
+            .exists()
+    );
+    // The neighbour is untouched.
+    assert!(
+        state_root
+            .join("learnings")
+            .join(format!("{}.json", kept_learning.learning_id))
+            .exists()
+    );
+    client
+        .get(format!("{base}/v1/runs/{}", kept_run.run_id))
+        .send()
+        .await?
+        .error_for_status()?;
+    // The purge is audited in the supervisor audit log.
+    let audit = client
+        .get(format!("{base}/v1/agents/audit"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<Value>>()
+        .await?;
+    assert!(
+        audit.iter().any(|entry| entry["event"] == "session_purged"
+            && entry["session_id"] == "mission-purge"
+            && entry["reason"] == "retention"),
+        "{audit:#?}"
+    );
+    assert_eq!(
+        delete_session(&client, &base, "mission-purge")
+            .await?
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    // Crash safety: the daemon stops right after writing the plan of a
+    // second purge; the next boot finishes it.
+    end_session(&client, &base, "mission-keep").await?;
+    let keep_view = client
+        .get(format!("{base}/v1/sessions/mission-keep"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionView>()
+        .await?;
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+    let plan_path = kheish_session::prepare_storage_path_for_write(
+        &state_root.join("session-purges"),
+        "mission-keep",
+        "json",
+    )?;
+    std::fs::write(
+        &plan_path,
+        serde_json::to_string_pretty(&json!({
+            "session_id": "mission-keep",
+            "agent_id": keep_view.agent_id,
+            "reason": "retention",
+            "requested_at_ms": 1,
+        }))?,
+    )?;
+
+    let (address, shutdown) =
+        anthropic_provider_daemon(&state_root, &workspace_root, &endpoint).await?;
+    let base = format!("http://{address}");
+    let resumed = client
+        .get(format!("{base}/v1/sessions/mission-keep"))
+        .send()
+        .await?;
+    assert_eq!(resumed.status(), StatusCode::NOT_FOUND);
+    assert!(
+        !plan_path.exists(),
+        "the plan is removed once the purge finishes"
+    );
+    assert!(
+        !state_root
+            .join("learnings")
+            .join(format!("{}.json", kept_learning.learning_id))
+            .exists()
+    );
+    assert!(
+        !resolve_storage_path_for_read(&state_root.join("runs"), &kept_run.run_id, "json").exists()
+    );
+
+    // Purged run ids are never issued again.
+    create_test_session(&client, &base, "mission-next").await?;
+    let next = submit_run_and_complete(&client, &base, "mission-next", "hello").await?;
+    let highest_purged = purged
+        .run_ids
+        .iter()
+        .map(|run_id| run_number(run_id))
+        .max()
+        .unwrap_or_default();
+    assert!(
+        run_number(&next.run_id) > highest_purged,
+        "{} reuses a purged id (highest purged run-{highest_purged})",
+        next.run_id
+    );
+
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+    Ok(())
+}

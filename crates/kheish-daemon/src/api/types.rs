@@ -2367,6 +2367,31 @@ pub struct CancelUserQuestionRequest {
     pub justification: Option<String>,
 }
 
+/// Result of purging one ended session (`DELETE /v1/sessions/{session_id}`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPurgeView {
+    /// The purged session.
+    pub session_id: String,
+    /// The session's root agent, removed from the supervisor topology.
+    pub agent_id: String,
+    /// When the purge finished, in milliseconds since the Unix epoch.
+    pub purged_at_ms: u64,
+    /// Runs whose records, events, run memories, and debug artifacts were deleted.
+    pub run_ids: Vec<String>,
+    /// Session-scoped learnings that were deleted.
+    pub learning_ids: Vec<String>,
+    /// Session-scoped learning candidates that were deleted.
+    pub learning_candidate_ids: Vec<String>,
+}
+
+/// Query of `DELETE /v1/sessions/{session_id}`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PurgeSessionQuery {
+    /// Reason recorded in the supervisor audit log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// Session end request payload.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct EndSessionRequest {

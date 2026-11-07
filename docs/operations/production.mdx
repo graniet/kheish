@@ -88,6 +88,8 @@ append-only (grows), or cold (rarely touched).
 │           └── ...                 (task archive lives alongside as needed)
 │
 ├── run-memories/                   recovered run-memory files (crash-resume context)
+├── session-purges/                 plans of session purges in progress (finished at boot)
+├── run-seed-floor.json             highest purged run id, so run ids are never reused
 ├── learnings/                      durable published learnings (verified/provisional)
 ├── learning-candidates/            captured, not-yet-published learning candidates
 ├── learning-policy.json            LEGACY migration input only (policy now in runtime-config)

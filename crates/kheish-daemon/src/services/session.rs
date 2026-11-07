@@ -714,6 +714,38 @@ impl SessionService {
         Ok(config.clone())
     }
 
+    /// Loads one raw session metadata value, `None` when unset or null.
+    pub(crate) async fn load_session_metadata_value(
+        &self,
+        session_id: &str,
+        key: &str,
+    ) -> Result<Option<Value>> {
+        Ok(self
+            .sessions
+            .load_metadata_value(session_id, key)
+            .await?
+            .filter(|value| !value.is_null()))
+    }
+
+    /// Persists one raw session metadata value as a last-wins sidecar.
+    pub(crate) async fn save_session_metadata_value(
+        &self,
+        session_id: &str,
+        key: &str,
+        value: Value,
+    ) -> Result<()> {
+        self.sessions
+            .append(
+                session_id,
+                PersistedSessionRecord::Metadata {
+                    key: key.to_string(),
+                    value,
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Loads the native tool surface overrides for one session.
     pub(crate) async fn load_session_tool_overrides(
         &self,

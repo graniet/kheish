@@ -770,7 +770,10 @@ where
             "/v1/sessions",
             post(create_session::<M>).get(list_sessions::<M>),
         )
-        .route("/v1/sessions/{session_id}", get(get_session::<M>))
+        .route(
+            "/v1/sessions/{session_id}",
+            get(get_session::<M>).delete(purge_session::<M>),
+        )
         .route(
             "/v1/sessions/{session_id}/permission-audits",
             get(get_session_permission_audits::<M>),
@@ -1992,7 +1995,7 @@ const CONTROL_PLANE_OPENAPI_ROUTES: &[OpenApiRouteSpec] = &[
     },
     OpenApiRouteSpec {
         path: "/v1/sessions/{session_id}",
-        methods: &["GET"],
+        methods: &["GET", "DELETE"],
     },
     OpenApiRouteSpec {
         path: "/v1/sessions/{session_id}/permission-audits",
@@ -5989,6 +5992,21 @@ where
 {
     state
         .set_session_credential_scope(&session_id, None)
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn purge_session<M>(
+    State(state): State<Arc<DaemonState<M>>>,
+    AxumPath(session_id): AxumPath<String>,
+    Query(query): Query<crate::PurgeSessionQuery>,
+) -> Result<Json<crate::SessionPurgeView>, ApiError>
+where
+    M: ModelDriver + Send + Sync + 'static,
+{
+    state
+        .purge_session(&session_id, query.reason)
         .await
         .map(Json)
         .map_err(internal_error)

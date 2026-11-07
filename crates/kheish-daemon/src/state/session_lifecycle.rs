@@ -299,6 +299,8 @@ where
             let _ = self.orchestrator.close_runtime(&agent_id);
             self.persist_topology().await?;
         }
+        self.record_session_ended(session_id, reason.as_deref())
+            .await?;
         info!(
             session_id = %session_id,
             agent_id = %agent_id.0,

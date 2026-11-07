@@ -23,6 +23,7 @@ where
     }
 
     pub(crate) async fn start_restored_run_scheduler_on_boot(self: &Arc<Self>) -> Result<()> {
+        self.resume_pending_session_purges().await;
         let queued_sessions = self.run_service.session_ids().await;
         for session_id in queued_sessions {
             self.refresh_session_queue(&session_id).await?;

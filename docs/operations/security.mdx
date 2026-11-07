@@ -614,6 +614,15 @@ host — via `KHEISH_EXTERNAL_ACTION_AUDIT_SIGNING_KEY_FILE`. The daemon emits a
 startup warning whenever it falls back to the co-located key, precisely so this
 choice is never silent.
 
+A session purge (`DELETE /v1/sessions/{session_id}`) does not touch this
+ledger. The purged runs' ledger files stay, because the ledger is append-only
+and its value is that nothing is ever removed from it. They hold no prompt,
+model output, or tool argument: only ids, targets, digests, outcomes, and
+signatures, so what a purge erases (journals, run records, run memories,
+learnings) is not recoverable from them, while the record that an action
+happened, and its hash chain, stay verifiable. See
+[Session purge](../reference/sessions-and-runs-api#session-purge).
+
 ## What Kheish does not protect against
 
 An honest security model names its edges. Kheish is a serious execution system,

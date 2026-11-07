@@ -424,6 +424,16 @@ impl LearningView {
     }
 }
 
+fn remove_file_if_present(path: &std::path::Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(anyhow::Error::from(error).context(format!("failed to delete {}", path.display())))
+        }
+    }
+}
+
 /// Filesystem-backed learning storage rooted under one daemon state directory.
 #[derive(Clone, Debug)]
 pub(crate) struct FileLearningStore {
@@ -472,6 +482,16 @@ impl FileLearningStore {
     pub(crate) fn save_learning(&self, learning: &LearningView) -> Result<()> {
         learning.validate()?;
         write_json_pretty_atomically(&self.learning_path(&learning.learning_id), learning)
+    }
+
+    /// Deletes one learning candidate file. A missing file is not an error.
+    pub(crate) fn delete_candidate(&self, candidate_id: &str) -> Result<()> {
+        remove_file_if_present(&self.candidate_path(candidate_id))
+    }
+
+    /// Deletes one published learning file. A missing file is not an error.
+    pub(crate) fn delete_learning(&self, learning_id: &str) -> Result<()> {
+        remove_file_if_present(&self.learning_path(learning_id))
     }
 
     /// Returns the next numeric candidate identifier seed.

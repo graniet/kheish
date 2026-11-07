@@ -346,6 +346,14 @@ impl RunRequestPayload {
     }
 }
 
+/// File, under the daemon state root, holding the run-id floor left by purges.
+const RUN_SEED_FLOOR_FILE: &str = "run-seed-floor.json";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RunSeedFloor {
+    highest_purged_run_seed: u64,
+}
+
 /// One externally visible daemon run.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunView {
@@ -722,7 +730,8 @@ impl FileRunStore {
             .map_err(Into::into)
     }
 
-    /// Returns the next numeric seed inferred from persisted run identifiers.
+    /// Returns the next numeric seed inferred from persisted run identifiers,
+    /// never below the floor left by purged runs, so a run id is never reused.
     pub fn next_seed(&self) -> u64 {
         [
             self.root.join("runs"),
@@ -735,6 +744,60 @@ impl FileRunStore {
         .filter_map(|run_id| run_id.strip_prefix("run-").and_then(|raw| raw.parse().ok()))
         .max()
         .unwrap_or(0u64)
+        .max(self.seed_floor())
+    }
+
+    fn seed_floor_path(&self) -> PathBuf {
+        self.root.join(RUN_SEED_FLOOR_FILE)
+    }
+
+    fn seed_floor(&self) -> u64 {
+        fs::read(self.seed_floor_path())
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<RunSeedFloor>(&raw).ok())
+            .map(|floor| floor.highest_purged_run_seed)
+            .unwrap_or(0)
+    }
+
+    /// Remembers the highest numeric id among purged runs, so ids stay unique
+    /// after their records are deleted.
+    pub(crate) fn raise_seed_floor(&self, run_ids: &[String]) -> Result<()> {
+        let Some(highest) = run_ids
+            .iter()
+            .filter_map(|run_id| {
+                run_id
+                    .strip_prefix("run-")
+                    .and_then(|raw| raw.parse::<u64>().ok())
+            })
+            .max()
+        else {
+            return Ok(());
+        };
+        if highest <= self.seed_floor() {
+            return Ok(());
+        }
+        write_json_pretty_atomically(
+            &self.seed_floor_path(),
+            &RunSeedFloor {
+                highest_purged_run_seed: highest,
+            },
+        )
+        .with_context(|| format!("failed to write {}", self.seed_floor_path().display()))
+    }
+
+    /// Deletes one run's record and event log. Missing files are not errors.
+    pub(crate) fn delete_run_files(&self, run_id: &str) -> Result<()> {
+        for path in [self.run_path(run_id), self.events_path(run_id)] {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to delete {}", path.display()));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn persisted_storage_id(&self, path: &std::path::Path) -> Option<String> {

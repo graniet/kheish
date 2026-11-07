@@ -779,6 +779,19 @@ impl FileDaemonStore {
         append_json_line_sync(&path, record)
     }
 
+    /// Deletes one session's persisted daemon outputs. A missing file is not an error.
+    pub(crate) fn delete_outputs(&self, session_id: &str) -> Result<()> {
+        let path = self.outputs_path(session_id);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                Err(anyhow::Error::from(error)
+                    .context(format!("failed to delete {}", path.display())))
+            }
+        }
+    }
+
     pub(crate) fn load_outputs(&self, session_id: &str) -> Result<Vec<DaemonOutputRecord>> {
         let path = self.outputs_path(session_id);
         if !path.exists() {

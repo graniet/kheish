@@ -18,6 +18,7 @@ Sessions:
 - `POST /v1/sessions`
 - `GET /v1/sessions`
 - `GET /v1/sessions/{session_id}`
+- `DELETE /v1/sessions/{session_id}` (purge an ended session)
 - `GET /v1/sessions/{session_id}/memory-context`
 - `GET /v1/sessions/{session_id}/memory-search`
 - `GET /v1/sessions/{session_id}/skills`
@@ -683,6 +684,36 @@ frames above 1 MiB, so use list/get endpoints for bulk output reconciliation.
   "reason": "done"
 }
 ```
+
+Ending a session runs `session_end` hooks and records when and why it ended (metadata key `session_ended`). The session keeps its history and can still take input; ending is what makes it eligible for a purge.
+
+## Session purge
+
+`DELETE /v1/sessions/{session_id}` (admin token) deletes every durable trace of one ended session:
+
+- the session journal, its metadata sidecars, its terminal-task archive, and its persisted daemon outputs (`outputs/`);
+- its run records and run event logs, recovered run memories, and run debug artifacts;
+- its session-scoped learnings and learning candidates (`scope: session:<id>`);
+- its entries in the session index (bindings, idempotency receipts, run-memory index) and its root agent in the supervisor topology.
+
+An optional `?reason=` is recorded in the supervisor audit log (`GET /v1/agents/audit`, persisted in `daemon-supervisor.json` and `daemon-supervisor-audit.jsonl`) as a `session_purged` event with the session id, followed by the `removed` event of its root agent. The response is a `SessionPurgeView`:
+
+```json
+{
+  "session_id": "fm-7f3c",
+  "agent_id": "agent-12",
+  "purged_at_ms": 1794004700000,
+  "run_ids": ["run-41", "run-44"],
+  "learning_ids": ["learning-9"],
+  "learning_candidate_ids": ["learning-candidate-31"]
+}
+```
+
+The daemon refuses with `409` and domain `sessions` when the session was never ended (`session_not_ended`), has a run that is active, queued, or waiting for an approval or an answer (`session_busy`; cancel it first), still has child agents (`session_has_descendants`), or is still a project member, assigned to project tasks, or targeted by a live schedule (`session_has_dependencies`). An unknown session is `404`.
+
+The purge is crash-safe. The daemon first writes a plan under `<state_root>/session-purges/`, then removes the session from the index and the supervisor in one persisted step, so `GET /v1/sessions` never lists a half-deleted session; files are deleted after that, and the plan is removed last. A daemon that stops in between finishes the purge from the plan at its next boot. Purged run ids are never issued again: the highest one is kept in `<state_root>/run-seed-floor.json`.
+
+What a purge keeps: the signed external-action ledger (`<state_root>/external-actions/`, one hash-chained file per run) is append-only, so the purged runs' ledger files stay. They hold no prompt, output, or tool argument, only ids (session, agent, run, tool call, principal), targets such as `mcp:fregate/scan_target` or the provider endpoint, request and response digests, outcomes, and signatures; their chains stay verifiable. `GET /v1/runs/{run_id}/external-actions` answers `404` for a purged run because its run record is gone. Delete those files out of band only if your retention policy requires it and you accept losing that audit evidence. Also kept: the credential broker's grant and lease records (`auth/*.broker-state.json`), which name the session, agent, and run a credential was issued to but hold no secret or content; daemon-owned assets (`assets/`), which are not session-scoped; the supervisor audit log, which records the purge itself; and daemon logs and in-memory SSE replay buffers, which are not rewritten.
 
 ## Run inspection
 

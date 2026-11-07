@@ -582,6 +582,40 @@ impl LearningService {
         Ok(updated)
     }
 
+    /// Deletes every learning and learning candidate scoped to one session,
+    /// for a session purge, and returns their ids.
+    pub(crate) async fn purge_session_scope(
+        &self,
+        session_id: &str,
+    ) -> Result<(Vec<String>, Vec<String>)> {
+        let _mutation = self.mutation_lock.lock().await;
+        let mut candidates = self.candidates.lock().await;
+        let mut records = self.records.lock().await;
+        let in_session_scope = |scope: &kheish_types::LearningScope| {
+            scope.kind == kheish_types::LearningScopeKind::Session && scope.id == session_id
+        };
+        let learning_ids = records
+            .values()
+            .filter(|record| in_session_scope(&record.scope))
+            .map(|record| record.learning_id.clone())
+            .collect::<Vec<_>>();
+        let candidate_ids = candidates
+            .values()
+            .filter(|candidate| in_session_scope(&candidate.scope))
+            .map(|candidate| candidate.candidate_id.clone())
+            .collect::<Vec<_>>();
+        for learning_id in &learning_ids {
+            self.store.delete_learning(learning_id)?;
+            records.remove(learning_id);
+        }
+        for candidate_id in &candidate_ids {
+            self.store.delete_candidate(candidate_id)?;
+            candidates.remove(candidate_id);
+        }
+        *self.indexes.lock().await = build_indexes(&candidates, &records);
+        Ok((learning_ids, candidate_ids))
+    }
+
     /// Restores one previously persisted learning record verbatim.
     pub(crate) async fn restore(&self, learning: LearningView) -> Result<LearningView> {
         let _mutation = self.mutation_lock.lock().await;
