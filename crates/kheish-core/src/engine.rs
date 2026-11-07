@@ -3753,6 +3753,7 @@ mod tests {
                         "additionalProperties": false
                     }),
                     allows_parallel: true,
+                    strict: false,
                 },
                 ToolDefinition {
                     name: "write_file".to_string(),
@@ -3767,6 +3768,7 @@ mod tests {
                         "additionalProperties": false
                     }),
                     allows_parallel: false,
+                    strict: false,
                 },
             ];
             // Other tools the scripted turns call; every one is advertised so
@@ -3787,6 +3789,7 @@ mod tests {
                     description: format!("Scripted test tool {name}."),
                     input_schema: json!({"type": "object"}),
                     allows_parallel: false,
+                    strict: false,
                 }),
             );
             definitions
@@ -6027,6 +6030,7 @@ mod tests {
                 description: "Write one file".to_string(),
                 input_schema: json!({"type": "object"}),
                 allows_parallel: false,
+                strict: false,
             }],
             active_skills: vec![kheish_types::ActiveSkillSnapshot {
                 name: "machine_report".to_string(),

@@ -187,6 +187,7 @@ impl Tool for UseSkillTool {
                     }),
                     context_updates: Vec::new(),
                     hook_contexts: vec![skill.render_inline_instructions(request.args.as_deref())],
+                    is_error: false,
                 })
             }
             SkillExecutionContext::Fork => {

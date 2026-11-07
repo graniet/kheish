@@ -709,6 +709,7 @@ fn entry_config(
                 }
             }
         },
+        trust: Default::default(),
     })
 }
 

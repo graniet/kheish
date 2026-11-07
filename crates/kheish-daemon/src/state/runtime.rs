@@ -215,6 +215,11 @@ where
             )
             .into());
         }
+        // Trust is the admin's call: `result_format: "text"` drops the
+        // untrusted-data wrapper, so it is refused on an untrusted server.
+        entry.trust(name).map_err(|error| {
+            DaemonProblem::bad_request("mcp", "mcp_server_trust_invalid", format!("{error:#}"))
+        })?;
         let resolved_secrets =
             crate::builders::mcp_resolved_secrets_from_auth_store(&self.auth_manager).await?;
         let options = kheish_mcp::CodexCompatOptions {

@@ -3203,6 +3203,7 @@ mod tests {
             description: "test tool".to_string(),
             input_schema: json!({"type": "object"}),
             allows_parallel: false,
+            strict: false,
         }
     }
 

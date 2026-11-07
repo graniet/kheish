@@ -14,6 +14,7 @@ mod sse;
 mod test_fixtures;
 #[cfg(test)]
 mod testsupport;
+mod tool_schema;
 mod transcription;
 mod xai;
 

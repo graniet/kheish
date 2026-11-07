@@ -594,6 +594,7 @@ fn echo_tool_definition() -> ToolDefinition {
             "additionalProperties": false
         }),
         allows_parallel: false,
+        strict: false,
     }
 }
 

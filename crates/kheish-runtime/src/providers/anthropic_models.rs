@@ -90,6 +90,21 @@ pub(crate) fn anthropic_model_profile(model: &str) -> AnthropicModelProfile {
     }
 }
 
+/// Returns whether the model takes `strict: true` on a tool (structured
+/// outputs): every 5.x generation, Claude Opus 4.8, Claude Haiku 4.5, and the
+/// legacy Claude Opus 4.5 and 4.1. Another model gets no `strict` at all.
+pub(crate) fn anthropic_supports_strict_tools(model: &str) -> bool {
+    use ClaudeModelFamily::{Haiku, Opus};
+    let Some(id) = parse_claude_model_id(model) else {
+        return false;
+    };
+    match (id.family, id.major, id.minor) {
+        (_, major, _) if major >= 5 => true,
+        (Opus, 4, Some(8 | 5 | 1)) | (Haiku, 4, Some(5)) => true,
+        _ => false,
+    }
+}
+
 /// Returns whether the model takes `fallbacks` as a list of models. Claude
 /// Sonnet 5.5 takes only `"default"`.
 pub(crate) fn anthropic_accepts_fallback_models(model: &str) -> bool {

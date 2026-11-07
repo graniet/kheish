@@ -121,6 +121,11 @@ pub struct ToolExecutionOutput {
     /// Additional hook-provided context injected after the tool result.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hook_contexts: Vec<String>,
+    /// The tool ran and reported a failure in its own result (an MCP
+    /// `isError: true`), as opposed to failing to run. The result reaches
+    /// the model as an error (`is_error: true` on Anthropic).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_error: bool,
 }
 
 impl ToolExecutionOutput {
@@ -130,6 +135,7 @@ impl ToolExecutionOutput {
             output,
             context_updates: Vec::new(),
             hook_contexts: Vec::new(),
+            is_error: false,
         }
     }
 
@@ -139,7 +145,14 @@ impl ToolExecutionOutput {
             output,
             context_updates,
             hook_contexts: Vec::new(),
+            is_error: false,
         }
+    }
+
+    /// Marks the output as the tool's own report of a failure.
+    pub fn with_error(mut self, is_error: bool) -> Self {
+        self.is_error = is_error;
+        self
     }
 }
 
@@ -148,6 +161,13 @@ impl ToolExecutionOutput {
 pub trait Tool: Send + Sync {
     /// Returns the static descriptor for the tool.
     fn descriptor(&self) -> ToolDescriptor;
+
+    /// Returns what providers advertise for the tool. The default renders it
+    /// from the descriptor's runtime schema; a tool whose schema is someone
+    /// else's (an MCP server's `inputSchema`) returns that schema as written.
+    fn definition(&self) -> ToolDefinition {
+        self.descriptor().definition()
+    }
 
     /// Executes the tool.
     async fn execute(&self, ctx: ToolContext, input: Value) -> Result<ToolExecutionOutput>;
@@ -817,9 +837,10 @@ impl ScopedToolRuntime {
 
 impl ToolCatalog for ToolRuntime {
     fn definitions(&self) -> Vec<ToolDefinition> {
-        self.descriptors()
-            .into_iter()
-            .map(|descriptor| descriptor.definition())
+        self.registry
+            .read()
+            .values()
+            .map(|tool| tool.definition())
             .collect()
     }
 }
@@ -1128,7 +1149,7 @@ async fn execute_registered_tool(
         Ok(Ok(output)) => build_tool_result_record(
             call.id.clone(),
             output.output,
-            false,
+            output.is_error,
             Some(descriptor.name.clone()),
             output.context_updates,
             output.hook_contexts,
@@ -1674,6 +1695,7 @@ impl ToolDescriptor {
             description: self.description.clone(),
             input_schema: self.schema.json_schema(),
             allows_parallel: self.allows_parallel,
+            strict: false,
         }
     }
 }

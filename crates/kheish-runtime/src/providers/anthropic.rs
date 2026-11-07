@@ -35,6 +35,7 @@ use kheish_types::{
 use super::anthropic_models::{
     AnthropicModelProfile, AnthropicPricing, ThinkingMode, anthropic_accepts_fallback_models,
     anthropic_adaptive_effort, anthropic_list_pricing, anthropic_model_profile,
+    anthropic_supports_strict_tools,
 };
 use super::attachments::{
     AttachmentRenderCache, contains_supported_image_attachment, image_edit_attachment_hint_text,
@@ -219,7 +220,10 @@ impl AnthropicProvider {
         let tools = if matches!(request.generation.tool_choice, ToolChoice::None) {
             Vec::new()
         } else {
-            anthropic_tools(&request.available_tools)
+            anthropic_tools(
+                &request.available_tools,
+                anthropic_supports_strict_tools(&effective_model),
+            )
         };
         let reasoning = request.generation.reasoning.as_ref();
         let profile = anthropic_model_profile(&effective_model);
@@ -2161,24 +2165,246 @@ fn cache_write_1h_tokens(usage: &Value) -> u64 {
 
 /// Encodes the tools sorted by name, so the tool prefix renders the same
 /// bytes on every turn whatever order the runtime lists them in, with a
-/// prompt-cache breakpoint on the last one.
-fn anthropic_tools(tools: &[kheish_types::ToolDefinition]) -> Vec<Value> {
+/// prompt-cache breakpoint on the last one. Each `input_schema` goes out as
+/// the tool defines it. A tool that asks for strict input gets
+/// `strict: true` when the model takes it and its schema is in the subset
+/// strict tool use enforces, within the per-request limits (taken in name
+/// order, so the same tools always get the same answer).
+fn anthropic_tools(tools: &[kheish_types::ToolDefinition], strict_tools: bool) -> Vec<Value> {
     let mut sorted = tools.iter().collect::<Vec<_>>();
     sorted.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut budget = AnthropicStrictBudget::default();
     let mut encoded = sorted
         .into_iter()
         .map(|tool| {
-            json!({
+            let mut encoded = json!({
                 "name": tool.name,
                 "description": tool.description,
                 "input_schema": tool.input_schema,
-            })
+            });
+            if strict_tools
+                && tool.strict
+                && anthropic_strict_schema_cost(&tool.input_schema)
+                    .is_some_and(|cost| budget.admit(cost))
+            {
+                encoded["strict"] = Value::Bool(true);
+            }
+            encoded
         })
         .collect::<Vec<_>>();
     if let Some(Value::Object(last)) = encoded.last_mut() {
         last.insert("cache_control".to_string(), anthropic_cache_breakpoint());
     }
     encoded
+}
+
+/// The schema complexity limits of strict tool use, per request: the strict
+/// tools, and the optional parameters and the parameters with a union type
+/// (`anyOf` or a list of types) across all their schemas. A request past
+/// them is refused as too complex to compile.
+const ANTHROPIC_MAX_STRICT_TOOLS: usize = 20;
+const ANTHROPIC_MAX_STRICT_OPTIONAL_PARAMETERS: usize = 24;
+const ANTHROPIC_MAX_STRICT_UNION_PARAMETERS: usize = 16;
+
+/// The string formats strict tool use enforces.
+const ANTHROPIC_STRICT_STRING_FORMATS: &[&str] = &[
+    "date-time",
+    "time",
+    "date",
+    "duration",
+    "email",
+    "hostname",
+    "uri",
+    "ipv4",
+    "ipv6",
+    "uuid",
+];
+
+/// The JSON Schema keywords strict tool use enforces. Any other keyword
+/// (`minLength`, `maxLength`, `minimum`, `maximum`, `pattern`, `default`,
+/// `oneOf`, ...) leaves the tool non-strict, with its schema unchanged.
+const ANTHROPIC_STRICT_KEYWORDS: &[&str] = &[
+    "type",
+    "properties",
+    "required",
+    "additionalProperties",
+    "items",
+    "enum",
+    "const",
+    "anyOf",
+    "allOf",
+    "description",
+    "title",
+    "format",
+    "minItems",
+    "$ref",
+    "$defs",
+    "definitions",
+];
+
+const ANTHROPIC_STRICT_TYPES: &[&str] = &[
+    "object", "array", "string", "integer", "number", "boolean", "null",
+];
+
+/// What one strict schema costs of the per-request limits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AnthropicStrictCost {
+    optional_parameters: usize,
+    union_parameters: usize,
+}
+
+#[derive(Debug, Default)]
+struct AnthropicStrictBudget {
+    tools: usize,
+    optional_parameters: usize,
+    union_parameters: usize,
+}
+
+impl AnthropicStrictBudget {
+    /// Takes one more strict tool when it fits the limits.
+    fn admit(&mut self, cost: AnthropicStrictCost) -> bool {
+        let fits = self.tools < ANTHROPIC_MAX_STRICT_TOOLS
+            && self.optional_parameters + cost.optional_parameters
+                <= ANTHROPIC_MAX_STRICT_OPTIONAL_PARAMETERS
+            && self.union_parameters + cost.union_parameters
+                <= ANTHROPIC_MAX_STRICT_UNION_PARAMETERS;
+        if fits {
+            self.tools += 1;
+            self.optional_parameters += cost.optional_parameters;
+            self.union_parameters += cost.union_parameters;
+        }
+        fits
+    }
+}
+
+/// Returns what a tool schema costs under strict tool use, or `None` when
+/// strict tool use cannot enforce it: a keyword outside the enforced subset,
+/// an object that does not set `additionalProperties: false`, a `minItems`
+/// other than 0 or 1, an unsupported string format, a `$ref` that is not a
+/// local definition, or a recursive definition.
+fn anthropic_strict_schema_cost(schema: &Value) -> Option<AnthropicStrictCost> {
+    let definitions = schema
+        .get("$defs")
+        .or_else(|| schema.get("definitions"))
+        .and_then(Value::as_object);
+    let mut cost = AnthropicStrictCost::default();
+    anthropic_strict_node_cost(schema, definitions, &mut Vec::new(), &mut cost)?;
+    Some(cost)
+}
+
+fn anthropic_strict_node_cost(
+    node: &Value,
+    definitions: Option<&serde_json::Map<String, Value>>,
+    resolving: &mut Vec<String>,
+    cost: &mut AnthropicStrictCost,
+) -> Option<()> {
+    let object = node.as_object()?;
+    if object
+        .keys()
+        .any(|keyword| !ANTHROPIC_STRICT_KEYWORDS.contains(&keyword.as_str()))
+    {
+        return None;
+    }
+    // A node that constrains nothing (`{}`) is not something strict tool use
+    // compiles: every node names a type, a value set, variants or a reference.
+    if !["type", "enum", "const", "anyOf", "allOf", "$ref"]
+        .iter()
+        .any(|keyword| object.contains_key(*keyword))
+    {
+        return None;
+    }
+    if let Some(reference) = object.get("$ref") {
+        let name = reference
+            .as_str()?
+            .strip_prefix("#/$defs/")
+            .or_else(|| reference.as_str()?.strip_prefix("#/definitions/"))?;
+        if resolving.iter().any(|seen| seen == name) {
+            return None;
+        }
+        let target = definitions?.get(name)?;
+        resolving.push(name.to_string());
+        anthropic_strict_node_cost(target, definitions, resolving, cost)?;
+        resolving.pop();
+    }
+    let types = match object.get("type") {
+        None => Vec::new(),
+        Some(Value::String(kind)) => vec![kind.as_str()],
+        Some(Value::Array(kinds)) => kinds.iter().map(Value::as_str).collect::<Option<_>>()?,
+        Some(_) => return None,
+    };
+    if types
+        .iter()
+        .any(|kind| !ANTHROPIC_STRICT_TYPES.contains(kind))
+    {
+        return None;
+    }
+    if let Some(format) = object.get("format")
+        && !ANTHROPIC_STRICT_STRING_FORMATS.contains(&format.as_str()?)
+    {
+        return None;
+    }
+    if let Some(min_items) = object.get("minItems")
+        && !matches!(min_items.as_u64(), Some(0 | 1))
+    {
+        return None;
+    }
+    let is_object = types.contains(&"object") || object.contains_key("properties");
+    if is_object {
+        if object.get("additionalProperties") != Some(&Value::Bool(false)) {
+            return None;
+        }
+        let required = match object.get("required") {
+            None => Vec::new(),
+            Some(required) => required
+                .as_array()?
+                .iter()
+                .map(Value::as_str)
+                .collect::<Option<Vec<_>>>()?,
+        };
+        if let Some(properties) = object.get("properties") {
+            for (name, property) in properties.as_object()? {
+                if !required.contains(&name.as_str()) {
+                    cost.optional_parameters += 1;
+                }
+                let union = property.get("anyOf").is_some()
+                    || property.get("type").is_some_and(Value::is_array);
+                if union {
+                    cost.union_parameters += 1;
+                }
+                anthropic_strict_node_cost(property, definitions, resolving, cost)?;
+            }
+        }
+    } else if object.contains_key("additionalProperties") {
+        return None;
+    }
+    if let Some(items) = object.get("items") {
+        anthropic_strict_node_cost(items, definitions, resolving, cost)?;
+    }
+    for keyword in ["anyOf", "allOf"] {
+        if let Some(variants) = object.get(keyword) {
+            for variant in variants.as_array()? {
+                anthropic_strict_node_cost(variant, definitions, resolving, cost)?;
+            }
+        }
+    }
+    for keyword in ["$defs", "definitions"] {
+        if let Some(defs) = object.get(keyword) {
+            for (name, definition) in defs.as_object()? {
+                if resolving.iter().any(|seen| seen == name) {
+                    continue;
+                }
+                resolving.push(name.clone());
+                anthropic_strict_node_cost(
+                    definition,
+                    definitions,
+                    resolving,
+                    &mut AnthropicStrictCost::default(),
+                )?;
+                resolving.pop();
+            }
+        }
+    }
+    Some(())
 }
 
 fn map_stop_reason(stop_reason: &str) -> ModelFinishReason {
@@ -2467,6 +2693,7 @@ mod tests {
                             "additionalProperties": false
                         }),
                         allows_parallel: true,
+                        strict: false,
                     }],
                     generation: ModelGenerationConfig {
                         model: None,
@@ -3103,6 +3330,7 @@ mod tests {
                     description: "Echo".to_string(),
                     input_schema: json!({"type": "object"}),
                     allows_parallel: true,
+                    strict: false,
                 }],
                 generation: ModelGenerationConfig {
                     reasoning: Some(ReasoningConfig {
@@ -3138,6 +3366,7 @@ mod tests {
                     description: "Echo".to_string(),
                     input_schema: json!({"type": "object"}),
                     allows_parallel: true,
+                    strict: false,
                 }],
                 generation: ModelGenerationConfig {
                     reasoning: Some(ReasoningConfig {
@@ -3235,6 +3464,7 @@ mod tests {
                     description: "Echo".to_string(),
                     input_schema: json!({"type": "object"}),
                     allows_parallel: true,
+                    strict: false,
                 }],
                 generation: ModelGenerationConfig::default(),
             })
@@ -3510,6 +3740,7 @@ mod tests {
             description: format!("The {name} tool."),
             input_schema: json!({"type": "object", "properties": {}}),
             allows_parallel: true,
+            strict: false,
         }
     }
 
@@ -4947,6 +5178,318 @@ mod tests {
         assert_eq!(counts.resolves.load(Ordering::SeqCst), 1);
         assert_eq!(counts.refreshes.load(Ordering::SeqCst), 1);
         server.abort();
+        Ok(())
+    }
+
+    /// Fregate's verdict tool: enums, an integer, nested closed objects and
+    /// arrays with their own descriptions, every object closed. Strict tool
+    /// use enforces all of it.
+    fn submit_verdict_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "verdict": {"type": "string", "enum": ["confirmed", "likely_false_positive", "needs_human"]},
+                "confidence": {"type": "integer", "description": "0 to 100."},
+                "next_step": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["remediate", "dismiss", "recheck", "investigate"]},
+                        "detail": {"type": "string", "description": "Specifics, at most 500 characters."}
+                    },
+                    "required": ["action", "detail"],
+                    "additionalProperties": false
+                },
+                "reasons": {
+                    "type": "array",
+                    "description": "1 to 12 reasons.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["supports", "contradicts", "context"]},
+                            "evidence": {"type": "array", "items": {"type": "string"}}
+                        },
+                        "required": ["evidence", "kind"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["confidence", "next_step", "reasons", "verdict"],
+            "additionalProperties": false
+        })
+    }
+
+    /// The same shape with length and range limits, which strict tool use
+    /// does not enforce.
+    fn limited_schema() -> Value {
+        let mut schema = submit_verdict_schema();
+        schema["properties"]["confidence"]["minimum"] = json!(0);
+        schema["properties"]["confidence"]["maximum"] = json!(100);
+        schema["properties"]["next_step"]["properties"]["detail"]["maxLength"] = json!(500);
+        schema["properties"]["key"] = json!({"type": "string", "minLength": 3});
+        schema
+    }
+
+    fn mcp_tool(name: &str, input_schema: Value) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: "An MCP tool.".to_string(),
+            input_schema,
+            allows_parallel: true,
+            strict: true,
+        }
+    }
+
+    fn body_with_tools(model: &str, tools: Vec<ToolDefinition>) -> Result<Value> {
+        let provider = AnthropicProvider::new(AnthropicProviderConfig::new(model, "test-key"))?;
+        let mut request = runtime_request("session-tools", ModelGenerationConfig::default());
+        request.available_tools = tools;
+        Ok(provider.build_request_body(&request)?)
+    }
+
+    #[test]
+    fn mcp_tool_schemas_reach_the_request_body_exactly() -> Result<()> {
+        let body = body_with_tools(
+            "claude-opus-5-5",
+            vec![
+                mcp_tool("mcp__fregate__get_fact", limited_schema()),
+                mcp_tool("mcp__fregate__submit_verdict", submit_verdict_schema()),
+            ],
+        )?;
+        let tools = body["tools"].as_array().expect("tools");
+        assert_eq!(tools[0]["name"], "mcp__fregate__get_fact");
+        assert_eq!(
+            serde_json::to_string(&tools[0]["input_schema"])?,
+            serde_json::to_string(&limited_schema())?,
+            "enums, integers, nested objects and length limits reach the body byte for byte"
+        );
+        assert!(
+            tools[0].get("strict").is_none(),
+            "length and range limits leave the tool non-strict, with its schema unchanged"
+        );
+        assert_eq!(
+            serde_json::to_string(&tools[1]["input_schema"])?,
+            serde_json::to_string(&submit_verdict_schema())?
+        );
+        assert_eq!(tools[1]["strict"], json!(true));
+        assert_eq!(tools[1]["cache_control"], json!({"type": "ephemeral"}));
+        Ok(())
+    }
+
+    #[test]
+    fn strict_is_sent_only_when_asked_and_when_the_model_takes_it() -> Result<()> {
+        let mut own = mcp_tool("read_file", submit_verdict_schema());
+        own.strict = false;
+        let body = body_with_tools("claude-opus-5-5", vec![own])?;
+        assert!(body["tools"][0].get("strict").is_none());
+
+        for model in [
+            "claude-opus-4-6",
+            "claude-sonnet-4-5",
+            "claude-3-7-sonnet-latest",
+        ] {
+            let body = body_with_tools(
+                model,
+                vec![mcp_tool(
+                    "mcp__fregate__submit_verdict",
+                    submit_verdict_schema(),
+                )],
+            )?;
+            assert!(body["tools"][0].get("strict").is_none(), "{model}");
+        }
+        for model in [
+            "claude-sonnet-5",
+            "claude-haiku-4-5",
+            "claude-opus-4-8",
+            "claude-fable-5-1",
+        ] {
+            let body = body_with_tools(
+                model,
+                vec![mcp_tool(
+                    "mcp__fregate__submit_verdict",
+                    submit_verdict_schema(),
+                )],
+            )?;
+            assert_eq!(body["tools"][0]["strict"], json!(true), "{model}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn strict_tools_stay_within_the_request_limits() -> Result<()> {
+        // Twenty-two closed tools without optional parameters: the first
+        // twenty by name are strict.
+        let tools = (0..22)
+            .map(|index| mcp_tool(&format!("mcp__s__tool_{index:02}"), submit_verdict_schema()))
+            .collect();
+        let body = body_with_tools("claude-opus-5-5", tools)?;
+        let strict = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool.get("strict").is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(strict.iter().filter(|strict| **strict).count(), 20);
+        assert!(strict[..20].iter().all(|strict| *strict));
+
+        // Optional parameters share a budget of 24 across strict tools.
+        let mut optional =
+            json!({"type": "object", "properties": {}, "additionalProperties": false});
+        for index in 0..10 {
+            optional["properties"][format!("p{index}")] = json!({"type": "string"});
+        }
+        let tools = (0..3)
+            .map(|index| mcp_tool(&format!("mcp__s__opt_{index}"), optional.clone()))
+            .collect();
+        let body = body_with_tools("claude-opus-5-5", tools)?;
+        let strict = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool.get("strict").is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(strict, vec![true, true, false]);
+        Ok(())
+    }
+
+    #[test]
+    fn strict_schemas_are_the_subset_strict_tool_use_enforces() {
+        use super::anthropic_strict_schema_cost as cost;
+        assert!(cost(&submit_verdict_schema()).is_some());
+        assert!(cost(&limited_schema()).is_none());
+        // Every object must be closed.
+        assert!(
+            cost(&json!({"type": "object", "properties": {"a": {"type": "string"}}})).is_none()
+        );
+        assert!(
+            cost(&json!({
+                "type": "object",
+                "properties": {"a": {"type": "object", "properties": {}}},
+                "additionalProperties": false
+            }))
+            .is_none()
+        );
+        // Union types and optional parameters are counted.
+        let counted = cost(&json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": ["string", "null"]},
+                "b": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+                "c": {"type": "string", "format": "date-time"}
+            },
+            "required": ["c"],
+            "additionalProperties": false
+        }))
+        .expect("strict");
+        assert_eq!(counted.optional_parameters, 2);
+        assert_eq!(counted.union_parameters, 2);
+        // Unsupported formats, minItems above 1, untyped nodes, recursion.
+        for schema in [
+            json!({"type": "object", "properties": {"u": {"type": "string", "format": "uri-reference"}}, "additionalProperties": false}),
+            json!({"type": "object", "properties": {"l": {"type": "array", "items": {"type": "string"}, "minItems": 2}}, "additionalProperties": false}),
+            json!({"type": "object", "properties": {"x": {}}, "additionalProperties": false}),
+            json!({
+                "type": "object",
+                "properties": {"tree": {"$ref": "#/$defs/Node"}},
+                "additionalProperties": false,
+                "$defs": {"Node": {"type": "object", "properties": {"child": {"$ref": "#/$defs/Node"}}, "additionalProperties": false}}
+            }),
+        ] {
+            assert!(cost(&schema).is_none(), "{schema}");
+        }
+        // A non-recursive local definition is fine.
+        assert!(
+            cost(&json!({
+                "type": "object",
+                "properties": {"step": {"$ref": "#/$defs/Step"}},
+                "required": ["step"],
+                "additionalProperties": false,
+                "$defs": {"Step": {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"], "additionalProperties": false}}
+            }))
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn tool_results_carry_their_error_flag_and_plain_text() -> Result<()> {
+        let document = r#"{"ref":"fact:service:203.0.113.10:3389/tcp","in_current_state":true}"#;
+        let items = vec![
+            user_item("u1", "Verify."),
+            ProviderInputItem::Message {
+                id: "a1".to_string(),
+                role: kheish_types::Role::Assistant,
+                content: String::new(),
+                content_parts: Vec::new(),
+                attachments: Vec::new(),
+                provider_response_id: None,
+                provider_context: None,
+            },
+            ProviderInputItem::ToolCall {
+                assistant_message_id: Some("a1".to_string()),
+                call: ToolCallRecord {
+                    id: "toolu_1".to_string(),
+                    name: "mcp__fregate__get_fact".to_string(),
+                    input: json!({}),
+                    assistant_message_id: Some("a1".to_string()),
+                    assistant_provider_response_id: None,
+                },
+            },
+            ProviderInputItem::ToolCall {
+                assistant_message_id: Some("a1".to_string()),
+                call: ToolCallRecord {
+                    id: "toolu_2".to_string(),
+                    name: "mcp__fregate__get_fact".to_string(),
+                    input: json!({}),
+                    assistant_message_id: Some("a1".to_string()),
+                    assistant_provider_response_id: None,
+                },
+            },
+            ProviderInputItem::ToolResult {
+                result: ToolResultRecord {
+                    call_id: "toolu_1".to_string(),
+                    output: Value::String(document.to_string()),
+                    is_error: false,
+                    tool_name: Some("mcp__fregate__get_fact".to_string()),
+                    offset: None,
+                    timestamp_ms: None,
+                    context_updates: Vec::new(),
+                    hook_contexts: Vec::new(),
+                },
+            },
+            ProviderInputItem::ToolResult {
+                result: ToolResultRecord {
+                    call_id: "toolu_2".to_string(),
+                    output: Value::String("unknown fact".to_string()),
+                    is_error: true,
+                    tool_name: Some("mcp__fregate__get_fact".to_string()),
+                    offset: None,
+                    timestamp_ms: None,
+                    context_updates: Vec::new(),
+                    hook_contexts: Vec::new(),
+                },
+            },
+        ];
+        let provider =
+            AnthropicProvider::new(AnthropicProviderConfig::new("claude-opus-5-5", "test-key"))?;
+        let body = provider.build_request_body(&opus_5_5_request(items))?;
+        let results = &body["messages"][2]["content"];
+        assert_eq!(
+            results[0],
+            json!({
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "is_error": false,
+                "content": [{"type": "text", "text": document}]
+            })
+        );
+        assert_eq!(
+            results[1],
+            json!({
+                "type": "tool_result",
+                "tool_use_id": "toolu_2",
+                "is_error": true,
+                "content": [{"type": "text", "text": "unknown fact"}]
+            })
+        );
         Ok(())
     }
 }

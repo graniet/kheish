@@ -503,7 +503,9 @@ impl OpenRouterProvider {
                 .available_tools
                 .iter()
                 .map(|tool| {
-                    let (parameters, strict) = openai_tool_parameters_schema(&tool.input_schema);
+                    let (parameters, strict) = openai_tool_parameters_schema(
+                        &super::tool_schema::openai_compatible_tool_schema(&tool.input_schema),
+                    );
                     let mut function = json!({
                         "name": tool.name,
                         "description": tool.description,
@@ -3678,6 +3680,7 @@ mod tests {
                         "additionalProperties": false
                     }),
                     allows_parallel: false,
+                    strict: false,
                 }],
                 generation: ModelGenerationConfig::default(),
             })
@@ -3859,6 +3862,7 @@ mod tests {
                         "additionalProperties": false
                     }),
                     allows_parallel: false,
+                    strict: false,
                 }],
                 generation: ModelGenerationConfig::default(),
             })
@@ -3902,6 +3906,7 @@ mod tests {
                         "additionalProperties": false
                     }),
                     allows_parallel: false,
+                    strict: false,
                 }],
                 generation,
             })

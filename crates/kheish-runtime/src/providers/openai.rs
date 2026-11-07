@@ -391,7 +391,9 @@ impl OpenAiProvider {
                 .available_tools
                 .iter()
                 .map(|tool| {
-                    let (parameters, strict) = openai_tool_parameters_schema(&tool.input_schema);
+                    let (parameters, strict) = openai_tool_parameters_schema(
+                        &super::tool_schema::openai_compatible_tool_schema(&tool.input_schema),
+                    );
                     let mut entry = json!({
                         "type": "function",
                         "name": tool.name,
@@ -3682,6 +3684,7 @@ mod tests {
                             "additionalProperties": false
                         }),
                         allows_parallel: true,
+                        strict: false,
                     }],
                     generation: ModelGenerationConfig {
                         model: None,
@@ -4397,6 +4400,7 @@ mod tests {
                             "additionalProperties": false
                         }),
                         allows_parallel: true,
+                        strict: false,
                     }],
                     generation: ModelGenerationConfig::default(),
                 },
@@ -4435,6 +4439,7 @@ mod tests {
                             "additionalProperties": false
                         }),
                         allows_parallel: false,
+                        strict: false,
                     }],
                     generation: ModelGenerationConfig::default(),
                 },
@@ -4498,6 +4503,7 @@ mod tests {
                             "additionalProperties": false
                         }),
                         allows_parallel: false,
+                        strict: false,
                     }],
                     generation: ModelGenerationConfig::default(),
                 },
@@ -4677,6 +4683,7 @@ mod tests {
                             "additionalProperties": false
                         }),
                         allows_parallel: true,
+                        strict: false,
                     }],
                     generation: ModelGenerationConfig::default(),
                 },
@@ -5696,6 +5703,7 @@ mod tests {
                             "additionalProperties": false
                         }),
                         allows_parallel: true,
+                        strict: false,
                     }],
                     generation: ModelGenerationConfig {
                         tool_choice: ToolChoice::Specific {
@@ -6053,6 +6061,7 @@ mod tests {
                             "additionalProperties": false
                         }),
                         allows_parallel: true,
+                        strict: false,
                     }],
                     generation: ModelGenerationConfig {
                         response_format: ResponseFormat::StructuredJson {

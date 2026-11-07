@@ -94,6 +94,62 @@ impl std::fmt::Debug for McpHttpAuth {
     }
 }
 
+/// How the model sees one MCP server's tool results.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpResultFormat {
+    /// Each result is a JSON document that marks the server's output as
+    /// untrusted data: `untrusted`, `security_notice`, the `content` items
+    /// with their metadata, `structured_content`, `is_error` and `_meta`.
+    #[default]
+    Json,
+    /// The result's text items reach the model as plain text, unescaped and
+    /// unwrapped (several text items are joined with a newline). A result
+    /// holding anything else than text falls back to `json`. Only a trusted
+    /// server may use it.
+    Text,
+}
+
+impl McpResultFormat {
+    /// The wire name of the format.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Text => "text",
+        }
+    }
+}
+
+/// How far the daemon trusts one MCP server, as an admin set it on the
+/// server's registration. Servers are untrusted unless an admin says
+/// otherwise.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerTrust {
+    /// The server's tool and field descriptions reach the model as written,
+    /// without the untrusted-description prefix.
+    #[serde(default)]
+    pub trusted: bool,
+    /// How tool results are framed for the model.
+    #[serde(default)]
+    pub result_format: McpResultFormat,
+}
+
+impl McpServerTrust {
+    /// Builds and validates the trust of server `name`: a plain-text result
+    /// format drops the untrusted-data wrapper, so it needs a trusted server.
+    pub fn new(name: &str, trusted: bool, result_format: McpResultFormat) -> Result<Self> {
+        if result_format == McpResultFormat::Text && !trusted {
+            return Err(anyhow!(
+                "MCP server `{name}` sets result_format \"text\" without trusted = true; only a trusted server's results may reach the model without the untrusted-data wrapper"
+            ));
+        }
+        Ok(Self {
+            trusted,
+            result_format,
+        })
+    }
+}
+
 /// One daemon-usable MCP server definition.
 #[derive(Clone, PartialEq, Eq)]
 pub struct McpServerConfig {
@@ -115,12 +171,15 @@ pub struct McpServerConfig {
     pub credential_secret_refs: Vec<String>,
     /// Configured transport.
     pub transport: McpServerTransport,
+    /// Whether an admin trusts the server, and how its results are framed.
+    pub trust: McpServerTrust,
 }
 
 impl fmt::Debug for McpServerConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("McpServerConfig")
             .field("name", &self.name)
+            .field("trust", &self.trust)
             .field("startup_timeout_ms", &self.startup_timeout_ms)
             .field("tool_timeout_ms", &self.tool_timeout_ms)
             .field("required", &self.required)
@@ -310,6 +369,25 @@ pub struct CodexServerConfig {
     disabled_tools: Vec<String>,
     startup_timeout_sec: Option<u64>,
     tool_timeout_sec: Option<u64>,
+    /// Admin-set: the server's descriptions reach the model without the
+    /// untrusted-description prefix. Unset means untrusted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trusted: Option<bool>,
+    /// How tool results are framed for the model: `json` (the default) or,
+    /// for a trusted server only, `text`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result_format: Option<McpResultFormat>,
+}
+
+impl CodexServerConfig {
+    /// The trust this entry asks for, validated.
+    pub fn trust(&self, name: &str) -> Result<McpServerTrust> {
+        McpServerTrust::new(
+            name,
+            self.trusted.unwrap_or(false),
+            self.result_format.unwrap_or_default(),
+        )
+    }
 }
 
 /// Returns the default Codex-compatible MCP config path when available.
@@ -370,6 +448,7 @@ pub fn codex_server_to_config(
     if matches!(server.enabled, Some(false)) {
         return Ok(None);
     }
+    let trust = server.trust(&name)?;
     let startup_timeout_ms = server
         .startup_timeout_sec
         .unwrap_or(DEFAULT_STARTUP_TIMEOUT_MS / 1_000)
@@ -494,6 +573,7 @@ pub fn codex_server_to_config(
         inherit_env,
         credential_secret_refs,
         transport,
+        trust,
     }))
 }
 
@@ -795,8 +875,8 @@ mod tests {
 
     use super::{
         CodexCompatOptions, DEFAULT_STARTUP_TIMEOUT_MS, DEFAULT_TOOL_TIMEOUT_MS, McpHttpAuth,
-        McpLoadOptions, McpResolvedSecrets, McpServerConfig, McpServerSource, McpServerTransport,
-        load_codex_mcp_servers, load_mcp_servers, resolve_cwd,
+        McpLoadOptions, McpResolvedSecrets, McpResultFormat, McpServerConfig, McpServerSource,
+        McpServerTransport, McpServerTrust, load_codex_mcp_servers, load_mcp_servers, resolve_cwd,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -1002,6 +1082,7 @@ env_secret_refs = { "SECRET_TOKEN" = "mcp.custom.secretStdio.SECRET_TOKEN" }
                     scopes: vec!["tools".to_string()],
                 },
             },
+            trust: Default::default(),
         };
         kheish_auth::register_ephemeral_debug_redaction_token("arg-token-canary");
         let stdio = McpServerConfig {
@@ -1015,6 +1096,7 @@ env_secret_refs = { "SECRET_TOKEN" = "mcp.custom.secretStdio.SECRET_TOKEN" }
                 env: BTreeMap::from([("MCP_TOKEN".to_string(), "env-canary".to_string())]),
                 cwd: None,
             },
+            trust: Default::default(),
             ..config.clone()
         };
 
@@ -1327,6 +1409,99 @@ oauth_slot_ref = "mcp.github.GITHUB_PERSONAL_ACCESS_TOKEN"
                 .servers
                 .iter()
                 .any(|server| matches!(server.source, McpServerSource::BuiltInCatalog { .. }))
+        );
+    }
+
+    #[test]
+    fn mcp_server_trust_is_admin_set_and_text_results_need_it() {
+        let config_path = temp_path("trust.toml");
+        fs::write(
+            &config_path,
+            r#"
+[mcp_servers.plain]
+url = "http://127.0.0.1:9/mcp"
+
+[mcp_servers.fregate]
+url = "http://127.0.0.1:9/mcp"
+trusted = true
+result_format = "text"
+
+[mcp_servers.marked]
+url = "http://127.0.0.1:9/mcp"
+trusted = true
+"#,
+        )
+        .expect("config should be written");
+        let options = CodexCompatOptions {
+            config_path: Some(config_path.clone()),
+            credentials_path: None,
+            resolved_secrets: Default::default(),
+        };
+        let result = load_codex_mcp_servers(&options).expect("config should parse");
+        let trust = |name: &str| {
+            result
+                .iter()
+                .find(|server| server.name == name)
+                .map(|server| server.trust)
+                .expect("server")
+        };
+        assert_eq!(
+            trust("plain"),
+            McpServerTrust::default(),
+            "untrusted by default"
+        );
+        assert_eq!(
+            trust("fregate"),
+            McpServerTrust {
+                trusted: true,
+                result_format: McpResultFormat::Text
+            }
+        );
+        assert_eq!(
+            trust("marked"),
+            McpServerTrust {
+                trusted: true,
+                result_format: McpResultFormat::Json
+            }
+        );
+
+        fs::write(
+            &config_path,
+            r#"
+[mcp_servers.sneaky]
+url = "http://127.0.0.1:9/mcp"
+result_format = "text"
+"#,
+        )
+        .expect("config should be written");
+        let error = load_codex_mcp_servers(&options).expect_err("text needs trust");
+        fs::remove_file(config_path).ok();
+        assert!(
+            format!("{error:#}").contains("result_format \"text\" without trusted = true"),
+            "{error:#}"
+        );
+
+        // The runtime API takes the same entry as JSON.
+        let entry: super::CodexServerConfig = serde_json::from_value(serde_json::json!({
+            "url": "http://127.0.0.1:9/mcp",
+            "trusted": true,
+            "result_format": "text"
+        }))
+        .expect("entry");
+        assert_eq!(
+            entry.trust("fregate").expect("trust"),
+            McpServerTrust {
+                trusted: true,
+                result_format: McpResultFormat::Text
+            }
+        );
+        assert!(
+            serde_json::from_value::<super::CodexServerConfig>(serde_json::json!({
+                "url": "http://127.0.0.1:9/mcp",
+                "result_format": "markdown"
+            }))
+            .is_err(),
+            "an unknown result format is refused"
         );
     }
 

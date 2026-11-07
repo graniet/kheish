@@ -14,9 +14,9 @@ pub use catalog::{
 };
 pub use config::{
     CodexCompatOptions, CodexServerConfig, LoadedMcpServerConfig, McpLoadOptions, McpLoadResult,
-    McpServerConfig, McpServerSource, McpServerTransport, codex_server_to_config,
-    default_codex_credentials_path, default_codex_mcp_config_path, load_codex_mcp_servers,
-    load_mcp_servers,
+    McpResultFormat, McpServerConfig, McpServerSource, McpServerTransport, McpServerTrust,
+    codex_server_to_config, default_codex_credentials_path, default_codex_mcp_config_path,
+    load_codex_mcp_servers, load_mcp_servers,
 };
 pub use manager::{
     MCP_META_RUN_ID, MCP_META_SESSION_ID, MCP_META_TOOL_CALL_ID, McpManager, McpRuntimeSnapshot,

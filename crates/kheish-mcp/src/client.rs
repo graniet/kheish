@@ -1249,6 +1249,7 @@ mod tests {
                     token: "mcp-static-token-1".to_string(),
                 },
             },
+            trust: Default::default(),
         };
         let client = McpClient::connect(&config, temp.path(), Some(auth_manager.clone())).await?;
         client.ensure_static_secret_refs_current()?;
@@ -1312,6 +1313,7 @@ mod tests {
                 ]),
                 auth: McpHttpAuth::None,
             },
+            trust: Default::default(),
         };
         let client = McpClient::connect(&config, temp.path(), Some(auth_manager.clone())).await?;
         client.ensure_static_secret_refs_current()?;
@@ -1628,6 +1630,7 @@ mod tests {
                 headers: headers.clone(),
                 auth: auth.clone(),
             },
+            trust: Default::default(),
         };
         let client = McpClient::connect(&config, temp.path(), Some(auth_manager.clone())).await?;
         let scope = kheish_runtime::ExecutionScope {

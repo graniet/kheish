@@ -697,14 +697,42 @@ struct McpStubLog {
     call_authorizations: Arc<Mutex<Vec<String>>>,
 }
 
+/// How an MCP stub answers one `tools/call`, from its `params`.
+type McpStubAnswer = fn(&Value) -> Value;
+
+#[derive(Clone)]
+struct McpStubState {
+    log: McpStubLog,
+    tools: Value,
+    answer: McpStubAnswer,
+}
+
 /// A minimal streamable-HTTP MCP server exposing one `scan_target` tool and
 /// answering with plain JSON responses.
 async fn spawn_mcp_stub() -> Result<(String, McpStubLog)> {
+    spawn_mcp_stub_serving(
+        json!([{
+            "name": "scan_target",
+            "description": "Scans one target.",
+            "inputSchema": {"type": "object", "properties": {"target": {"type": "string"}}}
+        }]),
+        |_| json!({"content": [{"type": "text", "text": "SCANNED"}], "isError": false}),
+    )
+    .await
+}
+
+/// A streamable-HTTP MCP server listing `tools` and answering each
+/// `tools/call` with `answer`, over plain JSON responses.
+async fn spawn_mcp_stub_serving(
+    tools: Value,
+    answer: McpStubAnswer,
+) -> Result<(String, McpStubLog)> {
     async fn rpc(
-        State(log): State<McpStubLog>,
+        State(stub): State<McpStubState>,
         headers: axum::http::HeaderMap,
         body: Bytes,
     ) -> axum::response::Response {
+        let log = stub.log;
         let Ok(message) = serde_json::from_slice::<Value>(&body) else {
             return StatusCode::BAD_REQUEST.into_response();
         };
@@ -719,11 +747,7 @@ async fn spawn_mcp_stub() -> Result<(String, McpStubLog)> {
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "fregate-stub", "version": "1.0.0"}
             }),
-            "tools/list" => json!({"tools": [{
-                "name": "scan_target",
-                "description": "Scans one target.",
-                "inputSchema": {"type": "object", "properties": {"target": {"type": "string"}}}
-            }]}),
+            "tools/list" => json!({"tools": stub.tools}),
             "tools/call" => {
                 log.calls.lock().push(message["params"].clone());
                 log.call_authorizations.lock().push(
@@ -733,7 +757,7 @@ async fn spawn_mcp_stub() -> Result<(String, McpStubLog)> {
                         .unwrap_or_default()
                         .to_string(),
                 );
-                json!({"content": [{"type": "text", "text": "SCANNED"}], "isError": false})
+                (stub.answer)(&message["params"])
             }
             _ => json!({}),
         };
@@ -758,7 +782,11 @@ async fn spawn_mcp_stub() -> Result<(String, McpStubLog)> {
                 .get(|| async { StatusCode::METHOD_NOT_ALLOWED })
                 .delete(|| async { StatusCode::ACCEPTED }),
         )
-        .with_state(log.clone());
+        .with_state(McpStubState {
+            log: log.clone(),
+            tools,
+            answer,
+        });
     tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
@@ -939,6 +967,262 @@ async fn mcp_tool_calls_carry_the_execution_context_and_survive_secret_rotation(
             .last()
             .map(String::as_str),
         Some("Bearer mcp-token-B")
+    );
+
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+    Ok(())
+}
+
+/// Fregate's `get_fact`: enums, an integer with a range, a string with length
+/// limits, and descriptions at every depth. Strict tool use cannot enforce
+/// the limits, so the tool goes out as written, without `strict`.
+fn verify_get_fact_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": ["hostname", "service", "certificate"],
+                "description": "The fact's kind."
+            },
+            "key": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 300,
+                "description": "The fact's key, as get_exposure or list_facts gave it."
+            },
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535}
+        },
+        "required": ["key", "kind"],
+        "additionalProperties": false
+    })
+}
+
+/// Fregate's `submit_verdict`: closed objects at every depth, enums, an
+/// integer. Strict tool use enforces all of it.
+fn verify_submit_verdict_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "verdict": {"type": "string", "enum": ["confirmed", "likely_false_positive", "needs_human"]},
+            "confidence": {"type": "integer", "description": "0 to 100."},
+            "next_step": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["remediate", "dismiss", "recheck", "investigate"]},
+                    "detail": {"type": "string", "description": "Specifics, at most 500 characters."}
+                },
+                "required": ["action", "detail"],
+                "additionalProperties": false
+            }
+        },
+        "required": ["confidence", "next_step", "verdict"],
+        "additionalProperties": false
+    })
+}
+
+/// The fact document `get_fact` answers with: JSON, inside one text item.
+const VERIFY_FACT_DOCUMENT: &str = r#"{"ref":"fact:service:203.0.113.10:3389/tcp","in_current_state":true,"value":{"port":3389,"service":"ms-wbt-server"}}"#;
+
+/// A streamable-HTTP MCP server with Fregate's two verification tools. A
+/// `get_fact` on a key it does not know answers `isError: true`.
+async fn spawn_verify_mcp_stub() -> Result<(String, McpStubLog)> {
+    spawn_mcp_stub_serving(
+        json!([
+            {
+                "name": "get_fact",
+                "description": "Read one fact of the workspace.",
+                "inputSchema": verify_get_fact_schema()
+            },
+            {
+                "name": "submit_verdict",
+                "description": "Submit your verdict. Call it exactly once, at the end.",
+                "inputSchema": verify_submit_verdict_schema()
+            }
+        ]),
+        |params| match params["name"].as_str() {
+            Some("get_fact") if params["arguments"]["key"] == "203.0.113.10:3389/tcp" => {
+                json!({"content": [{"type": "text", "text": VERIFY_FACT_DOCUMENT}]})
+            }
+            Some("get_fact") => json!({
+                "content": [{"type": "text", "text": format!("unknown fact {}", params["arguments"]["key"].as_str().unwrap_or_default())}],
+                "isError": true
+            }),
+            _ => json!({"content": [{"type": "text", "text": "Verdict saved."}]}),
+        },
+    )
+    .await
+}
+
+/// Boots a daemon whose `verify` route serves `claude-opus-5-5` from the
+/// Messages mock, with Fregate's MCP server registered as `fregate`.
+async fn verify_daemon(
+    state_root: &Path,
+    workspace_root: &Path,
+    mock: &AnthropicMock,
+    mcp_server: Value,
+) -> Result<(String, oneshot::Sender<()>)> {
+    let endpoint = format!("{}/v1/messages", mock.base);
+    let (address, shutdown) =
+        anthropic_provider_daemon(state_root, workspace_root, &endpoint).await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+    post_route(
+        &client,
+        &base,
+        json!({"route_id": "verify", "provider": "anthropic", "model": "claude-opus-5-5",
+               "api_key": "verify-key", "base_url": endpoint}),
+    )
+    .await?
+    .error_for_status()?;
+    client
+        .post(format!("{base}/v1/runtime/mcp/servers"))
+        .json(&mcp_server)
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok((base, shutdown))
+}
+
+/// Submits one run on the `verify` route with `options` merged into the
+/// request, and waits for it to complete.
+async fn complete_verify_run(
+    client: &Client,
+    base: &str,
+    session_id: &str,
+    options: Value,
+) -> Result<RunView> {
+    let mut body = json!({"content": "Verify this exposure.", "provider": "verify"});
+    if let (Value::Object(body), Value::Object(options)) = (&mut body, options) {
+        body.extend(options);
+    }
+    let run = client
+        .post(format!("{base}/v1/sessions/{session_id}/runs"))
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<RunView>()
+        .await?;
+    wait_for_run_status(client, base, &run.run_id, &[DaemonRunStatus::Completed]).await
+}
+
+/// The tool advertised as `name` in one Messages request body.
+fn advertised_tool(body: &Value, name: &str) -> Value {
+    body["tools"]
+        .as_array()
+        .and_then(|tools| tools.iter().find(|tool| tool["name"] == name))
+        .cloned()
+        .unwrap_or_else(|| panic!("tool {name} advertised in {body:#}"))
+}
+
+#[tokio::test]
+async fn trusted_mcp_servers_reach_the_model_as_written() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-state");
+    let workspace_root = temp.path().join("workspace");
+    let mock = spawn_anthropic_messages_mock("Done.").await?;
+    let (mcp_url, mcp_log) = spawn_verify_mcp_stub().await?;
+    let (base, shutdown) = verify_daemon(
+        &state_root,
+        &workspace_root,
+        &mock,
+        json!({"name": "fregate", "url": mcp_url, "trusted": true, "result_format": "text"}),
+    )
+    .await?;
+    let client = Client::new();
+
+    // Plain-text results drop the untrusted-data wrapper: an untrusted server
+    // may not ask for them.
+    let refused = client
+        .post(format!("{base}/v1/runtime/mcp/servers"))
+        .json(&json!({"name": "other", "url": mcp_url, "result_format": "text"}))
+        .send()
+        .await?;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        refused.json::<ProblemDetails>().await?.code,
+        "mcp_server_trust_invalid"
+    );
+    let runtime = client
+        .get(format!("{base}/v1/runtime"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    let server = runtime["mcp"]["servers"]
+        .as_array()
+        .and_then(|servers| servers.iter().find(|server| server["server"] == "fregate"))
+        .cloned()
+        .expect("fregate server listed");
+    assert_eq!(server["trusted"], json!(true), "{server:#}");
+    assert_eq!(server["result_format"], json!("text"), "{server:#}");
+
+    create_test_session(&client, &base, "mission-v1").await?;
+    client
+        .put(format!("{base}/v1/sessions/mission-v1/permission-mode"))
+        .json(&json!({"mode": "bypassPermissions"}))
+        .send()
+        .await?
+        .error_for_status()?;
+    mock.push(MockReply::ToolUse {
+        id: "toolu_missing".to_string(),
+        name: "mcp__fregate__get_fact".to_string(),
+        input: json!({"kind": "service", "key": "203.0.113.10:9999/tcp"}),
+    });
+    mock.push(MockReply::ToolUse {
+        id: "toolu_fact".to_string(),
+        name: "mcp__fregate__get_fact".to_string(),
+        input: json!({"kind": "service", "key": "203.0.113.10:3389/tcp"}),
+    });
+    complete_verify_run(&client, &base, "mission-v1", json!({})).await?;
+    assert_eq!(mcp_log.calls.lock().len(), 2);
+
+    let requests = mock.captured.lock().clone();
+    assert_eq!(requests.len(), 3);
+    let first = &requests[0].body;
+    let get_fact = advertised_tool(first, "mcp__fregate__get_fact");
+    assert_eq!(
+        serde_json::to_string(&get_fact["input_schema"])?,
+        serde_json::to_string(&verify_get_fact_schema())?,
+        "the server's schema reaches the request body as written"
+    );
+    assert_eq!(
+        get_fact["description"], "Read one fact of the workspace.",
+        "a trusted server's description carries no prefix"
+    );
+    assert!(
+        get_fact.get("strict").is_none(),
+        "length limits are not enforceable strictly: {get_fact:#}"
+    );
+    let verdict = advertised_tool(first, "mcp__fregate__submit_verdict");
+    assert_eq!(verdict["input_schema"], verify_submit_verdict_schema());
+    assert_eq!(verdict["strict"], json!(true));
+
+    // The failed call reaches the model as an error, its text as written.
+    let messages = requests[1].body["messages"].as_array().expect("messages");
+    let results = messages.last().expect("tool results");
+    assert_eq!(
+        results["content"],
+        json!([{
+            "type": "tool_result",
+            "tool_use_id": "toolu_missing",
+            "is_error": true,
+            "content": [{"type": "text", "text": "unknown fact 203.0.113.10:9999/tcp"}]
+        }])
+    );
+    // A result is the server's text, unescaped and unwrapped.
+    let messages = requests[2].body["messages"].as_array().expect("messages");
+    assert_eq!(
+        messages.last().expect("tool results")["content"],
+        json!([{
+            "type": "tool_result",
+            "tool_use_id": "toolu_fact",
+            "is_error": false,
+            "content": [{"type": "text", "text": VERIFY_FACT_DOCUMENT}]
+        }])
     );
 
     let _ = shutdown.send(());

@@ -1369,6 +1369,7 @@ mod tests {
             description: "Generate an image".to_string(),
             input_schema: serde_json::Value::Null,
             allows_parallel: false,
+            strict: false,
         }
     }
 

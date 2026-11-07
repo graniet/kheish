@@ -108,6 +108,23 @@ The tools are sorted by name, so the cached prefix renders the same bytes on eve
 order the runtime lists them in. A prompt shorter than the model's minimum cacheable length (512
 tokens on the 5.x generations) is simply not cached.
 
+### Tool schemas
+
+Each tool goes out with its JSON Schema as the tool defines it: Kheish's own tools render theirs,
+an MCP tool carries the server's `inputSchema` unchanged (enums, integers, nested descriptions,
+limits). An MCP tool also asks for strict input: the driver sends `strict: true` when the model
+takes strict tool use (every 5.x generation, Claude Opus 4.8, Claude Haiku 4.5, Claude Opus 4.5 and
+4.1) and the schema is in the subset it enforces (every object closed with
+`additionalProperties: false`; no length, range or pattern limits; supported string formats only;
+no recursive references). The first 20 such tools by name get it, within 24 optional and 16
+union-typed parameters across them. A tool result the tool reported as failed (an MCP `isError`)
+is sent with `is_error: true`.
+
+The other drivers take a subset of JSON Schema. OpenAI, OpenRouter and xAI get the structural
+keywords (`type` including `integer`, `description`, `properties`, `required`,
+`additionalProperties`, `items`, `enum`, `const`, `anyOf`) with local references inlined; Gemini
+gets references inlined, nullable types as `nullable: true`, and the keywords it takes.
+
 ### Usage and cost
 
 Model usage (`api_usage` on assistant messages, the runtime's model budget counters) carries the

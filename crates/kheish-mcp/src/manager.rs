@@ -18,13 +18,14 @@ use tokio::sync::RwLock;
 
 use crate::client::McpClient;
 use crate::config::{
-    CodexCompatOptions, LoadedMcpServerConfig, McpHttpAuth, McpLoadOptions, McpServerConfig,
-    McpServerSource, McpServerTransport, load_codex_mcp_servers, load_mcp_servers,
+    CodexCompatOptions, LoadedMcpServerConfig, McpHttpAuth, McpLoadOptions, McpResultFormat,
+    McpServerConfig, McpServerSource, McpServerTransport, McpServerTrust, load_codex_mcp_servers,
+    load_mcp_servers,
 };
 use crate::tools::{
     MCP_UNTRUSTED_NOTICE, McpListResourceTemplatesTool, McpListResourcesTool, McpReadResourceTool,
-    McpToolAdapter, discovered_tool_descriptor, qualify_tool_name, resource_contents_json,
-    sanitize_mcp_value, tool_result_json,
+    McpToolAdapter, qualify_tool_name, resource_contents_json, sanitize_mcp_value,
+    tool_result_output,
 };
 
 /// `tools/call` `_meta` key carrying the calling Kheish session id.
@@ -123,6 +124,13 @@ pub struct McpServerSnapshot {
     /// Optional human-readable server instructions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    /// Whether an admin trusts the server: its descriptions reach the model
+    /// without the untrusted-description prefix.
+    #[serde(default)]
+    pub trusted: bool,
+    /// How the server's tool results are framed for the model.
+    #[serde(default)]
+    pub result_format: McpResultFormat,
 }
 
 /// MCP runtime state exported by the daemon.
@@ -219,6 +227,9 @@ pub(crate) struct DiscoveredMcpTool {
     pub(crate) description: String,
     pub(crate) input_schema: Value,
     pub(crate) tool_timeout_ms: u64,
+    /// The owning server's trust, which shapes the tool's description,
+    /// schema and results as the model sees them.
+    pub(crate) trust: McpServerTrust,
 }
 
 #[derive(Clone)]
@@ -632,10 +643,7 @@ impl McpManager {
         runtime.try_register_unique(McpReadResourceTool::new(Arc::new(self.clone())))?;
         let tools: Vec<DiscoveredMcpTool> = self.tools.read().values().cloned().collect();
         for tool in &tools {
-            runtime.try_register_unique(McpToolAdapter::new(
-                Arc::new(self.clone()),
-                discovered_tool_descriptor(tool),
-            ))?;
+            runtime.try_register_unique(McpToolAdapter::for_tool(Arc::new(self.clone()), tool))?;
         }
         Ok(())
     }
@@ -696,8 +704,7 @@ impl McpManager {
         }
         let mut registered: Vec<String> = Vec::with_capacity(server.tools.len());
         for tool in &server.tools {
-            let adapter =
-                McpToolAdapter::new(Arc::new(self.clone()), discovered_tool_descriptor(tool));
+            let adapter = McpToolAdapter::for_tool(Arc::new(self.clone()), tool);
             if let Err(error) = runtime.register_dynamic(Arc::new(adapter)) {
                 for name in &registered {
                     runtime.unregister_dynamic(name);
@@ -826,6 +833,8 @@ impl McpManager {
                     .instructions
                     .as_ref()
                     .map(|instructions| sanitize_server_instructions(instructions)),
+                trusted: server.config.trust.trusted,
+                result_format: server.config.trust.result_format,
             })
             .collect();
         McpRuntimeSnapshot {
@@ -915,7 +924,7 @@ impl McpManager {
                 return Err(error);
             }
         };
-        let output = ToolExecutionOutput::json(tool_result_json(&result));
+        let output = tool_result_output(&result, tool.trust.result_format);
         self.mark_server_runtime_success(&tool.server_name).await;
         self.record_external_action(
             "response",
@@ -1454,8 +1463,7 @@ impl McpManager {
             // server's own tool is already present (a concurrent/idempotent
             // re-hydration), then claim the name.
             if !self.tools.read().contains_key(&tool.qualified_name) {
-                let adapter =
-                    McpToolAdapter::new(Arc::new(self.clone()), discovered_tool_descriptor(&tool));
+                let adapter = McpToolAdapter::for_tool(Arc::new(self.clone()), &tool);
                 let _ = runtime.register_dynamic(Arc::new(adapter));
             }
             owned.push(tool);
@@ -1801,6 +1809,7 @@ fn filter_discovered_tools(
             description: tool.description.as_deref().unwrap_or_default().to_string(),
             input_schema: Value::Object((*tool.input_schema).clone()),
             tool_timeout_ms: config.tool_timeout_ms,
+            trust: config.trust,
         })
         .collect()
 }
@@ -1829,7 +1838,7 @@ mod tests {
     use crate::config::{
         LoadedMcpServerConfig, McpHttpAuth, McpServerConfig, McpServerSource, McpServerTransport,
     };
-    use crate::tools::{McpToolAdapter, discovered_tool_descriptor};
+    use crate::tools::McpToolAdapter;
 
     fn auth_env_guard() -> parking_lot::MutexGuard<'static, ()> {
         static LOCK: OnceLock<SyncMutex<()>> = OnceLock::new();
@@ -1862,6 +1871,7 @@ mod tests {
                     scopes: vec!["read".to_string()],
                 },
             },
+            trust: Default::default(),
         }
     }
 
@@ -1940,6 +1950,7 @@ mod tests {
                 env: BTreeMap::new(),
                 cwd: None,
             },
+            trust: Default::default(),
         };
         let workspace_root = std::env::current_dir()?;
         let client = Arc::new(McpClient::connect(&config, &workspace_root, None).await?);
@@ -1994,6 +2005,7 @@ mod tests {
                 env: BTreeMap::new(),
                 cwd: None,
             },
+            trust: Default::default(),
         };
         let workspace_root = std::env::current_dir()?;
         let client = Arc::new(McpClient::connect(&config, &workspace_root, None).await?);
@@ -2088,6 +2100,7 @@ mod tests {
                 env: BTreeMap::new(),
                 cwd: None,
             },
+            trust: Default::default(),
         };
         let workspace_root = temp.path().to_path_buf();
         let client = Arc::new(
@@ -2112,6 +2125,7 @@ mod tests {
                         description: "lookup".to_string(),
                         input_schema: json!({"type":"object"}),
                         tool_timeout_ms: 120_000,
+                        trust: Default::default(),
                     }],
                     error: None,
                     connected: true,
@@ -2134,9 +2148,9 @@ mod tests {
                 .tools
                 .write()
                 .insert(tool.qualified_name.clone(), tool.clone());
-            runtime.register_dynamic(Arc::new(McpToolAdapter::new(
+            runtime.register_dynamic(Arc::new(McpToolAdapter::for_tool(
                 Arc::new(manager.clone()),
-                discovered_tool_descriptor(tool),
+                tool,
             )))?;
         }
 
@@ -2401,6 +2415,7 @@ mod tests {
             description: String::new(),
             input_schema: json!({"type": "object"}),
             tool_timeout_ms: 1_000,
+            trust: Default::default(),
         };
         let mut current = BTreeMap::new();
         current.insert(
@@ -2445,6 +2460,7 @@ mod tests {
                 env: BTreeMap::new(),
                 cwd: None,
             },
+            trust: Default::default(),
         };
         let stdio_client =
             Arc::new(McpClient::connect(&stdio_config, &workspace_root, None).await?);
@@ -2464,6 +2480,7 @@ mod tests {
             description: "already hydrated".to_string(),
             input_schema: json!({"type": "object"}),
             tool_timeout_ms: 120_000,
+            trust: Default::default(),
         };
 
         let manager = McpManager {
@@ -2613,6 +2630,7 @@ mod tests {
                 env: BTreeMap::new(),
                 cwd: None,
             },
+            trust: Default::default(),
         };
         let workspace_root = std::env::current_dir()?;
         let client = Arc::new(McpClient::connect(&config, &workspace_root, None).await?);
@@ -2683,6 +2701,7 @@ mod tests {
                 env: BTreeMap::from([("LOG_LEVEL".to_string(), "debug".to_string())]),
                 cwd: None,
             },
+            trust: Default::default(),
         };
         assert!(!public.uses_credentials());
 
@@ -2701,6 +2720,7 @@ mod tests {
                 env: BTreeMap::from([("ACCESS_TOKEN".to_string(), "token-value".to_string())]),
                 cwd: None,
             },
+            trust: Default::default(),
         };
         assert!(credentialed.uses_credentials());
     }
@@ -2721,6 +2741,7 @@ mod tests {
                 headers: BTreeMap::from([("Accept".to_string(), "application/json".to_string())]),
                 auth: McpHttpAuth::None,
             },
+            trust: Default::default(),
         };
         assert!(!public.uses_credentials());
 
@@ -2738,6 +2759,7 @@ mod tests {
                 headers: BTreeMap::from([("x-api-key".to_string(), "secret-value".to_string())]),
                 auth: McpHttpAuth::None,
             },
+            trust: Default::default(),
         };
         assert!(credentialed.uses_credentials());
     }
@@ -2762,6 +2784,7 @@ mod tests {
                     scopes: vec!["read".to_string()],
                 },
             },
+            trust: Default::default(),
         };
         let manager = McpManager::bootstrap(
             std::env::current_dir()?,

@@ -997,6 +997,7 @@ mod tests {
             description: "note how you read someone".to_string(),
             input_schema: json!({"type": "object"}),
             allows_parallel: false,
+            strict: false,
         }];
 
         // No ledger yet, but the tool is present -> a generic framing still renders.
@@ -1042,6 +1043,7 @@ mod tests {
             description: "open a goal".to_string(),
             input_schema: json!({"type": "object"}),
             allows_parallel: false,
+            strict: false,
         }];
 
         // create_goal can be used when the user explicitly requests a goal, but
@@ -1227,6 +1229,7 @@ mod tests {
             description: "Reads one file".to_string(),
             input_schema: json!({"type": "object"}),
             allows_parallel: true,
+            strict: false,
         }]
     }
 
@@ -1334,6 +1337,7 @@ mod tests {
                 description: "Fetches URLs".to_string(),
                 input_schema: json!({"type": "object"}),
                 allows_parallel: true,
+                strict: false,
             }],
             None,
             None,
@@ -1375,6 +1379,7 @@ mod tests {
                 description: "Ask the user one structured clarification request.".to_string(),
                 input_schema: json!({"type": "object"}),
                 allows_parallel: false,
+                strict: false,
             }],
             None,
             None,

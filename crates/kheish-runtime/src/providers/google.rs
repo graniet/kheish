@@ -421,7 +421,9 @@ impl GoogleProvider {
                     json!({
                         "name": tool.name,
                         "description": tool.description,
-                        "parameters": google_function_parameters_schema(&tool.input_schema),
+                        "parameters": google_function_parameters_schema(
+                            &super::tool_schema::gemini_compatible_tool_schema(&tool.input_schema),
+                        ),
                     })
                 })
                 .collect::<Vec<_>>();
@@ -2395,6 +2397,7 @@ mod tests {
                 "additionalProperties": false
             }),
             allows_parallel: false,
+            strict: false,
         }];
         request.generation.response_format = ResponseFormat::StructuredJson {
             schema: StructuredFieldSchema {
@@ -2476,6 +2479,7 @@ mod tests {
                 "required": ["path"]
             }),
             allows_parallel: false,
+            strict: false,
         }];
         request.generation.tool_choice = ToolChoice::Specific {
             name: "generate_audio".to_string(),
@@ -2760,6 +2764,7 @@ mod tests {
                 }
             }),
             allows_parallel: false,
+            strict: false,
         }];
         let (sender, mut receiver) = mpsc::unbounded_channel();
         provider

@@ -108,8 +108,16 @@ pub struct ToolCallRecord {
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
+    /// The tool's JSON Schema. Kheish's own tools render it from their
+    /// runtime schema; an MCP tool carries the server's `inputSchema` as the
+    /// server wrote it, and each provider converts it to what it supports.
     pub input_schema: Value,
     pub allows_parallel: bool,
+    /// Asks the provider to hold the model's input to `input_schema` exactly
+    /// (Anthropic strict tool use). A provider applies it only when the
+    /// schema is in the subset it can enforce, and within its limits.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strict: bool,
 }
 
 /// Declares one allow/deny filter applied to an agent-specific tool surface.
