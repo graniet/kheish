@@ -193,10 +193,12 @@ current Claude models:
 - `generation.reasoning.effort`: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`
   ([mapping](./model-providers#thinking-and-effort));
 - `generation.refusal_fallbacks`: `"default"` or up to three `{ "model", "max_tokens" }`, the models an
-  Anthropic route retries a declined request on ([refusal fallback](./model-providers#refusal-fallback)).
+  Anthropic route retries a declined request on ([refusal fallback](./model-providers#refusal-fallback));
+- `generation.retry_max_tokens`: the output cap of the one retry a turn cut off at
+  `max_output_tokens` gets ([output limit](./sessions-and-runs-api#output-limit)).
 
 A run that ends on a model condition is `failed` with a machine-readable `RunView.error_code`
-(`model_refusal`, with `RunView.refusal`), also carried by its `failed` run event; see
+(`model_refusal`, with `RunView.refusal`; `output_limit_exceeded`), also carried by its `failed` run event; see
 [run error codes](./sessions-and-runs-api#run-error-codes).
 
 ## Route groups at a glance

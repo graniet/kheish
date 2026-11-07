@@ -3702,6 +3702,7 @@ mod tests {
                             },
                         },
                         refusal_fallbacks: None,
+                        retry_max_tokens: None,
                     },
                 },
                 ModelEventSink::new(sender),

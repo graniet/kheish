@@ -40,7 +40,6 @@ use state::{AutocompactTracking, ExecutedBatchOutcome, PendingQuestionExecution,
 mod state;
 
 const MAX_COMPACTION_PTL_RETRIES: usize = 3;
-const MAX_OUTPUT_TOKENS_RECOVERY_LIMIT: u8 = 3;
 const PROMPT_VISIBLE_TOOL_OUTPUT_TOKEN_LIMIT: usize = 10_000;
 const PROMPT_VISIBLE_TOOL_OUTPUT_PREVIEW_CHARS: usize = 32_000;
 
@@ -762,48 +761,70 @@ impl AgentEngine {
             let mut reactive_compacted = false;
             let mut aggressively_snipped = false;
             let mut fallback_model_applied = false;
+            // The output cap of a turn that was cut off, once it is asked again.
+            let mut cut_off_cap: Option<u32> = None;
             let model_turn = loop {
-                match model.next_turn(request.clone()).await {
-                    Ok(model_turn) => break model_turn,
-                    Err(error) if Self::is_prompt_too_long_error(&error) => {
-                        if !aggressively_snipped {
-                            let snip_start_offset = self.next_offset;
-                            if let Some(rebuilt) =
-                                self.aggressive_snip_workspace(turn, &request.generation)
-                            {
-                                trace.compaction_boundaries.extend(
-                                    self.collect_compaction_boundaries_since(snip_start_offset),
-                                );
-                                request.prompt = rebuilt.prompt.clone();
-                                request.provider_prompt = rebuilt.provider_prompt.clone();
-                                aggressively_snipped = true;
-                                continue;
+                let model_turn = loop {
+                    match model.next_turn(request.clone()).await {
+                        Ok(model_turn) => break model_turn,
+                        Err(error) if Self::is_prompt_too_long_error(&error) => {
+                            if !aggressively_snipped {
+                                let snip_start_offset = self.next_offset;
+                                if let Some(rebuilt) =
+                                    self.aggressive_snip_workspace(turn, &request.generation)
+                                {
+                                    trace.compaction_boundaries.extend(
+                                        self.collect_compaction_boundaries_since(snip_start_offset),
+                                    );
+                                    request.prompt = rebuilt.prompt.clone();
+                                    request.provider_prompt = rebuilt.provider_prompt.clone();
+                                    aggressively_snipped = true;
+                                    continue;
+                                }
                             }
-                        }
-                        if !reactive_compacted {
-                            let reactive_start_offset = self.next_offset;
-                            if let Some(checkpoint) = self
-                                .force_reactive_compaction(turn, model, restoration)
-                                .await?
-                            {
-                                trace.checkpoints.push(CheckpointTrace {
-                                    compacted_until_offset: checkpoint.compacted_until_offset,
-                                    journal_digest: checkpoint.journal_digest.clone(),
-                                    summary_chars: checkpoint.summary_text.len(),
-                                });
-                                snapshot_checkpoints.push(checkpoint);
-                                trace.compaction_boundaries.extend(
-                                    self.collect_compaction_boundaries_since(reactive_start_offset),
-                                );
-                                run_meta.autocompact = self.snapshot_autocompact_tracking();
-                                let rebuilt = self.build_prompt_workspace();
-                                request.prompt = rebuilt.prompt.clone();
-                                request.provider_prompt = rebuilt.provider_prompt.clone();
-                                reactive_compacted = true;
-                                continue;
+                            if !reactive_compacted {
+                                let reactive_start_offset = self.next_offset;
+                                if let Some(checkpoint) = self
+                                    .force_reactive_compaction(turn, model, restoration)
+                                    .await?
+                                {
+                                    trace.checkpoints.push(CheckpointTrace {
+                                        compacted_until_offset: checkpoint.compacted_until_offset,
+                                        journal_digest: checkpoint.journal_digest.clone(),
+                                        summary_chars: checkpoint.summary_text.len(),
+                                    });
+                                    snapshot_checkpoints.push(checkpoint);
+                                    trace.compaction_boundaries.extend(
+                                        self.collect_compaction_boundaries_since(
+                                            reactive_start_offset,
+                                        ),
+                                    );
+                                    run_meta.autocompact = self.snapshot_autocompact_tracking();
+                                    let rebuilt = self.build_prompt_workspace();
+                                    request.prompt = rebuilt.prompt.clone();
+                                    request.provider_prompt = rebuilt.provider_prompt.clone();
+                                    reactive_compacted = true;
+                                    continue;
+                                }
                             }
+                            if !fallback_model_applied {
+                                if let Some(fallback_generation) = Self::fallback_model_generation(
+                                    &generation,
+                                    &request_generation,
+                                ) {
+                                    pending_generation = fallback_generation.clone();
+                                    request.generation = fallback_generation;
+                                    fallback_model_applied = true;
+                                    continue;
+                                }
+                            }
+                            return Err(error);
                         }
-                        if !fallback_model_applied {
+                        Err(error)
+                            if !fallback_model_applied
+                                && (Self::is_rate_limit_error(&error)
+                                    || Self::is_provider_unavailable_error(&error)) =>
+                        {
                             if let Some(fallback_generation) =
                                 Self::fallback_model_generation(&generation, &request_generation)
                             {
@@ -812,26 +833,31 @@ impl AgentEngine {
                                 fallback_model_applied = true;
                                 continue;
                             }
+                            return Err(error);
                         }
-                        return Err(error);
+                        Err(error) => return Err(error),
                     }
-                    Err(error)
-                        if !fallback_model_applied
-                            && (Self::is_rate_limit_error(&error)
-                                || Self::is_provider_unavailable_error(&error)) =>
-                    {
-                        if let Some(fallback_generation) =
-                            Self::fallback_model_generation(&generation, &request_generation)
-                        {
-                            pending_generation = fallback_generation.clone();
-                            request.generation = fallback_generation;
-                            fallback_model_applied = true;
-                            continue;
-                        }
-                        return Err(error);
+                };
+                if matches!(model_turn.finish_reason, ModelFinishReason::MaxTokens) {
+                    // The answer was cut off at the output limit. Whatever it
+                    // holds (a partial text, a tool call whose input was cut)
+                    // is discarded: it never enters the history, and its tool
+                    // calls never run. The same turn is asked once more with
+                    // the run's larger cap; a second cut-off ends the run.
+                    let cap = request.generation.effective_max_output_tokens();
+                    if let Some(first_cap) = cut_off_cap {
+                        return Err(anyhow::Error::new(RunTerminalError::output_limit_exceeded(
+                            first_cap, cap,
+                        )));
                     }
-                    Err(error) => return Err(error),
+                    cut_off_cap = Some(cap);
+                    request.generation.max_output_tokens =
+                        Some(request.generation.output_limit_retry_cap(cap));
+                    run_meta.max_output_tokens_recovery_count =
+                        run_meta.max_output_tokens_recovery_count.saturating_add(1);
+                    continue;
                 }
+                break model_turn;
             };
             if matches!(model_turn.finish_reason, ModelFinishReason::Blocked) {
                 // A final refusal: no fallback served the request. The
@@ -1030,25 +1056,6 @@ impl AgentEngine {
                 run_meta.permission_denied_retry_count =
                     run_meta.permission_denied_retry_count.saturating_add(1);
                 pending_generation = request_generation.clone();
-                continue;
-            }
-
-            if tool_executions.is_empty()
-                && matches!(model_turn.finish_reason, ModelFinishReason::MaxTokens)
-            {
-                if Self::should_escalate_max_output_tokens(&generation, &request_generation) {
-                    pending_generation =
-                        Self::max_tokens_recovery_generation(&generation, &request_generation);
-                    continue;
-                }
-                if run_meta.max_output_tokens_recovery_count >= MAX_OUTPUT_TOKENS_RECOVERY_LIMIT {
-                    bail!("model output exceeded max tokens after recovery");
-                }
-                self.append_max_tokens_recovery_message(turn);
-                run_meta.max_output_tokens_recovery_count =
-                    run_meta.max_output_tokens_recovery_count.saturating_add(1);
-                pending_generation =
-                    Self::max_tokens_recovery_generation(&generation, &request_generation);
                 continue;
             }
 
@@ -1699,41 +1706,6 @@ impl AgentEngine {
                  Continue from where you left off. If you still need the action, retry with safer input or a narrower scope instead of stopping."
             ),
         ));
-    }
-
-    fn append_max_tokens_recovery_message(&mut self, turn: usize) {
-        self.append_message(MessageRecord::new(
-            format!("user-max-tokens-recovery-{turn}"),
-            Role::User,
-            Self::max_tokens_recovery_message(),
-        ));
-    }
-
-    fn max_tokens_recovery_message() -> String {
-        "Output token limit hit. Resume directly — no apology, no recap of what you were doing. Pick up mid-thought if that is where the cut happened. Break remaining work into smaller pieces.".to_string()
-    }
-
-    fn should_escalate_max_output_tokens(
-        base: &ModelGenerationConfig,
-        current: &ModelGenerationConfig,
-    ) -> bool {
-        base.max_output_tokens.is_none()
-            && current
-                .max_output_tokens
-                .unwrap_or_default()
-                .lt(&kheish_types::ESCALATED_MAX_OUTPUT_TOKENS)
-    }
-
-    fn max_tokens_recovery_generation(
-        base: &ModelGenerationConfig,
-        current: &ModelGenerationConfig,
-    ) -> ModelGenerationConfig {
-        if Self::should_escalate_max_output_tokens(base, current) {
-            let mut generation = current.clone();
-            generation.max_output_tokens = Some(kheish_types::ESCALATED_MAX_OUTPUT_TOKENS);
-            return generation;
-        }
-        base.clone()
     }
 
     /// Parses and validates the run's final answer against its contract.
@@ -3329,6 +3301,7 @@ impl AgentEngine {
             reasoning: None,
             response_format: kheish_types::ResponseFormat::Text,
             refusal_fallbacks: None,
+            retry_max_tokens: None,
         }
     }
 
@@ -5121,49 +5094,158 @@ mod tests {
         Ok(())
     }
 
+    fn cut_off_turn(id: &str) -> ModelTurn {
+        ModelTurn {
+            assistant_message: MessageRecord::new(id, Role::Assistant, "The report starts with"),
+            tool_calls: vec![ToolCallRecord {
+                id: format!("call-{id}"),
+                name: "write_file".to_string(),
+                input: json!({"path": "reports/summary.txt"}),
+                assistant_message_id: None,
+                assistant_provider_response_id: None,
+            }],
+            finish_reason: ModelFinishReason::MaxTokens,
+            usage: None,
+            refusal: None,
+        }
+    }
+
+    fn sixteen_k_run() -> ModelGenerationConfig {
+        ModelGenerationConfig {
+            model: Some("claude-opus-5-5".to_string()),
+            max_output_tokens: Some(16_000),
+            retry_max_tokens: Some(32_000),
+            ..ModelGenerationConfig::default()
+        }
+    }
+
+    fn assistant_ids(engine: &AgentEngine) -> Vec<String> {
+        engine
+            .journal()
+            .iter()
+            .filter_map(|entry| match &entry.event {
+                SessionEvent::MessageAppended { message } if message.role == Role::Assistant => {
+                    Some(message.id.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     #[tokio::test]
-    async fn max_tokens_recovery_escalates_then_continues() -> Result<()> {
-        let conversation = ConversationKey {
-            session_id: "session-3c".to_string(),
-            thread_id: None,
-        };
+    async fn a_cut_off_turn_is_discarded_and_asked_again_with_the_retry_cap() -> Result<()> {
         let mut engine = AgentEngine::new(
-            conversation,
+            ConversationKey {
+                session_id: "session-cut-off".to_string(),
+                thread_id: None,
+            },
             LoopPolicy {
                 max_turns: 5,
-                keep_last_messages: 3,
                 ..LoopPolicy::default()
             },
         );
-
         let model = ScriptedModel::new(vec![
-            ModelTurn {
-                assistant_message: MessageRecord::new("assistant-max-1", Role::Assistant, ""),
-                tool_calls: Vec::new(),
-                finish_reason: ModelFinishReason::MaxTokens,
-                usage: None,
-                refusal: None,
+            cut_off_turn("assistant-cut"),
+            text_turn("assistant-done", "The report is done."),
+        ]);
+        let input = InputEnvelope::text("daemon", "api", "session-cut-off", "user-1", "Report.");
+
+        let outcome = engine
+            .run_input_with_generation(
+                input,
+                sixteen_k_run(),
+                &model,
+                &EchoToolExecutor,
+                &AllowAllPermissions,
+            )
+            .await?;
+
+        assert_eq!(outcome.status, RunStatus::Completed);
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].generation.max_output_tokens, Some(16_000));
+        assert_eq!(requests[1].generation.max_output_tokens, Some(32_000));
+        // The retry sends exactly the history the cut-off turn was asked on.
+        assert_eq!(requests[0].provider_prompt, requests[1].provider_prompt);
+        // The cut-off answer and its tool call never enter the history.
+        assert_eq!(assistant_ids(&engine), vec!["assistant-done".to_string()]);
+        assert!(!engine.journal().iter().any(|entry| matches!(
+            &entry.event,
+            SessionEvent::ToolCallStarted { .. } | SessionEvent::ToolCallFinished { .. }
+        )));
+        assert_eq!(
+            outcome.snapshot.run_meta.max_output_tokens_recovery_count,
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_second_cut_off_ends_the_run_with_output_limit_exceeded() -> Result<()> {
+        let mut engine = AgentEngine::new(
+            ConversationKey {
+                session_id: "session-cut-twice".to_string(),
+                thread_id: None,
             },
-            ModelTurn {
-                assistant_message: MessageRecord::new("assistant-max-2", Role::Assistant, ""),
-                tool_calls: Vec::new(),
-                finish_reason: ModelFinishReason::MaxTokens,
-                usage: None,
-                refusal: None,
+            LoopPolicy {
+                max_turns: 5,
+                ..LoopPolicy::default()
             },
+        );
+        let model = ScriptedModel::new(vec![
+            cut_off_turn("assistant-cut-1"),
+            cut_off_turn("assistant-cut-2"),
+            text_turn("assistant-never", "unused"),
+        ]);
+        let input = InputEnvelope::text("daemon", "api", "session-cut-twice", "user-1", "Report.");
+
+        let error = engine
+            .run_input_with_generation(
+                input,
+                sixteen_k_run(),
+                &model,
+                &EchoToolExecutor,
+                &AllowAllPermissions,
+            )
+            .await
+            .expect_err("a second cut-off ends the run");
+
+        let terminal = kheish_types::RunTerminalError::find(error.as_ref())
+            .expect("the run error carries its code");
+        assert_eq!(
+            terminal.code,
+            kheish_types::RunErrorCode::OutputLimitExceeded
+        );
+        assert!(terminal.message.contains("16000") && terminal.message.contains("32000"));
+        assert_eq!(model.requests().len(), 2);
+        assert!(assistant_ids(&engine).is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn each_turn_gets_its_own_output_limit_retry() -> Result<()> {
+        let mut engine = AgentEngine::new(
+            ConversationKey {
+                session_id: "session-cut-per-turn".to_string(),
+                thread_id: None,
+            },
+            LoopPolicy {
+                max_turns: 5,
+                ..LoopPolicy::default()
+            },
+        );
+        let model = ScriptedModel::new(vec![
+            cut_off_turn("assistant-cut-1"),
             ModelTurn {
                 assistant_message: MessageRecord::new(
-                    "assistant-write-after-max",
+                    "assistant-tool",
                     Role::Assistant,
-                    "Writing the report now.",
+                    "Writing.",
                 ),
                 tool_calls: vec![ToolCallRecord {
-                    id: "call-write-after-max".to_string(),
+                    id: "call-write".to_string(),
                     name: "write_file".to_string(),
-                    input: json!({
-                        "path": "reports/summary.txt",
-                        "content": "report body after recovery",
-                    }),
+                    input: json!({"path": "reports/summary.txt", "content": "body"}),
                     assistant_message_id: None,
                     assistant_provider_response_id: None,
                 }],
@@ -5171,51 +5253,35 @@ mod tests {
                 usage: None,
                 refusal: None,
             },
-            ModelTurn {
-                assistant_message: MessageRecord::new(
-                    "assistant-max-done",
-                    Role::Assistant,
-                    "Done.",
-                ),
-                tool_calls: Vec::new(),
-                finish_reason: ModelFinishReason::Completed,
-                usage: None,
-                refusal: None,
-            },
+            cut_off_turn("assistant-cut-2"),
+            text_turn("assistant-done", "Done."),
         ]);
+        let input = InputEnvelope::text("daemon", "api", "session-cut-per-turn", "user-1", "Go.");
 
-        let mut input = InputEnvelope::text(
-            "daemon",
-            "api",
-            "session-3c",
-            "user-1",
-            "Write the report file in the workspace.",
-        );
-        input.metadata = kheish_types::metadata_with_completion_requirements(
-            serde_json::Value::Null,
-            &[CompletionRequirement::WorkspaceFile {
-                path: Some("reports/summary.txt".to_string()),
-            }],
-        )?;
-
-        let outcome = engine.run_input(input, &model, &EchoToolExecutor).await?;
+        let outcome = engine
+            .run_input_with_generation(
+                input,
+                sixteen_k_run(),
+                &model,
+                &EchoToolExecutor,
+                &AllowAllPermissions,
+            )
+            .await?;
 
         assert_eq!(outcome.status, RunStatus::Completed);
-        let requests = model.requests();
-        assert_eq!(requests.len(), 4);
-        assert_eq!(requests[0].generation.max_output_tokens, None);
+        let caps = model
+            .requests()
+            .iter()
+            .map(|request| request.generation.max_output_tokens)
+            .collect::<Vec<_>>();
         assert_eq!(
-            requests[1].generation.max_output_tokens,
-            Some(kheish_types::ESCALATED_MAX_OUTPUT_TOKENS)
+            caps,
+            vec![Some(16_000), Some(32_000), Some(16_000), Some(32_000)]
         );
-        assert_eq!(requests[2].generation.max_output_tokens, None);
-        assert!(engine.journal().iter().any(|entry| matches!(
-            &entry.event,
-            SessionEvent::MessageAppended { message }
-                if message.role == Role::User
-                    && message.content.contains("Output token limit hit.")
-        )));
-
+        assert_eq!(
+            assistant_ids(&engine),
+            vec!["assistant-tool".to_string(), "assistant-done".to_string()]
+        );
         Ok(())
     }
 

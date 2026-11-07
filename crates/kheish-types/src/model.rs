@@ -907,6 +907,10 @@ pub struct ModelGenerationConfig {
     pub allow_parallel_tool_calls: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+    /// The output cap of the one retry a turn cut off at `max_output_tokens`
+    /// gets. Unset, it is twice the cut-off cap, within the model's limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(default, skip_serializing_if = "reasoning_option_is_empty")]
@@ -916,6 +920,30 @@ pub struct ModelGenerationConfig {
 }
 
 impl ModelGenerationConfig {
+    /// Returns the output cap a request with this generation runs with.
+    pub fn effective_max_output_tokens(&self) -> u32 {
+        self.max_output_tokens
+            .unwrap_or_else(|| match self.model.as_deref() {
+                Some(model) => capped_default_max_output_tokens(model),
+                None => CAPPED_DEFAULT_MAX_OUTPUT_TOKENS,
+            })
+    }
+
+    /// Returns the output cap of the one retry a turn cut off at `cut_off_cap`
+    /// gets: `retry_max_tokens` when set, else twice the cut-off cap within the
+    /// model's documented upper limit. Never below the cut-off cap.
+    pub fn output_limit_retry_cap(&self, cut_off_cap: u32) -> u32 {
+        let retry = self.retry_max_tokens.unwrap_or_else(|| {
+            let upper_limit = self
+                .model
+                .as_deref()
+                .map(|model| model_max_output_tokens(model).upper_limit)
+                .unwrap_or(ESCALATED_MAX_OUTPUT_TOKENS);
+            cut_off_cap.saturating_mul(2).min(upper_limit)
+        });
+        retry.max(cut_off_cap)
+    }
+
     /// Merges an explicit generation override onto a default/base generation.
     ///
     /// Fields that still equal the type default are treated as unspecified so
@@ -947,6 +975,9 @@ impl ModelGenerationConfig {
                 max_output_tokens: override_generation
                     .max_output_tokens
                     .or(base.max_output_tokens),
+                retry_max_tokens: override_generation
+                    .retry_max_tokens
+                    .or(base.retry_max_tokens),
                 temperature: override_generation.temperature.or(base.temperature),
                 reasoning: merge_reasoning_override(base.reasoning, override_generation.reasoning),
                 response_format: if override_generation.response_format
@@ -996,6 +1027,7 @@ impl Default for ModelGenerationConfig {
             tool_choice: ToolChoice::Auto,
             allow_parallel_tool_calls: true,
             max_output_tokens: None,
+            retry_max_tokens: None,
             temperature: None,
             reasoning: None,
             response_format: ResponseFormat::Text,
@@ -1119,6 +1151,40 @@ mod tests {
             merged.refusal_fallbacks,
             Some(RefusalFallbacks::default_routing())
         );
+    }
+
+    #[test]
+    fn the_output_limit_retry_cap_defaults_to_twice_the_cut_off_cap() {
+        let opus = ModelGenerationConfig {
+            model: Some("claude-opus-5-5".to_string()),
+            max_output_tokens: Some(16_000),
+            ..ModelGenerationConfig::default()
+        };
+        assert_eq!(opus.effective_max_output_tokens(), 16_000);
+        assert_eq!(opus.output_limit_retry_cap(16_000), 32_000);
+        // Within the model's limit.
+        assert_eq!(opus.output_limit_retry_cap(100_000), 128_000);
+        // The run's own cap wins, but never below the cut-off cap.
+        let pinned = ModelGenerationConfig {
+            retry_max_tokens: Some(48_000),
+            ..opus.clone()
+        };
+        assert_eq!(pinned.output_limit_retry_cap(16_000), 48_000);
+        assert_eq!(pinned.output_limit_retry_cap(64_000), 64_000);
+        // No model, no cap: the capped default, then the escalated ceiling.
+        let bare = ModelGenerationConfig::default();
+        assert_eq!(bare.effective_max_output_tokens(), 8_000);
+        assert_eq!(bare.output_limit_retry_cap(8_000), 16_000);
+        assert_eq!(bare.output_limit_retry_cap(40_000), 64_000);
+        let merged = ModelGenerationConfig::merge_override(
+            Some(ModelGenerationConfig {
+                retry_max_tokens: Some(32_000),
+                ..ModelGenerationConfig::default()
+            }),
+            Some(ModelGenerationConfig::default()),
+        )
+        .expect("merged");
+        assert_eq!(merged.retry_max_tokens, Some(32_000));
     }
 
     #[test]

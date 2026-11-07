@@ -1839,6 +1839,8 @@ pub struct RunMetaSnapshot {
     pub output_contract_repair_count: u8,
     #[serde(default)]
     pub permission_denied_retry_count: u8,
+    /// The turns of this run asked again after being cut off at the output
+    /// limit.
     #[serde(default)]
     pub max_output_tokens_recovery_count: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]

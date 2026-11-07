@@ -286,6 +286,7 @@ impl crate::GenerationArgs {
             reasoning: self.reasoning_config(),
             response_format,
             refusal_fallbacks: None,
+            retry_max_tokens: None,
         }))
     }
 

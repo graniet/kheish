@@ -846,6 +846,13 @@ impl ModelProvider for AnthropicProvider {
             }
         }
 
+        if let Some(message) = state.unparsed_tool_input.take() {
+            return Err(ProviderError {
+                message,
+                retryable: true,
+                retry_after_ms: None,
+            });
+        }
         state.finish(&sink)?;
         Ok(())
     }
@@ -1627,6 +1634,10 @@ struct AnthropicStreamState {
     /// Tool calls, held until the answer is complete: a refusal fallback
     /// withdraws the tool uses of the attempt it replaced.
     tool_calls: Vec<ToolCallRecord>,
+    /// Why a tool use's input did not parse. An answer cut off at the output
+    /// limit can end inside a tool use: that turn is discarded whole, so the
+    /// cut input is only an error when the answer was not cut off.
+    unparsed_tool_input: Option<String>,
     /// The `input_transformations` the API reported for the request: thinking
     /// blocks it dropped (or would have, on a request it does not enforce).
     input_transformations: Vec<Value>,
@@ -1658,6 +1669,7 @@ impl AnthropicStreamState {
             layout: Vec::new(),
             has_positioned_blocks: false,
             tool_calls: Vec::new(),
+            unparsed_tool_input: None,
             input_transformations: Vec::new(),
             finished: false,
             usage: serde_json::Map::new(),
@@ -1993,11 +2005,14 @@ fn handle_sse_event(
                     let input = if input_json.trim().is_empty() {
                         json!({})
                     } else {
-                        serde_json::from_str(&input_json).map_err(|error| ProviderError {
-                            message: format!("invalid Anthropic tool JSON payload: {error}"),
-                            retryable: true,
-                            retry_after_ms: None,
-                        })?
+                        match serde_json::from_str(&input_json) {
+                            Ok(input) => input,
+                            Err(error) => {
+                                state.unparsed_tool_input =
+                                    Some(format!("invalid Anthropic tool JSON payload: {error}"));
+                                return Ok(());
+                            }
+                        }
                     };
                     state.layout.push(json!({ "type": "tool_use", "id": id }));
                     state.tool_calls.push(ToolCallRecord {
@@ -2052,6 +2067,15 @@ fn handle_sse_event(
                 .pointer("/delta/stop_reason")
                 .and_then(Value::as_str)
             {
+                if !matches!(stop_reason, "max_tokens" | "model_context_window_exceeded")
+                    && let Some(message) = state.unparsed_tool_input.take()
+                {
+                    return Err(ProviderError {
+                        message,
+                        retryable: true,
+                        retry_after_ms: None,
+                    });
+                }
                 // The runtime settles the turn on the stop event: everything
                 // the turn keeps goes out before it.
                 state.finish(sink)?;
@@ -2463,6 +2487,7 @@ mod tests {
                             },
                         },
                         refusal_fallbacks: None,
+                        retry_max_tokens: None,
                     },
                 },
                 ModelEventSink::new(sender),
@@ -4198,6 +4223,57 @@ mod tests {
                 ),
                 model: Some("claude-opus-5".to_string()),
             })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_answer_cut_off_inside_a_tool_use_is_a_max_tokens_turn() -> Result<()> {
+        let cut = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-cut\",\"model\":\"claude-opus-5-5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_cut\",\"name\":\"write_file\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"content\\\":\\\"the report sta\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\",\"stop_details\":null},\"usage\":{\"output_tokens\":16000}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let (url, _recorded) =
+            spawn_recording_mock_server(vec![MockHttpResponse::sse(cut)]).await?;
+        let provider = AnthropicProvider::new(AnthropicProviderConfig {
+            base_url: url,
+            ..AnthropicProviderConfig::new("claude-opus-5-5", "test-key")
+        })?;
+        let turn = runtime_for(provider)
+            .next_turn(default_model_request("fm-mission"))
+            .await?;
+        assert_eq!(
+            turn.finish_reason,
+            crate::model::ModelFinishReason::MaxTokens
+        );
+        assert!(turn.tool_calls.is_empty());
+
+        // The same cut input on an answer that was not cut off is an error.
+        let broken = cut.replace("\"max_tokens\"", "\"tool_use\"");
+        let (url, _recorded) =
+            spawn_recording_mock_server(vec![MockHttpResponse::sse(&broken)]).await?;
+        let provider = AnthropicProvider::new(AnthropicProviderConfig {
+            base_url: url,
+            ..AnthropicProviderConfig::new("claude-opus-5-5", "test-key")
+        })?;
+        let error = runtime_for(provider)
+            .next_turn(default_model_request("fm-mission"))
+            .await
+            .expect_err("a tool use that does not parse fails the attempt");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid Anthropic tool JSON payload")
         );
         Ok(())
     }

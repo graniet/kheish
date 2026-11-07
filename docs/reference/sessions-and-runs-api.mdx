@@ -143,6 +143,7 @@ Fields:
 - `generation.tool_choice`
 - `generation.allow_parallel_tool_calls`
 - `generation.max_output_tokens`
+- `generation.retry_max_tokens`: the output cap of the one retry a turn cut off at `max_output_tokens` gets (see [Output limit](#output-limit)). Unset, it is twice the cut-off cap, within the model's documented maximum output.
 - `generation.temperature`
 - `generation.reasoning`: `effort` (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`), `summary`, `budget_tokens`, `interleaved`; how each driver maps them is in [Model providers and routes](./model-providers#thinking-and-effort). OpenAI routes reject `max` and `budget_tokens`.
 - `generation.refusal_fallbacks`: Anthropic routes only, `"default"` or a list of `{ "model", "max_tokens" }` (one to three); overrides the route's `anthropic_refusal_fallbacks`. Other drivers reject it. See [Refusal fallback](./model-providers#refusal-fallback).
@@ -720,6 +721,16 @@ text:
 | `error_code` | Meaning |
 |---|---|
 | `model_refusal` | The model declined the request and no refusal fallback served it. `refusal.category` is the policy area (`cyber`, `bio`, ...), absent when the refusal maps to no named category. |
+| `output_limit_exceeded` | The model's answer was cut off at the output limit, then again when asked once more with `generation.retry_max_tokens`. |
+
+### Output limit
+
+A model turn that stops at its output limit (`max_tokens` on Anthropic, `length` or `max_output_tokens`
+elsewhere) is discarded, whatever it holds: its partial text never enters the session history and
+its tool calls never run, including one whose input the limit cut. The same turn is asked again once,
+on the same history, with `max_output_tokens` raised to `generation.retry_max_tokens`. A second
+cut-off on that turn ends the run `failed` with `error_code: "output_limit_exceeded"`; each later turn
+gets its own retry. The discarded turn's tokens still count in the runtime's model budget counters.
 
 ```json
 {
