@@ -71,8 +71,8 @@ pub(crate) fn daemon_model_retry_policy() -> ModelRetryPolicy {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn daemon_model_budget() -> ModelBudget {
     ModelBudget {
-        max_total_output_tokens: 1_000_000,
-        max_total_cost_usd: 500.0,
+        max_total_output_tokens: Some(1_000_000),
+        max_total_cost_usd: Some(500.0),
     }
 }
 

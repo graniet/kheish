@@ -113,8 +113,8 @@ async fn serve_daemon(args: crate::ServeArgs, options: ServeOptions) -> Result<(
     config.scheduler_enabled = !args.disable_scheduler;
     config.event_history_capacity = args.event_history_capacity.max(1);
     config.learning_read_scopes = args.learning_read_scopes.clone();
-    config.model_budget_max_total_output_tokens = args.model_budget_max_total_output_tokens;
-    config.model_budget_max_total_cost_usd = args.model_budget_max_total_cost_usd;
+    config.model_budget_max_total_output_tokens = args.model_budget_max_total_output_tokens.0;
+    config.model_budget_max_total_cost_usd = args.model_budget_max_total_cost_usd.0;
     info!(
         bind = %args.bind,
         routes_file = args.routes_file.as_ref().map(|path| path.display().to_string()).as_deref(),

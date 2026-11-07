@@ -531,18 +531,22 @@ struct ServeArgs {
         default_value_t = 64_000
     )]
     max_spawn_output_tokens_per_request: u64,
+    /// Process-wide output-token cap of each route's model runtime: a number,
+    /// or `off` for no cap. `0` is a zero budget, not "unlimited".
     #[arg(
         long,
         env = "KHEISH_MODEL_BUDGET_MAX_TOTAL_OUTPUT_TOKENS",
-        default_value_t = 1_000_000
+        default_value_t = kheish_daemon::ModelBudgetLimit(Some(kheish_daemon::DEFAULT_MODEL_BUDGET_MAX_TOTAL_OUTPUT_TOKENS))
     )]
-    model_budget_max_total_output_tokens: u64,
+    model_budget_max_total_output_tokens: kheish_daemon::ModelBudgetLimit<u64>,
+    /// Process-wide cost cap in USD of each route's model runtime: a number,
+    /// or `off` for no cap. `0` is a zero budget, not "unlimited".
     #[arg(
         long,
         env = "KHEISH_MODEL_BUDGET_MAX_TOTAL_COST_USD",
-        default_value_t = 500.0
+        default_value_t = kheish_daemon::ModelBudgetLimit(Some(kheish_daemon::DEFAULT_MODEL_BUDGET_MAX_TOTAL_COST_USD))
     )]
-    model_budget_max_total_cost_usd: f64,
+    model_budget_max_total_cost_usd: kheish_daemon::ModelBudgetLimit<f64>,
     #[arg(
         long,
         env = "KHEISH_MAX_SPAWN_COST_MICROUSD_PER_WINDOW",
@@ -7430,8 +7434,8 @@ auth_ref = "openrouter.primary"
             max_spawns_global_window: 240,
             max_spawn_input_tokens_per_request: 128_000,
             max_spawn_output_tokens_per_request: 64_000,
-            model_budget_max_total_output_tokens: 1_000_000,
-            model_budget_max_total_cost_usd: 500.0,
+            model_budget_max_total_output_tokens: kheish_daemon::ModelBudgetLimit(Some(1_000_000)),
+            model_budget_max_total_cost_usd: kheish_daemon::ModelBudgetLimit(Some(500.0)),
             max_spawn_cost_microusd_per_window: 1_000_000,
             max_spawn_cpu_ms_per_window: 240_000,
             estimated_spawn_cost_microusd: 1_000,

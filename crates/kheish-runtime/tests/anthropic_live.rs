@@ -629,8 +629,8 @@ fn live_runtime() -> Result<Option<ModelRuntime<AnthropicProvider>>> {
             inactivity_timeout_ms: 90_000,
         },
         ModelBudget {
-            max_total_output_tokens: 16_000,
-            max_total_cost_usd: 50.0,
+            max_total_output_tokens: Some(16_000),
+            max_total_cost_usd: Some(50.0),
         },
         Arc::new(NoopObserver),
     )))

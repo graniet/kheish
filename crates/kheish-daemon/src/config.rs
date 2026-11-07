@@ -346,8 +346,75 @@ impl std::fmt::Display for LearningReadScopes {
     }
 }
 
-fn default_model_budget_max_total_output_tokens() -> u64 {
-    1_000_000
+fn default_model_budget_max_total_output_tokens() -> Option<u64> {
+    Some(DEFAULT_MODEL_BUDGET_MAX_TOTAL_OUTPUT_TOKENS)
+}
+
+/// Default process-wide output-token cap of each route's model runtime.
+pub const DEFAULT_MODEL_BUDGET_MAX_TOTAL_OUTPUT_TOKENS: u64 = 1_000_000;
+/// Default process-wide cost cap in USD of each route's model runtime.
+pub const DEFAULT_MODEL_BUDGET_MAX_TOTAL_COST_USD: f64 = 500.0;
+
+/// One process-wide model budget cap: a number, or `off` for no cap.
+///
+/// `KHEISH_MODEL_BUDGET_MAX_TOTAL_OUTPUT_TOKENS` and
+/// `KHEISH_MODEL_BUDGET_MAX_TOTAL_COST_USD` take this shape. `0` keeps its
+/// historical meaning, a zero budget that stops a route after its first
+/// metered response; use `off` (or `unlimited`, `none`) to turn a cap off.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ModelBudgetLimit<T>(pub Option<T>);
+
+impl<T> std::str::FromStr for ModelBudgetLimit<T>
+where
+    T: std::str::FromStr + ModelBudgetValue,
+{
+    type Err = String;
+
+    fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
+        let raw = raw.trim();
+        if matches!(
+            raw.to_ascii_lowercase().as_str(),
+            "off" | "unlimited" | "none"
+        ) {
+            return Ok(Self(None));
+        }
+        let value = raw
+            .parse::<T>()
+            .map_err(|_| format!("invalid model budget `{raw}`: use a number or `off`"))?;
+        if !value.is_valid_budget() {
+            return Err(format!(
+                "invalid model budget `{raw}`: use a finite, non-negative number or `off`"
+            ));
+        }
+        Ok(Self(Some(value)))
+    }
+}
+
+impl<T: std::fmt::Display> std::fmt::Display for ModelBudgetLimit<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(value) => write!(formatter, "{value}"),
+            None => formatter.write_str("off"),
+        }
+    }
+}
+
+/// A numeric type usable as a model budget cap.
+pub trait ModelBudgetValue {
+    /// Returns whether the value is an acceptable cap.
+    fn is_valid_budget(&self) -> bool;
+}
+
+impl ModelBudgetValue for u64 {
+    fn is_valid_budget(&self) -> bool {
+        true
+    }
+}
+
+impl ModelBudgetValue for f64 {
+    fn is_valid_budget(&self) -> bool {
+        self.is_finite() && *self >= 0.0
+    }
 }
 
 /// Default token budget for goals an agent creates for itself, so the headless
@@ -356,8 +423,8 @@ pub(crate) fn default_agent_goal_token_budget() -> u64 {
     1_000_000
 }
 
-fn default_model_budget_max_total_cost_usd() -> f64 {
-    500.0
+fn default_model_budget_max_total_cost_usd() -> Option<f64> {
+    Some(DEFAULT_MODEL_BUDGET_MAX_TOTAL_COST_USD)
 }
 
 fn default_max_spawns_per_profile_window() -> usize {
@@ -735,12 +802,14 @@ pub struct DaemonConfig {
     /// Number of daemon events retained for SSE replay and live backpressure buffering.
     #[serde(default = "default_event_history_capacity")]
     pub event_history_capacity: usize,
-    /// Maximum cumulative output tokens one model runtime may emit.
+    /// Maximum cumulative output tokens one model runtime may emit for the
+    /// life of the process; `None` turns the cap off.
     #[serde(default = "default_model_budget_max_total_output_tokens")]
-    pub model_budget_max_total_output_tokens: u64,
-    /// Maximum cumulative model cost in USD one model runtime may incur.
+    pub model_budget_max_total_output_tokens: Option<u64>,
+    /// Maximum cumulative model cost in USD one model runtime may incur for
+    /// the life of the process; `None` turns the cap off.
     #[serde(default = "default_model_budget_max_total_cost_usd")]
-    pub model_budget_max_total_cost_usd: f64,
+    pub model_budget_max_total_cost_usd: Option<f64>,
     /// The learning scopes runs read.
     #[serde(default)]
     pub learning_read_scopes: LearningReadScopes,
@@ -972,5 +1041,41 @@ mod learning_read_scope_tests {
 
         assert!("".parse::<LearningReadScopes>().is_err());
         assert!("session,tenant".parse::<LearningReadScopes>().is_err());
+    }
+}
+
+#[cfg(test)]
+mod model_budget_limit_tests {
+    use super::ModelBudgetLimit;
+
+    #[test]
+    fn model_budget_limits_parse_numbers_and_off() {
+        assert_eq!(
+            "1000000".parse::<ModelBudgetLimit<u64>>(),
+            Ok(ModelBudgetLimit(Some(1_000_000)))
+        );
+        assert_eq!(
+            "0".parse::<ModelBudgetLimit<u64>>(),
+            Ok(ModelBudgetLimit(Some(0)))
+        );
+        for off in ["off", "OFF", "unlimited", "none"] {
+            assert_eq!(
+                off.parse::<ModelBudgetLimit<u64>>(),
+                Ok(ModelBudgetLimit(None))
+            );
+            assert_eq!(
+                off.parse::<ModelBudgetLimit<f64>>(),
+                Ok(ModelBudgetLimit(None))
+            );
+        }
+        assert_eq!(
+            "500.5".parse::<ModelBudgetLimit<f64>>(),
+            Ok(ModelBudgetLimit(Some(500.5)))
+        );
+        assert!("-1".parse::<ModelBudgetLimit<f64>>().is_err());
+        assert!("inf".parse::<ModelBudgetLimit<f64>>().is_err());
+        assert!("lots".parse::<ModelBudgetLimit<u64>>().is_err());
+        assert_eq!(ModelBudgetLimit::<u64>(None).to_string(), "off");
+        assert_eq!(ModelBudgetLimit(Some(500.0_f64)).to_string(), "500");
     }
 }

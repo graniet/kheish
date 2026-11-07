@@ -27,17 +27,29 @@ use crate::observability::{DebugArtifact, RuntimeObserver, TraceEvent, TraceEven
 /// Runtime-wide model budget limits.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ModelBudget {
-    /// The maximum cumulative output tokens.
-    pub max_total_output_tokens: u64,
-    /// The maximum cumulative model cost in USD.
-    pub max_total_cost_usd: f64,
+    /// The maximum cumulative output tokens; `None` means no cap.
+    pub max_total_output_tokens: Option<u64>,
+    /// The maximum cumulative model cost in USD; `None` means no cap.
+    pub max_total_cost_usd: Option<f64>,
 }
 
 impl Default for ModelBudget {
     fn default() -> Self {
         Self {
-            max_total_output_tokens: 50_000,
-            max_total_cost_usd: 20.0,
+            max_total_output_tokens: Some(50_000),
+            max_total_cost_usd: Some(20.0),
+        }
+    }
+}
+
+impl ModelBudget {
+    /// A budget that never stops a request, for embedders that meter model
+    /// usage themselves.
+    #[must_use]
+    pub fn unlimited() -> Self {
+        Self {
+            max_total_output_tokens: None,
+            max_total_cost_usd: None,
         }
     }
 }
@@ -531,10 +543,18 @@ impl<P> ModelRuntime<P> {
     fn consume_budget(&self, usage: &ModelUsage) -> Result<()> {
         let mut consumed = self.consumed.lock();
         accumulate_usage(&mut consumed, usage);
-        if consumed.output_tokens > self.budget.max_total_output_tokens {
+        if self
+            .budget
+            .max_total_output_tokens
+            .is_some_and(|max| consumed.output_tokens > max)
+        {
             bail!("model output token budget exceeded");
         }
-        if consumed.cost_usd > self.budget.max_total_cost_usd {
+        if self
+            .budget
+            .max_total_cost_usd
+            .is_some_and(|max| consumed.cost_usd > max)
+        {
             bail!("model cost budget exceeded");
         }
         Ok(())
@@ -1262,6 +1282,50 @@ mod tests {
         assert_eq!(snapshot.consumed.output_tokens, 5);
         assert_eq!(snapshot.consumed.cost_usd, 0.2);
         Ok(())
+    }
+
+    #[test]
+    fn model_budget_caps_are_optional() {
+        let observer = InMemoryObserver::shared();
+        let usage = ModelUsage {
+            output_tokens: 10,
+            cost_usd: 1.0,
+            ..ModelUsage::default()
+        };
+        let capped = ModelRuntime::new(
+            ScriptedProvider::new(Vec::new()),
+            ModelRetryPolicy::default(),
+            ModelBudget {
+                max_total_output_tokens: Some(5),
+                max_total_cost_usd: Some(100.0),
+            },
+            observer.clone(),
+        );
+        assert!(capped.consume_budget(&usage).is_err());
+        let zero = ModelRuntime::new(
+            ScriptedProvider::new(Vec::new()),
+            ModelRetryPolicy::default(),
+            ModelBudget {
+                max_total_output_tokens: Some(0),
+                max_total_cost_usd: Some(0.0),
+            },
+            observer.clone(),
+        );
+        assert!(
+            zero.consume_budget(&usage).is_err(),
+            "0 stays a zero budget"
+        );
+        let unlimited = ModelRuntime::new(
+            ScriptedProvider::new(Vec::new()),
+            ModelRetryPolicy::default(),
+            ModelBudget::unlimited(),
+            observer,
+        );
+        for _ in 0..1_000 {
+            unlimited
+                .consume_budget(&usage)
+                .expect("an unlimited budget never stops a request");
+        }
     }
 
     #[tokio::test]

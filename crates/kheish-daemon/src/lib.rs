@@ -133,11 +133,13 @@ pub use channels::{
 };
 pub use config::{
     ControlPlaneAuthConfig, ControlPlaneAuthTokenFiles, ControlPlaneCorsConfig,
-    DEFAULT_EVENT_HISTORY_CAPACITY, DaemonConfig, DaemonOutputRecord, DaemonOutputSourceKind,
-    LearningReadScopes, SubagentPolicyConfig, SubagentPolicyDecisionView,
-    SubagentPolicyEstimateView, SubagentPolicyLimitPatch, SubagentPolicyLimits, SubagentPolicyRule,
-    SubagentPolicyScopeView, SubagentPolicySelector, SubagentPolicyStatusView,
-    SubagentPolicyUsageView, SubagentReservationStatusView, is_loopback_control_plane_origin,
+    DEFAULT_EVENT_HISTORY_CAPACITY, DEFAULT_MODEL_BUDGET_MAX_TOTAL_COST_USD,
+    DEFAULT_MODEL_BUDGET_MAX_TOTAL_OUTPUT_TOKENS, DaemonConfig, DaemonOutputRecord,
+    DaemonOutputSourceKind, LearningReadScopes, ModelBudgetLimit, ModelBudgetValue,
+    SubagentPolicyConfig, SubagentPolicyDecisionView, SubagentPolicyEstimateView,
+    SubagentPolicyLimitPatch, SubagentPolicyLimits, SubagentPolicyRule, SubagentPolicyScopeView,
+    SubagentPolicySelector, SubagentPolicyStatusView, SubagentPolicyUsageView,
+    SubagentReservationStatusView, is_loopback_control_plane_origin,
 };
 pub use connectors::{
     ConnectorKind, ConnectorSessionPolicy, ConnectorSettings, ExternalChildProcessConfig,

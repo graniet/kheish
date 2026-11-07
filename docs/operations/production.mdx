@@ -661,6 +661,27 @@ admin one, cannot widen them.
   shared personas cannot carry one tenant's learnings into another's prompts.
   See [Limiting the scopes runs read](../concepts/memory#limiting-the-scopes-runs-read).
 
+### Process-wide model budget counters
+
+Each route's model runtime keeps two cumulative counters for the life of the
+process: output tokens and cost in USD. When either passes its cap, every later
+request on that route fails with `model output token budget exceeded` or
+`model cost budget exceeded` until the daemon restarts (the counters are not
+persisted).
+
+| Variable / flag | Default | Meaning |
+|---|---|---|
+| `KHEISH_MODEL_BUDGET_MAX_TOTAL_OUTPUT_TOKENS` / `--model-budget-max-total-output-tokens` | `1000000` | output-token cap per route runtime |
+| `KHEISH_MODEL_BUDGET_MAX_TOTAL_COST_USD` / `--model-budget-max-total-cost-usd` | `500` | cost cap in USD per route runtime |
+
+Both accept a number or `off` (also `unlimited` or `none`) to turn the cap off.
+`0` keeps its historical meaning, a zero budget that stops the route after its
+first metered response; it never means "unlimited". Turn the counters off when
+something in front of the daemon owns budgets, for example a relay that meters
+every model call per tenant, so a busy process does not stall every tenant once
+the process-wide total is reached. Per-run limits (`max_turns`,
+`max_duration_ms` on the run request) still apply.
+
 ---
 
 ## Upgrade procedure
