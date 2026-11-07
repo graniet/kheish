@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error as _;
 use std::fmt::{Debug, Formatter};
 use std::path::PathBuf;
@@ -7,6 +7,7 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use parking_lot::Mutex;
 use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
 use reqwest::{Client, StatusCode};
 use serde::Serialize;
@@ -29,7 +30,8 @@ use kheish_auth::{RequestAuthProvider, ResolvedAuthMaterial};
 use kheish_codec::digest_json_value;
 use kheish_types::{
     InputContentPart, ModelRefusal, ModelUsageIteration, RefusalFallbackRouting, RefusalFallbacks,
-    ToolCallRecord, ToolResultRecord, capped_default_max_output_tokens, model_max_output_tokens,
+    ToolCallRecord, ToolResultRecord, ToolStrictRank, capped_default_max_output_tokens,
+    model_max_output_tokens,
 };
 
 use super::anthropic_models::{
@@ -41,7 +43,10 @@ use super::attachments::{
     AttachmentRenderCache, contains_supported_image_attachment, image_edit_attachment_hint_text,
     load_attachment_preview_image, load_document_attachment_text, load_image_attachment,
 };
-use super::errors::{safe_error_payload_for_level, sanitize_upstream_error_message};
+use super::errors::{
+    safe_error_payload_for_level, sanitize_upstream_error_message,
+    sanitize_upstream_error_message_with_kind,
+};
 use super::prompt::{NormalizedConversationItem, normalize_provider_prompt};
 use super::sse::{JsonSseEvent, parse_json_sse_frame, pop_sse_frame};
 
@@ -158,6 +163,79 @@ struct AnthropicRequest {
     betas: Vec<&'static str>,
     /// The model the request names.
     model: String,
+    /// What the body sends with `strict: true`.
+    strict: AnthropicStrictTools,
+}
+
+/// The strict tools of one request body.
+#[derive(Debug, Default)]
+struct AnthropicStrictTools {
+    /// How many tools go out with `strict: true`.
+    sent: usize,
+    /// The fingerprint of the request's strict candidates (see
+    /// [`anthropic_strict_key`]), under which the provider remembers a cap
+    /// the API taught it. `None` when no tool is a candidate.
+    key: Option<String>,
+}
+
+/// How many requests one `stream` call sends at most while the API refuses
+/// the grammar of the strict tools: the first, then the retries with fewer
+/// strict tools. Each retry keeps three quarters of the strict tools the
+/// refused request sent, rounded down (see [`anthropic_lower_strict_cap`]),
+/// and a request holds at most 20 strict tools, so ten requests are enough to
+/// go from 20 to none: 20, 15, 11, 8, 6, 4, 3, 2, 1, 0. The explicit bound
+/// keeps the retries finite whatever the selection does.
+const ANTHROPIC_MAX_STRICT_GRAMMAR_ATTEMPTS: usize = 10;
+
+/// How many sets of strict candidates the provider remembers a learnt cap
+/// for. A set is only remembered once the API refused its grammar, which few
+/// tool sets ever see, so a small fixed number covers a daemon's routes and
+/// MCP servers. Past it the set learnt first is forgotten first; forgetting
+/// costs that set one more refused request when it comes back.
+const ANTHROPIC_LEARNT_STRICT_CAPS: usize = 32;
+
+/// The stable detail a refused strict grammar adds to the error a `stream`
+/// call returns, so an operator can tell why without the provider's text.
+const ANTHROPIC_STRICT_GRAMMAR_KIND: &str = "strict_grammar_too_large";
+
+/// The strict caps the Messages API taught this provider. The grammar the
+/// API compiles from the strict tools' schemas has a size limit it does not
+/// publish, so Kheish cannot predict it from the schemas: it learns it from
+/// a refusal, as the most tools of one set of strict candidates that may go
+/// out strict. Every later request with the same candidates starts at that
+/// cap, so it sends the same tool bytes (the cached tool prefix holds) and
+/// the refusal is paid once per daemon lifetime. The caps live in memory
+/// only: a restart relearns each with one refused request.
+#[derive(Debug, Default)]
+struct AnthropicStrictCaps {
+    /// The learnt caps by candidate fingerprint, the first learnt first.
+    learnt: Mutex<VecDeque<(String, usize)>>,
+}
+
+impl AnthropicStrictCaps {
+    /// Returns the cap learnt for one fingerprint.
+    fn get(&self, key: &str) -> Option<usize> {
+        self.learnt
+            .lock()
+            .iter()
+            .find(|(known, _)| known == key)
+            .map(|(_, cap)| *cap)
+    }
+
+    /// Records that requests with these candidates send at most `cap` strict
+    /// tools. A cap only ever goes down: two calls that learn concurrently
+    /// keep the lower answer.
+    fn learn(&self, key: &str, cap: usize) {
+        let mut learnt = self.learnt.lock();
+        if let Some((_, known)) = learnt.iter_mut().find(|(known, _)| known == key) {
+            *known = (*known).min(cap);
+            return;
+        }
+        if learnt.len() >= ANTHROPIC_LEARNT_STRICT_CAPS {
+            learnt.pop_front();
+        }
+        learnt.push_back((key.to_string(), cap));
+    }
 }
 
 /// The prompt-cache breakpoint Kheish places (the default 5-minute cache).
@@ -170,6 +248,7 @@ pub struct AnthropicProvider {
     client: Client,
     config: AnthropicProviderConfig,
     observer: Arc<dyn RuntimeObserver>,
+    strict_caps: AnthropicStrictCaps,
 }
 
 impl AnthropicProvider {
@@ -192,6 +271,7 @@ impl AnthropicProvider {
             client,
             config,
             observer,
+            strict_caps: AnthropicStrictCaps::default(),
         })
     }
 
@@ -203,6 +283,16 @@ impl AnthropicProvider {
     fn build_request(
         &self,
         request: &ModelRuntimeRequest,
+    ) -> Result<AnthropicRequest, ProviderError> {
+        self.build_request_with_strict_cap(request, None)
+    }
+
+    /// Builds the request. At most `strict_cap` tools go out strict, and no
+    /// more than the cap learnt for the request's strict candidates.
+    fn build_request_with_strict_cap(
+        &self,
+        request: &ModelRuntimeRequest,
+        strict_cap: Option<usize>,
     ) -> Result<AnthropicRequest, ProviderError> {
         let effective_model = request
             .generation
@@ -217,13 +307,10 @@ impl AnthropicProvider {
             &self.config.attachment_cache,
         )?;
         let default_max_output_tokens = capped_default_max_output_tokens(&effective_model);
-        let tools = if matches!(request.generation.tool_choice, ToolChoice::None) {
-            Vec::new()
+        let (tools, strict) = if matches!(request.generation.tool_choice, ToolChoice::None) {
+            (Vec::new(), AnthropicStrictTools::default())
         } else {
-            anthropic_tools(
-                &request.available_tools,
-                anthropic_supports_strict_tools(&effective_model),
-            )
+            self.request_tools(&request.available_tools, &effective_model, strict_cap)
         };
         let reasoning = request.generation.reasoning.as_ref();
         let profile = anthropic_model_profile(&effective_model);
@@ -367,7 +454,127 @@ impl AnthropicProvider {
             body: Value::Object(body),
             betas,
             model: effective_model,
+            strict,
         })
+    }
+
+    /// Encodes the tools of one request, sorted by name. When the model
+    /// takes strict tool use, [`anthropic_strict_selection`] chooses the
+    /// strict tools within the per-request limits, and at most the lower of
+    /// `strict_cap` and the cap learnt for these strict candidates keep
+    /// `strict`, the highest ranked first.
+    fn request_tools(
+        &self,
+        tools: &[kheish_types::ToolDefinition],
+        model: &str,
+        strict_cap: Option<usize>,
+    ) -> (Vec<Value>, AnthropicStrictTools) {
+        let mut sorted = tools.iter().collect::<Vec<_>>();
+        sorted.sort_by(|left, right| left.name.cmp(&right.name));
+        if !anthropic_supports_strict_tools(model) {
+            let strict = vec![false; sorted.len()];
+            return (
+                anthropic_tools(&sorted, &strict),
+                AnthropicStrictTools::default(),
+            );
+        }
+        let candidates = anthropic_strict_candidates(&sorted);
+        let key = anthropic_strict_key(model, &sorted, &candidates);
+        let learnt = key.as_deref().and_then(|key| self.strict_caps.get(key));
+        let cap = strict_cap.into_iter().chain(learnt).min();
+        let strict = anthropic_strict_selection(sorted.len(), &candidates, cap);
+        let sent = strict.iter().filter(|strict| **strict).count();
+        (
+            anthropic_tools(&sorted, &strict),
+            AnthropicStrictTools { sent, key },
+        )
+    }
+
+    /// Sends one request body, refreshing the auth material once when the
+    /// API answers 401 and a request auth provider is configured. Returns
+    /// the response whatever its status, with its audit target and grant.
+    async fn send_request(
+        &self,
+        request: &ModelRuntimeRequest,
+        built: &AnthropicRequest,
+    ) -> Result<(reqwest::Response, String, Option<String>), ProviderError> {
+        let mut force_refresh = false;
+        loop {
+            let auth_material = self.auth_material(force_refresh).await?;
+            let grant_id = auth_material.grant_id.clone();
+            let mut headers = self.headers_from_material(&auth_material, &built.betas)?;
+            super::insert_execution_context_headers(&mut headers, &request.session_id)?;
+            let endpoint = auth_material
+                .base_url_override
+                .clone()
+                .unwrap_or_else(|| self.config.base_url.clone());
+            debug!(
+                session_id = %request.session_id,
+                thread_id = request.thread_id.as_deref(),
+                turn = request.turn,
+                provider = "anthropic",
+                model = request
+                    .generation
+                    .model
+                    .as_deref()
+                .unwrap_or(self.config.model.as_str()),
+                endpoint = %endpoint,
+                tool_count = request.available_tools.len(),
+                forced_refresh = force_refresh,
+                "starting Anthropic provider request"
+            );
+            self.ensure_auth_material_active(&auth_material).await?;
+            self.record_provider_request(
+                request,
+                &endpoint,
+                &headers,
+                &built.body,
+                grant_id.clone(),
+            )?;
+            let response = match self
+                .client
+                .post(&endpoint)
+                .headers(headers)
+                .json(&built.body)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    let mapped = map_transport_error(error);
+                    self.record_provider_failure(
+                        anthropic_external_action_target(&endpoint),
+                        &mapped.message,
+                        grant_id,
+                    )?;
+                    return Err(mapped);
+                }
+            };
+            if response.status() == StatusCode::UNAUTHORIZED
+                && self.config.request_auth_provider.is_some()
+                && !force_refresh
+            {
+                self.record_provider_failure(
+                    anthropic_external_action_target(&endpoint),
+                    "401-refresh",
+                    grant_id,
+                )?;
+                warn!(
+                    session_id = %request.session_id,
+                    turn = request.turn,
+                    provider = "anthropic",
+                    endpoint = %endpoint,
+                    "Anthropic provider returned 401, forcing auth refresh"
+                );
+                force_refresh = true;
+                continue;
+            }
+            return Ok((
+                response,
+                anthropic_external_action_target(&endpoint),
+                grant_id,
+            ));
+        }
     }
 
     async fn auth_material(
@@ -645,103 +852,60 @@ impl ModelProvider for AnthropicProvider {
         request: ModelRuntimeRequest,
         sink: ModelEventSink,
     ) -> std::result::Result<(), ProviderError> {
-        let AnthropicRequest {
-            body,
-            betas: request_betas,
-            model: requested_model,
-        } = self.build_request(&request)?;
-        let mut force_refresh = false;
+        let mut built = self.build_request(&request)?;
+        let mut attempts = 1;
         let (response, response_target, response_grant_id) = loop {
-            let auth_material = self.auth_material(force_refresh).await?;
-            let grant_id = auth_material.grant_id.clone();
-            let mut headers = self.headers_from_material(&auth_material, &request_betas)?;
-            super::insert_execution_context_headers(&mut headers, &request.session_id)?;
-            let endpoint = auth_material
-                .base_url_override
-                .clone()
-                .unwrap_or_else(|| self.config.base_url.clone());
-            debug!(
-                session_id = %request.session_id,
-                thread_id = request.thread_id.as_deref(),
-                turn = request.turn,
-                provider = "anthropic",
-                model = request
-                    .generation
-                    .model
-                    .as_deref()
-                .unwrap_or(self.config.model.as_str()),
-                endpoint = %endpoint,
-                tool_count = request.available_tools.len(),
-                forced_refresh = force_refresh,
-                "starting Anthropic provider request"
-            );
-            self.ensure_auth_material_active(&auth_material).await?;
-            self.record_provider_request(&request, &endpoint, &headers, &body, grant_id.clone())?;
-            let response = match self
-                .client
-                .post(&endpoint)
-                .headers(headers)
-                .json(&body)
-                .send()
-                .await
-            {
-                Ok(response) => response,
-                Err(error) => {
-                    let mapped = map_transport_error(error);
-                    self.record_provider_failure(
-                        anthropic_external_action_target(&endpoint),
-                        &mapped.message,
-                        grant_id,
-                    )?;
-                    return Err(mapped);
-                }
-            };
-            if response.status() == StatusCode::UNAUTHORIZED
-                && self.config.request_auth_provider.is_some()
-                && !force_refresh
-            {
-                self.record_provider_failure(
-                    anthropic_external_action_target(&endpoint),
-                    "401-refresh",
-                    grant_id,
-                )?;
-                warn!(
-                    session_id = %request.session_id,
-                    turn = request.turn,
-                    provider = "anthropic",
-                    endpoint = %endpoint,
-                    "Anthropic provider returned 401, forcing auth refresh"
-                );
-                force_refresh = true;
-                continue;
+            let (response, target, grant_id) = self.send_request(&request, &built).await?;
+            if response.status().is_success() {
+                break (response, target, grant_id);
             }
-            break (
-                response,
-                anthropic_external_action_target(&endpoint),
-                grant_id,
-            );
-        };
-
-        if !response.status().is_success() {
             let status = response.status().as_u16();
             let response_headers = response.headers().clone();
-            let error = map_http_error(response).await;
-            warn!(
-                session_id = %request.session_id,
-                thread_id = request.thread_id.as_deref(),
-                turn = request.turn,
-                provider = "anthropic",
-                model = request
-                    .generation
-                    .model
-                    .as_deref()
-                    .unwrap_or(self.config.model.as_str()),
-                status,
-                retryable = error.retryable,
-                retry_after_ms = error.retry_after_ms,
-                error = %error.message,
-                "Anthropic provider request failed"
-            );
+            let AnthropicHttpError {
+                error,
+                strict_grammar_too_large,
+            } = map_http_error(response).await;
+            // The API refused the grammar it compiles from the strict tools'
+            // schemas, whose size limit it does not publish. Nothing has
+            // reached the sink yet, so this call sends the request again with
+            // fewer strict tools rather than fail the run. A refusal of a
+            // request without strict tools is not theirs to fix.
+            let retry_cap = (strict_grammar_too_large
+                && built.strict.sent > 0
+                && attempts < ANTHROPIC_MAX_STRICT_GRAMMAR_ATTEMPTS)
+                .then(|| anthropic_lower_strict_cap(built.strict.sent));
+            if let Some(cap) = retry_cap {
+                warn!(
+                    session_id = %request.session_id,
+                    thread_id = request.thread_id.as_deref(),
+                    turn = request.turn,
+                    provider = "anthropic",
+                    model = %built.model,
+                    status,
+                    attempt = attempts,
+                    strict_tools = built.strict.sent,
+                    retry_strict_tools = cap,
+                    error = %error.message,
+                    "Anthropic refused the grammar of the strict tools, retrying with fewer strict tools"
+                );
+            } else {
+                warn!(
+                    session_id = %request.session_id,
+                    thread_id = request.thread_id.as_deref(),
+                    turn = request.turn,
+                    provider = "anthropic",
+                    model = request
+                        .generation
+                        .model
+                        .as_deref()
+                        .unwrap_or(self.config.model.as_str()),
+                    status,
+                    retryable = error.retryable,
+                    retry_after_ms = error.retry_after_ms,
+                    error = %error.message,
+                    "Anthropic provider request failed"
+                );
+            }
             let payload = json!({
                 "message": error.message,
                 "retryable": error.retryable,
@@ -749,14 +913,25 @@ impl ModelProvider for AnthropicProvider {
             });
             self.record_provider_response(
                 &request,
-                &response_target,
+                &target,
                 status,
                 &response_headers,
                 Some(&payload),
-                response_grant_id.clone(),
+                grant_id,
             )?;
-            return Err(error);
-        }
+            let Some(cap) = retry_cap else {
+                return Err(error);
+            };
+            // Every later request with these candidates starts at the lower
+            // cap, so it sends the bytes the retry sends and the cached tool
+            // prefix holds.
+            if let Some(key) = &built.strict.key {
+                self.strict_caps.learn(key, cap);
+            }
+            built = self.build_request_with_strict_cap(&request, Some(cap))?;
+            attempts += 1;
+        };
+        let requested_model = built.model;
 
         self.record_provider_response(
             &request,
@@ -2230,23 +2405,15 @@ fn cache_write_1h_tokens(usage: &Value) -> u64 {
         .unwrap_or_default()
 }
 
-/// Encodes the tools sorted by name, so the tool prefix renders the same
+/// Encodes the tools, sorted by name so the tool prefix renders the same
 /// bytes on every turn whatever order the runtime lists them in, with a
 /// prompt-cache breakpoint on the last one. Each `input_schema` goes out as
-/// the tool defines it. A tool that asks for strict input gets
-/// `strict: true` when the model takes it, its schema is in the subset
-/// strict tool use enforces, and [`anthropic_strict_selection`] keeps it
-/// within the per-request limits.
-fn anthropic_tools(tools: &[kheish_types::ToolDefinition], strict_tools: bool) -> Vec<Value> {
-    let mut sorted = tools.iter().collect::<Vec<_>>();
-    sorted.sort_by(|left, right| left.name.cmp(&right.name));
-    let strict = if strict_tools {
-        anthropic_strict_selection(&sorted)
-    } else {
-        vec![false; sorted.len()]
-    };
+/// the tool defines it. `strict` holds one flag per tool: a tool whose flag
+/// is set goes out with `strict: true` (see
+/// [`AnthropicProvider::request_tools`]).
+fn anthropic_tools(sorted: &[&kheish_types::ToolDefinition], strict: &[bool]) -> Vec<Value> {
     let mut encoded = sorted
-        .into_iter()
+        .iter()
         .zip(strict)
         .map(|(tool, strict)| {
             let mut encoded = json!({
@@ -2254,7 +2421,7 @@ fn anthropic_tools(tools: &[kheish_types::ToolDefinition], strict_tools: bool) -
                 "description": tool.description,
                 "input_schema": tool.input_schema,
             });
-            if strict {
+            if *strict {
                 encoded["strict"] = Value::Bool(true);
             }
             encoded
@@ -2266,45 +2433,155 @@ fn anthropic_tools(tools: &[kheish_types::ToolDefinition], strict_tools: bool) -
     encoded
 }
 
-/// Chooses the tools that go out with `strict: true`: one flag per tool of
-/// `tools`, which are sorted by name. The candidates are the tools that ask
-/// for strict input with a schema strict tool use enforces. When they all
-/// fit the per-request limits, every candidate is strict. Otherwise the
-/// candidates whose [`ToolStrictRank`](kheish_types::ToolStrictRank) does not
-/// prefer strict input all lose it, and the others are taken by priority,
-/// highest first, then by name: each is strict when it still fits what the
-/// ones before it left, so a tool never loses strict input to one ranked
-/// below it. Without ranks (every tool but a trusted MCP server's) this is
-/// name order. The same tools always get the same answer, so the tool prefix
-/// stays byte-stable from one turn to the next.
-fn anthropic_strict_selection(tools: &[&kheish_types::ToolDefinition]) -> Vec<bool> {
-    let candidates = tools
+/// A tool that asks for strict input with a schema strict tool use enforces.
+#[derive(Clone, Copy, Debug)]
+struct AnthropicStrictCandidate {
+    /// Its place among the tools sorted by name.
+    index: usize,
+    rank: ToolStrictRank,
+    cost: AnthropicStrictCost,
+}
+
+/// Returns the strict candidates among `tools`, which are sorted by name, in
+/// that order.
+fn anthropic_strict_candidates(
+    tools: &[&kheish_types::ToolDefinition],
+) -> Vec<AnthropicStrictCandidate> {
+    tools
         .iter()
         .enumerate()
         .filter(|(_, tool)| tool.strict)
         .filter_map(|(index, tool)| {
-            anthropic_strict_schema_cost(&tool.input_schema)
-                .map(|cost| (index, tool.strict_rank, cost))
+            anthropic_strict_schema_cost(&tool.input_schema).map(|cost| AnthropicStrictCandidate {
+                index,
+                rank: tool.strict_rank,
+                cost,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+/// Chooses the tools that go out with `strict: true`: one flag for each of
+/// `tool_count` tools sorted by name, of which `candidates` are the strict
+/// candidates. When they all fit the per-request limits, every candidate is
+/// strict. Otherwise the candidates whose [`ToolStrictRank`] does not prefer
+/// strict input all lose it, and the others are taken by priority, highest
+/// first, then by name: each is strict when it still fits what the ones
+/// before it left, so a tool never loses strict input to one ranked below
+/// it. Without ranks (every tool but a trusted MCP server's) this is name
+/// order.
+///
+/// A `cap` (from a grammar the API refused) then keeps at most that many of
+/// the chosen tools strict, ranked the same way: the ones that prefer strict
+/// input first, then by priority, highest first, then by name. A cap at or
+/// above what the limits chose changes nothing, and a lower cap only ever
+/// takes strict input away. The same tools and cap always get the same
+/// answer, so the tool prefix stays byte-stable from one turn to the next.
+fn anthropic_strict_selection(
+    tool_count: usize,
+    candidates: &[AnthropicStrictCandidate],
+    cap: Option<usize>,
+) -> Vec<bool> {
     let mut everyone = AnthropicStrictBudget::default();
-    let ranked = if candidates.iter().all(|(_, _, cost)| everyone.admit(*cost)) {
-        candidates
+    let ranked = if candidates
+        .iter()
+        .all(|candidate| everyone.admit(candidate.cost))
+    {
+        candidates.to_vec()
     } else {
         let mut ranked = candidates
-            .into_iter()
-            .filter(|(_, rank, _)| rank.preferred)
+            .iter()
+            .filter(|candidate| candidate.rank.preferred)
+            .copied()
             .collect::<Vec<_>>();
         // A stable sort: equal priorities keep name order.
-        ranked.sort_by_key(|(_, rank, _)| std::cmp::Reverse(rank.priority));
+        ranked.sort_by_key(|candidate| std::cmp::Reverse(candidate.rank.priority));
         ranked
     };
-    let mut selected = vec![false; tools.len()];
+    let mut selected = vec![false; tool_count];
     let mut budget = AnthropicStrictBudget::default();
-    for (index, _, cost) in ranked {
-        selected[index] = budget.admit(cost);
+    let mut chosen = Vec::new();
+    for candidate in ranked {
+        if budget.admit(candidate.cost) {
+            selected[candidate.index] = true;
+            chosen.push(candidate);
+        }
+    }
+    if let Some(cap) = cap
+        && chosen.len() > cap
+    {
+        // A stable sort: equal ranks keep name order.
+        chosen.sort_by_key(|candidate| {
+            (
+                std::cmp::Reverse(candidate.rank.preferred),
+                std::cmp::Reverse(candidate.rank.priority),
+            )
+        });
+        for candidate in &chosen[cap..] {
+            selected[candidate.index] = false;
+        }
     }
     selected
+}
+
+/// The fingerprint a cap learnt from a refused grammar is kept under: the
+/// model, and each strict candidate's name, `input_schema` and rank, in the
+/// order the request sends them. Those are what the strict selection and
+/// the grammar depend on; a tool that cannot be strict adds nothing to the
+/// grammar, so it is left out. `None` when no tool is a candidate.
+fn anthropic_strict_key(
+    model: &str,
+    tools: &[&kheish_types::ToolDefinition],
+    candidates: &[AnthropicStrictCandidate],
+) -> Option<String> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let candidates = candidates
+        .iter()
+        .map(|candidate| {
+            let tool = tools[candidate.index];
+            json!({
+                "name": tool.name,
+                "input_schema": tool.input_schema,
+                "preferred": candidate.rank.preferred,
+                "priority": candidate.rank.priority,
+            })
+        })
+        .collect::<Vec<_>>();
+    digest_json_value(&json!({ "model": model, "candidates": candidates })).ok()
+}
+
+/// The strict cap to retry with after the API refused the grammar of a
+/// request that sent `sent` strict tools: about a quarter fewer, and at
+/// least one fewer, so strict input stays on as many tools as possible.
+fn anthropic_lower_strict_cap(sent: usize) -> usize {
+    sent - sent.div_ceil(4)
+}
+
+/// Returns whether a failed Messages API response refused the grammar the
+/// API compiles from the request's strict tools: HTTP 400, an
+/// `invalid_request_error`, and a message that says the grammar is too large
+/// or too complex. The API words it as "The compiled grammar is too large,
+/// which would cause performance issues. Simplify your tool schemas or
+/// reduce the number of strict tools."; the match ignores case and the rest
+/// of the wording so a rephrasing still counts. The message is only read
+/// here, to classify the refusal: like every provider message, it is never
+/// logged or returned.
+fn anthropic_strict_grammar_too_large(
+    status: StatusCode,
+    error_type: Option<&str>,
+    message: Option<&str>,
+) -> bool {
+    if status != StatusCode::BAD_REQUEST || error_type != Some("invalid_request_error") {
+        return false;
+    }
+    let Some(message) = message else {
+        return false;
+    };
+    let message = message.to_lowercase();
+    message.contains("grammar")
+        && (message.contains("too large") || message.contains("too complex"))
 }
 
 /// The schema complexity limits of strict tool use, per request: the strict
@@ -2550,26 +2827,40 @@ fn map_transport_error(error: reqwest::Error) -> ProviderError {
     }
 }
 
-async fn map_http_error(response: reqwest::Response) -> ProviderError {
+/// A failed Messages API response, read once.
+struct AnthropicHttpError {
+    /// The sanitized error.
+    error: ProviderError,
+    /// Whether the API refused the grammar of the request's strict tools
+    /// (see [`anthropic_strict_grammar_too_large`]).
+    strict_grammar_too_large: bool,
+}
+
+async fn map_http_error(response: reqwest::Response) -> AnthropicHttpError {
     let status = response.status();
     let retry_after_ms = retry_after_ms(response.headers());
     let body = response.text().await.unwrap_or_default();
     let payload = serde_json::from_str::<Value>(&body).ok();
-    let message = sanitize_upstream_error_message(
+    let error_type = payload
+        .as_ref()
+        .and_then(|value| value.pointer("/error/type"))
+        .and_then(Value::as_str);
+    let upstream_message = payload
+        .as_ref()
+        .and_then(|value| value.pointer("/error/message"))
+        .and_then(Value::as_str);
+    let strict_grammar_too_large =
+        anthropic_strict_grammar_too_large(status, error_type, upstream_message);
+    let message = sanitize_upstream_error_message_with_kind(
         "Anthropic",
         "request failed",
         Some(status),
-        payload
-            .as_ref()
-            .and_then(|value| value.pointer("/error/type"))
-            .and_then(Value::as_str),
+        error_type,
         None,
-        payload
-            .as_ref()
-            .and_then(|value| value.pointer("/error/message"))
-            .and_then(Value::as_str),
+        upstream_message,
+        strict_grammar_too_large.then_some(ANTHROPIC_STRICT_GRAMMAR_KIND),
     );
-    ProviderError {
+    let error = ProviderError {
         message,
         retryable: matches!(
             status,
@@ -2581,6 +2872,10 @@ async fn map_http_error(response: reqwest::Response) -> ProviderError {
                 | StatusCode::GATEWAY_TIMEOUT
         ) || status.as_u16() == 529,
         retry_after_ms,
+    };
+    AnthropicHttpError {
+        error,
+        strict_grammar_too_large,
     }
 }
 
@@ -5789,6 +6084,504 @@ mod tests {
             }))
             .is_some()
         );
+    }
+
+    /// The Messages API's answer when the grammar it compiles from the
+    /// strict tools' schemas is too large.
+    const STRICT_GRAMMAR_TOO_LARGE: &str = "The compiled grammar is too large, which would cause performance issues. Simplify your tool schemas or reduce the number of strict tools.";
+
+    /// What a `stream` call returns once the API refused every strict tool
+    /// grammar: the sanitized summary and the kind, never the API's text.
+    const STRICT_GRAMMAR_ERROR: &str = "Anthropic request failed with status 400: type=invalid_request_error, kind=strict_grammar_too_large";
+
+    fn invalid_request_response(message: &str) -> MockHttpResponse {
+        MockHttpResponse::json(
+            400,
+            &json!({
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": message}
+            }),
+        )
+    }
+
+    /// Fregate's 24 tools with strict ranks: the six id-only reads do not
+    /// prefer strict input, `submit_verdict` ranks first, `run_template` and
+    /// `start_scan` next. The other eighteen go out strict.
+    fn ranked_fregate_surface() -> Vec<ToolDefinition> {
+        FREGATE_READS
+            .iter()
+            .map(|name| ranked_tool(&fregate_tool_name(name), id_only_schema(), false, 0))
+            .chain(FREGATE_OTHERS.iter().map(|name| {
+                let priority = match *name {
+                    "submit_verdict" => 20,
+                    "run_template" | "start_scan" => 10,
+                    _ => 0,
+                };
+                ranked_tool(
+                    &fregate_tool_name(name),
+                    submit_verdict_schema(),
+                    true,
+                    priority,
+                )
+            }))
+            .collect()
+    }
+
+    /// Twenty-two unranked tools that all ask for strict input: the first
+    /// twenty by name go out strict.
+    fn unranked_strict_tools() -> Vec<ToolDefinition> {
+        (0..22)
+            .map(|index| mcp_tool(&format!("mcp__s__tool_{index:02}"), submit_verdict_schema()))
+            .collect()
+    }
+
+    fn tools_request(tools: Vec<ToolDefinition>) -> ModelRuntimeRequest {
+        let mut request =
+            runtime_request("session-strict-grammar", ModelGenerationConfig::default());
+        request.available_tools = tools;
+        request
+    }
+
+    fn provider_at(url: String, model: &str) -> Result<AnthropicProvider> {
+        Ok(AnthropicProvider::new(AnthropicProviderConfig {
+            base_url: url,
+            ..AnthropicProviderConfig::new(model, "test-key")
+        })?)
+    }
+
+    /// Streams one request and returns its result with every event the sink
+    /// received.
+    async fn stream_and_collect(
+        provider: &AnthropicProvider,
+        request: ModelRuntimeRequest,
+    ) -> (
+        std::result::Result<(), crate::model::ProviderError>,
+        Vec<ModelStreamEvent>,
+    ) {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let result = provider.stream(request, ModelEventSink::new(sender)).await;
+        let mut events = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            events.push(event);
+        }
+        (result, events)
+    }
+
+    /// The request body without the tools' `strict` flags.
+    fn without_strict(body: &Value) -> Value {
+        let mut body = body.clone();
+        for tool in body["tools"].as_array_mut().expect("tools") {
+            tool.as_object_mut().expect("tool").remove("strict");
+        }
+        body
+    }
+
+    /// The tools of a recorded request as they went out on the wire.
+    fn tool_bytes(request: &crate::providers::testsupport::RecordedRequest) -> String {
+        let tools = serde_json::to_string(&request.json()["tools"]).expect("tools serialize");
+        assert!(request.body.contains(&tools), "compact JSON round-trips");
+        tools
+    }
+
+    /// The names the strict selection, under an optional cap, makes strict.
+    fn capped_strict_names(tools: &[ToolDefinition], cap: Option<usize>) -> Vec<String> {
+        use super::{anthropic_strict_candidates, anthropic_strict_selection};
+        let mut sorted = tools.iter().collect::<Vec<_>>();
+        sorted.sort_by(|left, right| left.name.cmp(&right.name));
+        let candidates = anthropic_strict_candidates(&sorted);
+        anthropic_strict_selection(sorted.len(), &candidates, cap)
+            .into_iter()
+            .zip(&sorted)
+            .filter(|(strict, _)| *strict)
+            .map(|(_, tool)| tool.name.clone())
+            .collect()
+    }
+
+    fn strict_key(model: &str, tools: &[ToolDefinition]) -> Option<String> {
+        use super::{anthropic_strict_candidates, anthropic_strict_key};
+        let mut sorted = tools.iter().collect::<Vec<_>>();
+        sorted.sort_by(|left, right| left.name.cmp(&right.name));
+        let candidates = anthropic_strict_candidates(&sorted);
+        anthropic_strict_key(model, &sorted, &candidates)
+    }
+
+    #[test]
+    fn strict_grammar_refusals_are_recognised() {
+        use super::anthropic_strict_grammar_too_large as refused;
+        use reqwest::StatusCode;
+        let invalid = Some("invalid_request_error");
+        for message in [
+            STRICT_GRAMMAR_TOO_LARGE,
+            "THE COMPILED GRAMMAR IS TOO LARGE",
+            "Compiled Grammar Too Large for this request",
+            "The grammar for your tools is too complex to compile.",
+            "strict tool grammar: too complex",
+        ] {
+            assert!(
+                refused(StatusCode::BAD_REQUEST, invalid, Some(message)),
+                "{message}"
+            );
+        }
+        for message in [
+            "prompt is too long: 250000 tokens > 200000 maximum",
+            "tools.3.custom.input_schema: JSON schema is invalid",
+            "Request too large",
+            "The schema is too complex for strict mode",
+            "The compiled grammar could not be built",
+            "",
+        ] {
+            assert!(
+                !refused(StatusCode::BAD_REQUEST, invalid, Some(message)),
+                "{message}"
+            );
+        }
+        assert!(!refused(StatusCode::BAD_REQUEST, invalid, None));
+        // Only an invalid request with status 400 counts.
+        for error_type in [None, Some("api_error"), Some("request_too_large")] {
+            assert!(!refused(
+                StatusCode::BAD_REQUEST,
+                error_type,
+                Some(STRICT_GRAMMAR_TOO_LARGE)
+            ));
+        }
+        for status in [
+            StatusCode::PAYLOAD_TOO_LARGE,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert!(!refused(status, invalid, Some(STRICT_GRAMMAR_TOO_LARGE)));
+        }
+    }
+
+    #[test]
+    fn a_strict_cap_keeps_the_highest_ranked_tools() {
+        // The limits choose the eighteen tools that prefer strict input.
+        let surface = ranked_fregate_surface();
+        let chosen = capped_strict_names(&surface, None);
+        assert_eq!(chosen.len(), 18);
+        for cap in [18, 19, 20, 24, usize::MAX] {
+            assert_eq!(capped_strict_names(&surface, Some(cap)), chosen, "{cap}");
+        }
+        // Below it, priority first, then name.
+        let ranked_first = ["submit_verdict", "run_template", "start_scan"].map(fregate_tool_name);
+        let first_by_name = chosen
+            .iter()
+            .filter(|name| !ranked_first.contains(name))
+            .take(10)
+            .cloned();
+        assert_eq!(
+            capped_strict_names(&surface, Some(13)),
+            sorted_names(ranked_first.iter().cloned().chain(first_by_name))
+        );
+        // A lower cap only takes strict input away, one tool at a time.
+        let mut previous = chosen.clone();
+        for cap in (0..18).rev() {
+            let capped = capped_strict_names(&surface, Some(cap));
+            assert_eq!(capped.len(), cap);
+            assert!(capped.iter().all(|name| previous.contains(name)), "{cap}");
+            previous = capped;
+        }
+        assert!(previous.is_empty());
+
+        // When every candidate fits, all are strict, those that
+        // do not prefer strict input included; a cap takes it from those
+        // first, then by priority and name.
+        let tools = vec![
+            ranked_tool("a_read", id_only_schema(), false, 0),
+            ranked_tool("b_read", id_only_schema(), false, 0),
+            ranked_tool("c_act", submit_verdict_schema(), true, 0),
+            ranked_tool("d_act", submit_verdict_schema(), true, 5),
+            ranked_tool("e_act", submit_verdict_schema(), true, 0),
+        ];
+        let all = capped_strict_names(&tools, None);
+        assert_eq!(all.len(), 5);
+        assert_eq!(capped_strict_names(&tools, Some(5)), all);
+        assert_eq!(
+            capped_strict_names(&tools, Some(4)),
+            ["a_read", "c_act", "d_act", "e_act"].map(String::from)
+        );
+        assert_eq!(
+            capped_strict_names(&tools, Some(3)),
+            ["c_act", "d_act", "e_act"].map(String::from)
+        );
+        assert_eq!(
+            capped_strict_names(&tools, Some(1)),
+            ["d_act"].map(String::from)
+        );
+
+        // Without ranks the cap keeps name order.
+        let tools = unranked_strict_tools();
+        let all = capped_strict_names(&tools, None);
+        assert_eq!(all.len(), 20);
+        assert_eq!(capped_strict_names(&tools, Some(15)), all[..15].to_vec());
+    }
+
+    #[test]
+    fn strict_caps_step_down_by_a_quarter_within_the_attempt_bound() {
+        use super::{
+            ANTHROPIC_MAX_STRICT_GRAMMAR_ATTEMPTS, ANTHROPIC_MAX_STRICT_TOOLS,
+            anthropic_lower_strict_cap,
+        };
+        let mut steps = vec![ANTHROPIC_MAX_STRICT_TOOLS];
+        while let Some(&sent) = steps.last().filter(|sent| **sent > 0) {
+            steps.push(anthropic_lower_strict_cap(sent));
+        }
+        assert_eq!(steps, vec![20, 15, 11, 8, 6, 4, 3, 2, 1, 0]);
+        // From the most strict tools a request can send, every request the
+        // bound allows is needed to reach none.
+        assert_eq!(steps.len(), ANTHROPIC_MAX_STRICT_GRAMMAR_ATTEMPTS);
+        for sent in 1..=ANTHROPIC_MAX_STRICT_TOOLS {
+            let lower = anthropic_lower_strict_cap(sent);
+            assert!(lower < sent, "{sent}");
+            assert!(lower * 4 >= sent * 3 - 3, "about a quarter fewer: {sent}");
+        }
+    }
+
+    #[test]
+    fn learnt_strict_caps_only_go_down_and_forget_the_oldest_first() {
+        use super::{ANTHROPIC_LEARNT_STRICT_CAPS, AnthropicStrictCaps};
+        let caps = AnthropicStrictCaps::default();
+        assert_eq!(caps.get("first"), None);
+        caps.learn("first", 15);
+        caps.learn("first", 18);
+        assert_eq!(caps.get("first"), Some(15));
+        caps.learn("first", 11);
+        assert_eq!(caps.get("first"), Some(11));
+        for index in 1..ANTHROPIC_LEARNT_STRICT_CAPS {
+            caps.learn(&format!("set-{index}"), index);
+        }
+        assert_eq!(caps.get("first"), Some(11));
+        caps.learn("one-too-many", 3);
+        assert_eq!(caps.get("first"), None, "the first learnt goes first");
+        assert_eq!(caps.get("set-1"), Some(1));
+        assert_eq!(caps.get("one-too-many"), Some(3));
+        assert_eq!(caps.learnt.lock().len(), ANTHROPIC_LEARNT_STRICT_CAPS);
+    }
+
+    #[test]
+    fn strict_keys_follow_the_model_and_the_strict_candidates() {
+        let surface = ranked_fregate_surface();
+        let key = strict_key("claude-opus-5-5", &surface).expect("candidates");
+
+        // Neither the order the runtime lists the tools in, nor a
+        // description, nor a tool that cannot be strict changes it.
+        let mut reordered = surface.clone();
+        reordered.reverse();
+        reordered[0].description = "Another description.".to_string();
+        reordered.push(tool("read_file"));
+        reordered.push(mcp_tool("mcp__s__limited", limited_schema()));
+        assert_eq!(strict_key("claude-opus-5-5", &reordered), Some(key.clone()));
+
+        // The model, a candidate's name, schema or rank, or one more
+        // candidate does.
+        assert_ne!(strict_key("claude-sonnet-5", &surface), Some(key.clone()));
+        let changed = |change: &dyn Fn(&mut ToolDefinition)| {
+            let mut tools = surface.clone();
+            change(&mut tools[10]);
+            strict_key("claude-opus-5-5", &tools)
+        };
+        assert_ne!(
+            changed(&|tool| tool.name.push_str("_v2")),
+            Some(key.clone())
+        );
+        assert_ne!(
+            changed(&|tool| tool.input_schema = id_only_schema()),
+            Some(key.clone())
+        );
+        assert_ne!(
+            changed(&|tool| tool.strict_rank.priority = 7),
+            Some(key.clone())
+        );
+        assert_ne!(
+            changed(&|tool| tool.strict_rank.preferred = false),
+            Some(key.clone())
+        );
+        let mut more = surface.clone();
+        more.push(mcp_tool("mcp__s__extra", id_only_schema()));
+        assert_ne!(strict_key("claude-opus-5-5", &more), Some(key));
+
+        // No candidate, no key.
+        assert_eq!(strict_key("claude-opus-5-5", &[tool("read_file")]), None);
+    }
+
+    #[tokio::test]
+    async fn a_refused_strict_grammar_is_retried_with_fewer_strict_tools() -> Result<()> {
+        let (url, recorded) = spawn_recording_mock_server(vec![
+            invalid_request_response(STRICT_GRAMMAR_TOO_LARGE),
+            MockHttpResponse::sse(&sse_text_stream("msg-retry", "hello")),
+        ])
+        .await?;
+        let provider = provider_at(url, "claude-opus-5-5")?;
+        let (result, events) =
+            stream_and_collect(&provider, tools_request(ranked_fregate_surface())).await;
+        result?;
+        assert!(events.contains(&ModelStreamEvent::TextDelta {
+            text: "hello".to_string()
+        }));
+        assert!(events.contains(&ModelStreamEvent::Stop {
+            reason: crate::model::ModelFinishReason::Completed
+        }));
+
+        let recorded = recorded.lock().clone();
+        assert_eq!(recorded.len(), 2);
+        let refused = strict_tool_names(&recorded[0].json());
+        let retried = strict_tool_names(&recorded[1].json());
+        assert_eq!(refused.len(), 18);
+        // A quarter fewer, rounded up: 18 - 5.
+        assert_eq!(retried.len(), 13);
+        assert_eq!(
+            retried,
+            capped_strict_names(&ranked_fregate_surface(), Some(13))
+        );
+        for kept in ["submit_verdict", "run_template", "start_scan"] {
+            assert!(retried.contains(&fregate_tool_name(kept)), "{kept}");
+        }
+        // Only the strict flags changed.
+        assert_eq!(
+            without_strict(&recorded[0].json()),
+            without_strict(&recorded[1].json())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_learnt_strict_cap_holds_for_later_requests_with_the_same_candidates() -> Result<()> {
+        let (url, recorded) = spawn_recording_mock_server(vec![
+            invalid_request_response(STRICT_GRAMMAR_TOO_LARGE),
+            MockHttpResponse::sse(&sse_text_stream("msg-retry", "hello")),
+            MockHttpResponse::sse(&sse_text_stream("msg-next", "hello")),
+            MockHttpResponse::sse(&sse_text_stream("msg-one-more-tool", "hello")),
+            MockHttpResponse::sse(&sse_text_stream("msg-other-set", "hello")),
+        ])
+        .await?;
+        let provider = provider_at(url, "claude-opus-5-5")?;
+        let (result, _) =
+            stream_and_collect(&provider, tools_request(ranked_fregate_surface())).await;
+        result?;
+
+        // A later turn with the same tools: one request, already at the
+        // learnt cap, with the retry's tool bytes.
+        let mut later = tools_request(ranked_fregate_surface());
+        later.session_id = "session-later".to_string();
+        later.prompt.instructions = vec!["You verify findings.".to_string()];
+        let (result, _) = stream_and_collect(&provider, later).await;
+        result?;
+        {
+            let recorded = recorded.lock();
+            assert_eq!(recorded.len(), 3);
+            assert_ne!(recorded[2].body, recorded[1].body);
+            assert_eq!(tool_bytes(&recorded[2]), tool_bytes(&recorded[1]));
+            assert_eq!(strict_tool_names(&recorded[2].json()).len(), 13);
+        }
+
+        // A tool that cannot be strict adds nothing to the grammar: the
+        // learnt cap holds.
+        let mut tools = ranked_fregate_surface();
+        tools.push(tool("read_file"));
+        let (result, _) = stream_and_collect(&provider, tools_request(tools)).await;
+        result?;
+        // Other candidates are another set: the selection without a cap.
+        let tools = ranked_fregate_surface()
+            .into_iter()
+            .filter(|tool| tool.name != fregate_tool_name("add_note"))
+            .collect::<Vec<_>>();
+        let (result, _) = stream_and_collect(&provider, tools_request(tools)).await;
+        result?;
+
+        let recorded = recorded.lock().clone();
+        assert_eq!(recorded.len(), 5);
+        assert_eq!(
+            strict_tool_names(&recorded[3].json()),
+            strict_tool_names(&recorded[2].json())
+        );
+        assert_eq!(strict_tool_names(&recorded[4].json()).len(), 17);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn strict_grammar_refusals_end_once_no_strict_tool_is_left() -> Result<()> {
+        use super::ANTHROPIC_MAX_STRICT_GRAMMAR_ATTEMPTS;
+        let mut responses = (0..ANTHROPIC_MAX_STRICT_GRAMMAR_ATTEMPTS)
+            .map(|_| invalid_request_response(STRICT_GRAMMAR_TOO_LARGE))
+            .collect::<Vec<_>>();
+        // Served only to a request past the bound, then to the next call.
+        responses.push(MockHttpResponse::sse(&sse_text_stream("msg-next", "hello")));
+        let (url, recorded) = spawn_recording_mock_server(responses).await?;
+        let provider = provider_at(url, "claude-opus-5-5")?;
+
+        let (result, events) =
+            stream_and_collect(&provider, tools_request(unranked_strict_tools())).await;
+        let error = result.expect_err("every request was refused");
+        assert_eq!(error.message, STRICT_GRAMMAR_ERROR);
+        assert!(!error.message.to_lowercase().contains("compiled grammar"));
+        assert!(!error.retryable);
+        assert!(events.is_empty(), "nothing reached the sink: {events:?}");
+        let sent = recorded
+            .lock()
+            .iter()
+            .map(|request| strict_tool_names(&request.json()).len())
+            .collect::<Vec<_>>();
+        assert_eq!(sent, vec![20, 15, 11, 8, 6, 4, 3, 2, 1, 0]);
+        assert_eq!(sent.len(), ANTHROPIC_MAX_STRICT_GRAMMAR_ATTEMPTS);
+
+        // The provider learnt that none of these may be strict: the next
+        // call sends one request, without strict tools.
+        let (result, _) =
+            stream_and_collect(&provider, tools_request(unranked_strict_tools())).await;
+        result?;
+        let recorded = recorded.lock().clone();
+        assert_eq!(recorded.len(), ANTHROPIC_MAX_STRICT_GRAMMAR_ATTEMPTS + 1);
+        assert!(
+            strict_tool_names(&recorded[ANTHROPIC_MAX_STRICT_GRAMMAR_ATTEMPTS].json()).is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn other_invalid_requests_are_returned_at_once() -> Result<()> {
+        let (url, recorded) = spawn_recording_mock_server(vec![
+            invalid_request_response("tools.3.custom.input_schema: JSON schema is invalid"),
+            MockHttpResponse::sse(&sse_text_stream("msg-next", "hello")),
+        ])
+        .await?;
+        let provider = provider_at(url, "claude-opus-5-5")?;
+        let (result, events) =
+            stream_and_collect(&provider, tools_request(ranked_fregate_surface())).await;
+        let error = result.expect_err("refused");
+        assert_eq!(
+            error.message,
+            "Anthropic request failed with status 400: type=invalid_request_error"
+        );
+        assert!(events.is_empty());
+        assert_eq!(recorded.lock().len(), 1);
+        // Nothing was learnt: the next call sends the same bytes.
+        let (result, _) =
+            stream_and_collect(&provider, tools_request(ranked_fregate_surface())).await;
+        result?;
+        {
+            let recorded = recorded.lock();
+            assert_eq!(recorded.len(), 2);
+            assert_eq!(recorded[1].body, recorded[0].body);
+            assert_eq!(strict_tool_names(&recorded[1].json()).len(), 18);
+        }
+
+        // A grammar refusal of a request without strict tools (a model
+        // that does not take them) has nothing to retry: one request, and
+        // the error says why.
+        let (url, recorded) = spawn_recording_mock_server(vec![
+            invalid_request_response(STRICT_GRAMMAR_TOO_LARGE),
+            MockHttpResponse::sse(&sse_text_stream("msg-never", "hello")),
+        ])
+        .await?;
+        let provider = provider_at(url, "claude-opus-4-6")?;
+        let (result, events) =
+            stream_and_collect(&provider, tools_request(ranked_fregate_surface())).await;
+        assert_eq!(result.expect_err("refused").message, STRICT_GRAMMAR_ERROR);
+        assert!(events.is_empty());
+        let recorded = recorded.lock().clone();
+        assert_eq!(recorded.len(), 1);
+        assert!(strict_tool_names(&recorded[0].json()).is_empty());
+        Ok(())
     }
 
     #[test]

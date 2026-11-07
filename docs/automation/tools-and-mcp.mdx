@@ -741,7 +741,11 @@ embeds Kheish; leave third-party servers untrusted.
   strict tools, 24 optional parameters and 16 union-typed parameters go into one
   request. When the tools asking for strict input do not all fit, a trusted
   server's hints choose which keep it (next section); without hints they are
-  taken in tool-name order. The tools left out are sent without `strict`.
+  taken in tool-name order. The tools left out are sent without `strict`. If
+  the API still refuses the request because the strict tools' compiled grammar
+  is too large, Kheish retries it with fewer strict tools, the lowest ranked
+  first, and remembers the lower number for that tool set (see
+  [Tool schemas](/reference/model-providers#tool-schemas)).
 - **Other providers.** OpenAI, OpenRouter and xAI routes get the structural
   subset (`type` with `integer`, `description`, `properties`, `required`,
   `additionalProperties`, `items`, `enum`, `const`, `anyOf`, with `oneOf` read as

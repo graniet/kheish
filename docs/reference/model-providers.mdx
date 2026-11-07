@@ -144,6 +144,19 @@ keeps `strict` when it still fits what the tools before it left. Without hints (
 an untrusted server's) the order is the tool name. The same tools get the same answer on every turn,
 so the cached tool prefix holds. See
 [Choosing which MCP tools stay strict](/automation/tools-and-mcp#choosing-which-mcp-tools-stay-strict).
+
+The API also compiles the strict tools' schemas into a grammar whose size limit is not published,
+and refuses a request whose grammar is too large (HTTP 400, `invalid_request_error`). The driver
+then sends the request again, in the same call and before anything is streamed, with about a
+quarter fewer strict tools (the lowest ranked lose `strict` first, in the order above), until the
+API accepts it or no strict tool is left: at most ten requests, enough to go from 20 strict tools
+to none. The provider remembers the lower cap for that model and set of strict tools (their names,
+schemas and ranks), so later turns and sessions with the same tools start there and send the same
+tool bytes: the refusal is paid once per daemon lifetime. The memory holds 32 tool sets, forgets
+the oldest first, and does not survive a restart. When even the last request is refused, the error
+reads `... type=invalid_request_error, kind=strict_grammar_too_large`; like every provider error,
+it never carries the API's own message.
+
 A tool result the tool reported as failed (an MCP `isError`) is sent with `is_error: true`.
 
 The other drivers take a subset of JSON Schema. OpenAI, OpenRouter and xAI get the structural

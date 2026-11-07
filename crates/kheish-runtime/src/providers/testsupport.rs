@@ -121,6 +121,15 @@ impl MockHttpResponse {
             body: body.to_string(),
         }
     }
+
+    /// A JSON response with any status, such as a provider's error body.
+    pub fn json(status: u16, body: &serde_json::Value) -> Self {
+        Self {
+            status,
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            body: body.to_string(),
+        }
+    }
 }
 
 /// Spawns an HTTP mock server that answers one connection per canned response,

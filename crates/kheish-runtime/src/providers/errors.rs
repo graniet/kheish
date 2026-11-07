@@ -21,6 +21,23 @@ pub(crate) fn sanitize_upstream_error_message(
     error_code: Option<&str>,
     message: Option<&str>,
 ) -> String {
+    sanitize_upstream_error_message_with_kind(
+        provider, phase, status, error_type, error_code, message, None,
+    )
+}
+
+/// Builds the same summary as [`sanitize_upstream_error_message`], with a
+/// stable `kind=<kind>` detail for a failure the provider adapter classified
+/// itself from the free-form message, which stays out of the summary.
+pub(crate) fn sanitize_upstream_error_message_with_kind(
+    provider: &str,
+    phase: &str,
+    status: Option<StatusCode>,
+    error_type: Option<&str>,
+    error_code: Option<&str>,
+    message: Option<&str>,
+    kind: Option<&str>,
+) -> String {
     if let Some(message) = message.map(str::trim).filter(|message| !message.is_empty()) {
         if message.contains(CONTEXT_OVERFLOW_MARKER) {
             return redact_text(message);
@@ -43,6 +60,9 @@ pub(crate) fn sanitize_upstream_error_message(
         == ProviderErrorKind::ContextWindowExceeded
     {
         details.push("kind=context_window_exceeded".to_string());
+    }
+    if let Some(kind) = kind {
+        details.push(format!("kind={kind}"));
     }
     if !details.is_empty() {
         rendered.push_str(": ");
@@ -107,6 +127,31 @@ mod tests {
         assert_eq!(
             classify_provider_error_message(&message),
             ProviderErrorKind::ContextWindowExceeded
+        );
+    }
+
+    #[test]
+    fn a_kind_the_adapter_classified_is_kept_without_the_raw_message() {
+        let message = sanitize_upstream_error_message_with_kind(
+            "Anthropic",
+            "request failed",
+            Some(StatusCode::BAD_REQUEST),
+            Some("invalid_request_error"),
+            None,
+            Some("The compiled grammar is too large for user-secret-value."),
+            Some("strict_grammar_too_large"),
+        );
+
+        assert_eq!(
+            message,
+            "Anthropic request failed with status 400: type=invalid_request_error, kind=strict_grammar_too_large"
+        );
+        assert!(!message.contains("user-secret-value"));
+        // It stays an invalid request: the runtime must not take it for a
+        // context overflow and compact the conversation.
+        assert_eq!(
+            classify_provider_error_message(&message),
+            ProviderErrorKind::InvalidRequest
         );
     }
 
