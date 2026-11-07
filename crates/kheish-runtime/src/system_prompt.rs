@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use kheish_types::{
     AFFINITY_CUE_THRESHOLD, AffinityStanding, AffinityTabDir, CompletionRequirement,
-    MAX_SOCIAL_LEDGER_EDGES, SessionControlState, SessionGoal, SessionPersonaBinding,
-    SessionSocialLedger, SystemPromptSection, TaskStatus, ToolDefinition,
+    MAX_SOCIAL_LEDGER_EDGES, PromptPreamble, SessionControlState, SessionGoal,
+    SessionPersonaBinding, SessionSocialLedger, SystemPromptSection, TaskStatus, ToolDefinition,
 };
 use serde::{Deserialize, Serialize};
 
@@ -106,6 +106,11 @@ impl SystemPromptBuilder {
     }
 
     /// Builds the effective system prompt sections for one agent turn.
+    ///
+    /// A persona with the `minimal` preamble gets no default sections (the
+    /// generic agent sections, the capability sections, the environment and
+    /// the tool list): the persona's soul is the prompt, with the session's
+    /// own state and the operator's prompt settings around it.
     pub fn build_sections(
         &self,
         tools: &[ToolDefinition],
@@ -117,6 +122,7 @@ impl SystemPromptBuilder {
         session_social_ledger: Option<&SessionSocialLedger>,
     ) -> Vec<SystemPromptSection> {
         let settings = self.settings();
+        let minimal = preamble_of(session_persona) == PromptPreamble::Minimal;
         let override_prompt = non_empty(&settings.override_prompt);
         let mut sections = if let Some(override_prompt) = override_prompt {
             vec![section("override_prompt", override_prompt.to_string())]
@@ -135,6 +141,7 @@ impl SystemPromptBuilder {
                     Some(custom_prompt) => {
                         vec![section("custom_prompt", custom_prompt.to_string())]
                     }
+                    None if minimal => minimal_sections(completion_requirements),
                     None => self.default_sections(tools, &settings, completion_requirements),
                 },
             }
@@ -144,7 +151,11 @@ impl SystemPromptBuilder {
             && let Some(session_persona) =
                 session_persona.filter(|binding| !binding.soul.trim().is_empty())
         {
-            sections.push(persona_section(session_persona));
+            sections.push(if minimal {
+                section("persona", session_persona.soul.clone())
+            } else {
+                persona_section(session_persona)
+            });
         }
 
         sections.extend(session_control_sections(session_control));
@@ -251,6 +262,26 @@ impl SystemPromptBuilder {
 
         lines.join("\n")
     }
+}
+
+/// The preamble a session's persona asks for; a session without a persona
+/// gets the full one.
+pub fn preamble_of(session_persona: Option<&SessionPersonaBinding>) -> PromptPreamble {
+    session_persona
+        .map(|binding| binding.preamble)
+        .unwrap_or_default()
+}
+
+/// What a `minimal` preamble keeps of the default sections: only the run's
+/// own completion criteria, when it has some.
+fn minimal_sections(completion_requirements: &[CompletionRequirement]) -> Vec<SystemPromptSection> {
+    if completion_requirements.is_empty() {
+        return Vec::new();
+    }
+    vec![section(
+        "completion_criteria",
+        completion_criteria_section(completion_requirements),
+    )]
 }
 
 fn session_goal_section(goal: &SessionGoal) -> SystemPromptSection {
@@ -804,14 +835,16 @@ impl ToolCapabilities {
     }
 }
 
+/// Reads the capability sections a tool surface calls for from Kheish's own
+/// tools, by name. Other tools (MCP tools, a host's tools) add none, whatever
+/// their descriptions say: a description is not a capability.
 fn detect_capabilities(tools: &[ToolDefinition]) -> ToolCapabilities {
     let mut capabilities = ToolCapabilities::default();
 
     for tool in tools {
-        let name = tool.name.as_str();
-        match name {
-            "read_file" | "write_file" | "edit_file" | "list_files" | "glob_search"
-            | "grep_search" => capabilities.has_filesystem = true,
+        match tool.name.as_str() {
+            "read_file" | "write_file" | "edit_file" | "apply_patch" | "list_files"
+            | "glob_search" | "grep_search" => capabilities.has_filesystem = true,
             "bash" => capabilities.has_shell = true,
             "web_fetch" | "web_search" => capabilities.has_web = true,
             "ask_user_question" => capabilities.has_user_questions = true,
@@ -825,40 +858,7 @@ fn detect_capabilities(tools: &[ToolDefinition]) -> ToolCapabilities {
             | "schedule_pause"
             | "schedule_resume"
             | "schedule_trigger_now" => capabilities.has_scheduling = true,
-            _ => {
-                let lowered = tool.description.to_ascii_lowercase();
-                if lowered.contains("file")
-                    || lowered.contains("workspace")
-                    || lowered.contains("directory")
-                {
-                    capabilities.has_filesystem = true;
-                }
-                if lowered.contains("shell") || lowered.contains("command") {
-                    capabilities.has_shell = true;
-                }
-                if lowered.contains("http") || lowered.contains("web") || lowered.contains("url") {
-                    capabilities.has_web = true;
-                }
-                if lowered.contains("structured clarification")
-                    || lowered.contains("user input before continuing")
-                {
-                    capabilities.has_user_questions = true;
-                }
-                if lowered.contains("parent session")
-                    || lowered.contains("parent clarification")
-                    || lowered.contains("answer will arrive later through mailbox")
-                {
-                    capabilities.has_parent_clarification = true;
-                }
-                if lowered.contains("wake-up")
-                    || lowered.contains("wake up later")
-                    || lowered.contains("schedule")
-                    || lowered.contains("recurring")
-                    || lowered.contains("cron")
-                {
-                    capabilities.has_scheduling = true;
-                }
-            }
+            _ => {}
         }
     }
 
@@ -887,8 +887,8 @@ mod tests {
     };
     use kheish_types::{
         AffinityEdge, AffinityOpenTab, AffinityStanding, AffinityTabDir, CapabilityScope,
-        CompletionRequirement, SessionControlState, SessionPersonaBinding, SessionSocialLedger,
-        TaskRecord, TaskStatus, TodoItem, ToolDefinition,
+        CompletionRequirement, PromptPreamble, SessionControlState, SessionPersonaBinding,
+        SessionSocialLedger, TaskRecord, TaskStatus, TodoItem, ToolDefinition,
     };
 
     fn ledger_with_one_edge() -> SessionSocialLedger {
@@ -1249,6 +1249,7 @@ mod tests {
                 soul: "Reply as Analyst.".to_string(),
                 soul_sha256: "hash".to_string(),
                 bound_at_ms: 42,
+                preamble: Default::default(),
                 capability_scope: CapabilityScope::default(),
                 default_inline_skills: Vec::new(),
             }),
@@ -1466,6 +1467,7 @@ mod tests {
                 soul: "Always review carefully.".to_string(),
                 soul_sha256: "abc123".to_string(),
                 bound_at_ms: 7,
+                preamble: Default::default(),
                 capability_scope: CapabilityScope::default(),
                 default_inline_skills: Vec::new(),
             }),
@@ -1555,6 +1557,195 @@ mod tests {
         assert!(sections.iter().any(|section| section.name == "plan_mode"));
         assert!(sections.iter().any(|section| section.name == "todos"));
         assert!(sections.iter().any(|section| section.name == "tasks"));
+    }
+
+    /// Fregate's verification tools, as its session allow-list exposes them.
+    /// Their descriptions mention HTTP, URLs, files, commands and schedules.
+    fn fregate_verify_tools() -> Vec<ToolDefinition> {
+        [
+            ("mcp__fregate__get_coverage", "When the scans last covered an asset: an absence means something only if a schedule covered it."),
+            ("mcp__fregate__get_exposure", "The exposure, its check, the evidence and its timeline."),
+            ("mcp__fregate__get_fact", "One fact: a service, an HTTP endpoint, a certificate, a file listing."),
+            ("mcp__fregate__get_threat_context", "Whether a CVE is exploited (CISA KEV) and its EPSS score, from the web."),
+            ("mcp__fregate__list_changes", "What appeared, changed or disappeared lately."),
+            ("mcp__fregate__list_facts", "The asset's other facts: hostnames, URLs, web resources."),
+            ("mcp__fregate__services_on", "What else answers on an address and port: the HTTP endpoint, the certificate, a command-line banner."),
+            ("mcp__fregate__submit_verdict", "Submit your verdict. Call it exactly once, at the end."),
+        ]
+        .into_iter()
+        .map(|(name, description)| ToolDefinition {
+            name: name.to_string(),
+            description: description.to_string(),
+            input_schema: json!({"type": "object"}),
+            allows_parallel: true,
+            strict: true,
+        })
+        .collect()
+    }
+
+    fn fregate_persona(preamble: PromptPreamble) -> SessionPersonaBinding {
+        SessionPersonaBinding {
+            preamble,
+            persona_id: "fp-verify".to_string(),
+            persona_version: 1,
+            display_name: "Fregate verify".to_string(),
+            soul: "You are the verification assistant of Fregate.\n\n# Verdicts\n\n- confirmed: the exposure is real.\n".to_string(),
+            soul_sha256: "hash".to_string(),
+            bound_at_ms: 42,
+            capability_scope: CapabilityScope::default(),
+            default_inline_skills: Vec::new(),
+        }
+    }
+
+    fn system_prompt_text(sections: &[kheish_types::SystemPromptSection]) -> String {
+        sections
+            .iter()
+            .map(|section| section.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    #[test]
+    fn a_minimal_preamble_makes_the_soul_the_whole_system_prompt() {
+        let builder = SystemPromptBuilder::new(
+            SystemPromptEnvironment::new("/workspace", "/bin/bash"),
+            SystemPromptSettings::default(),
+        );
+        let persona = fregate_persona(PromptPreamble::Minimal);
+
+        let sections = builder.build_sections(
+            &fregate_verify_tools(),
+            Some(&persona),
+            None,
+            &[],
+            &SessionControlState::default(),
+            None,
+            None,
+        );
+
+        assert_eq!(
+            system_prompt_text(&sections).as_bytes(),
+            b"You are the verification assistant of Fregate.\n\n# Verdicts\n\n- confirmed: the exposure is real.\n",
+            "exactly the soul as written: no generic sections, no tool list, no persona framing"
+        );
+        assert_eq!(
+            sections
+                .iter()
+                .map(|section| section.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["persona"]
+        );
+    }
+
+    #[test]
+    fn a_minimal_preamble_keeps_what_the_operator_and_the_run_set() {
+        let builder = SystemPromptBuilder::new(
+            SystemPromptEnvironment::new("/workspace", "/bin/bash"),
+            SystemPromptSettings {
+                custom_prompt: Some("You run one Fregate mission.".to_string()),
+                append_prompt: Some("Answer in English.".to_string()),
+                ..SystemPromptSettings::default()
+            },
+        );
+        let sections = builder.build_sections(
+            &fregate_verify_tools(),
+            Some(&fregate_persona(PromptPreamble::Minimal)),
+            None,
+            &[],
+            &SessionControlState::default(),
+            None,
+            None,
+        );
+        assert_eq!(
+            sections
+                .iter()
+                .map(|section| section.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["custom_prompt", "persona", "append_prompt"]
+        );
+
+        let builder = SystemPromptBuilder::new(
+            SystemPromptEnvironment::new("/workspace", "/bin/bash"),
+            SystemPromptSettings::default(),
+        );
+        let sections = builder.build_sections(
+            &fregate_verify_tools(),
+            Some(&fregate_persona(PromptPreamble::Minimal)),
+            None,
+            &[CompletionRequirement::WorkspaceFile {
+                path: Some("report.md".to_string()),
+            }],
+            &SessionControlState::default(),
+            None,
+            None,
+        );
+        assert_eq!(
+            sections
+                .iter()
+                .map(|section| section.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["completion_criteria", "persona"]
+        );
+    }
+
+    #[test]
+    fn capability_sections_follow_kheish_tools_not_descriptions() {
+        let builder = SystemPromptBuilder::new(
+            SystemPromptEnvironment::new("/workspace", "/bin/bash"),
+            SystemPromptSettings::default(),
+        );
+        let persona = fregate_persona(PromptPreamble::Full);
+        let names = |tools: &[ToolDefinition]| {
+            builder
+                .build_sections(
+                    tools,
+                    Some(&persona),
+                    None,
+                    &[],
+                    &SessionControlState::default(),
+                    None,
+                    None,
+                )
+                .into_iter()
+                .map(|section| section.name)
+                .collect::<Vec<_>>()
+        };
+
+        let fregate = names(&fregate_verify_tools());
+        for capability in [
+            "web_research",
+            "local_workspace",
+            "scheduling",
+            "user_questions",
+        ] {
+            assert!(
+                !fregate.iter().any(|name| name == capability),
+                "{capability} from an MCP description: {fregate:?}"
+            );
+        }
+        assert!(
+            fregate.iter().any(|name| name == "intro"),
+            "the full preamble stays the default"
+        );
+
+        let mut tools = fregate_verify_tools();
+        tools.push(ToolDefinition {
+            name: "web_search".to_string(),
+            description: "Searches.".to_string(),
+            input_schema: json!({"type": "object"}),
+            allows_parallel: true,
+            strict: false,
+        });
+        tools.push(ToolDefinition {
+            name: "apply_patch".to_string(),
+            description: "Applies hunks.".to_string(),
+            input_schema: json!({"type": "object"}),
+            allows_parallel: false,
+            strict: false,
+        });
+        let with_builtins = names(&tools);
+        assert!(with_builtins.iter().any(|name| name == "web_research"));
+        assert!(with_builtins.iter().any(|name| name == "local_workspace"));
     }
 
     #[test]

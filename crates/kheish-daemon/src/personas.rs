@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use kheish_session::{
     prepare_storage_path_for_write, resolve_storage_path_for_read, write_json_pretty_atomically,
 };
-use kheish_types::{CapabilityScope, PersonaSkillAssignment};
+use kheish_types::{CapabilityScope, PersonaSkillAssignment, PromptPreamble};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -38,6 +38,10 @@ pub(crate) struct PersonaRecord {
     /// Optional caller-supplied metadata.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub(crate) metadata: Value,
+    /// How much of Kheish's own system prompt surrounds the soul in bound
+    /// sessions.
+    #[serde(default, skip_serializing_if = "PromptPreamble::is_full")]
+    pub(crate) preamble: PromptPreamble,
 }
 
 /// One compact persona index entry used for listing and update validation.
@@ -236,6 +240,7 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 2,
             metadata: json!({"team": "ops"}),
+            preamble: Default::default(),
         })?;
 
         let repaired = store.load_index_repaired()?;

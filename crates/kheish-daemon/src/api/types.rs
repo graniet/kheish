@@ -2153,6 +2153,10 @@ pub struct CreatePersonaRequest {
     /// Default inline skills resolved and frozen into future session bindings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_skills: Option<Vec<PersonaSkillAssignment>>,
+    /// How much of Kheish's own system prompt surrounds the soul: `full`
+    /// (the default) or `minimal`, where the soul is the prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preamble: Option<kheish_types::PromptPreamble>,
 }
 
 /// Persona update request payload.
@@ -2173,6 +2177,9 @@ pub struct UpdatePersonaRequest {
     /// Optional default inline skill replacement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_skills: Option<Vec<PersonaSkillAssignment>>,
+    /// Optional preamble replacement (`full` or `minimal`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preamble: Option<kheish_types::PromptPreamble>,
 }
 
 /// Session persona mutation payload.
@@ -2223,6 +2230,9 @@ pub struct PersonaView {
     pub default_skills: Vec<PersonaSkillAssignment>,
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub metadata: Value,
+    /// How much of Kheish's own system prompt surrounds the soul.
+    #[serde(default, skip_serializing_if = "kheish_types::PromptPreamble::is_full")]
+    pub preamble: kheish_types::PromptPreamble,
 }
 
 /// Compact session persona summary projected from one bound persona snapshot.
@@ -4664,6 +4674,7 @@ impl From<&PersonaRecord> for PersonaView {
             capability_scope: value.capability_scope.clone(),
             default_skills: value.default_skills.clone(),
             metadata: value.metadata.clone(),
+            preamble: value.preamble,
         }
     }
 }

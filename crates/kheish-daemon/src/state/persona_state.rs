@@ -18,6 +18,7 @@ fn bind_persona_snapshot(
         capability_scope: record.capability_scope.clone(),
         default_inline_skills,
         bound_at_ms,
+        preamble: record.preamble,
     }
 }
 
@@ -90,6 +91,7 @@ where
         capability_scope: kheish_types::CapabilityScope,
         default_skills: Vec<kheish_types::PersonaSkillAssignment>,
         metadata: Value,
+        preamble: kheish_types::PromptPreamble,
     ) -> Result<PersonaRecord> {
         let capability_scope = capability_scope.normalized();
         let default_skills = normalize_persona_skill_assignments(&default_skills)?;
@@ -106,6 +108,7 @@ where
             created_at_ms: timestamp_ms,
             updated_at_ms: timestamp_ms,
             metadata,
+            preamble,
         };
         self.persona_service.create_persona(record).await
     }
@@ -118,6 +121,7 @@ where
         capability_scope: Option<kheish_types::CapabilityScope>,
         default_skills: Option<Vec<kheish_types::PersonaSkillAssignment>>,
         metadata: Option<Value>,
+        preamble: Option<kheish_types::PromptPreamble>,
     ) -> Result<PersonaRecord> {
         let current = self.get_persona_record(persona_id).await?;
         let capability_scope = capability_scope.map(|scope| scope.normalized());
@@ -163,6 +167,12 @@ where
                     && record.metadata != metadata
                 {
                     record.metadata = metadata;
+                    changed = true;
+                }
+                if let Some(preamble) = preamble
+                    && record.preamble != preamble
+                {
+                    record.preamble = preamble;
                     changed = true;
                 }
                 if changed {
@@ -264,6 +274,7 @@ where
             && existing.persona_version == persona.version
             && existing.display_name == persona.display_name
             && existing.soul == persona.soul
+            && existing.preamble == persona.preamble
             && existing.capability_scope == persona.capability_scope
             && existing.default_inline_skills == default_inline_skills
         {

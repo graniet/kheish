@@ -587,17 +587,24 @@ fn build_runtime_system_sections<M>(
         ));
     }
     let execution_scope = current_execution_scope();
-    if let Some(section) = active_route_section(
-        execution_scope
-            .as_ref()
-            .and_then(|scope| scope.provider.as_deref()),
-        generation.model.as_deref().or_else(|| {
-            execution_scope
-                .as_ref()
-                .and_then(|scope| scope.model.as_deref())
-        }),
-        generation.fallback_model.as_deref(),
-    ) {
+    // A minimal preamble leaves the route out too: the persona is the prompt.
+    let route_section = (crate::system_prompt::preamble_of(session_persona)
+        == kheish_types::PromptPreamble::Full)
+        .then(|| {
+            active_route_section(
+                execution_scope
+                    .as_ref()
+                    .and_then(|scope| scope.provider.as_deref()),
+                generation.model.as_deref().or_else(|| {
+                    execution_scope
+                        .as_ref()
+                        .and_then(|scope| scope.model.as_deref())
+                }),
+                generation.fallback_model.as_deref(),
+            )
+        })
+        .flatten();
+    if let Some(section) = route_section {
         sections.push(section);
     }
     let (learned_context_section, learned_context_omitted) = pack_learned_context_section(
@@ -4087,6 +4094,7 @@ mod tests {
                         soul: "Reply as Analyst.".to_string(),
                         soul_sha256: "hash".to_string(),
                         bound_at_ms: 55,
+                        preamble: Default::default(),
                         capability_scope: CapabilityScope::default(),
                         default_inline_skills: Vec::new(),
                     })?,
@@ -4227,6 +4235,7 @@ mod tests {
             soul: "Reply as Scoped.".to_string(),
             soul_sha256: "hash".to_string(),
             bound_at_ms: 1,
+            preamble: Default::default(),
             capability_scope: CapabilityScope {
                 skill_allow: vec!["live-inline-marker".to_string()],
                 mcp_server_allow: vec!["openaiDeveloperDocs".to_string()],
@@ -4345,6 +4354,7 @@ mod tests {
             soul: "Reply as Scoped.".to_string(),
             soul_sha256: "hash".to_string(),
             bound_at_ms: 1,
+            preamble: Default::default(),
             capability_scope: CapabilityScope {
                 mcp_server_allow: vec!["github".to_string()],
                 ..CapabilityScope::default()
@@ -4525,6 +4535,7 @@ mod tests {
             soul: "Reply as Scoped.".to_string(),
             soul_sha256: "hash".to_string(),
             bound_at_ms: 1,
+            preamble: Default::default(),
             capability_scope: CapabilityScope {
                 mcp_server_allow: vec!["openaiDeveloperDocs".to_string()],
                 ..CapabilityScope::default()
@@ -4628,6 +4639,7 @@ mod tests {
             soul: "Reply as Scoped.".to_string(),
             soul_sha256: "hash".to_string(),
             bound_at_ms: 1,
+            preamble: Default::default(),
             capability_scope: CapabilityScope {
                 mcp_server_allow: vec!["openaiDeveloperDocs".to_string()],
                 ..CapabilityScope::default()
@@ -4727,6 +4739,7 @@ mod tests {
             soul: "Reply as Helper.".to_string(),
             soul_sha256: "hash".to_string(),
             bound_at_ms: 1,
+            preamble: Default::default(),
             capability_scope: CapabilityScope {
                 mcp_server_allow: vec!["docs-only".to_string()],
                 ..CapabilityScope::default()

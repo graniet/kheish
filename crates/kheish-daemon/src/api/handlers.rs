@@ -5540,6 +5540,7 @@ where
             request.capability_scope.unwrap_or_default(),
             request.default_skills.unwrap_or_default(),
             request.metadata.unwrap_or(Value::Null),
+            request.preamble.unwrap_or_default(),
         )
         .await
         .map(PersonaView::from)
@@ -5578,6 +5579,7 @@ where
             request.capability_scope,
             request.default_skills,
             request.metadata,
+            request.preamble,
         )
         .await
         .map(PersonaView::from)

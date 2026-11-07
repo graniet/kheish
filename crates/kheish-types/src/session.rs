@@ -361,6 +361,34 @@ pub struct SessionPersonaBinding {
     pub default_inline_skills: Vec<ActiveSkillSnapshot>,
     /// The timestamp when the session bound this persona snapshot.
     pub bound_at_ms: u64,
+    /// How much of Kheish's own system prompt surrounds the persona.
+    #[serde(default, skip_serializing_if = "PromptPreamble::is_full")]
+    pub preamble: PromptPreamble,
+}
+
+/// How much of Kheish's own system prompt a persona's sessions get around
+/// the persona's soul.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptPreamble {
+    /// Kheish's generic agent sections, the capability sections the session's
+    /// Kheish tools call for, the environment, the tool list and the active
+    /// route, then the persona.
+    #[default]
+    Full,
+    /// The persona's soul is the prompt. The generic agent sections, the
+    /// capability sections, the environment, the tool list, the persona
+    /// framing and the active route are left out; the session's own state
+    /// (plan mode, todos, tasks, goal), the run's completion criteria and
+    /// output contract, and the operator's prompt settings stay.
+    Minimal,
+}
+
+impl PromptPreamble {
+    /// Returns whether this is the default, full preamble.
+    pub fn is_full(&self) -> bool {
+        *self == Self::Full
+    }
 }
 
 /// Session-scoped hook execution state persisted with runtime metadata.
@@ -1603,6 +1631,7 @@ mod tests {
             },
             default_inline_skills: Vec::new(),
             bound_at_ms: 42,
+            preamble: Default::default(),
         };
 
         let metadata = metadata_with_session_persona_binding(

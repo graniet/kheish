@@ -8023,6 +8023,7 @@ HIDDEN_BETA
                     ..kheish_types::CapabilityScope::default()
                 }),
                 default_skills: None,
+                preamble: None,
             })
             .send()
             .await?,

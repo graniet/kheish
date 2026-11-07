@@ -301,6 +301,7 @@ where
                             request.capability_scope.unwrap_or_default(),
                             request.default_skills.unwrap_or_default(),
                             request.metadata.unwrap_or(Value::Null),
+                            request.preamble.unwrap_or_default(),
                         )
                         .await?,
                 ))
@@ -434,6 +435,7 @@ where
                             request.capability_scope,
                             request.default_skills,
                             request.metadata,
+                            request.preamble,
                         )
                         .await?,
                 ))
@@ -514,6 +516,7 @@ where
                     request.capability_scope.clone().unwrap_or_default(),
                     request.default_skills.clone().unwrap_or_default(),
                     request.metadata.clone().unwrap_or(Value::Null),
+                    request.preamble.unwrap_or_default(),
                 )
                 .await?,
         ))
@@ -3206,6 +3209,7 @@ where
                         metadata: Some(persona.metadata.clone()),
                         capability_scope: persona.capability_scope.clone(),
                         default_skills: Some(persona.default_skills.clone()),
+                        preamble: None,
                     },
                 )
                 .await?;
@@ -3225,6 +3229,7 @@ where
                 metadata: Some(persona.metadata.clone()),
                 capability_scope: persona.capability_scope.clone(),
                 default_skills: Some(persona.default_skills.clone()),
+                preamble: None,
             };
             if let Err(error) = client.create_persona_if_absent(&request).await {
                 let live_probe = client
@@ -6550,6 +6555,7 @@ mod tests {
                 capability_scope: request.capability_scope.unwrap_or_default(),
                 default_skills: request.default_skills.unwrap_or_default(),
                 metadata: request.metadata.unwrap_or(Value::Null),
+                preamble: request.preamble.unwrap_or_default(),
             })
         }
 
@@ -7167,6 +7173,7 @@ mod tests {
                     capability_scope: kheish_types::CapabilityScope::default(),
                     default_skills: Vec::new(),
                     metadata: Value::Null,
+                    preamble: kheish_types::PromptPreamble::Full,
                 };
                 return encode_response(Some(live));
             }

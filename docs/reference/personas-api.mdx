@@ -35,6 +35,7 @@ This distinction is operationally important:
 - `capability_scope` optional capability baseline inherited by future bound sessions
 - `default_skills` optional inline skill assignments resolved and frozen into future session bindings
 - `metadata` optional JSON metadata
+- `preamble` optional, `full` (the default) or `minimal`: how much of Kheish's own system prompt surrounds the soul in bound sessions (see [Preamble](#preamble))
 
 The CLI also exposes a Markdown import workflow:
 
@@ -53,6 +54,7 @@ Import rules and options:
 - `--capability-scope-json` and `--capability-scope-file` can attach one capability baseline at import time
 - `--default-skills-json` and `--default-skills-file` can attach persona default inline skills at import time
 - `--metadata-json` and `--metadata-file` can attach metadata at import time
+- `--preamble minimal` (also on `personas create` and `personas update`) sets the persona's [preamble](#preamble)
 
 `PUT /v1/personas/{persona_id}` can replace:
 
@@ -61,8 +63,9 @@ Import rules and options:
 - `capability_scope`
 - `default_skills`
 - `metadata`
+- `preamble`
 
-Persona detail responses return the latest mutable record, including the full `soul`, the latest `capability_scope`, and the latest `default_skills`.
+Persona detail responses return the latest mutable record, including the full `soul`, the latest `capability_scope`, the latest `default_skills`, and `preamble` when it is `minimal`. Changing the preamble is a new persona version.
 
 ## Session persona endpoints
 
@@ -138,6 +141,15 @@ The same binding also carries:
 
 - the persona capability baseline used to compute the session's effective capability scope
 - the persona default inline skills that seed the runtime's active inline skill set
+- the persona's `preamble`
+
+### Preamble
+
+With the default `full` preamble, the system prompt opens with Kheish's own sections (identity, system reminders, doing tasks, actions, tools, tone, output efficiency, environment), the capability sections the session's Kheish tools call for, the run's completion criteria, the operator's `language` and `output_style`, and an `Available Tools` list; then the `# Persona` section frames the soul with its display name, id and version; an `# Active Route` section names the run's route and model.
+
+With `minimal`, the soul is the prompt, as written. The generic sections, the capability sections, the environment, the tool list (the tools reach the model through the request's own tool definitions), the persona framing and the route section are left out. What stays: the operator's `override_prompt`, `custom_prompt` and `append_prompt` (`POST /v1/runtime/system-prompt`), the run's completion criteria and output contract, the session's own state (plan mode, todos, tasks, goal, colleagues), the available and active skills (a capability scope with `skill_deny: ["*"]` leaves them out), operator contact, and MCP server instructions. A session whose persona is `minimal`, with none of those set, sends exactly the soul.
+
+Capability sections follow Kheish's own tools by name, under either preamble: `read_file`, `write_file`, `edit_file`, `apply_patch`, `list_files`, `glob_search`, `grep_search` and `bash` add the local workspace section; `web_fetch` and `web_search` the web research section; `ask_user_question` and `request_parent_clarification` the clarification section; the wake and schedule tools the scheduling section. An MCP tool adds none, whatever its description says.
 
 ## CLI equivalents
 

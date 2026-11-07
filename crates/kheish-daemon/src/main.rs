@@ -3802,6 +3802,27 @@ struct CreatePersonaArgs {
     default_skills_json: Option<String>,
     #[arg(long)]
     default_skills_file: Option<PathBuf>,
+    /// How much of Kheish's own system prompt surrounds the soul.
+    #[arg(long, value_enum)]
+    preamble: Option<PersonaPreambleArg>,
+}
+
+/// A persona's system prompt preamble, as the CLI takes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum PersonaPreambleArg {
+    /// Kheish's own sections, then the persona (the default).
+    Full,
+    /// The soul is the whole prompt.
+    Minimal,
+}
+
+impl From<PersonaPreambleArg> for kheish_types::PromptPreamble {
+    fn from(value: PersonaPreambleArg) -> Self {
+        match value {
+            PersonaPreambleArg::Full => Self::Full,
+            PersonaPreambleArg::Minimal => Self::Minimal,
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -3832,6 +3853,9 @@ struct ImportPersonaArgs {
     /// Optional JSON file containing default inline-skill assignments.
     #[arg(long)]
     default_skills_file: Option<PathBuf>,
+    /// How much of Kheish's own system prompt surrounds the soul.
+    #[arg(long, value_enum)]
+    preamble: Option<PersonaPreambleArg>,
 }
 
 #[derive(Args, Debug)]
@@ -3857,6 +3881,9 @@ struct UpdatePersonaArgs {
     default_skills_json: Option<String>,
     #[arg(long)]
     default_skills_file: Option<PathBuf>,
+    /// How much of Kheish's own system prompt surrounds the soul.
+    #[arg(long, value_enum)]
+    preamble: Option<PersonaPreambleArg>,
 }
 
 #[derive(Args, Debug)]

@@ -1489,6 +1489,109 @@ async fn a_tool_batch_reminder_follows_every_batch_of_tool_results() -> Result<(
     Ok(())
 }
 
+/// A persona soul shaped like Fregate's verification prompt.
+const VERIFY_SOUL: &str = "You are the verification assistant of Fregate.\n\n# Verdicts\n\n- confirmed: the exposure is real and reachable as described.\n- needs_human: the evidence does not settle it.\n\n# How to work\n\n1. Start with get_exposure.\n2. Finish by calling submit_verdict.";
+
+#[tokio::test]
+async fn a_minimal_persona_is_the_whole_system_prompt() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-state");
+    let workspace_root = temp.path().join("workspace");
+    let mock = spawn_anthropic_messages_mock("Verdict submitted.").await?;
+    let (mcp_url, _mcp_log) = spawn_verify_mcp_stub().await?;
+    let (base, shutdown) = verify_daemon(
+        &state_root,
+        &workspace_root,
+        &mock,
+        json!({"name": "fregate", "url": mcp_url, "trusted": true, "result_format": "text"}),
+    )
+    .await?;
+    let client = Client::new();
+    for (persona_id, preamble) in [("fp-verify", "minimal"), ("fp-verify-full", "full")] {
+        let persona = client
+            .post(format!("{base}/v1/personas"))
+            // As Fregate provisions it: its MCP server, no skills.
+            .json(&json!({
+                "persona_id": persona_id,
+                "display_name": "Fregate verify",
+                "soul": VERIFY_SOUL,
+                "preamble": preamble,
+                "capability_scope": {"mcp_server_allow": ["fregate"], "skill_deny": ["*"]}
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        if preamble == "minimal" {
+            assert_eq!(persona["preamble"], "minimal", "{persona:#}");
+        } else {
+            assert!(
+                persona.get("preamble").is_none(),
+                "full is the default: {persona:#}"
+            );
+        }
+    }
+    for (session, persona_id) in [
+        ("mission-p1", "fp-verify"),
+        ("mission-p2", "fp-verify-full"),
+    ] {
+        create_test_session_with_persona(&client, &base, session, Some(persona_id)).await?;
+        client
+            .put(format!("{base}/v1/sessions/{session}/tool-overrides"))
+            .json(&json!({"allow": ["mcp__fregate__get_fact", "mcp__fregate__submit_verdict"]}))
+            .send()
+            .await?
+            .error_for_status()?;
+        client
+            .put(format!("{base}/v1/sessions/{session}/permission-mode"))
+            .json(&json!({"mode": "bypassPermissions"}))
+            .send()
+            .await?
+            .error_for_status()?;
+    }
+
+    complete_verify_run(&client, &base, "mission-p1", json!({})).await?;
+    let minimal = mock.last_request().expect("model request").body;
+    assert_eq!(
+        minimal["system"],
+        json!([{"type": "text", "text": VERIFY_SOUL, "cache_control": {"type": "ephemeral"}}]),
+        "the system prompt is the soul, byte for byte"
+    );
+    let tools = minimal["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .map(|tool| tool["name"].clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        tools,
+        vec![
+            json!("mcp__fregate__get_fact"),
+            json!("mcp__fregate__submit_verdict")
+        ]
+    );
+
+    // The same soul under the full preamble keeps Kheish's own sections, the
+    // persona framing and the route; still no web research from MCP
+    // descriptions.
+    complete_verify_run(&client, &base, "mission-p2", json!({})).await?;
+    let full = mock.last_request().expect("model request").body;
+    let text = full["system"][0]["text"].as_str().unwrap_or_default();
+    assert!(text.starts_with("You are Kheish"), "{text}");
+    assert!(text.contains("# Persona\n"), "{text}");
+    assert!(text.contains(VERIFY_SOUL), "{text}");
+    assert!(text.contains("# Active Route"), "{text}");
+    assert!(!text.contains("# Web Research"), "{text}");
+
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+    Ok(())
+}
+
 /// One request received by the HTTP hook stub.
 #[derive(Clone, Debug)]
 struct CapturedHookRequest {

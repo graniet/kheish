@@ -2307,6 +2307,7 @@ mod tests {
                         capability_scope: CapabilityScope::default(),
                         default_inline_skills: Vec::new(),
                         bound_at_ms: 1,
+                        preamble: Default::default(),
                     })?,
                 },
             )
@@ -2370,6 +2371,7 @@ mod tests {
                             capability_scope: CapabilityScope::default(),
                             default_inline_skills: Vec::new(),
                             bound_at_ms: 1,
+                            preamble: Default::default(),
                         })?,
                     },
                 )
@@ -2449,6 +2451,7 @@ mod tests {
                         capability_scope: CapabilityScope::default(),
                         default_inline_skills: Vec::new(),
                         bound_at_ms: 1,
+                        preamble: Default::default(),
                     })?,
                 },
             )
@@ -2467,6 +2470,7 @@ mod tests {
                         capability_scope: CapabilityScope::default(),
                         default_inline_skills: Vec::new(),
                         bound_at_ms: 1,
+                        preamble: Default::default(),
                     })?,
                 },
             )
@@ -2512,6 +2516,7 @@ mod tests {
             capability_scope: CapabilityScope::default(),
             default_inline_skills: Vec::new(),
             bound_at_ms: 1,
+            preamble: Default::default(),
         };
         let scope = CapabilityScope {
             skill_allow: vec!["alpha".to_string()],

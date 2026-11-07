@@ -68,6 +68,7 @@ pub(crate) async fn run_personas_command(
                     metadata,
                     capability_scope,
                     default_skills,
+                    preamble: args.preamble.map(Into::into),
                 },
             )
             .await?;
@@ -102,6 +103,7 @@ pub(crate) async fn run_personas_command(
                     metadata,
                     capability_scope,
                     default_skills,
+                    preamble: args.preamble.map(Into::into),
                 },
             )
             .await?;
@@ -149,6 +151,7 @@ pub(crate) async fn run_personas_command(
                         metadata,
                         capability_scope,
                         default_skills,
+                        preamble: args.preamble.map(Into::into),
                     },
                 )
                 .await?;

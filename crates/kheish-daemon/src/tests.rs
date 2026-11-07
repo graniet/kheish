@@ -3620,6 +3620,7 @@ async fn create_test_persona(
             metadata: Some(json!({"fixture": true})),
             capability_scope: None,
             default_skills: None,
+            preamble: None,
         })
         .send()
         .await?
@@ -3644,6 +3645,7 @@ async fn update_test_persona(
             metadata: None,
             capability_scope: None,
             default_skills: None,
+            preamble: None,
         })
         .send()
         .await?
@@ -41513,6 +41515,7 @@ async fn daemon_repairs_recently_stale_persona_cache_entries_on_restart() -> Res
                     capability_scope: binding.capability_scope.clone(),
                     default_inline_skills: binding.default_inline_skills.clone(),
                     bound_at_ms: binding.bound_at_ms,
+                    preamble: Default::default(),
                 })?,
             },
         )
