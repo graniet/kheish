@@ -2296,9 +2296,46 @@ pub struct SubmitRunRequest {
     /// Optional caller key used to deduplicate direct run submissions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    /// Turn cap for this run, applied below the daemon `max_turns` ceiling.
+    /// A run that uses every turn fails with `error_code: "max_turns_exceeded"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<usize>,
+    /// Wall-clock budget of this run in milliseconds, from its first start and
+    /// including approval waits. When it runs out the run is cancelled with
+    /// `error_code: "deadline_exceeded"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_duration_ms: Option<u64>,
     /// The actual input request fields.
     #[serde(flatten)]
     pub request: SubmitInputRequest,
+}
+
+impl SubmitRunRequest {
+    /// Validates and returns the caller-set limits of this run, if any.
+    pub fn run_limits(&self) -> anyhow::Result<Option<crate::RunLimits>> {
+        if self.max_turns == Some(0) {
+            return Err(crate::problems::DaemonProblem::bad_request(
+                "runs",
+                "run_limits_invalid",
+                "max_turns must be at least 1",
+            )
+            .into());
+        }
+        if self.max_duration_ms == Some(0) {
+            return Err(crate::problems::DaemonProblem::bad_request(
+                "runs",
+                "run_limits_invalid",
+                "max_duration_ms must be at least 1",
+            )
+            .into());
+        }
+        let limits = crate::RunLimits {
+            max_turns: self.max_turns,
+            max_duration_ms: self.max_duration_ms,
+            deadline_at_ms: None,
+        };
+        Ok((!limits.is_empty()).then_some(limits))
+    }
 }
 
 /// Approval resolution request payload.

@@ -1342,6 +1342,8 @@ mod tests {
                 outputs: Vec::new(),
                 deliveries: Vec::new(),
                 error: None,
+                error_code: None,
+                limits: None,
             },
             reply_targets: Vec::new(),
             payload: RunRequestPayload::ScheduledInput {
@@ -1396,6 +1398,8 @@ mod tests {
                 outputs: Vec::new(),
                 deliveries: Vec::new(),
                 error: None,
+                error_code: None,
+                limits: None,
             },
             reply_targets: Vec::new(),
             payload: RunRequestPayload::ApprovalResume {

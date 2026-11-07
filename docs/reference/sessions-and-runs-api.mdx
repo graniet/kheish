@@ -487,6 +487,26 @@ Important rules:
 
 Attachment inputs use the same daemon-owned asset model documented in [Assets API](./assets-api). Inline assets require both a non-empty `file_name` and non-empty `content_base64`.
 
+### Run limits
+
+`POST /v1/sessions/{session_id}/runs` (`SubmitRunRequest`) accepts every `SubmitInputRequest` field plus:
+
+- `idempotency_key`: deduplicates the submission per session, durably across restarts. The same key with a different body, limits included, returns `409 idempotency_conflict`.
+- `max_turns` (integer, at least 1): the run's turn cap. It only lowers the daemon ceiling (`KHEISH_AGENT_MAX_TURNS`), never raises it. A run that uses every turn fails with `error_code: "max_turns_exceeded"`.
+- `max_duration_ms` (integer, at least 1): the run's wall-clock budget, counted from its first start (`started_at_ms`) and including time spent waiting for approvals or user answers. When it runs out the daemon cancels the run, whether it is executing or waiting, with `status: "cancelled"` and `error_code: "deadline_exceeded"`. The deadline is fixed on first start as `limits.deadline_at_ms` and survives daemon restarts: a waiting run whose deadline passed while the daemon was down is cancelled at boot.
+
+```json
+{
+  "idempotency_key": "mission:7f3c:run:1",
+  "content": "Verify exposure 42.",
+  "metadata": {"mission_id": "7f3c", "correlation_id": "corr-1"},
+  "max_turns": 12,
+  "max_duration_ms": 600000
+}
+```
+
+A zero limit returns `400` with domain `runs` and code `run_limits_invalid`. The limits are persisted with the run and returned as `RunView.limits` (`max_turns`, `max_duration_ms`, `deadline_at_ms`) by `GET /v1/runs/{run_id}`, the run lists, and every `run_updated` event. `/input` does not take limits.
+
 ### Generic input/output schema
 
 `input_items` is the preferred provider-neutral input surface. Supported item variants:
@@ -729,6 +749,8 @@ input runs are interrupted instead of replaying stale user/provider state.
 - `outputs`
 - `deliveries`
 - `error`
+- `error_code`, a machine-readable reason when the daemon classifies the terminal error: `max_turns_exceeded` (status `failed`) or `deadline_exceeded` (status `cancelled`). Omitted otherwise; `error` keeps the human-readable text.
+- `limits`, the caller-set run limits (`max_turns`, `max_duration_ms`, `deadline_at_ms`), omitted when the run has none
 
 `RunView.request` is a compact `RunRequestSummary`:
 

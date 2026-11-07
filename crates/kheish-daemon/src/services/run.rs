@@ -1844,6 +1844,7 @@ impl RunService {
             record.view.updated_at_ms = now_ms();
             record.view.finished_at_ms = Some(record.view.updated_at_ms);
             record.view.error = Some(error.to_string());
+            record.view.error_code = crate::run_error_code_for_failure(error).map(str::to_string);
             clear_pending_state(&mut record.view);
             Ok((Some(record.clone()), true))
         })
@@ -2011,14 +2012,42 @@ impl RunService {
 
     /// Cancels one active or queued run, updates the owned queue index, and persists the result.
     pub(crate) async fn cancel_run(&self, run_id: &str) -> Result<Option<RunCancellationResult>> {
-        self.cancel_run_with_error(run_id, None).await
+        self.cancel_run_with_error(run_id, None, None).await
     }
 
-    /// Cancels one active or queued run and records an optional terminal error reason.
+    /// Records the `max_duration_ms` deadline of one run on its first start.
+    ///
+    /// Returns the updated view, or `None` when the run is terminal, has no
+    /// duration limit, or already carries a deadline.
+    pub(crate) async fn record_run_deadline(
+        &self,
+        run_id: &str,
+        deadline_at_ms: u64,
+    ) -> Result<Option<RunView>> {
+        self.update_run_record(run_id, |record| {
+            if record.view.status.is_terminal() {
+                return Ok((None, false));
+            }
+            let Some(limits) = record.view.limits.as_mut() else {
+                return Ok((None, false));
+            };
+            if limits.max_duration_ms.is_none() || limits.deadline_at_ms.is_some() {
+                return Ok((None, false));
+            }
+            limits.deadline_at_ms = Some(deadline_at_ms);
+            record.view.updated_at_ms = now_ms();
+            Ok((Some(record.view.clone()), true))
+        })
+        .await
+    }
+
+    /// Cancels one active or queued run and records an optional terminal error
+    /// reason and machine-readable code.
     pub(crate) async fn cancel_run_with_error(
         &self,
         run_id: &str,
         error: Option<String>,
+        error_code: Option<&str>,
     ) -> Result<Option<RunCancellationResult>> {
         let (record, was_active, queue_updates) = {
             let mut runs = self.runs.lock().await;
@@ -2060,6 +2089,7 @@ impl RunService {
                 record.view.updated_at_ms = now_ms();
                 record.view.finished_at_ms = Some(record.view.updated_at_ms);
                 record.view.error = error.clone();
+                record.view.error_code = error_code.map(str::to_string);
                 clear_pending_state(&mut record.view);
             }
             let record = runs
@@ -3375,6 +3405,8 @@ mod tests {
                 outputs: Vec::new(),
                 deliveries: Vec::new(),
                 error: None,
+                error_code: None,
+                limits: None,
             },
             reply_targets: Vec::new(),
             payload: RunRequestPayload::MailboxDelivery {
@@ -5977,6 +6009,8 @@ mod tests {
                 outputs: Vec::new(),
                 deliveries: Vec::new(),
                 error: Some("delivery failed".to_string()),
+                error_code: None,
+                limits: None,
             },
             reply_targets: Vec::new(),
             payload: RunRequestPayload::MailboxDelivery {

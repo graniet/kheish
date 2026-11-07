@@ -698,12 +698,15 @@ impl AgentEngine {
             turn_counter: run_meta.autocompact.turn_counter,
         };
 
-        let turns: Box<dyn Iterator<Item = usize> + Send> = if self.policy.max_turns == 0 {
+        // The run's own cap, fixed when the run was accepted: the daemon
+        // ceiling, lowered by a caller-set `max_turns` for this run.
+        let max_turns = run_meta.policy.max_turns;
+        let turns: Box<dyn Iterator<Item = usize> + Send> = if max_turns == 0 {
             Box::new(std::iter::successors(Some(start_turn), |turn| {
                 turn.checked_add(1)
             }))
         } else {
-            Box::new(start_turn..=self.policy.max_turns)
+            Box::new(start_turn..=max_turns)
         };
 
         for turn in turns {
@@ -1102,10 +1105,10 @@ impl AgentEngine {
             }
         }
 
-        if self.policy.max_turns == 0 {
+        if max_turns == 0 {
             bail!("agent loop exhausted the usize turn counter");
         }
-        bail!("agent loop exceeded max_turns={}", self.policy.max_turns);
+        bail!("{MAX_TURNS_EXCEEDED_ERROR_PREFIX}{max_turns}");
     }
 
     /// Decides every model tool call of one turn.
@@ -1532,6 +1535,10 @@ impl AgentEngine {
         let learned_context = kheish_types::learned_context_from_metadata(&input.metadata)?;
         let recovered_memory = kheish_types::recovered_memory_from_metadata(&input.metadata)?;
         let visible_skills = kheish_types::session_visible_skills_from_metadata(&input.metadata)?;
+        let max_turns = effective_run_max_turns(
+            policy.max_turns,
+            kheish_types::run_max_turns_from_metadata(&input.metadata),
+        );
         Ok(RunMetaSnapshot {
             session_id: conversation.session_id.clone(),
             thread_id: conversation.thread_id.clone(),
@@ -1549,7 +1556,7 @@ impl AgentEngine {
             visible_skills,
             autocompact: kheish_types::AutocompactTracking::default(),
             policy: RunPolicySnapshot {
-                max_turns: policy.max_turns,
+                max_turns,
                 keep_last_messages: policy.keep_last_messages,
                 snip_token_budget: policy.snip_token_budget,
                 snip_keep_minimum_messages: policy.snip_keep_minimum,
@@ -3618,6 +3625,21 @@ impl AgentEngine {
     }
 }
 
+/// Error-message prefix of a run that used every turn it was allowed.
+///
+/// Daemons match on it to report a machine-readable `max_turns_exceeded`.
+pub const MAX_TURNS_EXCEEDED_ERROR_PREFIX: &str = "agent loop exceeded max_turns=";
+
+/// Returns the turn cap of one run: the engine ceiling (`0` = unbounded),
+/// lowered by the run's own cap when it sets a smaller one.
+fn effective_run_max_turns(ceiling: usize, requested: Option<usize>) -> usize {
+    match (ceiling, requested) {
+        (_, None) => ceiling,
+        (0, Some(requested)) => requested,
+        (ceiling, Some(requested)) => ceiling.min(requested),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -4339,6 +4361,54 @@ mod tests {
             "zero is the public sentinel for an unbounded turn policy"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn per_run_turn_caps_only_lower_the_engine_ceiling() {
+        assert_eq!(effective_run_max_turns(500, None), 500);
+        assert_eq!(effective_run_max_turns(500, Some(12)), 12);
+        assert_eq!(effective_run_max_turns(5, Some(12)), 5);
+        assert_eq!(effective_run_max_turns(0, Some(12)), 12);
+        assert_eq!(effective_run_max_turns(0, None), 0);
+    }
+
+    #[tokio::test]
+    async fn per_run_max_turns_from_input_metadata_caps_the_loop() -> Result<()> {
+        let conversation = ConversationKey {
+            session_id: "session-run-turns".to_string(),
+            thread_id: None,
+        };
+        let mut engine = AgentEngine::new(conversation, LoopPolicy::default());
+        let tool_turn = |index: usize| ModelTurn {
+            assistant_message: MessageRecord::new(
+                format!("assistant-turn-{index}"),
+                Role::Assistant,
+                "Looking again.",
+            ),
+            tool_calls: vec![ToolCallRecord {
+                id: format!("call-turn-{index}"),
+                name: "lookup_context".to_string(),
+                input: json!({"query": "more"}),
+                assistant_message_id: None,
+                assistant_provider_response_id: None,
+            }],
+            finish_reason: ModelFinishReason::ToolCalls,
+            usage: None,
+        };
+        let model = ScriptedModel::new((1..=4).map(tool_turn).collect());
+        let mut input = InputEnvelope::text("daemon", "api", "session-run-turns", "user-1", "go");
+        input.metadata = json!({ kheish_types::RUN_MAX_TURNS_METADATA_KEY: 2 });
+
+        let error = engine
+            .run_input_with_permissions(input, &model, &EchoToolExecutor, &SelectivePermissionGate)
+            .await
+            .expect_err("the run must stop at its own cap");
+        assert_eq!(
+            error.to_string(),
+            format!("{MAX_TURNS_EXCEEDED_ERROR_PREFIX}2")
+        );
+        assert_eq!(model.requests().len(), 2, "exactly two model turns ran");
         Ok(())
     }
 

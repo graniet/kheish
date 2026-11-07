@@ -6596,13 +6596,18 @@ where
 {
     let idempotency_key = direct_run_idempotency_key(&headers, request.idempotency_key.as_deref())
         .map_err(internal_error)?;
+    let limits = request.run_limits().map_err(internal_error)?;
     let run = match idempotency_key {
         Some(key) => {
             state
-                .submit_input_run_idempotent(&session_id, request.request, &key)
+                .submit_input_run_idempotent(&session_id, request.request, &key, limits)
                 .await
         }
-        None => state.submit_input_run(&session_id, request.request).await,
+        None => {
+            state
+                .submit_input_run_with_limits(&session_id, request.request, limits)
+                .await
+        }
     }
     .map_err(internal_error)?;
     Ok((StatusCode::ACCEPTED, Json(run)))

@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::problems::DaemonProblem;
+use crate::{RUN_ERROR_DEADLINE_EXCEEDED, RunLimits};
 use sha2::{Digest, Sha256};
 
 const RUN_SUMMARY_CANDIDATE_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
@@ -500,6 +501,8 @@ where
                     outputs: Vec::new(),
                     deliveries: Vec::new(),
                     error: None,
+                    error_code: None,
+                    limits: None,
                 },
                 reply_targets: Vec::new(),
                 payload: RunRequestPayload::MailboxDelivery {
@@ -534,6 +537,17 @@ where
         session_id: &str,
         request: SubmitInputRequest,
     ) -> Result<RunView> {
+        self.submit_input_run_with_limits(session_id, request, None)
+            .await
+    }
+
+    /// Queues one detached input run with caller-set limits.
+    pub(crate) async fn submit_input_run_with_limits(
+        self: &Arc<Self>,
+        session_id: &str,
+        request: SubmitInputRequest,
+        limits: Option<RunLimits>,
+    ) -> Result<RunView> {
         self.submit_input_run_inner(
             session_id,
             request,
@@ -543,6 +557,7 @@ where
             None,
             DaemonRunKind::Input,
             false,
+            limits,
         )
         .await
     }
@@ -574,6 +589,7 @@ where
                 None,
                 DaemonRunKind::Input,
                 true,
+                None,
             )
             .await;
         if result.is_err()
@@ -608,6 +624,7 @@ where
             None,
             DaemonRunKind::Input,
             false,
+            None,
         )
         .await
     }
@@ -617,11 +634,12 @@ where
         session_id: &str,
         request: SubmitInputRequest,
         idempotency_key: &str,
+        limits: Option<RunLimits>,
     ) -> Result<RunView> {
         let idempotency_key = normalize_session_run_idempotency_key(idempotency_key)?;
         let key_hash = session_run_idempotency_key_hash(&idempotency_key);
         let receipt_key = session_run_idempotency_receipt_key(session_id, &key_hash);
-        let request_fingerprint = submit_input_request_fingerprint(&request)?;
+        let request_fingerprint = submit_run_request_fingerprint(&request, limits.as_ref())?;
 
         if let Some(existing) = self
             .run_service
@@ -706,6 +724,7 @@ where
                     None,
                     DaemonRunKind::Input,
                     false,
+                    limits,
                 )
                 .await;
             match scheduled {
@@ -759,6 +778,7 @@ where
             None,
             DaemonRunKind::Input,
             false,
+            None,
         )
         .await
     }
@@ -779,6 +799,7 @@ where
             Some(scheduled_origin),
             DaemonRunKind::ScheduledInput,
             false,
+            None,
         )
         .await
     }
@@ -872,6 +893,7 @@ where
                 None,
                 DaemonRunKind::GoalContinuation,
                 false,
+                None,
             )
             .await
             .map(Some);
@@ -891,6 +913,7 @@ where
         scheduled_origin: Option<ScheduledRunOrigin>,
         kind: DaemonRunKind,
         require_idle: bool,
+        limits: Option<RunLimits>,
     ) -> Result<RunView> {
         if !allow_daemon_metadata && contains_flow_metadata(&request.metadata) {
             anyhow::bail!("metadata key `{KHEISH_FLOW_METADATA_KEY}` is daemon-owned");
@@ -985,6 +1008,8 @@ where
                 outputs: Vec::new(),
                 deliveries: Vec::new(),
                 error: None,
+                error_code: None,
+                limits,
             },
             reply_targets,
             payload,
@@ -1285,6 +1310,8 @@ where
                     outputs: Vec::new(),
                     deliveries: Vec::new(),
                     error: None,
+                    error_code: None,
+                    limits: None,
                 },
                 reply_targets,
                 payload: RunRequestPayload::ParentClarification {
@@ -2093,6 +2120,10 @@ where
             model: record.view.request.model.clone(),
             ..ExecutionScope::default()
         };
+        if !self.arm_run_deadline(&record).await? {
+            // The run's wall-clock budget ran out before this execution began.
+            return Ok(());
+        }
         // Every hook this execution triggers carries the run's caller metadata.
         let _hook_run_metadata = self
             .hooks
@@ -2102,7 +2133,10 @@ where
                 RunRequestPayload::Input { request, .. } => {
                     let request =
                         self.apply_fallback_reply_targets(&request, &record.reply_targets);
-                    let input = self.build_input_envelope(&session_id, &request).await?;
+                    let input = with_run_max_turns(
+                        self.build_input_envelope(&session_id, &request).await?,
+                        record.view.limits.as_ref(),
+                    );
                     self.orchestrator
                         .submit_input_for_run(
                             &agent_id,
@@ -2117,7 +2151,10 @@ where
                 RunRequestPayload::ScheduledInput { request, .. } => {
                     let request =
                         self.apply_fallback_reply_targets(&request, &record.reply_targets);
-                    let input = self.build_input_envelope(&session_id, &request).await?;
+                    let input = with_run_max_turns(
+                        self.build_input_envelope(&session_id, &request).await?,
+                        record.view.limits.as_ref(),
+                    );
                     self.orchestrator
                         .submit_input_for_run(
                             &agent_id,
@@ -3054,6 +3091,17 @@ where
         run_id: &str,
         error: Option<String>,
     ) -> Result<RunView> {
+        self.cancel_run_with_error_code(run_id, error, None).await
+    }
+
+    /// Cancels one run with an operator-facing error and a machine-readable
+    /// `error_code`.
+    async fn cancel_run_with_error_code(
+        self: &Arc<Self>,
+        run_id: &str,
+        error: Option<String>,
+        error_code: Option<&str>,
+    ) -> Result<RunView> {
         if let Some(view) = self
             .complete_or_decline_waiting_parent_clarification(
                 run_id,
@@ -3075,7 +3123,7 @@ where
         let agent_id = AgentId(record.view.agent_id.clone());
         let cancelled = if let Some(error) = error {
             self.run_service
-                .cancel_run_with_error(run_id, Some(error))
+                .cancel_run_with_error(run_id, Some(error), error_code)
                 .await?
         } else {
             self.run_service.cancel_run(run_id).await?
@@ -4109,6 +4157,118 @@ where
     pub(super) fn publish_run(&self, run: &RunView) {
         self.run_service.publish_run(run);
     }
+
+    /// Fixes a run's `max_duration_ms` deadline on its first start and arms
+    /// the timer that ends it, once per run per daemon process.
+    ///
+    /// Returns `false` when the deadline has already passed: the run is then
+    /// cancelled with `deadline_exceeded` and must not execute.
+    pub(super) async fn arm_run_deadline(self: &Arc<Self>, record: &RunRecord) -> Result<bool> {
+        let Some(limits) = record.view.limits.as_ref() else {
+            return Ok(true);
+        };
+        let Some(max_duration_ms) = limits.max_duration_ms else {
+            return Ok(true);
+        };
+        let run_id = record.view.run_id.as_str();
+        let deadline_at_ms = match limits.deadline_at_ms {
+            Some(deadline_at_ms) => deadline_at_ms,
+            None => {
+                let started_at_ms = record.view.started_at_ms.unwrap_or_else(now_ms);
+                let deadline_at_ms = started_at_ms.saturating_add(max_duration_ms);
+                if let Some(view) = self
+                    .run_service
+                    .record_run_deadline(run_id, deadline_at_ms)
+                    .await?
+                {
+                    self.publish_run(&view);
+                }
+                deadline_at_ms
+            }
+        };
+        if deadline_at_ms <= now_ms() {
+            self.cancel_run_for_deadline(run_id, max_duration_ms)
+                .await?;
+            return Ok(false);
+        }
+        self.spawn_run_deadline_timer(run_id, deadline_at_ms, max_duration_ms);
+        Ok(true)
+    }
+
+    fn spawn_run_deadline_timer(
+        self: &Arc<Self>,
+        run_id: &str,
+        deadline_at_ms: u64,
+        max_duration_ms: u64,
+    ) {
+        if !self.armed_run_deadlines.lock().insert(run_id.to_string()) {
+            return;
+        }
+        let state = Arc::clone(self);
+        let run_id = run_id.to_string();
+        tokio::spawn(async move {
+            let wait_ms = deadline_at_ms.saturating_sub(now_ms());
+            tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+            state.armed_run_deadlines.lock().remove(&run_id);
+            let still_running = match state.run_service.run_record(&run_id).await {
+                Ok(record) => !record.view.status.is_terminal(),
+                // A purged or unknown run has nothing left to stop.
+                Err(_) => false,
+            };
+            if still_running
+                && let Err(error) = state
+                    .cancel_run_for_deadline(&run_id, max_duration_ms)
+                    .await
+            {
+                warn!(
+                    run_id = %run_id,
+                    error = %error,
+                    "failed to end a run past its max_duration_ms deadline"
+                );
+            }
+        });
+    }
+
+    async fn cancel_run_for_deadline(
+        self: &Arc<Self>,
+        run_id: &str,
+        max_duration_ms: u64,
+    ) -> Result<()> {
+        info!(run_id = %run_id, max_duration_ms, "run exceeded its max_duration_ms deadline");
+        self.cancel_run_with_error_code(
+            run_id,
+            Some(format!("run exceeded max_duration_ms={max_duration_ms}")),
+            Some(RUN_ERROR_DEADLINE_EXCEEDED),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Re-arms the deadline timers of runs that survived a daemon restart
+    /// while waiting for an approval or an answer.
+    pub(crate) async fn rearm_run_deadlines_on_boot(self: &Arc<Self>) -> Result<()> {
+        let records = self.run_service.run_records_snapshot().await;
+        for record in records.values() {
+            if record.view.status.is_terminal() {
+                continue;
+            }
+            let Some(limits) = record.view.limits.as_ref() else {
+                continue;
+            };
+            let (Some(max_duration_ms), Some(deadline_at_ms)) =
+                (limits.max_duration_ms, limits.deadline_at_ms)
+            else {
+                continue;
+            };
+            if deadline_at_ms <= now_ms() {
+                self.cancel_run_for_deadline(&record.view.run_id, max_duration_ms)
+                    .await?;
+            } else {
+                self.spawn_run_deadline_timer(&record.view.run_id, deadline_at_ms, max_duration_ms);
+            }
+        }
+        Ok(())
+    }
 }
 
 fn normalize_session_run_idempotency_key(key: &str) -> Result<String> {
@@ -4147,13 +4307,43 @@ fn run_operation_idempotency_receipt_key(
     format!("run-op:{operation}:{session_id}:{key_hash}")
 }
 
-fn submit_input_request_fingerprint(request: &SubmitInputRequest) -> Result<String> {
-    let payload = serde_json::json!({
-        "version": 1,
-        "request": request,
-    });
+/// Fingerprints one direct run submission for idempotency. Limits are part of
+/// the request; a request without limits keeps its historical fingerprint.
+fn submit_run_request_fingerprint(
+    request: &SubmitInputRequest,
+    limits: Option<&RunLimits>,
+) -> Result<String> {
+    let payload = match limits {
+        None => serde_json::json!({
+            "version": 1,
+            "request": request,
+        }),
+        Some(limits) => serde_json::json!({
+            "version": 1,
+            "request": request,
+            "limits": limits,
+        }),
+    };
     let encoded = serde_json::to_vec(&payload)?;
     Ok(hex::encode(Sha256::digest(encoded)))
+}
+
+/// Writes a run's caller-set turn cap into its input envelope, where the
+/// engine reads it when the run starts.
+fn with_run_max_turns(mut input: InputEnvelope, limits: Option<&RunLimits>) -> InputEnvelope {
+    let Some(max_turns) = limits.and_then(|limits| limits.max_turns) else {
+        return input;
+    };
+    if !input.metadata.is_object() {
+        input.metadata = Value::Object(serde_json::Map::new());
+    }
+    if let Value::Object(metadata) = &mut input.metadata {
+        metadata.insert(
+            kheish_types::RUN_MAX_TURNS_METADATA_KEY.to_string(),
+            Value::from(max_turns),
+        );
+    }
+    input
 }
 
 fn contains_goal_daemon_metadata(metadata: &Option<Value>) -> bool {

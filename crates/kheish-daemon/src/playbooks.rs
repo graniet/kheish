@@ -1115,6 +1115,8 @@ mod tests {
             outputs: Vec::new(),
             deliveries: Vec::new(),
             error: None,
+            error_code: None,
+            limits: None,
         }
     }
 }

@@ -401,6 +401,50 @@ pub struct RunView {
     /// The terminal or transient error description, when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Machine-readable reason of a terminal error the daemon classifies,
+    /// such as [`RUN_ERROR_MAX_TURNS_EXCEEDED`] or [`RUN_ERROR_DEADLINE_EXCEEDED`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// Caller-set limits of this run, persisted with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<RunLimits>,
+}
+
+/// `RunView.error_code` of a run that used every turn it was allowed.
+pub const RUN_ERROR_MAX_TURNS_EXCEEDED: &str = "max_turns_exceeded";
+/// `RunView.error_code` of a run ended by its `max_duration_ms` deadline.
+pub const RUN_ERROR_DEADLINE_EXCEEDED: &str = "deadline_exceeded";
+
+/// Caller-set limits of one run.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunLimits {
+    /// Turn cap for this run, applied below the daemon `max_turns` ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<usize>,
+    /// Wall-clock budget of this run in milliseconds, counted from its first
+    /// start and including time spent waiting for approvals or answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_duration_ms: Option<u64>,
+    /// When the run is ended for exceeding `max_duration_ms`, in milliseconds
+    /// since the Unix epoch. Set once the run first starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_at_ms: Option<u64>,
+}
+
+impl RunLimits {
+    /// True when the limits constrain nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.max_turns.is_none() && self.max_duration_ms.is_none()
+    }
+}
+
+/// Classifies one terminal run error into a machine-readable code.
+#[must_use]
+pub fn run_error_code_for_failure(error: &str) -> Option<&'static str> {
+    error
+        .contains(kheish_core::MAX_TURNS_EXCEEDED_ERROR_PREFIX)
+        .then_some(RUN_ERROR_MAX_TURNS_EXCEEDED)
 }
 
 /// Rebuilds the in-memory pending question index from persisted runs.
@@ -799,6 +843,8 @@ mod tests {
                 outputs: Vec::new(),
                 deliveries: Vec::new(),
                 error: None,
+                error_code: None,
+                limits: None,
             },
             reply_targets: Vec::new(),
             payload: RunRequestPayload::Input {

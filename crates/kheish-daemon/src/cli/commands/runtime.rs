@@ -2516,6 +2516,8 @@ async fn submit_route_canary_run(
         .post_json::<_, kheish_daemon::RunView>(
             &path,
             &kheish_daemon::SubmitRunRequest {
+                max_turns: None,
+                max_duration_ms: None,
                 idempotency_key: Some(format!(
                     "doctor-route-canary-{}-{}",
                     route.route_id,

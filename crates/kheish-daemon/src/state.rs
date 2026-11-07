@@ -335,6 +335,8 @@ pub(crate) struct DaemonState<M> {
     project_service: ProjectService,
     playbook_service: PlaybookService,
     readiness: Arc<AtomicBool>,
+    /// Runs whose `max_duration_ms` timer is armed in this process.
+    armed_run_deadlines: Mutex<BTreeSet<String>>,
 }
 
 impl<M> DaemonState<M>
@@ -594,6 +596,7 @@ where
             ),
             playbook_service: PlaybookService::new(playbook_store, playbooks, flows, next_flow_id),
             readiness: Arc::new(AtomicBool::new(true)),
+            armed_run_deadlines: Mutex::new(BTreeSet::new()),
         }
     }
 

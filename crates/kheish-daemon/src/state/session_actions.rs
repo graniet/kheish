@@ -37,7 +37,7 @@ where
         for agent_id in mailbox_agents {
             let _ = self.schedule_mailbox_run(&agent_id).await?;
         }
-        Ok(())
+        self.rearm_run_deadlines_on_boot().await
     }
 
     pub(crate) async fn submit_input(

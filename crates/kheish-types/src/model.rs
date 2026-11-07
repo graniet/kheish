@@ -6,6 +6,22 @@ use serde_json::Value;
 
 /// Stable metadata key used to carry run completion requirements.
 pub const COMPLETION_REQUIREMENTS_METADATA_KEY: &str = "completion_requirements";
+/// Input-envelope metadata key carrying a caller-set turn cap for one run.
+///
+/// The daemon writes it from the run request; the engine applies it below
+/// its own `max_turns` ceiling and never above it.
+pub const RUN_MAX_TURNS_METADATA_KEY: &str = "kheish_run_max_turns";
+
+/// Reads the caller-set turn cap of one run from input-envelope metadata.
+///
+/// Absent, null, zero, or malformed values mean "no per-run cap".
+pub fn run_max_turns_from_metadata(metadata: &Value) -> Option<usize> {
+    metadata
+        .get(RUN_MAX_TURNS_METADATA_KEY)
+        .and_then(Value::as_u64)
+        .filter(|max_turns| *max_turns > 0)
+        .map(|max_turns| usize::try_from(max_turns).unwrap_or(usize::MAX))
+}
 /// Stable metadata key carrying the structured output contract of a run.
 pub const STRUCTURED_OUTPUT_CONTRACT_METADATA_KEY: &str = "structured_output_contract";
 /// Claude Code-style capped default output token ceiling.

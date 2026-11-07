@@ -257,6 +257,11 @@ enum MockReply {
         name: String,
         input: Value,
     },
+    /// Answers with text after a delay, like a slow model turn.
+    Stall {
+        delay_ms: u64,
+        text: String,
+    },
 }
 
 /// A local Anthropic Messages endpoint: it serves scripted replies (then a
@@ -288,7 +293,7 @@ fn anthropic_sse(reply: &MockReply) -> String {
         json!({"type": "message_start", "message": {"id": "msg-mock", "usage": {"input_tokens": 5, "output_tokens": 0}}}),
     );
     let stop_reason = match reply {
-        MockReply::Text(text) => {
+        MockReply::Text(text) | MockReply::Stall { text, .. } => {
             body.push_str(&anthropic_sse_event(
                 "content_block_start",
                 json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": text}}),
@@ -354,6 +359,9 @@ async fn spawn_anthropic_messages_mock(default_text: &str) -> Result<AnthropicMo
             .lock()
             .pop_front()
             .unwrap_or_else(|| MockReply::Text(state.default_text.clone()));
+        if let MockReply::Stall { delay_ms, .. } = &reply {
+            tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+        }
         ([(CONTENT_TYPE, "text/event-stream")], anthropic_sse(&reply))
     }
 
@@ -1156,6 +1164,228 @@ async fn http_hooks_reach_private_targets_with_secret_headers_and_run_context() 
         .await?;
     assert!(dead_letters.contains("fregate-approval"), "{dead_letters}");
     assert!(!dead_letters.contains("callback-secret"), "{dead_letters}");
+
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+    Ok(())
+}
+
+/// Reads a run's SSE stream from the start and returns every `run_updated`
+/// view until the run is terminal.
+async fn collect_run_updates(client: &Client, base: &str, run_id: &str) -> Result<Vec<RunView>> {
+    let mut response = client
+        .get(format!("{base}/v1/runs/{run_id}/stream?cursor=0"))
+        .send()
+        .await?
+        .error_for_status()?;
+    let mut buffer = String::new();
+    let mut updates = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        while let Some(frame_end) = buffer.find("\n\n") {
+            let frame = buffer[..frame_end].to_string();
+            buffer = buffer[frame_end + 2..].to_string();
+            let mut name = None;
+            let mut data = String::new();
+            for line in frame.lines() {
+                if let Some(value) = line.strip_prefix("event: ") {
+                    name = Some(value.trim().to_string());
+                } else if let Some(value) = line.strip_prefix("data: ") {
+                    data.push_str(value);
+                }
+            }
+            if name.as_deref() == Some("run_updated")
+                && let DaemonEvent::RunUpdated { run } = serde_json::from_str::<DaemonEvent>(&data)?
+            {
+                let terminal = run.status.is_terminal();
+                updates.push(run);
+                if terminal {
+                    return Ok(updates);
+                }
+            }
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "run {run_id} did not settle on its stream: {updates:#?}"
+        );
+        let chunk = tokio::time::timeout(Duration::from_secs(5), response.chunk())
+            .await
+            .context("timed out waiting for a run stream chunk")??
+            .ok_or_else(|| anyhow!("run stream ended before the run settled"))?;
+        buffer.push_str(std::str::from_utf8(&chunk)?);
+    }
+}
+
+async fn submit_limited_run(
+    client: &Client,
+    base: &str,
+    session_id: &str,
+    body: Value,
+) -> Result<reqwest::Response> {
+    Ok(client
+        .post(format!("{base}/v1/sessions/{session_id}/runs"))
+        .json(&body)
+        .send()
+        .await?)
+}
+
+#[tokio::test]
+async fn run_limits_cap_turns_and_wall_clock_with_distinct_error_codes() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-state");
+    let workspace_root = temp.path().join("workspace");
+    let mock = spawn_anthropic_messages_mock("done").await?;
+    let (mcp_url, mcp_log) = spawn_mcp_stub().await?;
+    let (address, shutdown) = anthropic_provider_daemon(
+        &state_root,
+        &workspace_root,
+        &format!("{}/v1/messages", mock.base),
+    )
+    .await?;
+    let client = Client::new();
+    let base = format!("http://{address}");
+    client
+        .post(format!("{base}/v1/runtime/mcp/servers"))
+        .json(&json!({"name": "fregate", "url": mcp_url}))
+        .send()
+        .await?
+        .error_for_status()?;
+    create_test_session(&client, &base, "limits-turns").await?;
+    client
+        .put(format!("{base}/v1/sessions/limits-turns/permission-mode"))
+        .json(&json!({"mode": "bypassPermissions"}))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    // Invalid limits are refused.
+    for body in [
+        json!({"content": "x", "max_turns": 0}),
+        json!({"content": "x", "max_duration_ms": 0}),
+    ] {
+        let refused = submit_limited_run(&client, &base, "limits-turns", body).await?;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            refused.json::<ProblemDetails>().await?.code,
+            "run_limits_invalid"
+        );
+    }
+
+    // max_turns: the model keeps calling tools; the run stops after 2 turns.
+    for index in 0..3 {
+        mock.push(scan_tool_use(
+            &format!("toolu_turn_{index}"),
+            json!({"target": format!("host-{index}.example")}),
+        ));
+    }
+    let run = submit_limited_run(
+        &client,
+        &base,
+        "limits-turns",
+        json!({"content": "keep scanning", "max_turns": 2, "idempotency_key": "turns-1"}),
+    )
+    .await?
+    .error_for_status()?
+    .json::<RunView>()
+    .await?;
+    assert_eq!(
+        run.limits.as_ref().and_then(|limits| limits.max_turns),
+        Some(2)
+    );
+    let updates = collect_run_updates(&client, &base, &run.run_id).await?;
+    let settled = updates.last().cloned().expect("terminal update");
+    assert_eq!(settled.status, DaemonRunStatus::Failed);
+    assert_eq!(settled.error_code.as_deref(), Some("max_turns_exceeded"));
+    assert!(
+        updates
+            .iter()
+            .all(|update| update.limits.as_ref().and_then(|limits| limits.max_turns) == Some(2)),
+        "every run_updated carries the limits: {updates:#?}"
+    );
+    assert_eq!(mcp_log.calls.lock().len(), 2, "exactly two turns ran tools");
+    let fetched = client
+        .get(format!("{base}/v1/runs/{}", run.run_id))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<RunView>()
+        .await?;
+    assert_eq!(fetched.error_code.as_deref(), Some("max_turns_exceeded"));
+    assert_eq!(
+        fetched.limits.as_ref().and_then(|limits| limits.max_turns),
+        Some(2)
+    );
+    // The same idempotency key with different limits is a different request.
+    let conflict = submit_limited_run(
+        &client,
+        &base,
+        "limits-turns",
+        json!({"content": "keep scanning", "max_turns": 3, "idempotency_key": "turns-1"}),
+    )
+    .await?;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    // Drop the tool call the capped run never consumed.
+    mock.script.lock().clear();
+
+    // max_duration_ms while the run executes: a slow model turn is cut off.
+    mock.push(MockReply::Stall {
+        delay_ms: 5_000,
+        text: "too late".to_string(),
+    });
+    let started = Instant::now();
+    let slow = submit_limited_run(
+        &client,
+        &base,
+        "limits-turns",
+        json!({"content": "think slowly", "max_duration_ms": 400}),
+    )
+    .await?
+    .error_for_status()?
+    .json::<RunView>()
+    .await?;
+    let updates = collect_run_updates(&client, &base, &slow.run_id).await?;
+    let settled = updates.last().cloned().expect("terminal update");
+    assert_eq!(settled.status, DaemonRunStatus::Cancelled);
+    assert_eq!(settled.error_code.as_deref(), Some("deadline_exceeded"));
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "the deadline cut the run short"
+    );
+    let limits = settled.limits.clone().expect("limits are kept");
+    assert_eq!(limits.max_duration_ms, Some(400));
+    let deadline_at_ms = limits.deadline_at_ms.expect("deadline fixed on start");
+    assert_eq!(
+        deadline_at_ms,
+        settled.started_at_ms.expect("run started") + 400
+    );
+
+    // max_duration_ms counts approval waits: an MCP call that asks for
+    // approval is cancelled at the deadline while it waits.
+    create_test_session(&client, &base, "limits-wait").await?;
+    mock.push(scan_tool_use(
+        "toolu_wait",
+        json!({"target": "example.com"}),
+    ));
+    let waiting = submit_limited_run(
+        &client,
+        &base,
+        "limits-wait",
+        json!({"content": "scan", "max_duration_ms": 600}),
+    )
+    .await?
+    .error_for_status()?
+    .json::<RunView>()
+    .await?;
+    let updates = collect_run_updates(&client, &base, &waiting.run_id).await?;
+    assert!(
+        updates
+            .iter()
+            .any(|update| update.status == DaemonRunStatus::WaitingForApproval),
+        "{updates:#?}"
+    );
+    let settled = updates.last().cloned().expect("terminal update");
+    assert_eq!(settled.status, DaemonRunStatus::Cancelled);
+    assert_eq!(settled.error_code.as_deref(), Some("deadline_exceeded"));
 
     let _ = shutdown.send(());
     wait_for_daemon_shutdown(&client, &base).await?;
