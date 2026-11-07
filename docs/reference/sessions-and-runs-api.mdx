@@ -498,6 +498,7 @@ Attachment inputs use the same daemon-owned asset model documented in [Assets AP
 - `idempotency_key`: deduplicates the submission per session, durably across restarts. The same key with a different body returns `409 idempotency_conflict`; the comparison covers every field, all `generation` options (`retry_max_tokens`, `refusal_fallbacks` and `reasoning` among them) and the limits below (the values you sent, never the deadline clock).
 - `max_turns` (integer, at least 1): the run's turn cap. It only lowers the daemon ceiling (`KHEISH_AGENT_MAX_TURNS`), never raises it. A run that uses every turn fails with `error_code: "max_turns_exceeded"` ([Run error codes](#run-error-codes)).
 - `max_duration_ms` (integer, at least 1): the run's active-time budget. The clock starts when the run first starts (`started_at_ms`) and counts only the time the run is active: it stops while the run waits for an approval (`waiting_for_approval`) or an answer (`waiting_for_user_question`), and runs again, with the budget that was left, when the run resumes. When the budget runs out the daemon cancels the run with `status: "cancelled"` and `error_code: "deadline_exceeded"` ([Run error codes](#run-error-codes)). [Run deadline](#run-deadline) describes the clock and restarts.
+- `stop_after_tool` (string, 1 to 256 characters, no whitespace): the run's report tool, by its exact name as the model sees it (for an MCP tool, `mcp__<server>__<tool>`). Once a call to it succeeds, the run ends `completed` right after that turn's tool results, with no further model turn. Every call of that turn runs first, whatever its order. A call that fails (an error result, a denied call, a tool error such as an MCP `isError`) does not end the run: the model sees the error and goes on. With completion requirements, the run ends there only once they are met. A run whose session has a structured output contract fails at its start (the run would end without the final answer the contract checks). An approved report call ends the run when the approval resumes it. When the report turn holds no text, the run delivers no output: its report is the tool call.
 
 ```json
 {
@@ -505,11 +506,12 @@ Attachment inputs use the same daemon-owned asset model documented in [Assets AP
   "content": "Verify exposure 42.",
   "metadata": {"mission_id": "7f3c", "correlation_id": "corr-1"},
   "max_turns": 12,
-  "max_duration_ms": 600000
+  "max_duration_ms": 600000,
+  "stop_after_tool": "mcp__fregate__submit_verdict"
 }
 ```
 
-A zero limit returns `400` with domain `runs` and code `run_limits_invalid`. The limits are persisted with the run and returned as `RunView.limits` (`max_turns`, `max_duration_ms`, and the clock's `deadline_at_ms` and `remaining_ms`) by `GET /v1/runs/{run_id}`, the run lists, and every `run_updated` event. `/input` does not take limits.
+A zero limit, or a `stop_after_tool` that is empty, too long or holds whitespace, returns `400` with domain `runs` and code `run_limits_invalid`. The limits are persisted with the run and returned as `RunView.limits` (`max_turns`, `max_duration_ms`, `stop_after_tool`, and the clock's `deadline_at_ms` and `remaining_ms`) by `GET /v1/runs/{run_id}`, the run lists, and every `run_updated` event. `/input` does not take limits.
 
 #### Run deadline
 
@@ -810,7 +812,7 @@ input runs are interrupted instead of replaying stale user/provider state.
 - `error`
 - `error_code`: the machine-readable code of a classified run ending (see [Run error codes](#run-error-codes)); omitted otherwise, with `error` keeping the human-readable text
 - `refusal`: for `error_code: "model_refusal"`, the refusal's `category`, `explanation` and `model`
-- `limits`: the caller-set run limits (`max_turns`, `max_duration_ms`) and the deadline clock (`deadline_at_ms` while the run runs, `remaining_ms` while it waits; see [Run deadline](#run-deadline)), omitted when the run has none
+- `limits`: the caller-set run limits (`max_turns`, `max_duration_ms`, `stop_after_tool`) and the deadline clock (`deadline_at_ms` while the run runs, `remaining_ms` while it waits; see [Run deadline](#run-deadline)), omitted when the run has none
 
 `RunView.request` is a compact `RunRequestSummary`:
 

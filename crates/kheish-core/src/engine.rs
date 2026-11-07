@@ -576,6 +576,8 @@ impl AgentEngine {
         let mut trace = RunTrace::default();
         let snapshot_turn =
             self.build_turn_snapshot_for_executed_batch(&finalized, &executed.tool_executions)?;
+        let report_in = executed.pending_question.is_none()
+            && self.report_tool_succeeded(&run_meta, &executed.tool_executions)?;
         trace.turns.push(TurnTrace {
             turn: finalized.turn,
             prompt: PromptTrace {
@@ -587,6 +589,19 @@ impl AgentEngine {
             assistant_message_id: finalized.assistant_message_id.clone(),
             tool_executions: executed.tool_executions,
         });
+        if report_in {
+            // The approved batch held the run's report: it ends on these
+            // results, with no further model turn.
+            return self.build_completed_outcome(
+                finalized.turn,
+                finalized.assistant_message_id.clone(),
+                run_meta,
+                trace,
+                vec![snapshot_turn],
+                Vec::new(),
+                None,
+            );
+        }
         self.drive_loop(
             finalized.turn.saturating_add(1),
             run_meta,
@@ -1040,6 +1055,22 @@ impl AgentEngine {
                 tool_calls: tool_call_snapshots,
                 tool_results: tool_result_snapshots,
             });
+
+            if self.report_tool_succeeded(&run_meta, &tool_executions)? {
+                // The run's report is in: the run ends on this turn's tool
+                // results (every call of the turn ran), with no further model
+                // turn.
+                Self::sync_run_meta_autocompact(&mut run_meta, &self.autocompact_tracking);
+                return self.build_completed_outcome(
+                    turn,
+                    final_message_id,
+                    run_meta,
+                    trace,
+                    snapshot_turns,
+                    snapshot_checkpoints,
+                    None,
+                );
+            }
 
             let denied_retries = pending_decisions
                 .iter()
@@ -1538,6 +1569,28 @@ impl AgentEngine {
         format!("user-{offset}")
     }
 
+    /// Whether one executed batch ran the run's report tool (`stop_after_tool`)
+    /// and the call succeeded, with the run's completion requirements met:
+    /// the run then ends on the batch's results.
+    fn report_tool_succeeded(
+        &self,
+        run_meta: &RunMetaSnapshot,
+        executions: &[ToolExecutionTrace],
+    ) -> Result<bool> {
+        let Some(report_tool) = run_meta.stop_after_tool.as_deref() else {
+            return Ok(false);
+        };
+        let reported = executions.iter().any(|execution| {
+            execution.tool_name == report_tool
+                && !execution.result_is_error
+                && matches!(execution.decision, PermissionDecision::Allow)
+        });
+        Ok(reported
+            && self
+                .unsatisfied_completion_requirements(run_meta)?
+                .is_empty())
+    }
+
     fn build_run_meta(
         conversation: &ConversationKey,
         policy: &LoopPolicy,
@@ -1548,6 +1601,12 @@ impl AgentEngine {
             kheish_types::completion_requirements_from_metadata(&input.metadata)?;
         let output_contract =
             kheish_types::structured_output_contract_from_metadata(&input.metadata)?;
+        let stop_after_tool = kheish_types::run_stop_after_tool_from_metadata(&input.metadata);
+        if stop_after_tool.is_some() && output_contract.is_some() {
+            bail!(
+                "stop_after_tool cannot be combined with a structured output contract: the run would end on a tool result, without the final answer the contract validates"
+            );
+        }
         let learned_context = kheish_types::learned_context_from_metadata(&input.metadata)?;
         let recovered_memory = kheish_types::recovered_memory_from_metadata(&input.metadata)?;
         let visible_skills = kheish_types::session_visible_skills_from_metadata(&input.metadata)?;
@@ -1565,6 +1624,7 @@ impl AgentEngine {
             completion_follow_up_count: 0,
             output_contract,
             output_contract_repair_count: 0,
+            stop_after_tool,
             max_output_tokens_recovery_count: 0,
             permission_denied_retry_count: 0,
             recovered_memory,
@@ -4406,6 +4466,229 @@ mod tests {
         Ok(())
     }
 
+    /// Echoes every call, except `machine_report` with `{"fail": true}`,
+    /// which reports a failure in its own result.
+    struct ReportToolExecutor;
+
+    impl ToolCatalog for ReportToolExecutor {
+        fn definitions(&self) -> Vec<ToolDefinition> {
+            EchoToolExecutor.definitions()
+        }
+    }
+
+    #[async_trait]
+    impl ToolExecutor for ReportToolExecutor {
+        async fn execute(&self, call: &ToolCallRecord) -> Result<ToolResultRecord> {
+            let mut result = EchoToolExecutor.execute(call).await?;
+            if call.name == "machine_report" && call.input["fail"] == json!(true) {
+                result.is_error = true;
+                result.output = json!({"error": "report rejected"});
+            }
+            Ok(result)
+        }
+    }
+
+    fn report_turn(index: usize, calls: Vec<(&str, serde_json::Value)>) -> ModelTurn {
+        ModelTurn {
+            assistant_message: MessageRecord::new(
+                format!("assistant-report-{index}"),
+                Role::Assistant,
+                "",
+            ),
+            tool_calls: calls
+                .into_iter()
+                .enumerate()
+                .map(|(position, (name, input))| ToolCallRecord {
+                    id: format!("call-{index}-{position}"),
+                    name: name.to_string(),
+                    input,
+                    assistant_message_id: None,
+                    assistant_provider_response_id: None,
+                })
+                .collect(),
+            finish_reason: ModelFinishReason::ToolCalls,
+            usage: None,
+            refusal: None,
+        }
+    }
+
+    fn report_input(session_id: &str) -> InputEnvelope {
+        let mut input = InputEnvelope::text("daemon", "api", session_id, "user-1", "report");
+        input.metadata =
+            json!({ kheish_types::RUN_STOP_AFTER_TOOL_METADATA_KEY: "machine_report" });
+        input
+    }
+
+    #[tokio::test]
+    async fn a_successful_report_call_ends_the_run_after_its_turn() -> Result<()> {
+        let conversation = ConversationKey {
+            session_id: "session-report".to_string(),
+            thread_id: None,
+        };
+        let mut engine = AgentEngine::new(conversation, LoopPolicy::default());
+        // The report turn also holds another call: both run, then the run
+        // ends without asking the model again.
+        let model = ScriptedModel::new(vec![
+            report_turn(1, vec![("lookup_context", json!({"query": "facts"}))]),
+            report_turn(
+                2,
+                vec![
+                    ("lookup_context", json!({"query": "more"})),
+                    ("machine_report", json!({"verdict": "confirmed"})),
+                ],
+            ),
+        ]);
+
+        let outcome = engine
+            .run_input_with_permissions(
+                report_input("session-report"),
+                &model,
+                &ReportToolExecutor,
+                &SelectivePermissionGate,
+            )
+            .await?;
+
+        assert_eq!(outcome.status, RunStatus::Completed);
+        assert_eq!(model.requests().len(), 2, "no model turn after the report");
+        assert_eq!(outcome.turns, 2);
+        assert_eq!(outcome.final_message_id, "assistant-report-2");
+        assert_eq!(
+            outcome.snapshot.run_meta.stop_after_tool.as_deref(),
+            Some("machine_report")
+        );
+        let state = engine.replay_from_journal();
+        let results = state
+            .completed_tool_results
+            .iter()
+            .map(|result| (result.call_id.as_str(), result.is_error))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results,
+            vec![
+                ("call-1-0", false),
+                ("call-2-0", false),
+                ("call-2-1", false)
+            ],
+            "every call of the report turn ran"
+        );
+        assert!(state.open_tool_calls.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_report_call_keeps_the_run_going() -> Result<()> {
+        let conversation = ConversationKey {
+            session_id: "session-report-failed".to_string(),
+            thread_id: None,
+        };
+        let mut engine = AgentEngine::new(conversation, LoopPolicy::default());
+        let model = ScriptedModel::new(vec![
+            report_turn(1, vec![("machine_report", json!({"fail": true}))]),
+            report_turn(2, vec![("machine_report", json!({"verdict": "confirmed"}))]),
+        ]);
+
+        let outcome = engine
+            .run_input_with_permissions(
+                report_input("session-report-failed"),
+                &model,
+                &ReportToolExecutor,
+                &SelectivePermissionGate,
+            )
+            .await?;
+
+        assert_eq!(outcome.status, RunStatus::Completed);
+        assert_eq!(
+            model.requests().len(),
+            2,
+            "the model sees the rejected report and reports again"
+        );
+        assert_eq!(outcome.final_message_id, "assistant-report-2");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_approved_report_call_ends_the_run_on_resume() -> Result<()> {
+        let conversation = ConversationKey {
+            session_id: "session-report-approval".to_string(),
+            thread_id: None,
+        };
+        let mut engine = AgentEngine::new(conversation, LoopPolicy::default());
+        let model = ScriptedModel::new(vec![report_turn(
+            1,
+            vec![("machine_report", json!({"verdict": "confirmed"}))],
+        )]);
+        let permissions = RecordingPermissionGate::new();
+
+        let waiting = engine
+            .run_input_with_permissions(
+                report_input("session-report-approval"),
+                &model,
+                &ReportToolExecutor,
+                &permissions,
+            )
+            .await?;
+        assert!(matches!(
+            waiting.status,
+            RunStatus::WaitingForApproval { .. }
+        ));
+        let resumed = engine
+            .resume_with_pending_batch(
+                waiting.snapshot.run_meta.clone(),
+                ModelGenerationConfig::default(),
+                waiting.pending_batch.clone().expect("pending batch"),
+                &[ApprovalResolution {
+                    request_id: "approval-call-1-0".to_string(),
+                    behavior: kheish_types::ApprovalResolutionBehavior::Allow,
+                    updated_input: None,
+                    justification: None,
+                    reason: None,
+                }],
+                &model,
+                &ReportToolExecutor,
+                &permissions,
+            )
+            .await?;
+
+        assert_eq!(resumed.status, RunStatus::Completed);
+        assert_eq!(resumed.turns, 1);
+        assert_eq!(model.requests().len(), 1, "no model turn after the report");
+        assert_eq!(resumed.snapshot.turns.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stop_after_tool_refuses_a_structured_output_contract() -> Result<()> {
+        let conversation = ConversationKey {
+            session_id: "session-report-contract".to_string(),
+            thread_id: None,
+        };
+        let mut engine = AgentEngine::new(conversation, LoopPolicy::default());
+        let model = ScriptedModel::new(Vec::new());
+        let mut input = report_input("session-report-contract");
+        input.metadata = kheish_types::metadata_with_structured_output_contract(
+            input.metadata,
+            &status_contract(None),
+        )?;
+
+        let error = engine
+            .run_input_with_permissions(
+                input,
+                &model,
+                &ReportToolExecutor,
+                &SelectivePermissionGate,
+            )
+            .await
+            .expect_err("a report tool and an output contract cannot both end the run");
+        assert!(
+            error
+                .to_string()
+                .contains("stop_after_tool cannot be combined with a structured output contract"),
+            "{error:#}"
+        );
+        assert!(model.requests().is_empty());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn hidden_tool_calls_are_refused_before_any_permission_is_evaluated() -> Result<()> {
         let conversation = ConversationKey {
@@ -5150,6 +5433,7 @@ mod tests {
             completion_follow_up_count: 0,
             output_contract: Some(contract.clone()),
             output_contract_repair_count: 2,
+            stop_after_tool: None,
             permission_denied_retry_count: 0,
             max_output_tokens_recovery_count: 0,
             recovered_memory: None,

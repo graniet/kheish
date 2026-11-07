@@ -52,14 +52,15 @@ pub use model::{
     CompletionRequirement, DEFAULT_OUTPUT_CONTRACT_REPAIR_ATTEMPTS, ESCALATED_MAX_OUTPUT_TOKENS,
     MAX_OUTPUT_CONTRACT_REPAIR_ATTEMPTS, ModelFinishReason, ModelGenerationConfig,
     ModelMaxOutputTokens, ModelProviderError, ModelUsage, ModelUsageIteration, ProviderErrorKind,
-    RUN_MAX_TURNS_METADATA_KEY, ReasoningConfig, ReasoningEffort, ReasoningSummary,
-    RefusalFallbackModel, RefusalFallbackRouting, RefusalFallbacks, ResponseFormat,
-    STRUCTURED_OUTPUT_CONTRACT_METADATA_KEY, StructuredFieldSchema, StructuredInputContract,
-    StructuredOutputContract, StructuredValueKind, ToolChoice, capped_default_max_output_tokens,
-    classify_provider_error_message, completion_requirements_from_metadata, extract_json_text,
+    RUN_MAX_TURNS_METADATA_KEY, RUN_STOP_AFTER_TOOL_METADATA_KEY, ReasoningConfig, ReasoningEffort,
+    ReasoningSummary, RefusalFallbackModel, RefusalFallbackRouting, RefusalFallbacks,
+    ResponseFormat, STRUCTURED_OUTPUT_CONTRACT_METADATA_KEY, StructuredFieldSchema,
+    StructuredInputContract, StructuredOutputContract, StructuredValueKind, ToolChoice,
+    capped_default_max_output_tokens, classify_provider_error_message,
+    completion_requirements_from_metadata, extract_json_text,
     metadata_with_completion_requirements, metadata_with_structured_output_contract,
     model_context_window, model_max_output_tokens, run_max_turns_from_metadata,
-    structured_output_contract_from_metadata,
+    run_stop_after_tool_from_metadata, structured_output_contract_from_metadata,
 };
 pub use prompt::{PromptProjection, ProviderInputItem, ProviderPrompt, SystemPromptSection};
 pub use routing::{

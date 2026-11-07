@@ -4817,6 +4817,7 @@ async fn daemon_run_approval_idempotency_dedupes_retries() -> Result<()> {
         .json(&SubmitRunRequest {
             max_turns: None,
             max_duration_ms: None,
+            stop_after_tool: None,
             idempotency_key: None,
             request: SubmitInputRequest {
                 source_plugin: None,

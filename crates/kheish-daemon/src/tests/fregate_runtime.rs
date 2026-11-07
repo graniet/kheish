@@ -258,6 +258,8 @@ enum MockReply {
         name: String,
         input: Value,
     },
+    /// One turn calling several tools, as `(id, name, input)`.
+    ToolUses(Vec<(String, String, Value)>),
     /// Answers with text after a delay, like a slow model turn.
     Stall {
         delay_ms: u64,
@@ -312,10 +314,33 @@ fn anthropic_sse(reply: &MockReply) -> String {
             ));
             "tool_use"
         }
+        MockReply::ToolUses(calls) => {
+            for (index, (id, name, input)) in calls.iter().enumerate() {
+                body.push_str(&anthropic_sse_event(
+                    "content_block_start",
+                    json!({"type": "content_block_start", "index": index, "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}}),
+                ));
+                body.push_str(&anthropic_sse_event(
+                    "content_block_delta",
+                    json!({"type": "content_block_delta", "index": index, "delta": {"type": "input_json_delta", "partial_json": input.to_string()}}),
+                ));
+                if index + 1 < calls.len() {
+                    body.push_str(&anthropic_sse_event(
+                        "content_block_stop",
+                        json!({"type": "content_block_stop", "index": index}),
+                    ));
+                }
+            }
+            "tool_use"
+        }
+    };
+    let last_index = match reply {
+        MockReply::ToolUses(calls) => calls.len().saturating_sub(1),
+        _ => 0,
     };
     body.push_str(&anthropic_sse_event(
         "content_block_stop",
-        json!({"type": "content_block_stop", "index": 0}),
+        json!({"type": "content_block_stop", "index": last_index}),
     ));
     body.push_str(&anthropic_sse_event(
         "message_delta",
@@ -1223,6 +1248,121 @@ async fn trusted_mcp_servers_reach_the_model_as_written() -> Result<()> {
             "is_error": false,
             "content": [{"type": "text", "text": VERIFY_FACT_DOCUMENT}]
         }])
+    );
+
+    let _ = shutdown.send(());
+    wait_for_daemon_shutdown(&client, &base).await?;
+    Ok(())
+}
+
+/// A `submit_verdict` input its schema accepts.
+fn verify_verdict_input() -> Value {
+    json!({
+        "verdict": "confirmed",
+        "confidence": 75,
+        "next_step": {"action": "remediate", "detail": "Put RDP behind the VPN gateway."}
+    })
+}
+
+#[tokio::test]
+async fn a_report_tool_ends_the_run_right_after_its_turn() -> Result<()> {
+    let temp = tempdir()?;
+    let state_root = temp.path().join("daemon-state");
+    let workspace_root = temp.path().join("workspace");
+    let mock = spawn_anthropic_messages_mock("Verdict submitted.").await?;
+    let (mcp_url, mcp_log) = spawn_verify_mcp_stub().await?;
+    let (base, shutdown) = verify_daemon(
+        &state_root,
+        &workspace_root,
+        &mock,
+        json!({"name": "fregate", "url": mcp_url, "trusted": true, "result_format": "text"}),
+    )
+    .await?;
+    let client = Client::new();
+    for session in ["mission-r1", "mission-r2"] {
+        create_test_session(&client, &base, session).await?;
+        client
+            .put(format!("{base}/v1/sessions/{session}/permission-mode"))
+            .json(&json!({"mode": "bypassPermissions"}))
+            .send()
+            .await?
+            .error_for_status()?;
+    }
+
+    let invalid = client
+        .post(format!("{base}/v1/sessions/mission-r1/runs"))
+        .json(&json!({"content": "Verify.", "provider": "verify", "stop_after_tool": "submit verdict"}))
+        .send()
+        .await?;
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        invalid.json::<ProblemDetails>().await?.code,
+        "run_limits_invalid"
+    );
+
+    // The report turn also reads a fact: both calls run, then the run ends
+    // without asking the model again.
+    mock.push(MockReply::ToolUses(vec![
+        (
+            "toolu_fact".to_string(),
+            "mcp__fregate__get_fact".to_string(),
+            json!({"kind": "service", "key": "203.0.113.10:3389/tcp"}),
+        ),
+        (
+            "toolu_verdict".to_string(),
+            "mcp__fregate__submit_verdict".to_string(),
+            verify_verdict_input(),
+        ),
+    ]));
+    let run = complete_verify_run(
+        &client,
+        &base,
+        "mission-r1",
+        json!({"stop_after_tool": "mcp__fregate__submit_verdict"}),
+    )
+    .await?;
+    assert_eq!(mock.captured.lock().len(), 1, "one model call");
+    let called = mcp_log
+        .calls
+        .lock()
+        .iter()
+        .map(|params| params["name"].as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(called, vec!["get_fact", "submit_verdict"]);
+    assert_eq!(
+        run.limits
+            .as_ref()
+            .and_then(|limits| limits.stop_after_tool.as_deref()),
+        Some("mcp__fregate__submit_verdict"),
+        "the run view shows its report tool"
+    );
+    assert!(
+        run.outputs.is_empty(),
+        "a turn of tool calls has no answer to deliver: {:?}",
+        run.outputs
+    );
+    let last_event = serde_json::to_value(terminal_run_event(&client, &base, &run.run_id).await?)?;
+    assert_eq!(last_event["type"], "completed", "{last_event:#}");
+
+    // A report call that fails does not end the run: the model sees the
+    // error and goes on.
+    mock.captured.lock().clear();
+    mock.push(MockReply::ToolUse {
+        id: "toolu_missing".to_string(),
+        name: "mcp__fregate__get_fact".to_string(),
+        input: json!({"kind": "service", "key": "203.0.113.10:9999/tcp"}),
+    });
+    complete_verify_run(
+        &client,
+        &base,
+        "mission-r2",
+        json!({"stop_after_tool": "mcp__fregate__get_fact"}),
+    )
+    .await?;
+    assert_eq!(
+        mock.captured.lock().len(),
+        2,
+        "the failed report call is followed by another model turn"
     );
 
     let _ = shutdown.send(());

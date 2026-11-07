@@ -2698,6 +2698,16 @@ where
                             .find(|message| message.role == Role::Assistant)
                             .map(|message| RichOutput::text(message.content))
                     });
+                    // A run that ended on its report tool (`stop_after_tool`)
+                    // may end on a turn without text: its report is the tool
+                    // call, and there is no answer to deliver.
+                    let rich_output = rich_output.filter(|output| {
+                        !(output_kind == "assistant_text"
+                            && outcome.snapshot.run_meta.stop_after_tool.is_some()
+                            && output.content.trim().is_empty()
+                            && output.parts.is_empty()
+                            && output.artifacts.is_empty())
+                    });
                     (rich_output, output_kind, None)
                 };
             if let Some(output) = rich_output {

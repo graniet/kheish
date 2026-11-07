@@ -1856,6 +1856,10 @@ pub struct RunMetaSnapshot {
     pub output_contract: Option<crate::StructuredOutputContract>,
     #[serde(default)]
     pub output_contract_repair_count: u8,
+    /// The run's report tool: once a call to it succeeds, the run ends after
+    /// that turn's tool results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_after_tool: Option<String>,
     #[serde(default)]
     pub permission_denied_retry_count: u8,
     /// The turns of this run asked again after being cut off at the output

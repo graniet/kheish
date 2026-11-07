@@ -2138,7 +2138,7 @@ where
                 RunRequestPayload::Input { request, .. } => {
                     let request =
                         self.apply_fallback_reply_targets(&request, &record.reply_targets);
-                    let input = with_run_max_turns(
+                    let input = with_run_limits(
                         self.build_input_envelope(&session_id, &request).await?,
                         record.view.limits.as_ref(),
                     );
@@ -2156,7 +2156,7 @@ where
                 RunRequestPayload::ScheduledInput { request, .. } => {
                     let request =
                         self.apply_fallback_reply_targets(&request, &record.reply_targets);
-                    let input = with_run_max_turns(
+                    let input = with_run_limits(
                         self.build_input_envelope(&session_id, &request).await?,
                         record.view.limits.as_ref(),
                     );
@@ -4488,20 +4488,35 @@ fn submit_run_request_fingerprint(
     Ok(hex::encode(Sha256::digest(encoded)))
 }
 
-/// Writes a run's caller-set turn cap into its input envelope, where the
-/// engine reads it when the run starts.
-fn with_run_max_turns(mut input: InputEnvelope, limits: Option<&RunLimits>) -> InputEnvelope {
-    let Some(max_turns) = limits.and_then(|limits| limits.max_turns) else {
+/// Writes a run's caller-set turn cap and report tool into its input
+/// envelope, where the engine reads them when the run starts.
+fn with_run_limits(mut input: InputEnvelope, limits: Option<&RunLimits>) -> InputEnvelope {
+    let Some(limits) = limits else {
         return input;
     };
+    let mut entries = Vec::new();
+    if let Some(max_turns) = limits.max_turns {
+        entries.push((
+            kheish_types::RUN_MAX_TURNS_METADATA_KEY,
+            Value::from(max_turns),
+        ));
+    }
+    if let Some(tool) = limits.stop_after_tool.as_deref() {
+        entries.push((
+            kheish_types::RUN_STOP_AFTER_TOOL_METADATA_KEY,
+            Value::from(tool),
+        ));
+    }
+    if entries.is_empty() {
+        return input;
+    }
     if !input.metadata.is_object() {
         input.metadata = Value::Object(serde_json::Map::new());
     }
     if let Value::Object(metadata) = &mut input.metadata {
-        metadata.insert(
-            kheish_types::RUN_MAX_TURNS_METADATA_KEY.to_string(),
-            Value::from(max_turns),
-        );
+        for (key, value) in entries {
+            metadata.insert(key.to_string(), value);
+        }
     }
     input
 }
@@ -4693,9 +4708,10 @@ mod goal_continuation_failure_tests {
 
 #[cfg(test)]
 mod submit_run_fingerprint_tests {
+    use kheish_types::InputEnvelope;
     use serde_json::json;
 
-    use super::{RunLimits, SubmitInputRequest, submit_run_request_fingerprint};
+    use super::{RunLimits, SubmitInputRequest, submit_run_request_fingerprint, with_run_limits};
 
     fn request(generation: serde_json::Value) -> SubmitInputRequest {
         serde_json::from_value(json!({"content": "scan example.com", "generation": generation}))
@@ -4748,6 +4764,13 @@ mod submit_run_fingerprint_tests {
                     ..RunLimits::default()
                 }),
             ),
+            fingerprint(
+                json!({"max_output_tokens": 4096}),
+                Some(&RunLimits {
+                    stop_after_tool: Some("mcp__fregate__submit_verdict".to_string()),
+                    ..RunLimits::default()
+                }),
+            ),
         ];
         for (index, variant) in variants.iter().enumerate() {
             assert_ne!(
@@ -4761,6 +4784,38 @@ mod submit_run_fingerprint_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn run_limits_reach_the_engine_through_the_input_metadata() {
+        let input = || {
+            let mut input = InputEnvelope::text("daemon", "api", "s1", "user", "go");
+            input.metadata = json!({"mission_id": "m1"});
+            input
+        };
+        assert_eq!(
+            with_run_limits(input(), None).metadata,
+            json!({"mission_id": "m1"})
+        );
+        let limits = RunLimits {
+            max_turns: Some(12),
+            max_duration_ms: Some(600_000),
+            stop_after_tool: Some("mcp__fregate__submit_verdict".to_string()),
+            ..RunLimits::default()
+        };
+        let metadata = with_run_limits(input(), Some(&limits)).metadata;
+        assert_eq!(
+            metadata,
+            json!({
+                "mission_id": "m1",
+                kheish_types::RUN_MAX_TURNS_METADATA_KEY: 12,
+                kheish_types::RUN_STOP_AFTER_TOOL_METADATA_KEY: "mcp__fregate__submit_verdict",
+            })
+        );
+        assert_eq!(
+            kheish_types::run_stop_after_tool_from_metadata(&metadata).as_deref(),
+            Some("mcp__fregate__submit_verdict")
+        );
     }
 
     #[test]

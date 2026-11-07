@@ -447,13 +447,17 @@ pub struct RunLimits {
     /// run starts waiting for an approval or an answer; unset while it runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remaining_ms: Option<u64>,
+    /// The run's report tool: once a call to it succeeds, the run ends
+    /// `completed` after that turn's tool results, with no further model turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_after_tool: Option<String>,
 }
 
 impl RunLimits {
     /// True when the limits constrain nothing.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.max_turns.is_none() && self.max_duration_ms.is_none()
+        self.max_turns.is_none() && self.max_duration_ms.is_none() && self.stop_after_tool.is_none()
     }
 
     /// The limits as the caller asked for them, without the deadline clock.
@@ -462,6 +466,7 @@ impl RunLimits {
         Self {
             max_turns: self.max_turns,
             max_duration_ms: self.max_duration_ms,
+            stop_after_tool: self.stop_after_tool.clone(),
             ..Self::default()
         }
     }

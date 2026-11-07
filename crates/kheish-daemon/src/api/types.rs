@@ -2287,6 +2287,9 @@ pub struct SubmitInputRequest {
     pub reply_address: Option<String>,
 }
 
+/// The longest `stop_after_tool` a run accepts.
+const MAX_STOP_AFTER_TOOL_CHARS: usize = 256;
+
 /// Direct run submission payload.
 ///
 /// This accepts the historical flat `SubmitInputRequest` shape and adds an
@@ -2305,6 +2308,12 @@ pub struct SubmitRunRequest {
     /// runs out the run is cancelled with `error_code: "deadline_exceeded"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_duration_ms: Option<u64>,
+    /// The run's report tool, by its exact name as the model sees it (for an
+    /// MCP tool, `mcp__<server>__<tool>`). Once a call to it succeeds, the run
+    /// ends `completed` right after that turn's tool results, with no further
+    /// model turn. A failed call (an error result) does not end the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_after_tool: Option<String>,
     /// The actual input request fields.
     #[serde(flatten)]
     pub request: SubmitInputRequest,
@@ -2329,9 +2338,24 @@ impl SubmitRunRequest {
             )
             .into());
         }
+        if let Some(tool) = self.stop_after_tool.as_deref()
+            && (tool.is_empty()
+                || tool.len() > MAX_STOP_AFTER_TOOL_CHARS
+                || tool.chars().any(|ch| ch.is_whitespace() || ch.is_control()))
+        {
+            return Err(crate::problems::DaemonProblem::bad_request(
+                "runs",
+                "run_limits_invalid",
+                format!(
+                    "stop_after_tool must be a tool name of 1 to {MAX_STOP_AFTER_TOOL_CHARS} characters without whitespace"
+                ),
+            )
+            .into());
+        }
         let limits = crate::RunLimits {
             max_turns: self.max_turns,
             max_duration_ms: self.max_duration_ms,
+            stop_after_tool: self.stop_after_tool.clone(),
             ..crate::RunLimits::default()
         };
         Ok((!limits.is_empty()).then_some(limits))

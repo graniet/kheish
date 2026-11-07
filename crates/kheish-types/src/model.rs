@@ -22,6 +22,23 @@ pub fn run_max_turns_from_metadata(metadata: &Value) -> Option<usize> {
         .filter(|max_turns| *max_turns > 0)
         .map(|max_turns| usize::try_from(max_turns).unwrap_or(usize::MAX))
 }
+/// Input-envelope metadata key naming a run's report tool. The daemon writes
+/// it from the run request's `stop_after_tool`; once a call to that tool
+/// succeeds, the run ends `completed` after that turn's tool results, with no
+/// further model turn.
+pub const RUN_STOP_AFTER_TOOL_METADATA_KEY: &str = "kheish_run_stop_after_tool";
+
+/// Reads the tool a run stops after from input-envelope metadata.
+///
+/// Absent, null, empty, or non-string values mean "no report tool".
+pub fn run_stop_after_tool_from_metadata(metadata: &Value) -> Option<String> {
+    metadata
+        .get(RUN_STOP_AFTER_TOOL_METADATA_KEY)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+}
 /// Stable metadata key carrying the structured output contract of a run.
 pub const STRUCTURED_OUTPUT_CONTRACT_METADATA_KEY: &str = "structured_output_contract";
 /// Claude Code-style capped default output token ceiling.
