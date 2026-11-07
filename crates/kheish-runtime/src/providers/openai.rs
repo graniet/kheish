@@ -3704,6 +3704,7 @@ mod tests {
                                 items: None,
                             },
                         },
+                        tool_batch_reminder: None,
                         refusal_fallbacks: None,
                         retry_max_tokens: None,
                     },

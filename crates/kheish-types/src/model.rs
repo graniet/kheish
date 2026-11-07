@@ -950,9 +950,37 @@ pub struct ModelGenerationConfig {
     pub reasoning: Option<ReasoningConfig>,
     #[serde(default)]
     pub response_format: ResponseFormat,
+    /// Operator text the provider request carries once after each batch of
+    /// tool results (one model turn's calls), where the conversation goes on:
+    /// on Anthropic, a `role: "system"` message after the tool-result user
+    /// message, or a text block closing that message on a model without
+    /// mid-conversation system messages. Every batch of the history carries
+    /// the same bytes, so the cached prefix holds. Anthropic routes only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_batch_reminder: Option<String>,
 }
 
+/// The longest `tool_batch_reminder` a generation accepts, in bytes.
+pub const MAX_TOOL_BATCH_REMINDER_BYTES: usize = 16 * 1024;
+
 impl ModelGenerationConfig {
+    /// Checks the options a caller sets that the request shape depends on:
+    /// a `tool_batch_reminder` holds text and stays under
+    /// [`MAX_TOOL_BATCH_REMINDER_BYTES`].
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(reminder) = self.tool_batch_reminder.as_deref() {
+            if reminder.trim().is_empty() {
+                return Err("tool_batch_reminder must hold text".to_string());
+            }
+            if reminder.len() > MAX_TOOL_BATCH_REMINDER_BYTES {
+                return Err(format!(
+                    "tool_batch_reminder must be at most {MAX_TOOL_BATCH_REMINDER_BYTES} bytes"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Returns the output cap a request with this generation runs with.
     pub fn effective_max_output_tokens(&self) -> u32 {
         self.max_output_tokens
@@ -993,6 +1021,9 @@ impl ModelGenerationConfig {
                 refusal_fallbacks: override_generation
                     .refusal_fallbacks
                     .or(base.refusal_fallbacks),
+                tool_batch_reminder: override_generation
+                    .tool_batch_reminder
+                    .or(base.tool_batch_reminder),
                 tool_choice: if override_generation.tool_choice == default_generation.tool_choice {
                     base.tool_choice
                 } else {
@@ -1064,6 +1095,7 @@ impl Default for ModelGenerationConfig {
             temperature: None,
             reasoning: None,
             response_format: ResponseFormat::Text,
+            tool_batch_reminder: None,
         }
     }
 }
@@ -1135,9 +1167,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ModelGenerationConfig, ModelUsage, ModelUsageIteration, ReasoningConfig, ReasoningEffort,
-        ReasoningSummary, RefusalFallbackModel, RefusalFallbacks, StructuredFieldSchema,
-        extract_json_text, model_context_window, model_max_output_tokens,
+        MAX_TOOL_BATCH_REMINDER_BYTES, ModelGenerationConfig, ModelUsage, ModelUsageIteration,
+        ReasoningConfig, ReasoningEffort, ReasoningSummary, RefusalFallbackModel, RefusalFallbacks,
+        StructuredFieldSchema, extract_json_text, model_context_window, model_max_output_tokens,
     };
 
     #[test]
@@ -1392,6 +1424,60 @@ mod tests {
         })
         .expect("generation serializes");
         assert!(empty_reasoning.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn tool_batch_reminders_merge_and_validate() {
+        let session = ModelGenerationConfig {
+            tool_batch_reminder: Some("Session reminder.".to_string()),
+            ..ModelGenerationConfig::default()
+        };
+        let kept = ModelGenerationConfig::merge_override(
+            Some(session.clone()),
+            Some(ModelGenerationConfig {
+                max_output_tokens: Some(4_096),
+                ..ModelGenerationConfig::default()
+            }),
+        )
+        .expect("merged");
+        assert_eq!(
+            kept.tool_batch_reminder.as_deref(),
+            Some("Session reminder.")
+        );
+        let overridden = ModelGenerationConfig::merge_override(
+            Some(session),
+            Some(ModelGenerationConfig {
+                tool_batch_reminder: Some("Run reminder.".to_string()),
+                ..ModelGenerationConfig::default()
+            }),
+        )
+        .expect("merged");
+        assert_eq!(
+            overridden.tool_batch_reminder.as_deref(),
+            Some("Run reminder.")
+        );
+
+        assert!(overridden.validate().is_ok());
+        for bad in [
+            String::new(),
+            " \n".to_string(),
+            "x".repeat(MAX_TOOL_BATCH_REMINDER_BYTES + 1),
+        ] {
+            let generation = ModelGenerationConfig {
+                tool_batch_reminder: Some(bad),
+                ..ModelGenerationConfig::default()
+            };
+            assert!(generation.validate().is_err());
+        }
+        let parsed: ModelGenerationConfig =
+            serde_json::from_value(serde_json::json!({"tool_batch_reminder": "R"})).unwrap();
+        assert_eq!(parsed.tool_batch_reminder.as_deref(), Some("R"));
+        assert!(
+            serde_json::to_value(ModelGenerationConfig::default())
+                .unwrap()
+                .get("tool_batch_reminder")
+                .is_none()
+        );
     }
 
     #[test]

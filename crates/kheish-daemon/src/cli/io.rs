@@ -285,6 +285,7 @@ impl crate::GenerationArgs {
             temperature: self.temperature,
             reasoning: self.reasoning_config(),
             response_format,
+            tool_batch_reminder: None,
             refusal_fallbacks: None,
             retry_max_tokens: None,
         }))

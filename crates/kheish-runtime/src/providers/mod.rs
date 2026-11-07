@@ -59,14 +59,47 @@ pub(crate) fn reject_anthropic_only_generation(
     generation: &crate::model::ModelGenerationConfig,
     provider: &str,
 ) -> Result<(), crate::model::ProviderError> {
-    if generation.refusal_fallbacks.is_some() {
-        return Err(crate::model::ProviderError {
-            message: format!(
-                "{provider} routes do not support refusal_fallbacks; it is an Anthropic route option"
-            ),
-            retryable: false,
-            retry_after_ms: None,
-        });
+    for (option, set) in [
+        ("refusal_fallbacks", generation.refusal_fallbacks.is_some()),
+        (
+            "tool_batch_reminder",
+            generation.tool_batch_reminder.is_some(),
+        ),
+    ] {
+        if set {
+            return Err(crate::model::ProviderError {
+                message: format!(
+                    "{provider} routes do not support {option}; it is an Anthropic route option"
+                ),
+                retryable: false,
+                retry_after_ms: None,
+            });
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::model::ModelGenerationConfig;
+
+    #[test]
+    fn anthropic_only_options_fail_other_routes() {
+        assert!(
+            super::reject_anthropic_only_generation(&ModelGenerationConfig::default(), "OpenAI")
+                .is_ok()
+        );
+        let error = super::reject_anthropic_only_generation(
+            &ModelGenerationConfig {
+                tool_batch_reminder: Some("Reminder.".to_string()),
+                ..ModelGenerationConfig::default()
+            },
+            "OpenAI",
+        )
+        .expect_err("a reminder needs an Anthropic route");
+        assert_eq!(
+            error.message,
+            "OpenAI routes do not support tool_batch_reminder; it is an Anthropic route option"
+        );
+    }
 }

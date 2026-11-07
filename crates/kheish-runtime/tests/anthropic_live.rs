@@ -99,6 +99,7 @@ async fn anthropic_live_structured_json_response() -> Result<()> {
                         items: None,
                     },
                 },
+                tool_batch_reminder: None,
                 temperature: Some(0.0),
                 ..ModelGenerationConfig::default()
             },

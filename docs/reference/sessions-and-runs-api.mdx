@@ -154,6 +154,7 @@ Fields:
 - `generation.reasoning`: `effort` (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`), `summary`, `budget_tokens`, `interleaved`; how each driver maps them is in [Model providers and routes](./model-providers#thinking-and-effort). OpenAI routes reject `max` and `budget_tokens`.
 - `generation.refusal_fallbacks`: Anthropic routes only, `"default"` or a list of `{ "model", "max_tokens" }` (one to three); overrides the route's `anthropic_refusal_fallbacks`. Other drivers reject it. See [Refusal fallback](./model-providers#refusal-fallback).
 - `generation.response_format`
+- `generation.tool_batch_reminder`: Anthropic routes only. Operator text the request carries once after each batch of tool results (one model turn's calls): a `role: "system"` message after the tool-result user message, or, on a model without mid-conversation system messages, a text block closing that message. See [Tool batch reminder](./model-providers#tool-batch-reminder). Set it in the session's `route_policy` to give every run of the session the same reminder, or on one run's `generation` (the run's wins). It must hold text and stay under 16 KiB, else `400` with domain `generation` and code `generation_invalid`. Other drivers reject it.
 
 Route precedence is:
 

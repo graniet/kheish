@@ -3417,6 +3417,7 @@ impl AgentEngine {
             temperature: Some(0.0),
             reasoning: None,
             response_format: kheish_types::ResponseFormat::Text,
+            tool_batch_reminder: None,
             refusal_fallbacks: None,
             retry_max_tokens: None,
         }

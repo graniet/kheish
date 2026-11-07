@@ -113,6 +113,15 @@ where
         provider: Option<&str>,
         generation: Option<ModelGenerationConfig>,
     ) -> Result<(Option<String>, Option<ModelGenerationConfig>)> {
+        if let Some(generation) = generation.as_ref() {
+            generation.validate().map_err(|detail| {
+                crate::problems::DaemonProblem::bad_request(
+                    "generation",
+                    "generation_invalid",
+                    detail,
+                )
+            })?;
+        }
         let Some(control) = self.model_control.as_ref() else {
             if provider.is_some() {
                 anyhow::bail!("provider override requires daemon model routing");

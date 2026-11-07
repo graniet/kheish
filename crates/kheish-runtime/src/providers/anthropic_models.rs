@@ -105,6 +105,25 @@ pub(crate) fn anthropic_supports_strict_tools(model: &str) -> bool {
     }
 }
 
+/// Returns whether the model takes `role: "system"` messages after the
+/// history (mid-conversation system messages, no beta): Claude Opus 5 and
+/// 5.5, Claude Opus 4.8, Claude Fable 5 and 5.1, Claude Mythos 5 and 5.1, and
+/// Claude Sonnet 5.5. Not Claude Sonnet 5 nor the Haiku models; a later
+/// generation stays off until it is listed.
+pub(crate) fn anthropic_supports_system_messages(model: &str) -> bool {
+    use ClaudeModelFamily::{Fable, Mythos, Opus, Sonnet};
+    let Some(id) = parse_claude_model_id(model) else {
+        return false;
+    };
+    matches!(
+        (id.family, id.major, id.minor),
+        (Opus, 5, None | Some(5))
+            | (Opus, 4, Some(8))
+            | (Fable | Mythos, 5, None | Some(1))
+            | (Sonnet, 5, Some(5))
+    )
+}
+
 /// Returns whether the model takes `fallbacks` as a list of models. Claude
 /// Sonnet 5.5 takes only `"default"`.
 pub(crate) fn anthropic_accepts_fallback_models(model: &str) -> bool {
