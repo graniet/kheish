@@ -90,6 +90,14 @@ pub(crate) fn anthropic_model_profile(model: &str) -> AnthropicModelProfile {
     }
 }
 
+/// Returns whether the model takes `fallbacks` as a list of models. Claude
+/// Sonnet 5.5 takes only `"default"`.
+pub(crate) fn anthropic_accepts_fallback_models(model: &str) -> bool {
+    anthropic_model_profile(model).server_side_fallback
+        && !parse_claude_model_id(model)
+            .is_some_and(|id| id.is(ClaudeModelFamily::Sonnet, 5, Some(5)))
+}
+
 /// Maps a reasoning effort onto the `output_config.effort` ladder (`low`,
 /// `medium`, `high`, `xhigh`, `max`), which every adaptive generation accepts.
 /// `none` maps to the lowest rung on models whose thinking cannot be turned
@@ -342,6 +350,19 @@ mod tests {
         );
         expect("claude-opus-4-5@20251101", Budget, false, false);
         expect("claude-opus-4-6[1m]", Budget, false, false);
+    }
+
+    #[test]
+    fn sonnet_5_5_takes_only_the_default_fallback_routing() {
+        assert!(super::anthropic_accepts_fallback_models("claude-opus-5-5"));
+        assert!(super::anthropic_accepts_fallback_models("claude-fable-5-1"));
+        assert!(!super::anthropic_accepts_fallback_models(
+            "claude-sonnet-5-5"
+        ));
+        assert!(!super::anthropic_accepts_fallback_models(
+            "claude-haiku-5-5"
+        ));
+        assert!(!super::anthropic_accepts_fallback_models("claude-opus-4-8"));
     }
 
     #[test]

@@ -285,6 +285,7 @@ impl crate::GenerationArgs {
             temperature: self.temperature,
             reasoning: self.reasoning_config(),
             response_format,
+            refusal_fallbacks: None,
         }))
     }
 

@@ -286,6 +286,7 @@ impl GoogleProvider {
 
     fn build_request_body(&self, request: &ModelRuntimeRequest) -> Result<Value, ProviderError> {
         let effective_model = effective_model_name(request, &self.config.model);
+        super::reject_anthropic_only_generation(&request.generation, "Google")?;
         let normalized = normalize_provider_prompt(&request.prompt);
         let mut contents = Vec::new();
         for item in normalized.conversation {

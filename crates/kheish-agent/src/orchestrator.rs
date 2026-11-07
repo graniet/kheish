@@ -655,8 +655,10 @@ where
                                     if let Ok(snapshot) = snapshot {
                                         cached_snapshot = snapshot;
                                     }
-                                    let message = error.to_string();
-                                    let _ = respond_to.send(Err(anyhow!(message.clone())));
+                                    // The run's own error goes back whole: a typed
+                                    // error (a run-ending model condition) keeps its
+                                    // code on the way to the daemon.
+                                    let _ = respond_to.send(Err(error));
                                     for waiter in interrupt_waiters {
                                         let _ = waiter.send(Ok(InterruptResult {
                                             interrupted: false,

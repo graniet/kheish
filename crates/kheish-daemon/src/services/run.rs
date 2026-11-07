@@ -1835,7 +1835,13 @@ impl RunService {
     }
 
     /// Marks one run as failed and persists the terminal state when it was still active.
-    pub(crate) async fn mark_failed(&self, run_id: &str, error: &str) -> Result<Option<RunRecord>> {
+    /// `terminal` carries the code and details of a run-ending model condition.
+    pub(crate) async fn mark_failed(
+        &self,
+        run_id: &str,
+        error: &str,
+        terminal: Option<&kheish_types::RunTerminalError>,
+    ) -> Result<Option<RunRecord>> {
         self.update_run_record(run_id, |record| {
             if record.view.status.is_terminal() {
                 return Ok((None, false));
@@ -1844,6 +1850,8 @@ impl RunService {
             record.view.updated_at_ms = now_ms();
             record.view.finished_at_ms = Some(record.view.updated_at_ms);
             record.view.error = Some(error.to_string());
+            record.view.error_code = terminal.map(|terminal| terminal.code);
+            record.view.refusal = terminal.and_then(|terminal| terminal.refusal.clone());
             clear_pending_state(&mut record.view);
             Ok((Some(record.clone()), true))
         })
@@ -2730,6 +2738,8 @@ fn reconciled_state_event(view: &RunView) -> Option<RunEvent> {
                 .error
                 .clone()
                 .unwrap_or_else(|| "run failed".to_string()),
+            code: view.error_code,
+            refusal: view.refusal.clone(),
         }),
         DaemonRunStatus::Interrupted => Some(RunEvent::Interrupted),
         DaemonRunStatus::Cancelled => Some(RunEvent::Cancelled),
@@ -3375,6 +3385,8 @@ mod tests {
                 outputs: Vec::new(),
                 deliveries: Vec::new(),
                 error: None,
+                error_code: None,
+                refusal: None,
             },
             reply_targets: Vec::new(),
             payload: RunRequestPayload::MailboxDelivery {
@@ -4327,6 +4339,8 @@ mod tests {
                 Some("boom".to_string()),
                 RunEvent::Failed {
                     error: "boom".to_string(),
+                    code: None,
+                    refusal: None,
                 },
             ),
             (DaemonRunStatus::Interrupted, None, RunEvent::Interrupted),
@@ -4687,6 +4701,8 @@ mod tests {
             agent_id: "agent-1".to_string(),
             event: RunEvent::Failed {
                 error: "provider failed after question resume".to_string(),
+                code: None,
+                refusal: None,
             },
         })?;
 
@@ -5977,6 +5993,8 @@ mod tests {
                 outputs: Vec::new(),
                 deliveries: Vec::new(),
                 error: Some("delivery failed".to_string()),
+                error_code: None,
+                refusal: None,
             },
             reply_targets: Vec::new(),
             payload: RunRequestPayload::MailboxDelivery {
@@ -6279,7 +6297,7 @@ mod tests {
         );
 
         let record = service
-            .mark_failed("run-1", "boom")
+            .mark_failed("run-1", "boom", None)
             .await?
             .expect("run should fail");
 
@@ -6288,6 +6306,59 @@ mod tests {
         assert!(record.view.pending_approval_ids.is_empty());
         assert!(record.view.pending_question_ids.is_empty());
         assert!(record.view.pending_questions.is_empty());
+        assert!(record.view.error_code.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_service_mark_failed_records_a_terminal_code_and_its_refusal() -> Result<()> {
+        let temp = tempdir()?;
+        let mut run = sample_run("run-1", "session-1");
+        run.view.status = DaemonRunStatus::Running;
+        let service = RunService::new(
+            FileRunStore::new(temp.path()),
+            FileRunMemoryStore::new(temp.path()),
+            FileDebugStore::new(temp.path()),
+            DaemonEventBus::new(16),
+            BTreeMap::from([("run-1".to_string(), run)]),
+            active_session_runs("session-1", "run-1"),
+            BTreeMap::<String, PendingQuestionView>::new(),
+            AtomicU64::new(0),
+        );
+        let terminal = kheish_types::RunTerminalError::refusal(kheish_types::ModelRefusal {
+            category: Some("bio".to_string()),
+            explanation: None,
+            model: Some("claude-opus-5-5".to_string()),
+        });
+
+        let record = service
+            .mark_failed("run-1", &terminal.to_string(), Some(&terminal))
+            .await?
+            .expect("run should fail");
+
+        assert_eq!(record.view.status, DaemonRunStatus::Failed);
+        assert_eq!(
+            record.view.error_code,
+            Some(kheish_types::RunErrorCode::ModelRefusal)
+        );
+        assert_eq!(
+            record
+                .view
+                .refusal
+                .as_ref()
+                .and_then(|refusal| refusal.category.as_deref()),
+            Some("bio")
+        );
+        let view = serde_json::to_value(&record.view)?;
+        assert_eq!(view["error_code"], "model_refusal");
+        assert_eq!(view["refusal"]["category"], "bio");
+        let Some(RunEvent::Failed { code, refusal, .. }) =
+            crate::services::run::reconciled_state_event(&record.view)
+        else {
+            panic!("a failed run reconciles to a failed event");
+        };
+        assert_eq!(code, Some(kheish_types::RunErrorCode::ModelRefusal));
+        assert_eq!(refusal, record.view.refusal);
         Ok(())
     }
 

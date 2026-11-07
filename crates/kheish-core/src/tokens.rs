@@ -166,6 +166,7 @@ mod tests {
                 cache_creation_input_tokens: 1_000,
                 cache_read_input_tokens: 150_000,
                 cost_usd: 0.0,
+                iterations: Vec::new(),
             }),
         ];
         assert_eq!(

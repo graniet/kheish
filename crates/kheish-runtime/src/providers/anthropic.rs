@@ -28,13 +28,13 @@ use crate::{
 use kheish_auth::{RequestAuthProvider, ResolvedAuthMaterial};
 use kheish_codec::digest_json_value;
 use kheish_types::{
-    InputContentPart, ToolCallRecord, ToolResultRecord, capped_default_max_output_tokens,
-    model_max_output_tokens,
+    InputContentPart, ModelRefusal, ModelUsageIteration, RefusalFallbackRouting, RefusalFallbacks,
+    ToolCallRecord, ToolResultRecord, capped_default_max_output_tokens, model_max_output_tokens,
 };
 
 use super::anthropic_models::{
-    AnthropicPricing, ThinkingMode, anthropic_adaptive_effort, anthropic_list_pricing,
-    anthropic_model_profile,
+    AnthropicModelProfile, AnthropicPricing, ThinkingMode, anthropic_accepts_fallback_models,
+    anthropic_adaptive_effort, anthropic_list_pricing, anthropic_model_profile,
 };
 use super::attachments::{
     AttachmentRenderCache, contains_supported_image_attachment, image_edit_attachment_hint_text,
@@ -51,6 +51,10 @@ const ANTHROPIC_INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-
 /// The beta that lets a request set `thinking.block_binding` and adds
 /// `input_transformations` to the response.
 const ANTHROPIC_THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+/// The beta that lets a request name `fallbacks`, in both its forms.
+const ANTHROPIC_SERVER_SIDE_FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
+/// The most fallback models a request may name.
+const MAX_ANTHROPIC_FALLBACK_MODELS: usize = 3;
 /// Configuration for the Anthropic provider adapter.
 #[derive(Clone)]
 pub struct AnthropicProviderConfig {
@@ -60,6 +64,9 @@ pub struct AnthropicProviderConfig {
     pub base_url: String,
     pub anthropic_version: String,
     pub beta_headers: Vec<String>,
+    /// The models the API retries a declined request on, for the route's
+    /// requests; a run's `generation.refusal_fallbacks` overrides it.
+    pub refusal_fallbacks: Option<RefusalFallbacks>,
     pub default_max_output_tokens: u32,
     /// Prices of the route's requests, overriding the published list price
     /// of the model a request names. A response served by another model (a
@@ -81,6 +88,7 @@ impl AnthropicProviderConfig {
             base_url: DEFAULT_ANTHROPIC_BASE_URL.to_string(),
             anthropic_version: DEFAULT_ANTHROPIC_VERSION.to_string(),
             beta_headers: Vec::new(),
+            refusal_fallbacks: None,
             pricing: None,
             asset_root: None,
             attachment_cache: AttachmentRenderCache::default(),
@@ -114,6 +122,7 @@ impl AnthropicProviderConfig {
             base_url: DEFAULT_ANTHROPIC_BASE_URL.to_string(),
             anthropic_version: DEFAULT_ANTHROPIC_VERSION.to_string(),
             beta_headers: Vec::new(),
+            refusal_fallbacks: None,
             pricing: None,
             asset_root: None,
             attachment_cache: AttachmentRenderCache::default(),
@@ -133,6 +142,7 @@ impl Debug for AnthropicProviderConfig {
             .field("base_url", &self.base_url)
             .field("anthropic_version", &self.anthropic_version)
             .field("beta_headers", &self.beta_headers)
+            .field("refusal_fallbacks", &self.refusal_fallbacks)
             .field("default_max_output_tokens", &self.default_max_output_tokens)
             .field("pricing", &self.pricing)
             .field("asset_root", &self.asset_root)
@@ -312,6 +322,23 @@ impl AnthropicProvider {
                 retryable: false,
                 retry_after_ms: None,
             });
+        }
+        if let Some(fallbacks) = request
+            .generation
+            .refusal_fallbacks
+            .as_ref()
+            .or(self.config.refusal_fallbacks.as_ref())
+        {
+            if let Some(value) = anthropic_fallbacks_value(fallbacks, &effective_model, &profile)? {
+                body.insert("fallbacks".to_string(), value);
+                betas.push(ANTHROPIC_SERVER_SIDE_FALLBACK_BETA);
+            } else {
+                debug!(
+                    session_id = %request.session_id,
+                    model = %effective_model,
+                    "Anthropic model takes no server-side refusal fallbacks in this form; sending none"
+                );
+            }
         }
         if let Some(tool_choice) = anthropic_tool_choice(
             &request.generation.tool_choice,
@@ -843,6 +870,15 @@ enum AnthropicContentBlock {
     RedactedThinking {
         data: String,
     },
+    /// The point where one model's output gave way to a refusal fallback's.
+    /// It stays where it appeared: the API uses its position to validate the
+    /// thinking blocks around it.
+    Fallback {
+        from: Value,
+        to: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        trigger: Option<Value>,
+    },
     Image {
         source: AnthropicImageSource,
     },
@@ -1157,6 +1193,14 @@ fn anthropic_recorded_blocks(provider_context: Option<&Value>) -> (Vec<RecordedB
                 let id = block.get("id").and_then(Value::as_str)?;
                 Some(RecordedBlock::ToolUse(id.to_string()))
             }
+            Some("fallback") => {
+                ordered = true;
+                Some(RecordedBlock::Native(AnthropicContentBlock::Fallback {
+                    from: block.get("from")?.clone(),
+                    to: block.get("to")?.clone(),
+                    trigger: block.get("trigger").cloned(),
+                }))
+            }
             _ => None,
         })
         .collect();
@@ -1168,6 +1212,58 @@ fn provider_audit_error(error: anyhow::Error) -> ProviderError {
         message: format!("external action audit failed: {error}"),
         retryable: false,
         retry_after_ms: None,
+    }
+}
+
+/// Encodes the request's `fallbacks`: `"default"` or the list of models,
+/// when the requested model takes that form. Returns `None` for a model
+/// without server-side fallback (it would reject the field), and for Claude
+/// Sonnet 5.5 asked for a model list, which only takes `"default"`.
+fn anthropic_fallbacks_value(
+    fallbacks: &RefusalFallbacks,
+    model: &str,
+    profile: &AnthropicModelProfile,
+) -> Result<Option<Value>, ProviderError> {
+    if !profile.server_side_fallback {
+        return Ok(None);
+    }
+    let invalid = |message: String| ProviderError {
+        message,
+        retryable: false,
+        retry_after_ms: None,
+    };
+    match fallbacks {
+        RefusalFallbacks::Routing(RefusalFallbackRouting::Default) => {
+            Ok(Some(Value::String("default".to_string())))
+        }
+        RefusalFallbacks::Models(models) => {
+            if !anthropic_accepts_fallback_models(model) {
+                return Ok(None);
+            }
+            if models.is_empty() || models.len() > MAX_ANTHROPIC_FALLBACK_MODELS {
+                return Err(invalid(format!(
+                    "refusal_fallbacks names {} models; Anthropic takes 1 to {MAX_ANTHROPIC_FALLBACK_MODELS}",
+                    models.len()
+                )));
+            }
+            let mut seen = BTreeSet::new();
+            let mut entries = Vec::with_capacity(models.len());
+            for entry in models {
+                let name = entry.model.trim();
+                if name.is_empty() || name == model || !seen.insert(name.to_string()) {
+                    return Err(invalid(format!(
+                        "refusal_fallbacks must name distinct models other than the requested model `{model}`"
+                    )));
+                }
+                let mut value = serde_json::Map::new();
+                value.insert("model".to_string(), Value::String(name.to_string()));
+                if let Some(max_tokens) = entry.max_tokens {
+                    value.insert("max_tokens".to_string(), Value::Number(max_tokens.into()));
+                }
+                entries.push(Value::Object(value));
+            }
+            Ok(Some(Value::Array(entries)))
+        }
     }
 }
 
@@ -1526,8 +1622,11 @@ struct AnthropicStreamState {
     /// text by value, tool uses by id.
     layout: Vec<Value>,
     /// Whether the answer carried a block whose bytes and position must be
-    /// replayed (thinking or redacted thinking).
+    /// replayed (thinking, redacted thinking, a fallback marker).
     has_positioned_blocks: bool,
+    /// Tool calls, held until the answer is complete: a refusal fallback
+    /// withdraws the tool uses of the attempt it replaced.
+    tool_calls: Vec<ToolCallRecord>,
     /// The `input_transformations` the API reported for the request: thinking
     /// blocks it dropped (or would have, on a request it does not enforce).
     input_transformations: Vec<Value>,
@@ -1558,6 +1657,7 @@ impl AnthropicStreamState {
             partial_blocks: BTreeMap::new(),
             layout: Vec::new(),
             has_positioned_blocks: false,
+            tool_calls: Vec::new(),
             input_transformations: Vec::new(),
             finished: false,
             usage: serde_json::Map::new(),
@@ -1590,7 +1690,48 @@ impl AnthropicStreamState {
         }
         let usage = Value::Object(self.usage.clone());
         let mut parsed = parse_usage(&usage);
-        if let Some(pricing) = self.pricing_for(&self.model, parsed.prompt_tokens()) {
+        let iterations = usage
+            .get("iterations")
+            .and_then(Value::as_array)
+            .filter(|iterations| !iterations.is_empty());
+        if let Some(iterations) = iterations {
+            // A refusal fallback ran: the top-level counts are the answering
+            // attempt's only, and each attempt bills at its own model's
+            // prices; an attempt that names no model ran the requested one.
+            parsed.iterations = iterations
+                .iter()
+                .map(|iteration| {
+                    let counts = parse_usage(iteration);
+                    let model = iteration
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    let priced_model = model.as_deref().unwrap_or(&self.requested_model);
+                    let cost_usd = self
+                        .pricing_for(priced_model, counts.prompt_tokens())
+                        .map(|pricing| pricing.cost_usd(&counts, cache_write_1h_tokens(iteration)))
+                        .unwrap_or_default();
+                    ModelUsageIteration {
+                        kind: iteration
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("message")
+                            .to_string(),
+                        model,
+                        input_tokens: counts.input_tokens,
+                        output_tokens: counts.output_tokens,
+                        cache_creation_input_tokens: counts.cache_creation_input_tokens,
+                        cache_read_input_tokens: counts.cache_read_input_tokens,
+                        cost_usd,
+                    }
+                })
+                .collect();
+            parsed.cost_usd = parsed
+                .iterations
+                .iter()
+                .map(|iteration| iteration.cost_usd)
+                .sum();
+        } else if let Some(pricing) = self.pricing_for(&self.model, parsed.prompt_tokens()) {
             parsed.cost_usd = pricing.cost_usd(&parsed, cache_write_1h_tokens(&usage));
         }
         sink.emit(ModelStreamEvent::Usage { usage: parsed })
@@ -1635,6 +1776,40 @@ impl AnthropicStreamState {
             return Ok(());
         }
         self.finished = true;
+        // After a refusal fallback, the attempts before the last marker are
+        // not part of the answer beyond their text: their thinking and tool
+        // uses are withdrawn (never run, never replayed), their text and the
+        // markers stay where they appeared.
+        let block_type = |block: &Value| {
+            block
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        if let Some(boundary) = self
+            .layout
+            .iter()
+            .rposition(|block| block_type(block) == "fallback")
+        {
+            let mut withdrawn = BTreeSet::new();
+            let layout = std::mem::take(&mut self.layout);
+            for (index, block) in layout.into_iter().enumerate() {
+                let kind = block_type(&block);
+                if index >= boundary || kind == "text" || kind == "fallback" {
+                    self.layout.push(block);
+                } else if kind == "tool_use"
+                    && let Some(id) = block.get("id").and_then(Value::as_str)
+                {
+                    withdrawn.insert(id.to_string());
+                }
+            }
+            self.tool_calls.retain(|call| !withdrawn.contains(&call.id));
+        }
+        for call in std::mem::take(&mut self.tool_calls) {
+            sink.emit(ModelStreamEvent::ToolCall { call })
+                .map_err(map_sink_error)?;
+        }
         if !self.has_positioned_blocks && self.input_transformations.is_empty() {
             return Ok(());
         }
@@ -1730,6 +1905,16 @@ fn handle_sse_event(
                         .unwrap_or_default()
                         .to_string(),
                 },
+                "fallback" => {
+                    // A start and stop pair with no deltas, between the
+                    // declined attempt's output and the next model's.
+                    state.has_positioned_blocks = true;
+                    if let Some(model) = block.pointer("/to/model").and_then(Value::as_str) {
+                        state.model = model.to_string();
+                    }
+                    state.layout.push(block.clone());
+                    PartialContentBlock::Ignored
+                }
                 "tool_use" => PartialContentBlock::ToolUse {
                     id: block
                         .get("id")
@@ -1815,16 +2000,13 @@ fn handle_sse_event(
                         })?
                     };
                     state.layout.push(json!({ "type": "tool_use", "id": id }));
-                    sink.emit(ModelStreamEvent::ToolCall {
-                        call: kheish_types::ToolCallRecord {
-                            id,
-                            name,
-                            input,
-                            assistant_message_id: None,
-                            assistant_provider_response_id: None,
-                        },
-                    })
-                    .map_err(map_sink_error)?;
+                    state.tool_calls.push(ToolCallRecord {
+                        id,
+                        name,
+                        input,
+                        assistant_message_id: None,
+                        assistant_provider_response_id: None,
+                    });
                 }
                 // The signature carries the reasoning: a block whose text is
                 // empty (the default display) is kept all the same, since
@@ -1873,6 +2055,27 @@ fn handle_sse_event(
                 // The runtime settles the turn on the stop event: everything
                 // the turn keeps goes out before it.
                 state.finish(sink)?;
+                if stop_reason == "refusal" {
+                    let details = event
+                        .payload
+                        .pointer("/delta/stop_details")
+                        .or_else(|| event.payload.get("stop_details"))
+                        .filter(|details| details.is_object());
+                    let field = |key: &str| {
+                        details
+                            .and_then(|details| details.get(key))
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    };
+                    sink.emit(ModelStreamEvent::Refusal {
+                        refusal: ModelRefusal {
+                            category: field("category"),
+                            explanation: field("explanation"),
+                            model: Some(state.model.clone()),
+                        },
+                    })
+                    .map_err(map_sink_error)?;
+                }
                 sink.emit(ModelStreamEvent::Stop {
                     reason: map_stop_reason(stop_reason),
                 })
@@ -1920,6 +2123,7 @@ fn parse_usage(usage: &Value) -> kheish_types::ModelUsage {
         cache_creation_input_tokens: count("cache_creation_input_tokens"),
         cache_read_input_tokens: count("cache_read_input_tokens"),
         cost_usd: 0.0,
+        iterations: Vec::new(),
     }
 }
 
@@ -2073,9 +2277,9 @@ mod tests {
     use kheish_core::ModelDriver;
     use kheish_types::capped_default_max_output_tokens;
     use kheish_types::{
-        CAPPED_DEFAULT_MAX_OUTPUT_TOKENS, ConversationKey, InputContentPart, PromptProjection,
-        ProviderInputItem, ProviderPrompt, SummaryBlock, ToolCallRecord, ToolDefinition,
-        ToolResultRecord,
+        CAPPED_DEFAULT_MAX_OUTPUT_TOKENS, ConversationKey, InputContentPart, ModelRefusal,
+        PromptProjection, ProviderInputItem, ProviderPrompt, RefusalFallbackModel,
+        RefusalFallbacks, SummaryBlock, ToolCallRecord, ToolDefinition, ToolResultRecord,
     };
     use tokio_util::sync::CancellationToken;
 
@@ -2258,6 +2462,7 @@ mod tests {
                                 items: None,
                             },
                         },
+                        refusal_fallbacks: None,
                     },
                 },
                 ModelEventSink::new(sender),
@@ -3716,6 +3921,283 @@ mod tests {
         assert_eq!(
             context["anthropic"]["input_transformations"][0]["reason"],
             "prefix_binding_mismatch"
+        );
+        Ok(())
+    }
+
+    /// Claude Opus 5.5 starts an answer and a tool call, declines mid-stream,
+    /// and Claude Opus 5 answers: the response shape the refusals and
+    /// fallback page documents for a streamed mid-output fallback.
+    const MID_STREAM_FALLBACK_STREAM: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-fb\",\"model\":\"claude-opus-5-5\",\"usage\":{\"input_tokens\":900,\"output_tokens\":1}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-declined\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Looking at the service. \"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_declined\",\"name\":\"mcp__fregate__scan_target\",\"input\":{}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"target\\\":\\\"a\\\"}\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"fallback\",\"from\":{\"model\":\"claude-opus-5-5\"},\"to\":{\"model\":\"claude-opus-5\"},\"trigger\":{\"type\":\"refusal\",\"category\":\"cyber\"}}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":3}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":4,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":4,\"delta\":{\"type\":\"text_delta\",\"text\":\"The port is closed.\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":4}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":5,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_served\",\"name\":\"mcp__fregate__submit_verdict\",\"input\":{}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":5,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"verdict\\\":\\\"closed\\\"}\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":5}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_details\":null},\"usage\":{\"input_tokens\":900,\"output_tokens\":120,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"iterations\":[{\"type\":\"message\",\"model\":\"claude-opus-5-5\",\"input_tokens\":900,\"output_tokens\":40,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0},{\"type\":\"fallback_message\",\"model\":\"claude-opus-5\",\"input_tokens\":900,\"output_tokens\":120,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}]}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+
+    fn runtime_for(provider: AnthropicProvider) -> ModelRuntime<AnthropicProvider> {
+        ModelRuntime::new(
+            provider,
+            ModelRetryPolicy {
+                max_attempts: 1,
+                ..ModelRetryPolicy::default()
+            },
+            ModelBudget {
+                max_total_output_tokens: 1_000_000,
+                max_total_cost_usd: 1_000.0,
+            },
+            Arc::new(NoopObserver),
+        )
+    }
+
+    #[test]
+    fn requests_name_refusal_fallbacks_from_the_run_or_the_route() -> Result<()> {
+        let route_default = AnthropicProviderConfig {
+            refusal_fallbacks: Some(RefusalFallbacks::default_routing()),
+            ..AnthropicProviderConfig::new("claude-opus-5-5", "key")
+        };
+        let provider = AnthropicProvider::new(route_default.clone())?;
+        let request = provider.build_request(&minimal_request(ModelGenerationConfig::default()))?;
+        assert_eq!(request.body["fallbacks"], "default");
+        assert!(request.betas.contains(&"server-side-fallback-2026-07-01"));
+
+        // The run's list overrides the route's routing.
+        let request = provider.build_request(&minimal_request(ModelGenerationConfig {
+            refusal_fallbacks: Some(RefusalFallbacks::Models(vec![
+                RefusalFallbackModel {
+                    model: "claude-opus-5".to_string(),
+                    max_tokens: Some(8_000),
+                },
+                RefusalFallbackModel {
+                    model: "claude-opus-4-8".to_string(),
+                    max_tokens: None,
+                },
+            ])),
+            ..ModelGenerationConfig::default()
+        }))?;
+        assert_eq!(
+            request.body["fallbacks"],
+            json!([
+                {"model": "claude-opus-5", "max_tokens": 8_000},
+                {"model": "claude-opus-4-8"}
+            ])
+        );
+
+        // Claude Sonnet 5.5 takes only the default routing; Claude Haiku 5.5
+        // and Claude Opus 4.8 no server-side fallback at all.
+        let list = ModelGenerationConfig {
+            refusal_fallbacks: Some(RefusalFallbacks::Models(vec![RefusalFallbackModel {
+                model: "claude-sonnet-5".to_string(),
+                max_tokens: None,
+            }])),
+            ..ModelGenerationConfig::default()
+        };
+        for model in ["claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-4-8"] {
+            let provider = AnthropicProvider::new(AnthropicProviderConfig::new(model, "key"))?;
+            let request = provider.build_request(&minimal_request(list.clone()))?;
+            assert!(request.body.get("fallbacks").is_none(), "{model}");
+            assert!(!request.betas.contains(&"server-side-fallback-2026-07-01"));
+        }
+        let provider =
+            AnthropicProvider::new(AnthropicProviderConfig::new("claude-sonnet-5-5", "key"))?;
+        let request = provider.build_request(&minimal_request(ModelGenerationConfig {
+            refusal_fallbacks: Some(RefusalFallbacks::default_routing()),
+            ..ModelGenerationConfig::default()
+        }))?;
+        assert_eq!(request.body["fallbacks"], "default");
+
+        // A list that names the requested model, repeats one, or is too long.
+        for models in [
+            vec!["claude-opus-5-5"],
+            vec!["claude-opus-5", "claude-opus-5"],
+            vec!["a-1", "a-2", "a-3", "a-4"],
+        ] {
+            let error = AnthropicProvider::new(route_default.clone())?
+                .build_request(&minimal_request(ModelGenerationConfig {
+                    refusal_fallbacks: Some(RefusalFallbacks::Models(
+                        models
+                            .iter()
+                            .map(|model| RefusalFallbackModel {
+                                model: model.to_string(),
+                                max_tokens: None,
+                            })
+                            .collect(),
+                    )),
+                    ..ModelGenerationConfig::default()
+                }))
+                .err()
+                .expect("an invalid list is refused before the request");
+            assert!(!error.retryable);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_mid_stream_fallback_withdraws_the_declined_attempt_and_prices_each() -> Result<()> {
+        let (url, recorded) =
+            spawn_recording_mock_server(vec![MockHttpResponse::sse(MID_STREAM_FALLBACK_STREAM)])
+                .await?;
+        let provider = AnthropicProvider::new(AnthropicProviderConfig {
+            base_url: url,
+            refusal_fallbacks: Some(RefusalFallbacks::default_routing()),
+            ..AnthropicProviderConfig::new("claude-opus-5-5", "test-key")
+        })?;
+        let turn = runtime_for(provider)
+            .next_turn(default_model_request("fm-mission"))
+            .await?;
+        let request = recorded.lock()[0].clone();
+        assert_eq!(request.json()["fallbacks"], "default");
+        assert!(
+            request
+                .header("anthropic-beta")
+                .expect("betas")
+                .contains("server-side-fallback-2026-07-01")
+        );
+
+        // Only the serving model's tool call runs.
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].id, "toolu_served");
+        // The declined attempt's text stays in the answer.
+        assert_eq!(
+            turn.assistant_message.content,
+            "Looking at the service. The port is closed."
+        );
+        // The replay keeps the text before the marker, the marker where it
+        // appeared, and everything after it.
+        let blocks = turn
+            .assistant_message
+            .provider_context
+            .as_ref()
+            .expect("context")["anthropic"]["content_blocks"]
+            .clone();
+        assert_eq!(
+            blocks,
+            json!([
+                {"type": "text", "text": "Looking at the service. "},
+                {"type": "fallback", "from": {"model": "claude-opus-5-5"}, "to": {"model": "claude-opus-5"}, "trigger": {"type": "refusal", "category": "cyber"}},
+                {"type": "text", "text": "The port is closed."},
+                {"type": "tool_use", "id": "toolu_served"},
+            ])
+        );
+        // Each attempt is priced at its own model's rates.
+        let usage = turn.usage.expect("usage");
+        assert_eq!(usage.iterations.len(), 2);
+        assert_eq!(usage.iterations[0].kind, "message");
+        assert_eq!(
+            usage.iterations[0].model.as_deref(),
+            Some("claude-opus-5-5")
+        );
+        assert_eq!(usage.iterations[1].kind, "fallback_message");
+        assert_eq!(usage.iterations[1].model.as_deref(), Some("claude-opus-5"));
+        let opus_5_5 = 900.0 * 4.0 / 1e6 + 40.0 * 20.0 / 1e6;
+        let opus_5 = 900.0 * 5.0 / 1e6 + 120.0 * 25.0 / 1e6;
+        assert!((usage.iterations[0].cost_usd - opus_5_5).abs() < 1e-12);
+        assert!((usage.iterations[1].cost_usd - opus_5).abs() < 1e-12);
+        assert!((usage.cost_usd - (opus_5_5 + opus_5)).abs() < 1e-12);
+        assert_eq!(usage.billed().output_tokens, 160);
+
+        // The stored turn replays as the API expects it back.
+        let message = turn.assistant_message;
+        let mut items = vec![user_item("u1", "Verify the exposure.")];
+        items.push(ProviderInputItem::Message {
+            id: message.id.clone(),
+            role: message.role.clone(),
+            content: message.content.clone(),
+            content_parts: Vec::new(),
+            attachments: Vec::new(),
+            provider_response_id: message.provider_response_id.clone(),
+            provider_context: message.provider_context.clone(),
+        });
+        for call in turn.tool_calls {
+            items.push(ProviderInputItem::ToolCall {
+                assistant_message_id: Some(message.id.clone()),
+                call,
+            });
+        }
+        let replay =
+            AnthropicProvider::new(AnthropicProviderConfig::new("claude-opus-5-5", "test-key"))?
+                .build_request_body(&opus_5_5_request(items))?;
+        assert_eq!(
+            replay["messages"][1]["content"],
+            json!([
+                {"type": "text", "text": "Looking at the service. "},
+                {"type": "fallback", "from": {"model": "claude-opus-5-5"}, "to": {"model": "claude-opus-5"}, "trigger": {"type": "refusal", "category": "cyber"}},
+                {"type": "text", "text": "The port is closed."},
+                {"type": "tool_use", "id": "toolu_served", "name": "mcp__fregate__submit_verdict", "input": {"verdict": "closed"}},
+            ])
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_final_refusal_reports_its_category() -> Result<()> {
+        let stream = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-refused\",\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":412,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"fallback\",\"from\":{\"model\":\"claude-opus-5-5\"},\"to\":{\"model\":\"claude-opus-5\"},\"trigger\":{\"type\":\"refusal\",\"category\":\"cyber\"}}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\",\"stop_details\":{\"type\":\"refusal\",\"category\":\"cyber\",\"explanation\":\"This request was declined because it could enable cyber harm.\",\"recommended_model\":null}},\"usage\":{\"output_tokens\":0}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let (url, _recorded) =
+            spawn_recording_mock_server(vec![MockHttpResponse::sse(stream)]).await?;
+        let provider = AnthropicProvider::new(AnthropicProviderConfig {
+            base_url: url,
+            ..AnthropicProviderConfig::new("claude-opus-5-5", "test-key")
+        })?;
+        let turn = runtime_for(provider)
+            .next_turn(default_model_request("fm-mission"))
+            .await?;
+        assert_eq!(turn.finish_reason, crate::model::ModelFinishReason::Blocked);
+        assert_eq!(
+            turn.refusal,
+            Some(ModelRefusal {
+                category: Some("cyber".to_string()),
+                explanation: Some(
+                    "This request was declined because it could enable cyber harm.".to_string()
+                ),
+                model: Some("claude-opus-5".to_string()),
+            })
         );
         Ok(())
     }

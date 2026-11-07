@@ -429,6 +429,7 @@ impl OpenRouterProvider {
 
     fn build_request_body(&self, request: &ModelRuntimeRequest) -> Result<Value, ProviderError> {
         let normalized = normalize_provider_prompt(&request.prompt);
+        super::reject_anthropic_only_generation(&request.generation, "OpenRouter")?;
         let effective_model = request
             .generation
             .model

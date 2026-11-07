@@ -3465,6 +3465,8 @@ where
                 outputs: Vec::new(),
                 deliveries: Vec::new(),
                 error: None,
+                error_code: None,
+                refusal: None,
             },
             reply_targets: Vec::new(),
             payload: RunRequestPayload::ChannelDelivery { request },

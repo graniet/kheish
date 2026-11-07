@@ -145,6 +145,7 @@ Fields:
 - `generation.max_output_tokens`
 - `generation.temperature`
 - `generation.reasoning`: `effort` (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`), `summary`, `budget_tokens`, `interleaved`; how each driver maps them is in [Model providers and routes](./model-providers#thinking-and-effort). OpenAI routes reject `max` and `budget_tokens`.
+- `generation.refusal_fallbacks`: Anthropic routes only, `"default"` or a list of `{ "model", "max_tokens" }` (one to three); overrides the route's `anthropic_refusal_fallbacks`. Other drivers reject it. See [Refusal fallback](./model-providers#refusal-fallback).
 - `generation.response_format`
 
 Route precedence is:
@@ -707,6 +708,28 @@ input runs are interrupted instead of replaying stale user/provider state.
 - `outputs`
 - `deliveries`
 - `error`
+- `error_code`: the machine-readable code of a run that ended on a model condition (below)
+- `refusal`: for `error_code: "model_refusal"`, the refusal's `category`, `explanation` and `model`
+
+### Run error codes
+
+A run that ends on a model condition is `failed` with a machine-readable `error_code`, also carried
+by its persisted `failed` run event (`code`, `refusal`). Decide on the code, never on the `error`
+text:
+
+| `error_code` | Meaning |
+|---|---|
+| `model_refusal` | The model declined the request and no refusal fallback served it. `refusal.category` is the policy area (`cyber`, `bio`, ...), absent when the refusal maps to no named category. |
+
+```json
+{
+  "run_id": "run-12",
+  "status": "failed",
+  "error": "model_refusal: the model declined the request by claude-opus-5 (refusal category: cyber)",
+  "error_code": "model_refusal",
+  "refusal": {"category": "cyber", "explanation": "This request was declined because it could enable cyber harm.", "model": "claude-opus-5"}
+}
+```
 
 `RunView.request` is a compact `RunRequestSummary`:
 

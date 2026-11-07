@@ -108,6 +108,9 @@ pub struct ModelTurn {
     pub tool_calls: Vec<ToolCallRecord>,
     pub finish_reason: ModelFinishReason,
     pub usage: Option<ModelUsage>,
+    /// Why the model declined, when `finish_reason` is `Blocked` and the
+    /// provider said.
+    pub refusal: Option<kheish_types::ModelRefusal>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

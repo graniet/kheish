@@ -8,6 +8,7 @@ mod memory;
 mod model;
 mod prompt;
 mod routing;
+mod run_error;
 mod session;
 mod skills;
 mod tools;
@@ -50,11 +51,12 @@ pub use model::{
     ApiUsage, CAPPED_DEFAULT_MAX_OUTPUT_TOKENS, COMPLETION_REQUIREMENTS_METADATA_KEY,
     CompletionRequirement, DEFAULT_OUTPUT_CONTRACT_REPAIR_ATTEMPTS, ESCALATED_MAX_OUTPUT_TOKENS,
     MAX_OUTPUT_CONTRACT_REPAIR_ATTEMPTS, ModelFinishReason, ModelGenerationConfig,
-    ModelMaxOutputTokens, ModelProviderError, ModelUsage, ProviderErrorKind, ReasoningConfig,
-    ReasoningEffort, ReasoningSummary, ResponseFormat, STRUCTURED_OUTPUT_CONTRACT_METADATA_KEY,
-    StructuredFieldSchema, StructuredInputContract, StructuredOutputContract, StructuredValueKind,
-    ToolChoice, capped_default_max_output_tokens, classify_provider_error_message,
-    completion_requirements_from_metadata, extract_json_text,
+    ModelMaxOutputTokens, ModelProviderError, ModelUsage, ModelUsageIteration, ProviderErrorKind,
+    ReasoningConfig, ReasoningEffort, ReasoningSummary, RefusalFallbackModel,
+    RefusalFallbackRouting, RefusalFallbacks, ResponseFormat,
+    STRUCTURED_OUTPUT_CONTRACT_METADATA_KEY, StructuredFieldSchema, StructuredInputContract,
+    StructuredOutputContract, StructuredValueKind, ToolChoice, capped_default_max_output_tokens,
+    classify_provider_error_message, completion_requirements_from_metadata, extract_json_text,
     metadata_with_completion_requirements, metadata_with_structured_output_contract,
     model_context_window, model_max_output_tokens, structured_output_contract_from_metadata,
 };
@@ -65,6 +67,7 @@ pub use routing::{
     ReplyHandle, RichOutput, SourceRef, asset_storage_uri, normalize_reply_targets,
     parse_asset_storage_uri, render_content_parts_text, render_document_attachment_text,
 };
+pub use run_error::{ModelRefusal, RunErrorCode, RunTerminalError};
 pub use session::{
     AFFINITY_CUE_THRESHOLD, AFFINITY_DECAY_HALF_LIFE_MS, AFFINITY_DRIFT_STEP, AFFINITY_TAB_TTL_MS,
     AffinityDrift, AffinityEdge, AffinityImpression, AffinityOpenTab, AffinityStanding,

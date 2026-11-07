@@ -184,6 +184,21 @@ Use the dedicated reference pages below instead of treating this page as the ful
 - [Skills API](./skills-api) for:
   - `/v1/skills`
 
+## Run requests and model conditions
+
+`POST /v1/sessions/{session_id}/runs` and `/input` take run-scoped `generation` options (the full list is in
+[Sessions and runs API](./sessions-and-runs-api#route-policy)). The ones that shape the model request on
+current Claude models:
+
+- `generation.reasoning.effort`: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`
+  ([mapping](./model-providers#thinking-and-effort));
+- `generation.refusal_fallbacks`: `"default"` or up to three `{ "model", "max_tokens" }`, the models an
+  Anthropic route retries a declined request on ([refusal fallback](./model-providers#refusal-fallback)).
+
+A run that ends on a model condition is `failed` with a machine-readable `RunView.error_code`
+(`model_refusal`, with `RunView.refusal`), also carried by its `failed` run event; see
+[run error codes](./sessions-and-runs-api#run-error-codes).
+
 ## Route groups at a glance
 
 The actual control-plane router currently exposes these groups:

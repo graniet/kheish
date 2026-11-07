@@ -256,6 +256,33 @@ pub struct ModelUsage {
     /// Prompt tokens read from the provider's prompt cache.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub cache_read_input_tokens: u64,
+    /// The cost of the turn: every attempt's when `iterations` lists them.
+    pub cost_usd: f64,
+    /// Every attempt the provider made to serve the turn, each with its own
+    /// model and cost, when a refusal fallback ran: the declined attempts and
+    /// the one that answered. The token counts above describe the answering
+    /// attempt only, as the provider reports them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub iterations: Vec<ModelUsageIteration>,
+}
+
+/// One attempt of a turn served through a refusal fallback.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelUsageIteration {
+    /// `message` for an attempt that declined, `fallback_message` for the
+    /// fallback attempt that answered (or declined last).
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// The model that ran the attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_creation_input_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_read_input_tokens: u64,
+    /// The attempt's cost, at its own model's prices.
     pub cost_usd: f64,
 }
 
@@ -271,6 +298,27 @@ impl ModelUsage {
     /// Returns the prompt and output tokens of the request.
     pub fn total_tokens(&self) -> u64 {
         self.prompt_tokens().saturating_add(self.output_tokens)
+    }
+
+    /// Returns the counts billed for the turn: the sum over every attempt
+    /// when the provider lists them, the turn's own counts otherwise.
+    pub fn billed(&self) -> ModelUsage {
+        if self.iterations.is_empty() {
+            let mut billed = self.clone();
+            billed.iterations.clear();
+            return billed;
+        }
+        let mut billed = ModelUsage {
+            cost_usd: self.cost_usd,
+            ..ModelUsage::default()
+        };
+        for iteration in &self.iterations {
+            billed.input_tokens += iteration.input_tokens;
+            billed.output_tokens += iteration.output_tokens;
+            billed.cache_creation_input_tokens += iteration.cache_creation_input_tokens;
+            billed.cache_read_input_tokens += iteration.cache_read_input_tokens;
+        }
+        billed
     }
 }
 
@@ -808,6 +856,41 @@ fn default_true() -> bool {
     true
 }
 
+/// The provider's recommended fallback routing by refusal category.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalFallbackRouting {
+    Default,
+}
+
+/// One model a declined request is retried on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefusalFallbackModel {
+    pub model: String,
+    /// Bounds this attempt's own output, apart from the request's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+}
+
+/// The models a provider retries a request on, within the same call, when
+/// its safety classifiers decline it: `"default"` for the provider's
+/// recommended routing by refusal category, or a list of models tried in
+/// order. Anthropic routes only; other drivers reject it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RefusalFallbacks {
+    Routing(RefusalFallbackRouting),
+    Models(Vec<RefusalFallbackModel>),
+}
+
+impl RefusalFallbacks {
+    /// The provider's recommended routing (`"default"`).
+    pub fn default_routing() -> Self {
+        Self::Routing(RefusalFallbackRouting::Default)
+    }
+}
+
 /// Groups provider-neutral generation options for one model turn.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ModelGenerationConfig {
@@ -815,6 +898,9 @@ pub struct ModelGenerationConfig {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_model: Option<String>,
+    /// Models the provider retries a declined request on (Anthropic).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal_fallbacks: Option<RefusalFallbacks>,
     #[serde(default)]
     pub tool_choice: ToolChoice,
     #[serde(default = "default_true")]
@@ -843,6 +929,9 @@ impl ModelGenerationConfig {
             (Some(base), Some(override_generation)) => Some(Self {
                 model: override_generation.model.or(base.model),
                 fallback_model: override_generation.fallback_model.or(base.fallback_model),
+                refusal_fallbacks: override_generation
+                    .refusal_fallbacks
+                    .or(base.refusal_fallbacks),
                 tool_choice: if override_generation.tool_choice == default_generation.tool_choice {
                     base.tool_choice
                 } else {
@@ -903,6 +992,7 @@ impl Default for ModelGenerationConfig {
         Self {
             model: None,
             fallback_model: None,
+            refusal_fallbacks: None,
             tool_choice: ToolChoice::Auto,
             allow_parallel_tool_calls: true,
             max_output_tokens: None,
@@ -980,9 +1070,86 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ModelGenerationConfig, ReasoningConfig, ReasoningEffort, ReasoningSummary,
-        StructuredFieldSchema, extract_json_text, model_context_window, model_max_output_tokens,
+        ModelGenerationConfig, ModelUsage, ModelUsageIteration, ReasoningConfig, ReasoningEffort,
+        ReasoningSummary, RefusalFallbackModel, RefusalFallbacks, StructuredFieldSchema,
+        extract_json_text, model_context_window, model_max_output_tokens,
     };
+
+    #[test]
+    fn refusal_fallbacks_take_the_default_routing_or_a_model_list() {
+        let routing: RefusalFallbacks = serde_json::from_value(json!("default")).expect("default");
+        assert_eq!(routing, RefusalFallbacks::default_routing());
+        let models: RefusalFallbacks = serde_json::from_value(json!([
+            {"model": "claude-opus-4-8"},
+            {"model": "claude-opus-5", "max_tokens": 8000}
+        ]))
+        .expect("models");
+        assert_eq!(
+            models,
+            RefusalFallbacks::Models(vec![
+                RefusalFallbackModel {
+                    model: "claude-opus-4-8".to_string(),
+                    max_tokens: None,
+                },
+                RefusalFallbackModel {
+                    model: "claude-opus-5".to_string(),
+                    max_tokens: Some(8_000),
+                },
+            ])
+        );
+        assert_eq!(
+            serde_json::to_value(&routing).expect("serializes"),
+            json!("default")
+        );
+        assert!(serde_json::from_value::<RefusalFallbacks>(json!("sometimes")).is_err());
+        assert!(
+            serde_json::from_value::<RefusalFallbacks>(json!([{"model": "m", "speed": "fast"}]))
+                .is_err()
+        );
+
+        let merged = ModelGenerationConfig::merge_override(
+            Some(ModelGenerationConfig {
+                refusal_fallbacks: Some(RefusalFallbacks::default_routing()),
+                ..ModelGenerationConfig::default()
+            }),
+            Some(ModelGenerationConfig::default()),
+        )
+        .expect("merged");
+        assert_eq!(
+            merged.refusal_fallbacks,
+            Some(RefusalFallbacks::default_routing())
+        );
+    }
+
+    #[test]
+    fn billed_usage_sums_every_attempt() {
+        let usage = ModelUsage {
+            input_tokens: 412,
+            output_tokens: 264,
+            cost_usd: 0.5,
+            iterations: vec![
+                ModelUsageIteration {
+                    kind: "message".to_string(),
+                    model: Some("claude-fable-5".to_string()),
+                    input_tokens: 535,
+                    ..ModelUsageIteration::default()
+                },
+                ModelUsageIteration {
+                    kind: "fallback_message".to_string(),
+                    model: Some("claude-opus-4-8".to_string()),
+                    input_tokens: 412,
+                    output_tokens: 264,
+                    ..ModelUsageIteration::default()
+                },
+            ],
+            ..ModelUsage::default()
+        };
+        let billed = usage.billed();
+        assert_eq!(billed.input_tokens, 947);
+        assert_eq!(billed.output_tokens, 264);
+        assert!((billed.cost_usd - 0.5).abs() < 1e-12);
+        assert!(billed.iterations.is_empty());
+    }
 
     fn order_schema() -> StructuredFieldSchema {
         StructuredFieldSchema::from_json_schema(&json!({

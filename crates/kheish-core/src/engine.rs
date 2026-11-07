@@ -14,11 +14,11 @@ use kheish_types::{
     PendingToolDecision, PendingUserQuestion, PermissionDecision, PostCompactRestoration,
     PreservedSegment, PromptMessageSnapshot, PromptProjection, PromptSnapshot, PromptTrace,
     ProviderErrorKind, ProviderInputItem, ProviderPrompt, Role, RunMetaSnapshot, RunPolicySnapshot,
-    RunSnapshot, RunStatus, RunTrace, SessionCheckpoint, SessionEvent, SummaryBlock,
-    SystemPromptSection, SystemPromptSectionSnapshot, ToolCallRecord, ToolCallSnapshot, ToolChoice,
-    ToolDefinition, ToolExecutionTrace, ToolResultRecord, ToolResultSnapshot, TurnSnapshot,
-    TurnTrace, UserQuestionRequest, UserQuestionResolution, model_context_window,
-    model_max_output_tokens,
+    RunSnapshot, RunStatus, RunTerminalError, RunTrace, SessionCheckpoint, SessionEvent,
+    SummaryBlock, SystemPromptSection, SystemPromptSectionSnapshot, ToolCallRecord,
+    ToolCallSnapshot, ToolChoice, ToolDefinition, ToolExecutionTrace, ToolResultRecord,
+    ToolResultSnapshot, TurnSnapshot, TurnTrace, UserQuestionRequest, UserQuestionResolution,
+    model_context_window, model_max_output_tokens,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -833,6 +833,15 @@ impl AgentEngine {
                     Err(error) => return Err(error),
                 }
             };
+            if matches!(model_turn.finish_reason, ModelFinishReason::Blocked) {
+                // A final refusal: no fallback served the request. The
+                // declined turn (empty, or a partial answer the provider
+                // withdrew) never enters the history, and the run ends with
+                // a code that carries the refusal's category.
+                return Err(anyhow::Error::new(RunTerminalError::refusal(
+                    model_turn.refusal.clone().unwrap_or_default(),
+                )));
+            }
             let final_message_id = model_turn.assistant_message.id.clone();
             let assistant_message_digest = Self::digest_of(&model_turn.assistant_message)?;
             let stop_reason = model_turn.finish_reason.as_str().to_string();
@@ -3319,6 +3328,7 @@ impl AgentEngine {
             temperature: Some(0.0),
             reasoning: None,
             response_format: kheish_types::ResponseFormat::Text,
+            refusal_fallbacks: None,
         }
     }
 
@@ -3904,6 +3914,7 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new(
@@ -3919,6 +3930,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new(
@@ -3929,6 +3941,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             },
         ]));
 
@@ -4003,6 +4016,7 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new(
@@ -4013,6 +4027,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             },
         ]);
 
@@ -4065,12 +4080,14 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new("assistant-final", Role::Assistant, "Done."),
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             },
         ]);
 
@@ -4141,6 +4158,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: ModelFinishReason::Completed,
             usage: None,
+            refusal: None,
         }]);
 
         let input = InputEnvelope::text(
@@ -4192,6 +4210,7 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new(
@@ -4208,6 +4227,7 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new(
@@ -4224,6 +4244,7 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new(
@@ -4234,6 +4255,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             },
         ]);
 
@@ -4282,6 +4304,7 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new(
@@ -4292,6 +4315,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             },
         ]);
 
@@ -4368,6 +4392,7 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new(
@@ -4378,6 +4403,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             },
         ]);
         let permissions = RecordingPermissionGate::new();
@@ -4455,6 +4481,7 @@ mod tests {
             }],
             finish_reason: ModelFinishReason::ToolCalls,
             usage: None,
+            refusal: None,
         }]);
         let permissions = RecordingPermissionGate::new();
 
@@ -4519,6 +4546,7 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new(
@@ -4529,6 +4557,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             },
         ]);
 
@@ -4583,6 +4612,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new(
@@ -4602,6 +4632,7 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new(
@@ -4612,6 +4643,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             },
         ]);
 
@@ -4694,6 +4726,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: ModelFinishReason::Completed,
             usage: None,
+            refusal: None,
         }
     }
 
@@ -4807,6 +4840,7 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
             text_turn(
                 "assistant-json",
@@ -4908,6 +4942,7 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new(
@@ -4918,6 +4953,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             },
         ]);
 
@@ -4981,6 +5017,7 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new("assistant-write-2", Role::Assistant, ""),
@@ -4996,6 +5033,7 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
         ]);
 
@@ -5029,6 +5067,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_refusal_ends_the_run_with_its_category_and_keeps_the_turn_out() -> Result<()> {
+        let mut engine = AgentEngine::new(
+            ConversationKey {
+                session_id: "session-refusal".to_string(),
+                thread_id: None,
+            },
+            LoopPolicy {
+                max_turns: 3,
+                ..LoopPolicy::default()
+            },
+        );
+        let refusal = kheish_types::ModelRefusal {
+            category: Some("cyber".to_string()),
+            explanation: Some("declined".to_string()),
+            model: Some("claude-opus-5".to_string()),
+        };
+        let model = ScriptedModel::new(vec![ModelTurn {
+            assistant_message: MessageRecord::new("assistant-refused", Role::Assistant, "partial"),
+            tool_calls: vec![ToolCallRecord {
+                id: "call-refused".to_string(),
+                name: "write_file".to_string(),
+                input: json!({"path": "x", "content": "y"}),
+                assistant_message_id: None,
+                assistant_provider_response_id: None,
+            }],
+            finish_reason: ModelFinishReason::Blocked,
+            usage: None,
+            refusal: Some(refusal.clone()),
+        }]);
+        let input = InputEnvelope::text("daemon", "api", "session-refusal", "user-1", "Scan it.");
+
+        let error = engine
+            .run_input(input, &model, &EchoToolExecutor)
+            .await
+            .expect_err("a final refusal ends the run");
+        let terminal = kheish_types::RunTerminalError::find(error.as_ref())
+            .expect("the run error carries its code");
+        assert_eq!(terminal.code, kheish_types::RunErrorCode::ModelRefusal);
+        assert_eq!(terminal.refusal, Some(refusal));
+        assert!(error.to_string().starts_with("model_refusal:"));
+        // Neither the declined answer nor its tool call enters the history.
+        assert!(!engine.journal().iter().any(|entry| matches!(
+            &entry.event,
+            SessionEvent::MessageAppended { message } if message.role == Role::Assistant
+        )));
+        assert!(
+            !engine
+                .journal()
+                .iter()
+                .any(|entry| matches!(&entry.event, SessionEvent::ToolCallStarted { .. }))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn max_tokens_recovery_escalates_then_continues() -> Result<()> {
         let conversation = ConversationKey {
             session_id: "session-3c".to_string(),
@@ -5049,12 +5142,14 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::MaxTokens,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new("assistant-max-2", Role::Assistant, ""),
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::MaxTokens,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new(
@@ -5074,6 +5169,7 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new(
@@ -5084,6 +5180,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             },
         ]);
 
@@ -5232,6 +5329,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             }),
             Err(anyhow!("prompt is too long: 205000 > 200000")),
             Ok(ModelTurn {
@@ -5243,6 +5341,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             }),
         ]);
 
@@ -5298,6 +5397,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             }),
         ]);
 
@@ -5449,6 +5549,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: ModelFinishReason::Completed,
             usage: None,
+            refusal: None,
         })]);
         let checkpoint = engine
             .compact_if_needed(1, &compaction_model)
@@ -5548,6 +5649,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: ModelFinishReason::Completed,
             usage: None,
+            refusal: None,
         })]);
         let restoration = PostCompactRestoration {
             modified_files: vec![kheish_types::FileSnapshot {
@@ -5808,6 +5910,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: ModelFinishReason::Completed,
             usage: None,
+            refusal: None,
         }]);
         let checkpoint = engine
             .compact_if_needed(1, &model)
@@ -5883,6 +5986,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: ModelFinishReason::Completed,
             usage: None,
+            refusal: None,
         }]);
         engine
             .compact_if_needed(1, &model)
@@ -6176,6 +6280,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             }),
         ]);
 

@@ -401,6 +401,13 @@ pub struct RunView {
     /// The terminal or transient error description, when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The machine-readable code of a run that ended on a model condition
+    /// (`model_refusal`, `output_limit_exceeded`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<kheish_types::RunErrorCode>,
+    /// The refusal that ended the run, for `error_code: model_refusal`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<kheish_types::ModelRefusal>,
 }
 
 /// Rebuilds the in-memory pending question index from persisted runs.
@@ -572,6 +579,10 @@ pub enum RunEvent {
     Completed,
     Failed {
         error: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<kheish_types::RunErrorCode>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refusal: Option<kheish_types::ModelRefusal>,
     },
     Interrupted,
     Cancelled,
@@ -799,6 +810,8 @@ mod tests {
                 outputs: Vec::new(),
                 deliveries: Vec::new(),
                 error: None,
+                error_code: None,
+                refusal: None,
             },
             reply_targets: Vec::new(),
             payload: RunRequestPayload::Input {

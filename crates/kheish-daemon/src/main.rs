@@ -8053,6 +8053,7 @@ auth_ref = "openrouter.primary"
             image_edit: None,
             audio_generation: None,
             transcription: None,
+            anthropic_refusal_fallbacks: None,
         };
 
         let home = std::env::var("HOME").expect("HOME should be set for tests");
@@ -8090,6 +8091,7 @@ auth_ref = "openrouter.primary"
             image_edit: None,
             audio_generation: None,
             transcription: None,
+            anthropic_refusal_fallbacks: None,
         };
 
         let error = resolve_route_openai_auth_source(&args, "openrouter", &entry)
@@ -8134,6 +8136,7 @@ auth_ref = "openrouter.primary"
             image_edit: None,
             audio_generation: None,
             transcription: None,
+            anthropic_refusal_fallbacks: None,
         };
 
         let error = resolve_route_openai_auth_source(&args, "openrouter", &entry)
@@ -8193,6 +8196,7 @@ auth_ref = "openrouter.primary"
             image_edit: None,
             audio_generation: None,
             transcription: None,
+            anthropic_refusal_fallbacks: None,
         };
 
         let route = resolve_configured_openai_route(
@@ -8363,6 +8367,7 @@ audio_generation = true
             image_edit: None,
             audio_generation: None,
             transcription: None,
+            anthropic_refusal_fallbacks: None,
         };
 
         let error = resolve_route_anthropic_auth_source(&args, "anthropic-route", &entry)
@@ -8420,6 +8425,7 @@ audio_generation = true
             image_edit: None,
             audio_generation: None,
             transcription: None,
+            anthropic_refusal_fallbacks: None,
         };
 
         let route = resolve_configured_anthropic_route(

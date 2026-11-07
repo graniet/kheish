@@ -362,6 +362,8 @@ where
                 outputs: Vec::new(),
                 deliveries: Vec::new(),
                 error: None,
+                error_code: None,
+                refusal: None,
             },
             reply_targets,
             payload: RunRequestPayload::ObservationMaterialization { request },

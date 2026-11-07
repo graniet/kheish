@@ -368,6 +368,7 @@ pub async fn run_fixture(fixture: ScenarioFixture) -> Result<ScenarioReport> {
                 ),
                 tool_calls: turn.tool_calls.into_iter().map(Into::into).collect(),
                 usage: None,
+                refusal: None,
             })
             .collect(),
     );

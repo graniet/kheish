@@ -500,6 +500,8 @@ where
                     outputs: Vec::new(),
                     deliveries: Vec::new(),
                     error: None,
+                    error_code: None,
+                    refusal: None,
                 },
                 reply_targets: Vec::new(),
                 payload: RunRequestPayload::MailboxDelivery {
@@ -985,6 +987,8 @@ where
                 outputs: Vec::new(),
                 deliveries: Vec::new(),
                 error: None,
+                error_code: None,
+                refusal: None,
             },
             reply_targets,
             payload,
@@ -1285,6 +1289,8 @@ where
                     outputs: Vec::new(),
                     deliveries: Vec::new(),
                     error: None,
+                    error_code: None,
+                    refusal: None,
                 },
                 reply_targets,
                 payload: RunRequestPayload::ParentClarification {
@@ -2203,7 +2209,12 @@ where
                 } else {
                     self.pause_goal_after_permanent_continuation_error(&record.view, &error)
                         .await;
-                    self.fail_run(run_id, error.to_string()).await
+                    let terminal = error
+                        .chain()
+                        .find_map(|source| source.downcast_ref::<kheish_types::RunTerminalError>())
+                        .cloned();
+                    self.fail_run_with(run_id, error.to_string(), terminal)
+                        .await
                 }
             }
         };
@@ -2591,7 +2602,22 @@ where
     }
 
     pub(super) async fn fail_run(self: &Arc<Self>, run_id: &str, error: String) -> Result<()> {
-        let Some(record) = self.run_service.mark_failed(run_id, &error).await? else {
+        self.fail_run_with(run_id, error, None).await
+    }
+
+    /// Fails a run, with the code and details of a run-ending model
+    /// condition when the run's error carries one.
+    pub(super) async fn fail_run_with(
+        self: &Arc<Self>,
+        run_id: &str,
+        error: String,
+        terminal: Option<kheish_types::RunTerminalError>,
+    ) -> Result<()> {
+        let Some(record) = self
+            .run_service
+            .mark_failed(run_id, &error, terminal.as_ref())
+            .await?
+        else {
             return Ok(());
         };
         let session_id = record.view.session_id.clone();
@@ -2608,6 +2634,8 @@ where
             &record.view,
             RunEvent::Failed {
                 error: error.clone(),
+                code: record.view.error_code,
+                refusal: record.view.refusal.clone(),
             },
         )?;
         self.sync_project_tasks_for_run_or_warn(&record.view, "fail_run")

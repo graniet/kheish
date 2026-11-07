@@ -1463,6 +1463,7 @@ pub(crate) async fn resolve_configured_anthropic_route(
         provider.anthropic_version = version;
     }
     provider.beta_headers = entry.anthropic_beta_headers.clone();
+    provider.refusal_fallbacks = entry.anthropic_refusal_fallbacks.clone();
     Ok(
         ConfiguredModelRoute::new(route_id.to_string(), ModelRouteConfig::Anthropic(provider))
             .with_auth_ref(auth_ref)

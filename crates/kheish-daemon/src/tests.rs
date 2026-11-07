@@ -20926,6 +20926,8 @@ async fn daemon_boot_ignores_stale_terminal_run_when_newer_run_is_non_terminal()
             outputs: Vec::new(),
             deliveries: Vec::new(),
             error: None,
+            error_code: None,
+            refusal: None,
         },
         reply_targets: Vec::new(),
         payload: RunRequestPayload::Input {
@@ -24261,6 +24263,8 @@ async fn daemon_restores_running_mailbox_runs_after_restart() -> Result<()> {
             outputs: Vec::new(),
             deliveries: Vec::new(),
             error: None,
+            error_code: None,
+            refusal: None,
         },
         reply_targets: Vec::new(),
         payload: RunRequestPayload::MailboxDelivery {
@@ -28347,6 +28351,8 @@ async fn daemon_does_not_repair_session_mapping_from_run_with_unknown_agent() ->
             outputs: Vec::new(),
             deliveries: Vec::new(),
             error: None,
+            error_code: None,
+            refusal: None,
         },
         reply_targets: Vec::new(),
         payload: RunRequestPayload::Input {
@@ -28378,6 +28384,8 @@ async fn daemon_does_not_repair_session_mapping_from_run_with_unknown_agent() ->
             outputs: Vec::new(),
             deliveries: Vec::new(),
             error: None,
+            error_code: None,
+            refusal: None,
         },
         reply_targets: Vec::new(),
         payload: RunRequestPayload::Input {
@@ -30601,6 +30609,8 @@ async fn daemon_run_endpoint_does_not_read_outside_run_root_for_hostile_run_ids(
                 outputs: Vec::new(),
                 deliveries: Vec::new(),
                 error: None,
+                error_code: None,
+                refusal: None,
             },
             reply_targets: Vec::new(),
             payload: RunRequestPayload::Input {

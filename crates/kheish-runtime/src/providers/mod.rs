@@ -51,3 +51,21 @@ pub use xai::{
     XAiImageEditor, XAiImageGenerator, XAiProvider, XAiProviderConfig, resolve_xai_image_model,
     resolve_xai_model,
 };
+
+/// Rejects generation options only the Anthropic driver honors, so a run that
+/// sets one on another route fails instead of silently losing it.
+pub(crate) fn reject_anthropic_only_generation(
+    generation: &crate::model::ModelGenerationConfig,
+    provider: &str,
+) -> Result<(), crate::model::ProviderError> {
+    if generation.refusal_fallbacks.is_some() {
+        return Err(crate::model::ProviderError {
+            message: format!(
+                "{provider} routes do not support refusal_fallbacks; it is an Anthropic route option"
+            ),
+            retryable: false,
+            retry_after_ms: None,
+        });
+    }
+    Ok(())
+}

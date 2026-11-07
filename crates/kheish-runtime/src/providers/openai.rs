@@ -366,6 +366,7 @@ impl OpenAiProvider {
         request: &ModelRuntimeRequest,
         codex_compat: bool,
     ) -> Result<Value, ProviderError> {
+        super::reject_anthropic_only_generation(&request.generation, self.display_name())?;
         let normalized = normalize_provider_prompt(&request.prompt);
         let effective_model = request
             .generation
@@ -3700,6 +3701,7 @@ mod tests {
                                 items: None,
                             },
                         },
+                        refusal_fallbacks: None,
                     },
                 },
                 ModelEventSink::new(sender),
