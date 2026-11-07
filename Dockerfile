@@ -5,6 +5,8 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY routes.default.toml ./routes.default.toml
+# The daemon embeds docs/ at build time (include_dir!).
+COPY docs ./docs
 
 RUN cargo build --locked --release -p kheish-daemon
 
