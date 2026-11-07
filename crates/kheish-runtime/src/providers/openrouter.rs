@@ -429,6 +429,7 @@ impl OpenRouterProvider {
 
     fn build_request_body(&self, request: &ModelRuntimeRequest) -> Result<Value, ProviderError> {
         let normalized = normalize_provider_prompt(&request.prompt);
+        super::reject_anthropic_only_generation(&request.generation, "OpenRouter")?;
         let effective_model = request
             .generation
             .model
@@ -764,7 +765,8 @@ impl ModelProvider for OpenRouterProvider {
                 .clone()
                 .unwrap_or_else(|| self.config.base_url.clone());
             let body = self.build_request_body(&request)?;
-            let headers = self.headers_from_material(&auth_material)?;
+            let mut headers = self.headers_from_material(&auth_material)?;
+            super::insert_execution_context_headers(&mut headers, &request.session_id)?;
             self.ensure_auth_material_active(&auth_material).await?;
             self.record_provider_request(&request, &endpoint, &headers, &body, grant_id.clone())?;
             let response = match self
@@ -1466,6 +1468,7 @@ fn parse_usage(usage: &Value) -> kheish_types::ModelUsage {
         input_tokens,
         output_tokens,
         cost_usd,
+        ..Default::default()
     }
 }
 
@@ -4752,5 +4755,62 @@ mod tests {
             headers: vec![("Content-Type".to_string(), "application/json".to_string())],
             body: serde_json::to_vec(&body).expect("json body"),
         }
+    }
+
+    #[tokio::test]
+    async fn openrouter_requests_carry_the_execution_scope_session_and_run() -> Result<()> {
+        let stream = concat!(
+            "data: {\"id\":\"gen-scope\",\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, captured) = spawn_mock_server(vec![MockResponse {
+            status: 200,
+            headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+            body: stream.as_bytes().to_vec(),
+        }])
+        .await?;
+        let mut config = OpenRouterProviderConfig::new("openai/gpt-test", "test-key");
+        config.base_url = format!("{base_url}/chat/completions");
+        let provider = OpenRouterProvider::new(config)?;
+        let scope = ExecutionScope {
+            session_id: "session-openrouter".to_string(),
+            run_id: Some("run-openrouter".to_string()),
+            ..ExecutionScope::default()
+        };
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        scope_execution(
+            scope,
+            tokio_util::sync::CancellationToken::new(),
+            provider.stream(
+                ModelRuntimeRequest {
+                    attempt: 1,
+                    kind: kheish_core::ModelRequestKind::MainLoop,
+                    session_id: "session-openrouter".to_string(),
+                    thread_id: None,
+                    turn: 1,
+                    prompt: ProviderPrompt::default(),
+                    available_tools: Vec::new(),
+                    generation: ModelGenerationConfig::default(),
+                },
+                ModelEventSink::new(sender),
+            ),
+        )
+        .await?;
+        let captured = captured.lock().clone();
+        assert_eq!(
+            captured[0]
+                .headers
+                .get("x-kheish-session-id")
+                .map(String::as_str),
+            Some("session-openrouter")
+        );
+        assert_eq!(
+            captured[0]
+                .headers
+                .get("x-kheish-run-id")
+                .map(String::as_str),
+            Some("run-openrouter")
+        );
+        Ok(())
     }
 }

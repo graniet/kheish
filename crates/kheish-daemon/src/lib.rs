@@ -218,11 +218,10 @@ pub use projects::{
 pub use route_auth::ScopedRequestAuthProvider;
 pub use runs::{
     ChannelDeliveryRunRequest, DaemonRunKind, DaemonRunStatus, FileRunStore,
-    ParentClarificationRunRequest, RUN_ERROR_DEADLINE_EXCEEDED, RUN_ERROR_MAX_TURNS_EXCEEDED,
-    RunEvent, RunEventEntry, RunLimits, RunRecord, RunRequestPayload, RunRequestSummary, RunView,
-    SessionRunState, now_ms, rebuild_session_run_state, run_error_code_for_failure,
-    summarize_approval_request, summarize_channel_delivery_request, summarize_input_request,
-    summarize_mailbox_request, summarize_parent_clarification_request,
+    ParentClarificationRunRequest, RunEvent, RunEventEntry, RunLimits, RunRecord,
+    RunRequestPayload, RunRequestSummary, RunView, SessionRunState, now_ms,
+    rebuild_session_run_state, summarize_approval_request, summarize_channel_delivery_request,
+    summarize_input_request, summarize_mailbox_request, summarize_parent_clarification_request,
     summarize_user_question_request,
 };
 pub use scheduler::{

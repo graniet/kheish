@@ -1,4 +1,5 @@
 mod capabilities;
+mod claude;
 mod compaction;
 mod hooks;
 mod interaction;
@@ -7,12 +8,17 @@ mod memory;
 mod model;
 mod prompt;
 mod routing;
+mod run_error;
 mod session;
 mod skills;
 mod tools;
 
 pub use capabilities::{
     CapabilityScope, CredentialScope, PersonaSkillAssignment, allow_list_allows_entry,
+};
+pub use claude::{
+    ClaudeModelFamily, ClaudeModelId, claude_context_window, claude_max_output_tokens,
+    parse_claude_model_id,
 };
 pub use compaction::{
     CompactBoundaryMetadata, CompactionBoundary, CompactionStrategy, CompactionTrigger,
@@ -45,8 +51,9 @@ pub use model::{
     ApiUsage, CAPPED_DEFAULT_MAX_OUTPUT_TOKENS, COMPLETION_REQUIREMENTS_METADATA_KEY,
     CompletionRequirement, DEFAULT_OUTPUT_CONTRACT_REPAIR_ATTEMPTS, ESCALATED_MAX_OUTPUT_TOKENS,
     MAX_OUTPUT_CONTRACT_REPAIR_ATTEMPTS, ModelFinishReason, ModelGenerationConfig,
-    ModelMaxOutputTokens, ModelProviderError, ModelUsage, ProviderErrorKind,
-    RUN_MAX_TURNS_METADATA_KEY, ReasoningConfig, ReasoningEffort, ReasoningSummary, ResponseFormat,
+    ModelMaxOutputTokens, ModelProviderError, ModelUsage, ModelUsageIteration, ProviderErrorKind,
+    RUN_MAX_TURNS_METADATA_KEY, ReasoningConfig, ReasoningEffort, ReasoningSummary,
+    RefusalFallbackModel, RefusalFallbackRouting, RefusalFallbacks, ResponseFormat,
     STRUCTURED_OUTPUT_CONTRACT_METADATA_KEY, StructuredFieldSchema, StructuredInputContract,
     StructuredOutputContract, StructuredValueKind, ToolChoice, capped_default_max_output_tokens,
     classify_provider_error_message, completion_requirements_from_metadata, extract_json_text,
@@ -61,6 +68,7 @@ pub use routing::{
     ReplyHandle, RichOutput, SourceRef, asset_storage_uri, normalize_reply_targets,
     parse_asset_storage_uri, render_content_parts_text, render_document_attachment_text,
 };
+pub use run_error::{ModelRefusal, RunErrorCode, RunTerminalError};
 pub use session::{
     AFFINITY_CUE_THRESHOLD, AFFINITY_DECAY_HALF_LIFE_MS, AFFINITY_DRIFT_STEP, AFFINITY_TAB_TTL_MS,
     AffinityDrift, AffinityEdge, AffinityImpression, AffinityOpenTab, AffinityStanding,
@@ -135,7 +143,13 @@ mod tests {
 
     #[test]
     fn model_context_window_matches_supported_provider_families() {
-        assert_eq!(model_context_window("claude-opus-4-6"), Some(200_000));
+        // Claude 4.6 and later generations serve a 1M-token window.
+        assert_eq!(model_context_window("claude-opus-4-6"), Some(1_000_000));
+        assert_eq!(model_context_window("claude-opus-5-5"), Some(1_000_000));
+        assert_eq!(
+            model_max_output_tokens("claude-opus-5-5").upper_limit,
+            128_000
+        );
         assert_eq!(model_context_window("claude-sonnet-4-5"), Some(200_000));
         assert_eq!(model_context_window("gpt-5.4"), Some(400_000));
         assert_eq!(model_context_window("gpt-4.1"), Some(1_047_576));

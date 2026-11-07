@@ -1,8 +1,10 @@
 //! Provider adapters that map semantic Kheish requests onto concrete model APIs.
 
 mod anthropic;
+mod anthropic_models;
 mod attachments;
 mod errors;
+mod execution_headers;
 mod google;
 mod openai;
 mod openrouter;
@@ -15,7 +17,10 @@ mod testsupport;
 mod transcription;
 mod xai;
 
-pub use anthropic::{AnthropicPricing, AnthropicProvider, AnthropicProviderConfig};
+pub use anthropic::{AnthropicProvider, AnthropicProviderConfig};
+pub use anthropic_models::AnthropicPricing;
+pub(crate) use execution_headers::insert_execution_context_headers;
+pub use execution_headers::{KHEISH_RUN_ID_HEADER, KHEISH_SESSION_ID_HEADER};
 pub use google::{
     GoogleGeneratedImage, GoogleImageEditInput, GoogleImageEditRequest, GoogleImageEditor,
     GoogleImageGenerationRequest, GoogleImageGenerationResponse, GoogleImageGenerator,
@@ -46,3 +51,21 @@ pub use xai::{
     XAiImageEditor, XAiImageGenerator, XAiProvider, XAiProviderConfig, resolve_xai_image_model,
     resolve_xai_model,
 };
+
+/// Rejects generation options only the Anthropic driver honors, so a run that
+/// sets one on another route fails instead of silently losing it.
+pub(crate) fn reject_anthropic_only_generation(
+    generation: &crate::model::ModelGenerationConfig,
+    provider: &str,
+) -> Result<(), crate::model::ProviderError> {
+    if generation.refusal_fallbacks.is_some() {
+        return Err(crate::model::ProviderError {
+            message: format!(
+                "{provider} routes do not support refusal_fallbacks; it is an Anthropic route option"
+            ),
+            retryable: false,
+            retry_after_ms: None,
+        });
+    }
+    Ok(())
+}

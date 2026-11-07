@@ -1,0 +1,202 @@
+---
+title: Model providers and routes
+description: What Kheish sends to model providers, route settings per driver, and the Anthropic Messages API request shape.
+---
+
+# Model providers and routes
+
+A route names one provider driver (`anthropic`, `openai`, `google`, `openrouter`, `xai`), its
+default model, its credential, and its endpoint. Routes come from the routes file passed to
+`serve --routes-file` or from the runtime route API; runs pick one with the `provider` field of
+their request, the session's route policy, or the daemon's `default_route` (see
+[Sessions and runs API](./sessions-and-runs-api#route-policy)).
+
+```toml
+# routes.toml
+version = 1
+default_route = "anthropic"
+
+[routes.anthropic]
+driver = "anthropic"
+default_model = "claude-opus-5-5"
+auth_ref = "anthropic.prod"
+# Optional: a gateway in front of the Messages API, posted to as-is.
+# base_url = "https://gateway.internal/v1/messages"
+# Optional: retry a request the model declines on another model, within the
+# same call: "default" routing, or up to three models tried in order.
+anthropic_refusal_fallbacks = "default"
+# anthropic_refusal_fallbacks = [{ model = "claude-opus-5" }, { model = "claude-opus-4-8", max_tokens = 8000 }]
+```
+
+Anthropic route settings:
+
+| Field | Meaning |
+|---|---|
+| `anthropic_version` | The `anthropic-version` header (default `2023-06-01`) |
+| `anthropic_beta_headers` | Extra `anthropic-beta` values sent on every request |
+| `anthropic_refusal_fallbacks` | The route's default refusal fallbacks (see [Refusal fallback](#refusal-fallback)); a run's `generation.refusal_fallbacks` overrides it |
+
+## Execution-context headers
+
+Every model request Kheish sends, on every driver, carries two headers that name the execution it
+belongs to:
+
+| Header | Value |
+|---|---|
+| `x-kheish-session-id` | The session whose run issued the request. |
+| `x-kheish-run-id` | The daemon run that issued the request. Absent when the request belongs to no daemon run (a CLI turn). |
+
+Kheish sets both from the runtime's execution scope, never from model output or tool arguments, and
+they replace any header of the same name the route's auth material carries. The values go in
+headers only; the request body, and so the model, never sees them. A gateway in front of the
+provider (a model relay that holds the real provider key, for example) can therefore authorize each
+request against the session and run it belongs to, and account for it.
+
+Compaction summaries and every retry of a model attempt carry the same headers as the run's turns.
+
+## Anthropic driver
+
+The `anthropic` driver speaks the Messages API over streaming HTTP. It recognizes a model by its
+family and version through every platform spelling: first-party ids (`claude-opus-5-5`), Amazon
+Bedrock ids (`anthropic.claude-opus-5-5`, `us.anthropic.claude-sonnet-5-5-v1:0`), Google Vertex AI
+snapshots (`claude-opus-4-5@20251101`) and context variants (`claude-opus-4-6[1m]`).
+
+### Thinking and effort
+
+Each generation takes thinking in one of three shapes:
+
+| Generations | Request shape | When the run sets no reasoning |
+|---|---|---|
+| Claude Opus 5.5, Claude Opus 5, Claude Fable 5.1 and 5, Claude Mythos 5.1 and 5, Claude Sonnet 5.5 and 5, Claude Haiku 5.5, and later 5.x releases | `thinking: {"type": "adaptive"}` with `output_config.effort`. `budget_tokens` and sampling parameters (`temperature`) are never sent: these models return a 400 for them. | `thinking` is omitted; the model still thinks, at its default effort (`medium` on Claude Opus 5.5 and Claude Haiku 5.5, `high` elsewhere). |
+| Claude Opus 4.8 and 4.7 | Adaptive thinking with `output_config.effort`, only when the run asks for reasoning. No `budget_tokens`, no sampling parameters. | No thinking. |
+| Claude Opus 4.6, Claude Sonnet 4.6, and earlier | `thinking: {"type": "enabled", "budget_tokens": N}`, sampling parameters allowed. | No thinking. |
+
+`generation.reasoning.effort` maps onto the adaptive ladder:
+
+| `reasoning.effort` | `output_config.effort` |
+|---|---|
+| `none` | `low` on the 5.x generations, whose thinking cannot be turned off; no thinking on Claude Opus 4.8 and 4.7 |
+| `minimal`, `low` | `low` |
+| `medium` | `medium` |
+| `high` | `high` |
+| `xhigh` | `xhigh` |
+| `max` | `max` |
+
+A `reasoning.budget_tokens` sent to an adaptive generation is folded onto the nearest rung (up to
+2,048 `low`, up to 4,096 `medium`, up to 8,192 `high`, up to 32,768 `xhigh`, above that `max`).
+`reasoning.summary` asks for `thinking.display: "summarized"`. On budget generations the effort
+picks a budget (`minimal` 1,024, `low` 2,048, `medium` 4,096, `high` 8,192, `xhigh` and `max`
+32,768), and `reasoning.interleaved` adds the `interleaved-thinking-2025-05-14` beta; adaptive
+thinking interleaves on its own and gets no such header.
+
+Thinking that is always on rules out forced tool use: on the 5.x generations a run whose
+`generation.tool_choice` is `required` or `specific` fails before the request is sent. Use `auto`.
+
+Kheish also knows each current generation's limits: a 1M-token context window and 128K output
+tokens on Claude Opus 4.6 and later, Claude Sonnet 4.6 and later, and every 5.x generation.
+
+### Prompt caching
+
+Every Messages API request carries three prompt-cache breakpoints (the default 5-minute cache):
+
+- the system prompt, sent as one text block with `cache_control: {"type": "ephemeral"}`; it caches
+  the tools rendered before it as well;
+- the last tool, so the tool prefix still hits when the system prompt changes;
+- the request's top-level `cache_control`, the API's automatic caching of the conversation tail.
+
+The tools are sorted by name, so the cached prefix renders the same bytes on every turn whatever
+order the runtime lists them in. A prompt shorter than the model's minimum cacheable length (512
+tokens on the 5.x generations) is simply not cached.
+
+### Usage and cost
+
+Model usage (`api_usage` on assistant messages, the runtime's model budget counters) carries the
+Messages API counts:
+
+| Field | Meaning |
+|---|---|
+| `input_tokens` | Prompt tokens billed at the full input rate |
+| `cache_creation_input_tokens` | Prompt tokens written to the prompt cache |
+| `cache_read_input_tokens` | Prompt tokens read from the prompt cache |
+| `output_tokens` | Output tokens, thinking included |
+| `cost_usd` | The request's cost, each count at its own rate |
+
+`message_start` reports the prompt counts and `message_delta` the output count, so the driver
+merges the two. The context the request carried is the sum of the three prompt counts; Kheish's
+compaction threshold and goal token accounting use that sum, not `input_tokens` alone.
+
+Costs use the model's published first-party price (5-minute cache writes at 1.25 times the input
+price, 1-hour writes at twice it, reads at 0.1 times it, except 0.025 times on Claude Fable 5.1
+and Claude Mythos 5.1 and 0.05 times on Claude Opus 5.5 and Claude Sonnet 5.5; Claude Haiku 5.5
+switches to its long-prompt prices above 100,000 prompt tokens). A route's `pricing` override, when
+an embedder sets one, replaces the price of the model the request names. A model without a published
+price is counted at zero cost.
+
+### Preserved thinking
+
+On Claude Fable 5.1, Claude Mythos 5.1, Claude Opus 5.5, Claude Sonnet 5.5 and Claude Haiku 5.5
+(and later 5.x ids) each thinking block's signature binds it to the conversation before it: the
+system prompt, the tools, and every earlier message. The driver keeps that conversation intact:
+
+- **Replay.** An answer's content blocks are recorded in the order the API returned them, in the
+  assistant message's provider context (`anthropic.content_blocks`): thinking and redacted
+  thinking blocks verbatim, signature included even when the thinking text is empty (the default
+  `display: "omitted"`), text by value, tool uses by id. The next request rebuilds the assistant
+  turn in that order, so a thinking block between two tool uses stays there.
+- **Edits.** Kheish edits an earlier part of the history in a few places: compaction, snip and
+  microcompact rewrite or remove earlier turns (the thinking of the turns before the latest
+  boundary is left out as a contiguous leading run, which the API accepts), and after a restart
+  an orphaned tool call gets a synthetic error result. Once an edit is in a session, every later
+  request replays it. Every request to these models therefore sends the binding control:
+
+  ```json
+  "thinking": {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "drop_block"}}
+  ```
+
+  with the `thinking-binding-controls-2026-08-01` beta. The field is set explicitly because its
+  default depends on the account's age (accounts created on or after 2026-08-31 are enforced with
+  `error` by default; older accounts let a stale block through). With `drop_block` a block that no
+  longer verifies is dropped and the request proceeds, instead of the run failing with a 400.
+- **Monitoring.** The response's `input_transformations` (each dropped block, with its `path` and
+  `reason`) is logged as a warning and kept in the assistant message's provider context
+  (`anthropic.input_transformations`).
+
+The models without the conversation check (Claude Opus 5, Claude Fable 5, Claude Sonnet 5, Claude
+Opus 4.8 and earlier) get neither the field nor the beta.
+
+### Refusal fallback
+
+The 5.x generations run safety classifiers that can decline a request: an HTTP 200 whose
+`stop_reason` is `refusal`, with a `stop_details` category such as `cyber` or `bio`. With refusal
+fallbacks configured (the route's `anthropic_refusal_fallbacks`, or the run's
+`generation.refusal_fallbacks`), the request names them and the API retries a declined request on
+another model inside the same call:
+
+```json
+{"model": "claude-opus-5-5", "fallbacks": "default", "...": "..."}
+{"model": "claude-opus-5-5", "fallbacks": [{"model": "claude-opus-5"}, {"model": "claude-opus-4-8", "max_tokens": 8000}], "...": "..."}
+```
+
+with the `server-side-fallback-2026-07-01` beta. `"default"` picks Anthropic's recommended model for
+the refusal's category; a list (one to three distinct models, none of them the requested one) is
+tried in order, each entry bounding its own output with an optional `max_tokens`. The field is sent
+only to models that take it: Claude Sonnet 5.5 takes only `"default"`, and Claude Haiku 5.5, Claude
+Opus 4.8 and earlier get no `fallbacks` (a request for them runs without).
+
+When a fallback served the turn:
+
+- **Content.** A `fallback` block (`from`, `to`, `trigger`) marks each point where a declining
+  model's output gave way. The declining attempt's text stays in the answer; its thinking and tool
+  uses are withdrawn: those tool calls never run. The answer replays on the next turn with the text
+  and every `fallback` block where they appeared (the API uses the marker's position to validate the
+  thinking around it), and the serving model's blocks after them.
+- **Usage.** `usage.iterations` lists every attempt (`message` for a declining one,
+  `fallback_message` for the one that answered) with its model and token counts. Each attempt is
+  priced at its own model's rates in `iterations[].cost_usd`, and the turn's `cost_usd` is their sum.
+  The top-level token counts describe the answering attempt, as the API reports them; the runtime's
+  model budget counters add up every attempt.
+
+A final refusal (no fallback configured, the model takes none, or every model declined) ends the run
+`failed` with `error_code: "model_refusal"` and the refusal's `category`, `explanation` and model in
+`RunView.refusal`. The declined turn, empty or partial, is not kept in the session history. See
+[Sessions and runs API](./sessions-and-runs-api#run-error-codes).

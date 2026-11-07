@@ -112,6 +112,9 @@ Use the dedicated reference pages below instead of treating this page as the ful
   - `/v1/runtime/debug-level`
   - `/v1/runtime/connectors/external/metrics`
   - `/v1/events/stream`
+- [Model providers and routes](./model-providers) for:
+  - route drivers and routes-file settings
+  - the execution-context headers every model request carries
 - [Channels API](./channels-api) for:
   - `/v1/channels`
   - channel members
@@ -180,6 +183,28 @@ Use the dedicated reference pages below instead of treating this page as the ful
   - session persona binding endpoints
 - [Skills API](./skills-api) for:
   - `/v1/skills`
+
+## Run requests and model conditions
+
+`POST /v1/sessions/{session_id}/runs` and `/input` take run-scoped `generation` options (the full list is in
+[Sessions and runs API](./sessions-and-runs-api#route-policy)). The ones that shape the model request on
+current Claude models:
+
+- `generation.reasoning.effort`: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`
+  ([mapping](./model-providers#thinking-and-effort));
+- `generation.refusal_fallbacks`: `"default"` or up to three `{ "model", "max_tokens" }`, the models an
+  Anthropic route retries a declined request on ([refusal fallback](./model-providers#refusal-fallback));
+- `generation.retry_max_tokens`: the output cap of the one retry a turn cut off at
+  `max_output_tokens` gets ([output limit](./sessions-and-runs-api#output-limit)).
+
+`POST /v1/sessions/{session_id}/runs` also takes run limits, `max_turns` and `max_duration_ms`
+([run limits](./sessions-and-runs-api#run-limits)).
+
+A run that ends on a model condition or past one of its limits carries a machine-readable
+`RunView.error_code`: `model_refusal` (with `RunView.refusal`), `output_limit_exceeded` and
+`max_turns_exceeded` end it `failed`, `deadline_exceeded` ends it `cancelled`. The same code is on its
+terminal run event (`failed` or `cancelled`, field `code`) and its last `run_updated`; see
+[run error codes](./sessions-and-runs-api#run-error-codes).
 
 ## Route groups at a glance
 

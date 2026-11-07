@@ -139,6 +139,8 @@ pub enum ModelStreamEvent {
     /// Provider-native context that should be retained with the assistant
     /// message and replayed by the same provider on later turns.
     ProviderContext { value: Value },
+    /// Why the model declined the request, sent before a `Blocked` stop.
+    Refusal { refusal: kheish_types::ModelRefusal },
     /// A terminal stop reason.
     Stop { reason: ModelFinishReason },
 }
@@ -315,6 +317,7 @@ where
             let mut structured_output = None;
             let mut provider_context = None;
             let mut finish_reason = None;
+            let mut refusal = None;
             let deadline =
                 tokio::time::Instant::now() + Duration::from_millis(self.retry.stream_timeout_ms);
 
@@ -342,6 +345,7 @@ where
                                     &mut structured_output,
                                     &mut provider_context,
                                     &mut finish_reason,
+                                    &mut refusal,
                                 );
                                 if finish_reason.is_some() {
                                     break Ok(());
@@ -385,6 +389,7 @@ where
                         &mut structured_output,
                         &mut provider_context,
                         &mut finish_reason,
+                        &mut refusal,
                     );
                 }
             }
@@ -460,6 +465,7 @@ where
                         tool_calls,
                         finish_reason: resolved_finish_reason,
                         usage: Some(usage),
+                        refusal,
                     });
                 }
                 Err(error) if error.retryable && attempt < self.retry.max_attempts => {
@@ -542,7 +548,7 @@ where
 impl<P> ModelRuntime<P> {
     fn consume_budget(&self, usage: &ModelUsage) -> Result<()> {
         let mut consumed = self.consumed.lock();
-        accumulate_usage(&mut consumed, usage);
+        accumulate_usage(&mut consumed, &usage.billed());
         if self
             .budget
             .max_total_output_tokens
@@ -707,6 +713,7 @@ fn apply_stream_event(
     structured_output: &mut Option<Value>,
     provider_context: &mut Option<Value>,
     finish_reason: &mut Option<ModelFinishReason>,
+    refusal: &mut Option<kheish_types::ModelRefusal>,
 ) {
     match event {
         ModelStreamEvent::MessageId { value } => *message_id = Some(value),
@@ -717,6 +724,7 @@ fn apply_stream_event(
         ModelStreamEvent::ProviderContext { value } => {
             merge_provider_context(provider_context, value);
         }
+        ModelStreamEvent::Refusal { refusal: reported } => *refusal = Some(reported),
         ModelStreamEvent::Stop { reason } => *finish_reason = Some(reason),
     }
 }
@@ -737,13 +745,13 @@ fn merge_provider_context(target: &mut Option<Value>, update: Value) {
 fn accumulate_usage(target: &mut ModelUsage, delta: &ModelUsage) {
     target.input_tokens += delta.input_tokens;
     target.output_tokens += delta.output_tokens;
+    target.cache_creation_input_tokens += delta.cache_creation_input_tokens;
+    target.cache_read_input_tokens += delta.cache_read_input_tokens;
     target.cost_usd += delta.cost_usd;
 }
 
 fn replace_usage(target: &mut ModelUsage, snapshot: &ModelUsage) {
-    target.input_tokens = snapshot.input_tokens;
-    target.output_tokens = snapshot.output_tokens;
-    target.cost_usd = snapshot.cost_usd;
+    *target = snapshot.clone();
 }
 
 fn parse_max_tokens_context_overflow_adjustment(message: &str) -> Option<u32> {
@@ -905,6 +913,7 @@ mod tests {
                         input_tokens: 1,
                         output_tokens: 2,
                         cost_usd: 0.1,
+                        ..Default::default()
                     },
                 },
             ]),
@@ -1074,6 +1083,7 @@ mod tests {
                             input_tokens: 1,
                             output_tokens: 2,
                             cost_usd: 0.1,
+                            ..Default::default()
                         },
                     },
                 ]),
@@ -1255,6 +1265,7 @@ mod tests {
                         input_tokens: 2,
                         output_tokens: 3,
                         cost_usd: 0.1,
+                        ..Default::default()
                     },
                 },
                 ModelStreamEvent::Usage {
@@ -1262,6 +1273,7 @@ mod tests {
                         input_tokens: 2,
                         output_tokens: 5,
                         cost_usd: 0.2,
+                        ..Default::default()
                     },
                 },
                 ModelStreamEvent::TextDelta {

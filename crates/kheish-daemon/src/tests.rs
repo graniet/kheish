@@ -17975,7 +17975,7 @@ async fn daemon_concurrent_cancel_is_idempotent_for_waiting_runs() -> Result<()>
         .await?;
     let cancelled_events = events
         .iter()
-        .filter(|entry| matches!(entry.event, RunEvent::Cancelled))
+        .filter(|entry| matches!(entry.event, RunEvent::Cancelled { .. }))
         .count();
     assert_eq!(
         cancelled_events,
@@ -18128,7 +18128,7 @@ async fn daemon_concurrent_cancel_and_approval_resume_settle_once() -> Result<()
     assert_eq!(
         events
             .iter()
-            .filter(|entry| matches!(entry.event, RunEvent::Cancelled))
+            .filter(|entry| matches!(entry.event, RunEvent::Cancelled { .. }))
             .count(),
         1,
         "cancel/resume race should record one terminal event: {events:#?}"
@@ -18302,7 +18302,7 @@ async fn daemon_user_question_resume_then_cancel_survives_restart_with_final_eve
                 RunEvent::Completed
                     | RunEvent::Failed { .. }
                     | RunEvent::Interrupted
-                    | RunEvent::Cancelled
+                    | RunEvent::Cancelled { .. }
             )
         })
         .collect::<Vec<_>>();
@@ -18312,13 +18312,13 @@ async fn daemon_user_question_resume_then_cancel_survives_restart_with_final_eve
         "question cancel/resume restart race should record one terminal event: {events:#?}"
     );
     assert!(
-        matches!(terminal_events[0].event, RunEvent::Cancelled),
+        matches!(terminal_events[0].event, RunEvent::Cancelled { .. }),
         "terminal event should match final cancelled state: {events:#?}"
     );
     assert!(
         matches!(
             events.last().map(|entry| &entry.event),
-            Some(RunEvent::Cancelled)
+            Some(RunEvent::Cancelled { code: None })
         ),
         "last repaired event should match final cancelled state: {events:#?}"
     );
@@ -20930,6 +20930,7 @@ async fn daemon_boot_ignores_stale_terminal_run_when_newer_run_is_non_terminal()
             deliveries: Vec::new(),
             error: None,
             error_code: None,
+            refusal: None,
             limits: None,
         },
         reply_targets: Vec::new(),
@@ -24267,6 +24268,7 @@ async fn daemon_restores_running_mailbox_runs_after_restart() -> Result<()> {
             deliveries: Vec::new(),
             error: None,
             error_code: None,
+            refusal: None,
             limits: None,
         },
         reply_targets: Vec::new(),
@@ -28355,6 +28357,7 @@ async fn daemon_does_not_repair_session_mapping_from_run_with_unknown_agent() ->
             deliveries: Vec::new(),
             error: None,
             error_code: None,
+            refusal: None,
             limits: None,
         },
         reply_targets: Vec::new(),
@@ -28388,6 +28391,7 @@ async fn daemon_does_not_repair_session_mapping_from_run_with_unknown_agent() ->
             deliveries: Vec::new(),
             error: None,
             error_code: None,
+            refusal: None,
             limits: None,
         },
         reply_targets: Vec::new(),
@@ -30613,6 +30617,7 @@ async fn daemon_run_endpoint_does_not_read_outside_run_root_for_hostile_run_ids(
                 deliveries: Vec::new(),
                 error: None,
                 error_code: None,
+                refusal: None,
                 limits: None,
             },
             reply_targets: Vec::new(),
@@ -36755,7 +36760,7 @@ async fn daemon_question_cancel_clears_pending_and_unblocks_next_input() -> Resu
     assert!(
         events
             .iter()
-            .any(|entry| matches!(entry.event, RunEvent::Cancelled))
+            .any(|entry| matches!(entry.event, RunEvent::Cancelled { .. }))
     );
 
     let next_run = client

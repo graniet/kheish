@@ -3956,7 +3956,7 @@ pub async fn run_session_run_idempotency_and_events_scenario(
                 RunEvent::Completed
                     | RunEvent::Failed { .. }
                     | RunEvent::Interrupted
-                    | RunEvent::Cancelled
+                    | RunEvent::Cancelled { .. }
             )
         })
         .count();

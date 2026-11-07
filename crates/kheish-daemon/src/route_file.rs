@@ -127,6 +127,10 @@ pub struct RouteFileEntry {
     pub anthropic_version: Option<String>,
     #[serde(default)]
     pub anthropic_beta_headers: Vec<String>,
+    /// The models the Messages API retries a declined request on:
+    /// `"default"` or a list of `{ model, max_tokens }`.
+    #[serde(default)]
+    pub anthropic_refusal_fallbacks: Option<kheish_types::RefusalFallbacks>,
     #[serde(default)]
     pub openai_auth_source: Option<RouteFileOpenAiAuthSource>,
     #[serde(default)]
@@ -221,6 +225,20 @@ impl RouteFileEntry {
         }
         if self.anthropic_credentials_file.is_some() && self.driver != RouteFileDriver::Anthropic {
             bail!("route `{route_id}` only anthropic routes may set anthropic_credentials_file");
+        }
+        if let Some(fallbacks) = &self.anthropic_refusal_fallbacks {
+            if self.driver != RouteFileDriver::Anthropic {
+                bail!(
+                    "route `{route_id}` only anthropic routes may set anthropic_refusal_fallbacks"
+                );
+            }
+            if let kheish_types::RefusalFallbacks::Models(models) = fallbacks
+                && (models.is_empty() || models.len() > 3)
+            {
+                bail!(
+                    "route `{route_id}` anthropic_refusal_fallbacks must name 1 to 3 models, or be \"default\""
+                );
+            }
         }
         Ok(())
     }
@@ -367,6 +385,61 @@ mod tests {
     use super::*;
 
     use tempfile::TempDir;
+
+    #[test]
+    fn anthropic_routes_name_refusal_fallbacks() -> Result<()> {
+        let config = RoutesFileConfig::from_toml_str(
+            r#"
+version = 1
+default_route = "fregate"
+
+[routes.fregate]
+driver = "anthropic"
+default_model = "claude-opus-5-5"
+anthropic_refusal_fallbacks = "default"
+
+[routes.pinned]
+driver = "anthropic"
+default_model = "claude-opus-5-5"
+anthropic_refusal_fallbacks = [{ model = "claude-opus-5" }, { model = "claude-opus-4-8", max_tokens = 8000 }]
+"#,
+        )?;
+        assert_eq!(
+            config.routes["fregate"].anthropic_refusal_fallbacks,
+            Some(kheish_types::RefusalFallbacks::default_routing())
+        );
+        let Some(kheish_types::RefusalFallbacks::Models(models)) =
+            &config.routes["pinned"].anthropic_refusal_fallbacks
+        else {
+            panic!("pinned route should list its fallback models");
+        };
+        assert_eq!(models[1].model, "claude-opus-4-8");
+        assert_eq!(models[1].max_tokens, Some(8_000));
+
+        let error = RoutesFileConfig::from_toml_str(
+            r#"
+version = 1
+[routes.openai]
+driver = "openai"
+default_model = "gpt-5.4"
+anthropic_refusal_fallbacks = "default"
+"#,
+        )
+        .expect_err("only anthropic routes take refusal fallbacks");
+        assert!(error.to_string().contains("anthropic_refusal_fallbacks"));
+        let error = RoutesFileConfig::from_toml_str(
+            r#"
+version = 1
+[routes.fregate]
+driver = "anthropic"
+default_model = "claude-opus-5-5"
+anthropic_refusal_fallbacks = []
+"#,
+        )
+        .expect_err("an empty list is refused");
+        assert!(error.to_string().contains("1 to 3 models"));
+        Ok(())
+    }
 
     #[test]
     fn parses_routes_file_and_resolves_default_route() -> Result<()> {

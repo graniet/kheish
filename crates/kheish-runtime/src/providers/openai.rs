@@ -366,6 +366,7 @@ impl OpenAiProvider {
         request: &ModelRuntimeRequest,
         codex_compat: bool,
     ) -> Result<Value, ProviderError> {
+        super::reject_anthropic_only_generation(&request.generation, self.display_name())?;
         let normalized = normalize_provider_prompt(&request.prompt);
         let effective_model = request
             .generation
@@ -784,6 +785,13 @@ fn openai_reasoning_payload(
             retry_after_ms: None,
         });
     }
+    if reasoning.effort == Some(crate::model::ReasoningEffort::Max) {
+        return Err(ProviderError {
+            message: "OpenAI reasoning does not accept effort max; use xhigh instead".to_string(),
+            retryable: false,
+            retry_after_ms: None,
+        });
+    }
 
     let mut payload = serde_json::Map::new();
     if let Some(effort) = reasoning.effort {
@@ -1046,7 +1054,8 @@ impl ModelProvider for OpenAiProvider {
                 .unwrap_or_else(|| self.config.base_url.clone());
             let body =
                 self.build_request_body(&request, Self::is_codex_account_endpoint(&endpoint))?;
-            let headers = self.headers_from_material(&auth_material)?;
+            let mut headers = self.headers_from_material(&auth_material)?;
+            super::insert_execution_context_headers(&mut headers, &request.session_id)?;
             debug!(
                 session_id = %request.session_id,
                 thread_id = request.thread_id.as_deref(),
@@ -2120,6 +2129,7 @@ fn parse_usage(usage: &Value, pricing: Option<&OpenAiPricing>) -> kheish_types::
         input_tokens,
         output_tokens,
         cost_usd,
+        ..Default::default()
     }
 }
 
@@ -3416,7 +3426,9 @@ mod tests {
         create_fixture_dir, write_document_attachment, write_document_attachment_with_preview,
         write_image_attachment,
     };
-    use crate::providers::testsupport::{spawn_chunked_mock_server, spawn_mock_server};
+    use crate::providers::testsupport::{
+        MockHttpResponse, spawn_chunked_mock_server, spawn_mock_server, spawn_recording_mock_server,
+    };
     use crate::{DebugCaptureLevel, NoopObserver};
     use kheish_auth::{RequestAuthProvider, ResolvedAuthMaterial};
     use kheish_core::{
@@ -3689,6 +3701,8 @@ mod tests {
                                 items: None,
                             },
                         },
+                        refusal_fallbacks: None,
+                        retry_max_tokens: None,
                     },
                 },
                 ModelEventSink::new(sender),
@@ -5839,6 +5853,29 @@ mod tests {
             .expect_err("OpenAI should reject Anthropic thinking budget");
 
         assert!(error.message.contains("budget_tokens"));
+
+        let error = provider
+            .build_request_body(
+                &ModelRuntimeRequest {
+                    attempt: 1,
+                    kind: kheish_core::ModelRequestKind::MainLoop,
+                    session_id: "session-openai-max".to_string(),
+                    thread_id: None,
+                    turn: 1,
+                    prompt: ProviderPrompt::default(),
+                    available_tools: Vec::new(),
+                    generation: ModelGenerationConfig {
+                        reasoning: Some(ReasoningConfig {
+                            effort: Some(ReasoningEffort::Max),
+                            ..ReasoningConfig::default()
+                        }),
+                        ..ModelGenerationConfig::default()
+                    },
+                },
+                false,
+            )
+            .expect_err("OpenAI has no max effort");
+        assert!(error.message.contains("effort max"));
     }
 
     #[test]
@@ -6040,6 +6077,53 @@ mod tests {
             "unexpected error: {}",
             error.message
         );
+    }
+
+    #[tokio::test]
+    async fn openai_requests_carry_the_execution_scope_session_and_run() -> Result<()> {
+        let response = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_scope\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n"
+        );
+        let (url, recorded) =
+            spawn_recording_mock_server(vec![MockHttpResponse::sse(response)]).await?;
+        let provider = OpenAiProvider::new(OpenAiProviderConfig {
+            base_url: url,
+            ..OpenAiProviderConfig::new("gpt-test", "test-key")
+        })?;
+        let scope = crate::execution::ExecutionScope {
+            session_id: "session-openai".to_string(),
+            run_id: Some("run-openai".to_string()),
+            ..Default::default()
+        };
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        crate::execution::scope_execution(
+            scope,
+            tokio_util::sync::CancellationToken::new(),
+            provider.stream(
+                ModelRuntimeRequest {
+                    attempt: 1,
+                    kind: kheish_core::ModelRequestKind::MainLoop,
+                    session_id: "session-openai".to_string(),
+                    thread_id: None,
+                    turn: 1,
+                    prompt: ProviderPrompt::default(),
+                    available_tools: Vec::new(),
+                    generation: ModelGenerationConfig::default(),
+                },
+                ModelEventSink::new(sender),
+            ),
+        )
+        .await?;
+        let recorded = recorded.lock().clone();
+        assert_eq!(
+            recorded[0].header("x-kheish-session-id"),
+            Some("session-openai")
+        );
+        assert_eq!(recorded[0].header("x-kheish-run-id"), Some("run-openai"));
+        Ok(())
     }
 
     #[tokio::test]

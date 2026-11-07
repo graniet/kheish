@@ -65,7 +65,7 @@ Supported providers in normal operation:
 
 If you are testing OpenAI live, prefer an explicit model such as `gpt-5.4`. Some local defaults may reject options like `temperature`.
 
-For route details, see `docs/runtime/providers-and-routing.mdx`.
+For route details, see `docs/reference/model-providers.mdx`.
 
 ## Build
 

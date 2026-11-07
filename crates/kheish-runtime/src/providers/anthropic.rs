@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as _;
 use std::fmt::{Debug, Formatter};
 use std::path::PathBuf;
@@ -28,9 +28,14 @@ use crate::{
 use kheish_auth::{RequestAuthProvider, ResolvedAuthMaterial};
 use kheish_codec::digest_json_value;
 use kheish_types::{
-    InputContentPart, ToolResultRecord, capped_default_max_output_tokens, model_max_output_tokens,
+    InputContentPart, ModelRefusal, ModelUsageIteration, RefusalFallbackRouting, RefusalFallbacks,
+    ToolCallRecord, ToolResultRecord, capped_default_max_output_tokens, model_max_output_tokens,
 };
 
+use super::anthropic_models::{
+    AnthropicModelProfile, AnthropicPricing, ThinkingMode, anthropic_accepts_fallback_models,
+    anthropic_adaptive_effort, anthropic_list_pricing, anthropic_model_profile,
+};
 use super::attachments::{
     AttachmentRenderCache, contains_supported_image_attachment, image_edit_attachment_hint_text,
     load_attachment_preview_image, load_document_attachment_text, load_image_attachment,
@@ -43,13 +48,13 @@ const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1/messages"
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 const MIN_ANTHROPIC_THINKING_BUDGET_TOKENS: u32 = 1024;
 const ANTHROPIC_INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
-/// Token pricing used to estimate request cost from usage snapshots.
-#[derive(Clone, Debug, PartialEq)]
-pub struct AnthropicPricing {
-    pub input_per_million_tokens_usd: f64,
-    pub output_per_million_tokens_usd: f64,
-}
-
+/// The beta that lets a request set `thinking.block_binding` and adds
+/// `input_transformations` to the response.
+const ANTHROPIC_THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+/// The beta that lets a request name `fallbacks`, in both its forms.
+const ANTHROPIC_SERVER_SIDE_FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
+/// The most fallback models a request may name.
+const MAX_ANTHROPIC_FALLBACK_MODELS: usize = 3;
 /// Configuration for the Anthropic provider adapter.
 #[derive(Clone)]
 pub struct AnthropicProviderConfig {
@@ -59,7 +64,13 @@ pub struct AnthropicProviderConfig {
     pub base_url: String,
     pub anthropic_version: String,
     pub beta_headers: Vec<String>,
+    /// The models the API retries a declined request on, for the route's
+    /// requests; a run's `generation.refusal_fallbacks` overrides it.
+    pub refusal_fallbacks: Option<RefusalFallbacks>,
     pub default_max_output_tokens: u32,
+    /// Prices of the route's requests, overriding the published list price
+    /// of the model a request names. A response served by another model (a
+    /// refusal fallback) is priced at that model's list price.
     pub pricing: Option<AnthropicPricing>,
     pub asset_root: Option<PathBuf>,
     pub(crate) attachment_cache: AttachmentRenderCache,
@@ -77,6 +88,7 @@ impl AnthropicProviderConfig {
             base_url: DEFAULT_ANTHROPIC_BASE_URL.to_string(),
             anthropic_version: DEFAULT_ANTHROPIC_VERSION.to_string(),
             beta_headers: Vec::new(),
+            refusal_fallbacks: None,
             pricing: None,
             asset_root: None,
             attachment_cache: AttachmentRenderCache::default(),
@@ -110,6 +122,7 @@ impl AnthropicProviderConfig {
             base_url: DEFAULT_ANTHROPIC_BASE_URL.to_string(),
             anthropic_version: DEFAULT_ANTHROPIC_VERSION.to_string(),
             beta_headers: Vec::new(),
+            refusal_fallbacks: None,
             pricing: None,
             asset_root: None,
             attachment_cache: AttachmentRenderCache::default(),
@@ -129,12 +142,26 @@ impl Debug for AnthropicProviderConfig {
             .field("base_url", &self.base_url)
             .field("anthropic_version", &self.anthropic_version)
             .field("beta_headers", &self.beta_headers)
+            .field("refusal_fallbacks", &self.refusal_fallbacks)
             .field("default_max_output_tokens", &self.default_max_output_tokens)
             .field("pricing", &self.pricing)
             .field("asset_root", &self.asset_root)
             .field("attachment_cache", &"<configured>")
             .finish()
     }
+}
+
+/// One Messages API request: its body and the beta features the body relies on.
+struct AnthropicRequest {
+    body: Value,
+    betas: Vec<&'static str>,
+    /// The model the request names.
+    model: String,
+}
+
+/// The prompt-cache breakpoint Kheish places (the default 5-minute cache).
+fn anthropic_cache_breakpoint() -> Value {
+    json!({ "type": "ephemeral" })
 }
 
 /// Anthropic streaming provider based on the Messages SSE API.
@@ -167,7 +194,15 @@ impl AnthropicProvider {
         })
     }
 
+    #[cfg(test)]
     fn build_request_body(&self, request: &ModelRuntimeRequest) -> Result<Value, ProviderError> {
+        Ok(self.build_request(request)?.body)
+    }
+
+    fn build_request(
+        &self,
+        request: &ModelRuntimeRequest,
+    ) -> Result<AnthropicRequest, ProviderError> {
         let effective_model = request
             .generation
             .model
@@ -184,86 +219,126 @@ impl AnthropicProvider {
         let tools = if matches!(request.generation.tool_choice, ToolChoice::None) {
             Vec::new()
         } else {
-            request
-                .available_tools
-                .iter()
-                .map(|tool| {
-                    json!({
-                        "name": tool.name,
-                        "description": tool.description,
-                        "input_schema": tool.input_schema,
-                    })
-                })
-                .collect()
+            anthropic_tools(&request.available_tools)
         };
         let reasoning = request.generation.reasoning.as_ref();
-        let adaptive = anthropic_model_uses_adaptive_thinking(&effective_model);
-        // Current-generation models reject `budget_tokens` and sampling
-        // parameters with HTTP 400; thinking is adaptive-only there and depth
-        // is steered through `output_config.effort`.
-        let thinking_budget = if adaptive {
-            None
-        } else {
+        let profile = anthropic_model_profile(&effective_model);
+        let mut betas = Vec::new();
+        // Adaptive generations reject `budget_tokens` and sampling parameters
+        // with HTTP 400; their depth is steered through `output_config.effort`.
+        let thinking_budget = if profile.thinking == ThinkingMode::Budget {
             anthropic_reasoning_budget(reasoning)?
+        } else {
+            None
         };
+        let interleaved = thinking_budget.is_some()
+            && reasoning
+                .map(|reasoning| reasoning.interleaved)
+                .unwrap_or(false);
+        if interleaved {
+            // Adaptive thinking interleaves on its own, without the beta.
+            betas.push(ANTHROPIC_INTERLEAVED_THINKING_BETA);
+        }
         let max_tokens = anthropic_max_tokens_for_reasoning(
             &effective_model,
             request.generation.max_output_tokens,
             default_max_output_tokens,
             thinking_budget,
-            reasoning
-                .map(|reasoning| reasoning.interleaved)
-                .unwrap_or(false),
+            interleaved,
         )?;
-
-        let adaptive_thinking = if adaptive {
-            anthropic_adaptive_thinking_value(reasoning)
-        } else {
-            None
+        let mut thinking = anthropic_thinking_request(profile.thinking, reasoning, thinking_budget);
+        if profile.preserved_thinking {
+            // Preserved thinking binds each thinking block to the conversation
+            // before it. Kheish edits that prefix in places (compaction, snip,
+            // microcompact, the repair of an orphaned tool call after a
+            // restart), and once an edit is in a session every later request
+            // replays it, so every request to these models asks the API to
+            // drop a block that no longer verifies rather than fail the run.
+            // The field is set explicitly because its default differs by
+            // account age; the dropped blocks come back in
+            // `input_transformations`.
+            let mut value = thinking
+                .thinking
+                .take()
+                .unwrap_or_else(|| json!({ "type": "adaptive" }));
+            value["block_binding"] = json!({ "prefix_mismatch_behavior": "drop_block" });
+            thinking.thinking = Some(value);
+            betas.push(ANTHROPIC_THINKING_BINDING_BETA);
+        }
+        let thinking_on = match profile.thinking {
+            ThinkingMode::Budget | ThinkingMode::AdaptiveOnRequest => thinking.thinking.is_some(),
+            ThinkingMode::AdaptiveByDefault => true,
         };
-        let thinking_requested = thinking_budget.is_some() || adaptive_thinking.is_some();
 
         let mut body = serde_json::Map::new();
-        body.insert("model".to_string(), Value::String(effective_model));
+        body.insert("model".to_string(), Value::String(effective_model.clone()));
         body.insert("max_tokens".to_string(), Value::Number(max_tokens.into()));
-        if let Some(budget_tokens) = thinking_budget {
-            body.insert(
-                "thinking".to_string(),
-                json!({
-                    "type": "enabled",
-                    "budget_tokens": budget_tokens,
-                }),
-            );
+        if let Some(value) = thinking.thinking {
+            body.insert("thinking".to_string(), value);
         }
-        if let Some(thinking) = adaptive_thinking {
-            body.insert("thinking".to_string(), thinking);
-            if let Some(effort) = reasoning.and_then(anthropic_effort_for_adaptive) {
-                body.insert("output_config".to_string(), json!({ "effort": effort }));
-            }
+        if let Some(effort) = thinking.effort {
+            body.insert("output_config".to_string(), json!({ "effort": effort }));
         }
         body.insert("stream".to_string(), Value::Bool(true));
         body.insert(
             "messages".to_string(),
             serde_json::to_value(messages).expect("anthropic messages serialize"),
         );
+        // Prompt caching: one breakpoint on the system prompt (it caches the
+        // tools rendered before it too), one on the last tool so the tool
+        // prefix still hits when the system prompt changes, and automatic
+        // caching of the conversation tail. The system prompt and the tools
+        // render the same bytes on every turn, so each turn reads the prefix
+        // the previous one wrote.
         if !system.is_empty() {
-            body.insert("system".to_string(), Value::String(system.join("\n\n")));
+            body.insert(
+                "system".to_string(),
+                json!([{
+                    "type": "text",
+                    "text": system.join("\n\n"),
+                    "cache_control": anthropic_cache_breakpoint(),
+                }]),
+            );
         }
         if !tools.is_empty() {
             body.insert("tools".to_string(), Value::Array(tools));
         }
-        if thinking_requested
+        body.insert("cache_control".to_string(), anthropic_cache_breakpoint());
+        if thinking_on
             && matches!(
                 request.generation.tool_choice,
                 ToolChoice::Required | ToolChoice::Specific { .. }
             )
         {
+            let message = if profile.thinking == ThinkingMode::AdaptiveByDefault {
+                format!(
+                    "Anthropic model {effective_model} always thinks, and thinking may not be enabled when tool_choice forces tool use; use tool_choice auto"
+                )
+            } else {
+                "Anthropic thinking may not be enabled when tool_choice forces tool use".to_string()
+            };
             return Err(ProviderError {
-                message: "Anthropic thinking may not be enabled when tool_choice forces tool use"
-                    .to_string(),
+                message,
                 retryable: false,
                 retry_after_ms: None,
             });
+        }
+        if let Some(fallbacks) = request
+            .generation
+            .refusal_fallbacks
+            .as_ref()
+            .or(self.config.refusal_fallbacks.as_ref())
+        {
+            if let Some(value) = anthropic_fallbacks_value(fallbacks, &effective_model, &profile)? {
+                body.insert("fallbacks".to_string(), value);
+                betas.push(ANTHROPIC_SERVER_SIDE_FALLBACK_BETA);
+            } else {
+                debug!(
+                    session_id = %request.session_id,
+                    model = %effective_model,
+                    "Anthropic model takes no server-side refusal fallbacks in this form; sending none"
+                );
+            }
         }
         if let Some(tool_choice) = anthropic_tool_choice(
             &request.generation.tool_choice,
@@ -274,7 +349,9 @@ impl AnthropicProvider {
                 serde_json::to_value(tool_choice).expect("tool choice serializes"),
             );
         }
-        if !adaptive && let Some(temperature) = request.generation.temperature {
+        if profile.thinking == ThinkingMode::Budget
+            && let Some(temperature) = request.generation.temperature
+        {
             body.insert(
                 "temperature".to_string(),
                 serde_json::Number::from_f64(temperature as f64)
@@ -282,7 +359,11 @@ impl AnthropicProvider {
                     .unwrap_or(Value::Null),
             );
         }
-        Ok(Value::Object(body))
+        Ok(AnthropicRequest {
+            body: Value::Object(body),
+            betas,
+            model: effective_model,
+        })
     }
 
     async fn auth_material(
@@ -336,7 +417,7 @@ impl AnthropicProvider {
     fn headers_from_material(
         &self,
         material: &ResolvedAuthMaterial,
-        reasoning: Option<&ReasoningConfig>,
+        request_betas: &[&'static str],
     ) -> Result<HeaderMap, ProviderError> {
         let mut headers = HeaderMap::new();
         for (name, value) in &material.headers {
@@ -375,15 +456,9 @@ impl AnthropicProvider {
                 beta_values.push(beta.clone());
             }
         }
-        if reasoning
-            .map(|reasoning| reasoning.interleaved)
-            .unwrap_or(false)
-        {
-            if !beta_values
-                .iter()
-                .any(|existing| existing == ANTHROPIC_INTERLEAVED_THINKING_BETA)
-            {
-                beta_values.push(ANTHROPIC_INTERLEAVED_THINKING_BETA.to_string());
+        for beta in request_betas {
+            if !beta_values.iter().any(|existing| existing == beta) {
+                beta_values.push((*beta).to_string());
             }
         }
         headers.insert(
@@ -566,13 +641,17 @@ impl ModelProvider for AnthropicProvider {
         request: ModelRuntimeRequest,
         sink: ModelEventSink,
     ) -> std::result::Result<(), ProviderError> {
-        let body = self.build_request_body(&request)?;
+        let AnthropicRequest {
+            body,
+            betas: request_betas,
+            model: requested_model,
+        } = self.build_request(&request)?;
         let mut force_refresh = false;
         let (response, response_target, response_grant_id) = loop {
             let auth_material = self.auth_material(force_refresh).await?;
             let grant_id = auth_material.grant_id.clone();
-            let headers =
-                self.headers_from_material(&auth_material, request.generation.reasoning.as_ref())?;
+            let mut headers = self.headers_from_material(&auth_material, &request_betas)?;
+            super::insert_execution_context_headers(&mut headers, &request.session_id)?;
             let endpoint = auth_material
                 .base_url_override
                 .clone()
@@ -683,8 +762,8 @@ impl ModelProvider for AnthropicProvider {
             None,
             response_grant_id.clone(),
         )?;
-        let mut partial_blocks = BTreeMap::new();
-        let mut preserved_context_blocks = Vec::new();
+        let mut state =
+            AnthropicStreamState::new(&request, requested_model, self.config.pricing.clone());
         // Buffer raw bytes until a full SSE frame arrives so split UTF-8 code points
         // across transport chunks do not fail decoding prematurely.
         let mut buffer = Vec::new();
@@ -723,14 +802,7 @@ impl ModelProvider for AnthropicProvider {
                 if let Some(event) = parsed {
                     let reached_message_stop = event.event_type == "message_stop";
                     self.record_provider_event(&request, &event);
-                    handle_sse_event(
-                        event,
-                        &mut partial_blocks,
-                        &mut preserved_context_blocks,
-                        &sink,
-                        self.config.pricing.as_ref(),
-                    )
-                    .map_err(|error| {
+                    handle_sse_event(event, &mut state, &sink).map_err(|error| {
                         self.record_provider_failure(
                             &response_target,
                             &error.message,
@@ -759,14 +831,7 @@ impl ModelProvider for AnthropicProvider {
             if let Some(event) = parsed {
                 let reached_message_stop = event.event_type == "message_stop";
                 self.record_provider_event(&request, &event);
-                handle_sse_event(
-                    event,
-                    &mut partial_blocks,
-                    &mut preserved_context_blocks,
-                    &sink,
-                    self.config.pricing.as_ref(),
-                )
-                .map_err(|error| {
+                handle_sse_event(event, &mut state, &sink).map_err(|error| {
                     self.record_provider_failure(
                         &response_target,
                         &error.message,
@@ -781,6 +846,14 @@ impl ModelProvider for AnthropicProvider {
             }
         }
 
+        if let Some(message) = state.unparsed_tool_input.take() {
+            return Err(ProviderError {
+                message,
+                retryable: true,
+                retry_after_ms: None,
+            });
+        }
+        state.finish(&sink)?;
         Ok(())
     }
 }
@@ -803,6 +876,15 @@ enum AnthropicContentBlock {
     },
     RedactedThinking {
         data: String,
+    },
+    /// The point where one model's output gave way to a refusal fallback's.
+    /// It stays where it appeared: the API uses its position to validate the
+    /// thinking blocks around it.
+    Fallback {
+        from: Value,
+        to: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        trigger: Option<Value>,
     },
     Image {
         source: AnthropicImageSource,
@@ -850,7 +932,9 @@ enum AnthropicToolChoice {
 
 #[derive(Clone, Debug)]
 enum PartialContentBlock {
-    Text,
+    Text {
+        text: String,
+    },
     Thinking {
         thinking: String,
         signature: String,
@@ -876,6 +960,23 @@ fn anthropic_prompt_from_items(
     let normalized = normalize_provider_prompt(prompt);
     let mut system = normalized.instructions;
     let mut messages = Vec::new();
+    // Tool calls by the assistant message that made them, so an answer with a
+    // recorded block order can place each tool use where the model wrote it.
+    let mut calls_by_message = BTreeMap::<String, Vec<ToolCallRecord>>::new();
+    for item in &normalized.conversation {
+        if let NormalizedConversationItem::AssistantToolCalls {
+            assistant_message_id: Some(message_id),
+            calls,
+            ..
+        } = item
+        {
+            calls_by_message
+                .entry(message_id.clone())
+                .or_default()
+                .extend(calls.iter().cloned());
+        }
+    }
+    let mut replayed_calls = BTreeSet::<String>::new();
 
     for item in normalized.conversation {
         match item {
@@ -919,17 +1020,55 @@ fn anthropic_prompt_from_items(
                 ..
             } => {
                 let kind = MessageBuilderKind::Assistant {
-                    message_id: Some(id),
+                    message_id: Some(id.clone()),
                 };
-                for block in anthropic_preserved_blocks_from_context(provider_context.as_ref()) {
-                    push_message_block(&mut messages, kind.clone(), block);
-                }
-                if !content.is_empty() {
-                    push_message_block(
-                        &mut messages,
-                        kind,
-                        AnthropicContentBlock::Text { text: content },
-                    );
+                let (recorded, ordered) = anthropic_recorded_blocks(provider_context.as_ref());
+                if ordered {
+                    // Replay the answer as the API returned it: thinking blocks
+                    // keep their place between the text and the tool uses, so
+                    // the conversation before each of them is unchanged.
+                    let calls = calls_by_message.get(&id).cloned().unwrap_or_default();
+                    for block in recorded {
+                        let block = match block {
+                            RecordedBlock::Native(block) => block,
+                            RecordedBlock::Text(text) if text.trim().is_empty() => continue,
+                            RecordedBlock::Text(text) => AnthropicContentBlock::Text { text },
+                            RecordedBlock::ToolUse(call_id) => {
+                                let Some(call) = calls.iter().find(|call| call.id == call_id)
+                                else {
+                                    continue;
+                                };
+                                if !replayed_calls.insert(call.id.clone()) {
+                                    continue;
+                                }
+                                anthropic_tool_use_block(call)
+                            }
+                        };
+                        push_message_block(&mut messages, kind.clone(), block);
+                    }
+                    // Calls the record does not name follow in their own order.
+                    for call in &calls {
+                        if replayed_calls.insert(call.id.clone()) {
+                            push_message_block(
+                                &mut messages,
+                                kind.clone(),
+                                anthropic_tool_use_block(call),
+                            );
+                        }
+                    }
+                } else {
+                    for block in recorded {
+                        if let RecordedBlock::Native(block) = block {
+                            push_message_block(&mut messages, kind.clone(), block);
+                        }
+                    }
+                    if !content.is_empty() {
+                        push_message_block(
+                            &mut messages,
+                            kind,
+                            AnthropicContentBlock::Text { text: content },
+                        );
+                    }
                 }
             }
             NormalizedConversationItem::AssistantToolCalls {
@@ -938,16 +1077,15 @@ fn anthropic_prompt_from_items(
                 calls,
             } => {
                 for call in calls {
+                    if replayed_calls.contains(&call.id) {
+                        continue;
+                    }
                     push_message_block(
                         &mut messages,
                         MessageBuilderKind::Assistant {
                             message_id: assistant_message_id.clone(),
                         },
-                        AnthropicContentBlock::ToolUse {
-                            id: call.id.clone(),
-                            name: call.name.clone(),
-                            input: call.input.clone(),
-                        },
+                        anthropic_tool_use_block(&call),
                     );
                 }
             }
@@ -991,44 +1129,89 @@ fn anthropic_external_action_target(endpoint: &str) -> String {
     format!("anthropic:{}", safe_url_audit_target(endpoint))
 }
 
-fn anthropic_preserved_blocks_from_context(
-    provider_context: Option<&Value>,
-) -> Vec<AnthropicContentBlock> {
+fn anthropic_tool_use_block(call: &ToolCallRecord) -> AnthropicContentBlock {
+    AnthropicContentBlock::ToolUse {
+        id: call.id.clone(),
+        name: call.name.clone(),
+        input: call.input.clone(),
+    }
+}
+
+fn anthropic_provider_context_payload(blocks: &[Value], input_transformations: &[Value]) -> Value {
+    let mut anthropic = serde_json::Map::new();
+    anthropic.insert("content_blocks".to_string(), Value::Array(blocks.to_vec()));
+    if !input_transformations.is_empty() {
+        anthropic.insert(
+            "input_transformations".to_string(),
+            Value::Array(input_transformations.to_vec()),
+        );
+    }
+    json!({ "anthropic": Value::Object(anthropic) })
+}
+
+/// One block of an assistant answer as recorded in its provider context.
+enum RecordedBlock {
+    /// A block replayed verbatim (thinking, redacted thinking).
+    Native(AnthropicContentBlock),
+    /// A text block, by value.
+    Text(String),
+    /// A tool use, by id: its input comes from the turn's tool call.
+    ToolUse(String),
+}
+
+/// Reads the recorded blocks of an assistant answer. `ordered` is true when
+/// the record carries the answer's full block order (text and tool uses
+/// included); older records list only the thinking blocks.
+fn anthropic_recorded_blocks(provider_context: Option<&Value>) -> (Vec<RecordedBlock>, bool) {
     let Some(blocks) = provider_context
         .and_then(|value| value.get("anthropic"))
         .and_then(|value| value.get("content_blocks"))
         .and_then(Value::as_array)
     else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
-    blocks
+    let mut ordered = false;
+    let recorded = blocks
         .iter()
         .filter_map(|block| match block.get("type").and_then(Value::as_str) {
             Some("thinking") => {
                 let thinking = block.get("thinking").and_then(Value::as_str)?;
                 let signature = block.get("signature").and_then(Value::as_str)?;
-                Some(AnthropicContentBlock::Thinking {
+                Some(RecordedBlock::Native(AnthropicContentBlock::Thinking {
                     thinking: thinking.to_string(),
                     signature: signature.to_string(),
-                })
+                }))
             }
             Some("redacted_thinking") => {
                 let data = block.get("data").and_then(Value::as_str)?;
-                Some(AnthropicContentBlock::RedactedThinking {
-                    data: data.to_string(),
-                })
+                Some(RecordedBlock::Native(
+                    AnthropicContentBlock::RedactedThinking {
+                        data: data.to_string(),
+                    },
+                ))
+            }
+            Some("text") => {
+                ordered = true;
+                let text = block.get("text").and_then(Value::as_str)?;
+                Some(RecordedBlock::Text(text.to_string()))
+            }
+            Some("tool_use") => {
+                ordered = true;
+                let id = block.get("id").and_then(Value::as_str)?;
+                Some(RecordedBlock::ToolUse(id.to_string()))
+            }
+            Some("fallback") => {
+                ordered = true;
+                Some(RecordedBlock::Native(AnthropicContentBlock::Fallback {
+                    from: block.get("from")?.clone(),
+                    to: block.get("to")?.clone(),
+                    trigger: block.get("trigger").cloned(),
+                }))
             }
             _ => None,
         })
-        .collect()
-}
-
-fn anthropic_provider_context_payload(blocks: &[Value]) -> Value {
-    json!({
-        "anthropic": {
-            "content_blocks": blocks,
-        }
-    })
+        .collect();
+    (recorded, ordered)
 }
 
 fn provider_audit_error(error: anyhow::Error) -> ProviderError {
@@ -1039,32 +1222,124 @@ fn provider_audit_error(error: anyhow::Error) -> ProviderError {
     }
 }
 
-/// Returns whether the model rejects `budget_tokens` and sampling parameters
-/// in favor of adaptive thinking (`thinking: {type: "adaptive"}` +
-/// `output_config.effort`). One line per model family; extend the list when a
-/// new generation ships.
-fn anthropic_model_uses_adaptive_thinking(model: &str) -> bool {
-    let canonical = model.trim().trim_matches('"').to_ascii_lowercase();
-    ["fable-5", "mythos-5", "opus-4-7", "opus-4-8", "sonnet-5"]
-        .iter()
-        .any(|family| canonical.contains(family))
+/// Encodes the request's `fallbacks`: `"default"` or the list of models,
+/// when the requested model takes that form. Returns `None` for a model
+/// without server-side fallback (it would reject the field), and for Claude
+/// Sonnet 5.5 asked for a model list, which only takes `"default"`.
+fn anthropic_fallbacks_value(
+    fallbacks: &RefusalFallbacks,
+    model: &str,
+    profile: &AnthropicModelProfile,
+) -> Result<Option<Value>, ProviderError> {
+    if !profile.server_side_fallback {
+        return Ok(None);
+    }
+    let invalid = |message: String| ProviderError {
+        message,
+        retryable: false,
+        retry_after_ms: None,
+    };
+    match fallbacks {
+        RefusalFallbacks::Routing(RefusalFallbackRouting::Default) => {
+            Ok(Some(Value::String("default".to_string())))
+        }
+        RefusalFallbacks::Models(models) => {
+            if !anthropic_accepts_fallback_models(model) {
+                return Ok(None);
+            }
+            if models.is_empty() || models.len() > MAX_ANTHROPIC_FALLBACK_MODELS {
+                return Err(invalid(format!(
+                    "refusal_fallbacks names {} models; Anthropic takes 1 to {MAX_ANTHROPIC_FALLBACK_MODELS}",
+                    models.len()
+                )));
+            }
+            let mut seen = BTreeSet::new();
+            let mut entries = Vec::with_capacity(models.len());
+            for entry in models {
+                let name = entry.model.trim();
+                if name.is_empty() || name == model || !seen.insert(name.to_string()) {
+                    return Err(invalid(format!(
+                        "refusal_fallbacks must name distinct models other than the requested model `{model}`"
+                    )));
+                }
+                let mut value = serde_json::Map::new();
+                value.insert("model".to_string(), Value::String(name.to_string()));
+                if let Some(max_tokens) = entry.max_tokens {
+                    value.insert("max_tokens".to_string(), Value::Number(max_tokens.into()));
+                }
+                entries.push(Value::Object(value));
+            }
+            Ok(Some(Value::Array(entries)))
+        }
+    }
 }
 
-/// Builds the `thinking` value for adaptive-only models. Returns `None` when
-/// the request does not ask for reasoning — the parameter is then omitted
-/// entirely, which is the only spelling every adaptive model accepts (an
-/// explicit `disabled` is rejected on some of them).
-fn anthropic_adaptive_thinking_value(reasoning: Option<&ReasoningConfig>) -> Option<Value> {
-    let reasoning = reasoning?;
-    let wants_thinking = reasoning
+/// The `thinking` and `output_config.effort` values of one request.
+struct AnthropicThinkingRequest {
+    thinking: Option<Value>,
+    effort: Option<&'static str>,
+}
+
+/// Builds the thinking fields for a model's thinking mode:
+/// - `budget_tokens` on generations that still take a manual budget;
+/// - on Claude Opus 4.7 and 4.8, adaptive thinking only when the run asks for
+///   reasoning (omitting `thinking` turns it off there);
+/// - on the 5.x generations, which think whether or not `thinking` is sent,
+///   adaptive thinking with the requested effort whenever the run carries a
+///   reasoning config, and nothing otherwise so the model's default applies.
+fn anthropic_thinking_request(
+    mode: ThinkingMode,
+    reasoning: Option<&ReasoningConfig>,
+    budget: Option<u32>,
+) -> AnthropicThinkingRequest {
+    let none = AnthropicThinkingRequest {
+        thinking: None,
+        effort: None,
+    };
+    match mode {
+        ThinkingMode::Budget => AnthropicThinkingRequest {
+            thinking: budget.map(|budget_tokens| {
+                json!({
+                    "type": "enabled",
+                    "budget_tokens": budget_tokens,
+                })
+            }),
+            effort: None,
+        },
+        ThinkingMode::AdaptiveOnRequest => {
+            let Some(reasoning) = reasoning.filter(|reasoning| anthropic_wants_thinking(reasoning))
+            else {
+                return none;
+            };
+            AnthropicThinkingRequest {
+                thinking: Some(anthropic_adaptive_thinking_value(reasoning)),
+                effort: anthropic_adaptive_effort(reasoning, mode),
+            }
+        }
+        ThinkingMode::AdaptiveByDefault => {
+            let Some(reasoning) = reasoning.filter(|reasoning| !reasoning.is_empty()) else {
+                return none;
+            };
+            AnthropicThinkingRequest {
+                thinking: Some(anthropic_adaptive_thinking_value(reasoning)),
+                effort: anthropic_adaptive_effort(reasoning, mode),
+            }
+        }
+    }
+}
+
+fn anthropic_wants_thinking(reasoning: &ReasoningConfig) -> bool {
+    reasoning
         .effort
         .map(|effort| effort != ReasoningEffort::None)
         .unwrap_or(false)
         || reasoning.budget_tokens.is_some()
-        || reasoning.interleaved;
-    if !wants_thinking {
-        return None;
-    }
+        || reasoning.interleaved
+}
+
+/// The adaptive `thinking` value: `{"type": "adaptive"}`, with the readable
+/// summary display when the run asks for a reasoning summary.
+fn anthropic_adaptive_thinking_value(reasoning: &ReasoningConfig) -> Value {
     let mut thinking = serde_json::Map::new();
     thinking.insert("type".to_string(), Value::String("adaptive".to_string()));
     if reasoning
@@ -1072,36 +1347,12 @@ fn anthropic_adaptive_thinking_value(reasoning: Option<&ReasoningConfig>) -> Opt
         .and_then(|summary| summary.as_provider_str())
         .is_some()
     {
-        // Adaptive thinking exposes readable reasoning through the display
-        // knob; the closest match for any requested summary style.
         thinking.insert(
             "display".to_string(),
             Value::String("summarized".to_string()),
         );
     }
-    Some(Value::Object(thinking))
-}
-
-/// Maps the requested reasoning depth onto the adaptive `output_config.effort`
-/// scale. Legacy `budget_tokens` configs are folded onto the nearest tier so
-/// existing routes keep a comparable thinking depth after a model upgrade.
-fn anthropic_effort_for_adaptive(reasoning: &ReasoningConfig) -> Option<&'static str> {
-    if let Some(effort) = reasoning.effort {
-        return match effort {
-            ReasoningEffort::None => None,
-            ReasoningEffort::Minimal | ReasoningEffort::Low => Some("low"),
-            ReasoningEffort::Medium => Some("medium"),
-            ReasoningEffort::High => Some("high"),
-            ReasoningEffort::Xhigh => Some("xhigh"),
-        };
-    }
-    let budget = reasoning.budget_tokens?;
-    Some(match budget {
-        0..=2_048 => "low",
-        2_049..=4_096 => "medium",
-        4_097..=8_192 => "high",
-        _ => "xhigh",
-    })
+    Value::Object(thinking)
 }
 
 fn anthropic_reasoning_budget(
@@ -1153,7 +1404,9 @@ fn anthropic_budget_for_effort(effort: ReasoningEffort) -> Option<u32> {
         ReasoningEffort::Low => Some(2_048),
         ReasoningEffort::Medium => Some(4_096),
         ReasoningEffort::High => Some(8_192),
-        ReasoningEffort::Xhigh => Some(32_768),
+        // The largest manual budget Kheish asks for; the adaptive ladder's
+        // `max` has no budget equivalent.
+        ReasoningEffort::Xhigh | ReasoningEffort::Max => Some(32_768),
     }
 }
 
@@ -1366,15 +1619,240 @@ fn render_tool_result_content(result: &ToolResultRecord) -> String {
     serde_json::to_string(&result.output).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// What one streamed Messages API answer has delivered so far.
+struct AnthropicStreamState {
+    partial_blocks: BTreeMap<usize, PartialContentBlock>,
+    /// The answer's content blocks in the order the API returned them, kept
+    /// so the assistant turn replays as the API expects it back: thinking and
+    /// redacted thinking verbatim (a thinking block keeps its signature even
+    /// when its text is empty, as under the default `display: "omitted"`),
+    /// text by value, tool uses by id.
+    layout: Vec<Value>,
+    /// Whether the answer carried a block whose bytes and position must be
+    /// replayed (thinking, redacted thinking, a fallback marker).
+    has_positioned_blocks: bool,
+    /// Tool calls, held until the answer is complete: a refusal fallback
+    /// withdraws the tool uses of the attempt it replaced.
+    tool_calls: Vec<ToolCallRecord>,
+    /// Why a tool use's input did not parse. An answer cut off at the output
+    /// limit can end inside a tool use: that turn is discarded whole, so the
+    /// cut input is only an error when the answer was not cut off.
+    unparsed_tool_input: Option<String>,
+    /// The `input_transformations` the API reported for the request: thinking
+    /// blocks it dropped (or would have, on a request it does not enforce).
+    input_transformations: Vec<Value>,
+    /// Whether the turn's provider context was emitted.
+    finished: bool,
+    /// The `usage` object as reported so far: `message_start` carries the
+    /// prompt counts, `message_delta` the output count (and, on newer API
+    /// versions, the prompt counts again), so the reports are merged, never
+    /// replaced.
+    usage: serde_json::Map<String, Value>,
+    /// The model the request named.
+    requested_model: String,
+    /// The model producing the message, as `message_start` names it.
+    model: String,
+    /// The route's price override for the requested model.
+    pricing_override: Option<AnthropicPricing>,
+    session_id: String,
+    turn: usize,
+}
+
+impl AnthropicStreamState {
+    fn new(
+        request: &ModelRuntimeRequest,
+        requested_model: String,
+        pricing_override: Option<AnthropicPricing>,
+    ) -> Self {
+        Self {
+            partial_blocks: BTreeMap::new(),
+            layout: Vec::new(),
+            has_positioned_blocks: false,
+            tool_calls: Vec::new(),
+            unparsed_tool_input: None,
+            input_transformations: Vec::new(),
+            finished: false,
+            usage: serde_json::Map::new(),
+            model: requested_model.clone(),
+            requested_model,
+            pricing_override,
+            session_id: request.session_id.clone(),
+            turn: request.turn,
+        }
+    }
+
+    /// Returns the prices of `model` for a request with `prompt_tokens`.
+    fn pricing_for(&self, model: &str, prompt_tokens: u64) -> Option<AnthropicPricing> {
+        if model == self.requested_model
+            && let Some(pricing) = &self.pricing_override
+        {
+            return Some(pricing.clone());
+        }
+        anthropic_list_pricing(model, prompt_tokens)
+    }
+
+    /// Merges one usage report and emits the turn's usage so far.
+    fn merge_usage(&mut self, update: &Value, sink: &ModelEventSink) -> Result<(), ProviderError> {
+        if let Some(update) = update.as_object() {
+            for (key, value) in update {
+                if !value.is_null() {
+                    self.usage.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        let usage = Value::Object(self.usage.clone());
+        let mut parsed = parse_usage(&usage);
+        let iterations = usage
+            .get("iterations")
+            .and_then(Value::as_array)
+            .filter(|iterations| !iterations.is_empty());
+        if let Some(iterations) = iterations {
+            // A refusal fallback ran: the top-level counts are the answering
+            // attempt's only, and each attempt bills at its own model's
+            // prices; an attempt that names no model ran the requested one.
+            parsed.iterations = iterations
+                .iter()
+                .map(|iteration| {
+                    let counts = parse_usage(iteration);
+                    let model = iteration
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    let priced_model = model.as_deref().unwrap_or(&self.requested_model);
+                    let cost_usd = self
+                        .pricing_for(priced_model, counts.prompt_tokens())
+                        .map(|pricing| pricing.cost_usd(&counts, cache_write_1h_tokens(iteration)))
+                        .unwrap_or_default();
+                    ModelUsageIteration {
+                        kind: iteration
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("message")
+                            .to_string(),
+                        model,
+                        input_tokens: counts.input_tokens,
+                        output_tokens: counts.output_tokens,
+                        cache_creation_input_tokens: counts.cache_creation_input_tokens,
+                        cache_read_input_tokens: counts.cache_read_input_tokens,
+                        cost_usd,
+                    }
+                })
+                .collect();
+            parsed.cost_usd = parsed
+                .iterations
+                .iter()
+                .map(|iteration| iteration.cost_usd)
+                .sum();
+        } else if let Some(pricing) = self.pricing_for(&self.model, parsed.prompt_tokens()) {
+            parsed.cost_usd = pricing.cost_usd(&parsed, cache_write_1h_tokens(&usage));
+        }
+        sink.emit(ModelStreamEvent::Usage { usage: parsed })
+            .map_err(map_sink_error)
+    }
+
+    /// Records the `input_transformations` of a response and logs each
+    /// thinking block the API dropped or would have dropped.
+    fn record_input_transformations(&mut self, value: Option<&Value>) {
+        let Some(entries) = value.and_then(Value::as_array) else {
+            return;
+        };
+        for entry in entries {
+            if self.input_transformations.contains(entry) {
+                continue;
+            }
+            let field = |key: &str| {
+                entry
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let (transformation, reason, path) = (field("type"), field("reason"), field("path"));
+            warn!(
+                session_id = %self.session_id,
+                turn = self.turn,
+                provider = "anthropic",
+                transformation = %transformation,
+                reason = %reason,
+                path = %path,
+                "Anthropic reported a replayed thinking block it could not use"
+            );
+            self.input_transformations.push(entry.clone());
+        }
+    }
+
+    /// Emits what the turn keeps for its replay once its content is complete.
+    /// Idempotent: the stop event and the end of the stream both call it.
+    fn finish(&mut self, sink: &ModelEventSink) -> Result<(), ProviderError> {
+        if self.finished {
+            return Ok(());
+        }
+        self.finished = true;
+        // After a refusal fallback, the attempts before the last marker are
+        // not part of the answer beyond their text: their thinking and tool
+        // uses are withdrawn (never run, never replayed), their text and the
+        // markers stay where they appeared.
+        let block_type = |block: &Value| {
+            block
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        if let Some(boundary) = self
+            .layout
+            .iter()
+            .rposition(|block| block_type(block) == "fallback")
+        {
+            let mut withdrawn = BTreeSet::new();
+            let layout = std::mem::take(&mut self.layout);
+            for (index, block) in layout.into_iter().enumerate() {
+                let kind = block_type(&block);
+                if index >= boundary || kind == "text" || kind == "fallback" {
+                    self.layout.push(block);
+                } else if kind == "tool_use"
+                    && let Some(id) = block.get("id").and_then(Value::as_str)
+                {
+                    withdrawn.insert(id.to_string());
+                }
+            }
+            self.tool_calls.retain(|call| !withdrawn.contains(&call.id));
+        }
+        for call in std::mem::take(&mut self.tool_calls) {
+            sink.emit(ModelStreamEvent::ToolCall { call })
+                .map_err(map_sink_error)?;
+        }
+        if !self.has_positioned_blocks && self.input_transformations.is_empty() {
+            return Ok(());
+        }
+        sink.emit(ModelStreamEvent::ProviderContext {
+            value: anthropic_provider_context_payload(&self.layout, &self.input_transformations),
+        })
+        .map_err(map_sink_error)
+    }
+}
+
+fn content_block_index(event: &JsonSseEvent, what: &str) -> Result<usize, ProviderError> {
+    event
+        .payload
+        .get("index")
+        .and_then(Value::as_u64)
+        .map(|index| index as usize)
+        .ok_or_else(|| ProviderError {
+            message: format!("missing content block {what}index"),
+            retryable: true,
+            retry_after_ms: None,
+        })
+}
+
 fn handle_sse_event(
     event: JsonSseEvent,
-    partial_blocks: &mut BTreeMap<usize, PartialContentBlock>,
-    preserved_context_blocks: &mut Vec<Value>,
+    state: &mut AnthropicStreamState,
     sink: &ModelEventSink,
-    pricing: Option<&AnthropicPricing>,
 ) -> Result<(), ProviderError> {
     match event.event_type.as_str() {
-        "ping" | "message_stop" => Ok(()),
+        "ping" => Ok(()),
+        "message_stop" => state.finish(sink),
         "message_start" => {
             if let Some(message) = event.payload.get("message") {
                 if let Some(id) = message.get("id").and_then(Value::as_str) {
@@ -1383,25 +1861,18 @@ fn handle_sse_event(
                     })
                     .map_err(map_sink_error)?;
                 }
+                if let Some(model) = message.get("model").and_then(Value::as_str) {
+                    state.model = model.to_string();
+                }
+                state.record_input_transformations(message.get("input_transformations"));
                 if let Some(usage) = message.get("usage") {
-                    sink.emit(ModelStreamEvent::Usage {
-                        usage: parse_usage(usage, pricing),
-                    })
-                    .map_err(map_sink_error)?;
+                    state.merge_usage(usage, sink)?;
                 }
             }
             Ok(())
         }
         "content_block_start" => {
-            let index = event
-                .payload
-                .get("index")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| ProviderError {
-                    message: "missing content block index".to_string(),
-                    retryable: true,
-                    retry_after_ms: None,
-                })? as usize;
+            let index = content_block_index(&event, "")?;
             let block = event
                 .payload
                 .get("content_block")
@@ -1416,15 +1887,16 @@ fn handle_sse_event(
                 .unwrap_or("unknown");
             let partial = match block_type {
                 "text" => {
-                    if let Some(text) = block.get("text").and_then(Value::as_str) {
-                        if !text.is_empty() {
-                            sink.emit(ModelStreamEvent::TextDelta {
-                                text: text.to_string(),
-                            })
+                    let text = block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if !text.is_empty() {
+                        sink.emit(ModelStreamEvent::TextDelta { text: text.clone() })
                             .map_err(map_sink_error)?;
-                        }
                     }
-                    PartialContentBlock::Text
+                    PartialContentBlock::Text { text }
                 }
                 "thinking" => PartialContentBlock::Thinking {
                     thinking: block
@@ -1445,6 +1917,16 @@ fn handle_sse_event(
                         .unwrap_or_default()
                         .to_string(),
                 },
+                "fallback" => {
+                    // A start and stop pair with no deltas, between the
+                    // declined attempt's output and the next model's.
+                    state.has_positioned_blocks = true;
+                    if let Some(model) = block.pointer("/to/model").and_then(Value::as_str) {
+                        state.model = model.to_string();
+                    }
+                    state.layout.push(block.clone());
+                    PartialContentBlock::Ignored
+                }
                 "tool_use" => PartialContentBlock::ToolUse {
                     id: block
                         .get("id")
@@ -1464,27 +1946,20 @@ fn handle_sse_event(
                 },
                 _ => PartialContentBlock::Ignored,
             };
-            partial_blocks.insert(index, partial);
+            state.partial_blocks.insert(index, partial);
             Ok(())
         }
         "content_block_delta" => {
-            let index = event
-                .payload
-                .get("index")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| ProviderError {
-                    message: "missing content block delta index".to_string(),
-                    retryable: true,
-                    retry_after_ms: None,
-                })? as usize;
+            let index = content_block_index(&event, "delta ")?;
             let delta = event.payload.get("delta").ok_or_else(|| ProviderError {
                 message: "missing content block delta payload".to_string(),
                 retryable: true,
                 retry_after_ms: None,
             })?;
-            match partial_blocks.get_mut(&index) {
-                Some(PartialContentBlock::Text) => {
+            match state.partial_blocks.get_mut(&index) {
+                Some(PartialContentBlock::Text { text: buffer }) => {
                     if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                        buffer.push_str(text);
                         sink.emit(ModelStreamEvent::TextDelta {
                             text: text.to_string(),
                         })
@@ -1517,16 +1992,11 @@ fn handle_sse_event(
             Ok(())
         }
         "content_block_stop" => {
-            let index = event
-                .payload
-                .get("index")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| ProviderError {
-                    message: "missing content block stop index".to_string(),
-                    retryable: true,
-                    retry_after_ms: None,
-                })? as usize;
-            match partial_blocks.remove(&index) {
+            let index = content_block_index(&event, "stop ")?;
+            match state.partial_blocks.remove(&index) {
+                Some(PartialContentBlock::Text { text }) => {
+                    state.layout.push(json!({ "type": "text", "text": text }));
+                }
                 Some(PartialContentBlock::ToolUse {
                     id,
                     name,
@@ -1535,69 +2005,103 @@ fn handle_sse_event(
                     let input = if input_json.trim().is_empty() {
                         json!({})
                     } else {
-                        serde_json::from_str(&input_json).map_err(|error| ProviderError {
-                            message: format!("invalid Anthropic tool JSON payload: {error}"),
-                            retryable: true,
-                            retry_after_ms: None,
-                        })?
+                        match serde_json::from_str(&input_json) {
+                            Ok(input) => input,
+                            Err(error) => {
+                                state.unparsed_tool_input =
+                                    Some(format!("invalid Anthropic tool JSON payload: {error}"));
+                                return Ok(());
+                            }
+                        }
                     };
-                    sink.emit(ModelStreamEvent::ToolCall {
-                        call: kheish_types::ToolCallRecord {
-                            id,
-                            name,
-                            input,
-                            assistant_message_id: None,
-                            assistant_provider_response_id: None,
-                        },
-                    })
-                    .map_err(map_sink_error)?;
-                    Ok(())
+                    state.layout.push(json!({ "type": "tool_use", "id": id }));
+                    state.tool_calls.push(ToolCallRecord {
+                        id,
+                        name,
+                        input,
+                        assistant_message_id: None,
+                        assistant_provider_response_id: None,
+                    });
                 }
+                // The signature carries the reasoning: a block whose text is
+                // empty (the default display) is kept all the same, since
+                // leaving one out of the replay breaks the chain of blocks.
                 Some(PartialContentBlock::Thinking {
                     thinking,
                     signature,
                 }) => {
-                    if !thinking.is_empty() && !signature.is_empty() {
-                        preserved_context_blocks.push(json!({
+                    if !signature.is_empty() {
+                        state.has_positioned_blocks = true;
+                        state.layout.push(json!({
                             "type": "thinking",
                             "thinking": thinking,
                             "signature": signature,
                         }));
-                        sink.emit(ModelStreamEvent::ProviderContext {
-                            value: anthropic_provider_context_payload(preserved_context_blocks),
-                        })
-                        .map_err(map_sink_error)?;
                     }
-                    Ok(())
                 }
                 Some(PartialContentBlock::RedactedThinking { data }) => {
                     if !data.is_empty() {
-                        preserved_context_blocks.push(json!({
+                        state.has_positioned_blocks = true;
+                        state.layout.push(json!({
                             "type": "redacted_thinking",
                             "data": data,
                         }));
-                        sink.emit(ModelStreamEvent::ProviderContext {
-                            value: anthropic_provider_context_payload(preserved_context_blocks),
-                        })
-                        .map_err(map_sink_error)?;
                     }
-                    Ok(())
                 }
-                _ => Ok(()),
+                Some(PartialContentBlock::Ignored) | None => {}
             }
+            Ok(())
         }
         "message_delta" => {
-            if let Some(delta) = event.payload.get("delta") {
-                if let Some(stop_reason) = delta.get("stop_reason").and_then(Value::as_str) {
-                    sink.emit(ModelStreamEvent::Stop {
-                        reason: map_stop_reason(stop_reason),
+            if let Some(usage) = event.payload.get("usage") {
+                state.merge_usage(usage, sink)?;
+            }
+            state.record_input_transformations(
+                event
+                    .payload
+                    .get("input_transformations")
+                    .or_else(|| event.payload.pointer("/delta/input_transformations")),
+            );
+            if let Some(stop_reason) = event
+                .payload
+                .pointer("/delta/stop_reason")
+                .and_then(Value::as_str)
+            {
+                if !matches!(stop_reason, "max_tokens" | "model_context_window_exceeded")
+                    && let Some(message) = state.unparsed_tool_input.take()
+                {
+                    return Err(ProviderError {
+                        message,
+                        retryable: true,
+                        retry_after_ms: None,
+                    });
+                }
+                // The runtime settles the turn on the stop event: everything
+                // the turn keeps goes out before it.
+                state.finish(sink)?;
+                if stop_reason == "refusal" {
+                    let details = event
+                        .payload
+                        .pointer("/delta/stop_details")
+                        .or_else(|| event.payload.get("stop_details"))
+                        .filter(|details| details.is_object());
+                    let field = |key: &str| {
+                        details
+                            .and_then(|details| details.get(key))
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    };
+                    sink.emit(ModelStreamEvent::Refusal {
+                        refusal: ModelRefusal {
+                            category: field("category"),
+                            explanation: field("explanation"),
+                            model: Some(state.model.clone()),
+                        },
                     })
                     .map_err(map_sink_error)?;
                 }
-            }
-            if let Some(usage) = event.payload.get("usage") {
-                sink.emit(ModelStreamEvent::Usage {
-                    usage: parse_usage(usage, pricing),
+                sink.emit(ModelStreamEvent::Stop {
+                    reason: map_stop_reason(stop_reason),
                 })
                 .map_err(map_sink_error)?;
             }
@@ -1634,26 +2138,47 @@ fn handle_sse_event(
     }
 }
 
-fn parse_usage(usage: &Value, pricing: Option<&AnthropicPricing>) -> kheish_types::ModelUsage {
-    let input_tokens = usage
-        .get("input_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or_default();
-    let output_tokens = usage
-        .get("output_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or_default();
-    let cost_usd = pricing
-        .map(|pricing| {
-            (input_tokens as f64 / 1_000_000.0) * pricing.input_per_million_tokens_usd
-                + (output_tokens as f64 / 1_000_000.0) * pricing.output_per_million_tokens_usd
-        })
-        .unwrap_or_default();
+/// Reads the token counts of a Messages API `usage` object (unpriced).
+fn parse_usage(usage: &Value) -> kheish_types::ModelUsage {
+    let count = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or_default();
     kheish_types::ModelUsage {
-        input_tokens,
-        output_tokens,
-        cost_usd,
+        input_tokens: count("input_tokens"),
+        output_tokens: count("output_tokens"),
+        cache_creation_input_tokens: count("cache_creation_input_tokens"),
+        cache_read_input_tokens: count("cache_read_input_tokens"),
+        cost_usd: 0.0,
+        iterations: Vec::new(),
     }
+}
+
+/// The part of a usage report's cache writes that went to the 1-hour cache.
+fn cache_write_1h_tokens(usage: &Value) -> u64 {
+    usage
+        .pointer("/cache_creation/ephemeral_1h_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+}
+
+/// Encodes the tools sorted by name, so the tool prefix renders the same
+/// bytes on every turn whatever order the runtime lists them in, with a
+/// prompt-cache breakpoint on the last one.
+fn anthropic_tools(tools: &[kheish_types::ToolDefinition]) -> Vec<Value> {
+    let mut sorted = tools.iter().collect::<Vec<_>>();
+    sorted.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut encoded = sorted
+        .into_iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+            })
+        })
+        .collect::<Vec<_>>();
+    if let Some(Value::Object(last)) = encoded.last_mut() {
+        last.insert("cache_control".to_string(), anthropic_cache_breakpoint());
+    }
+    encoded
 }
 
 fn map_stop_reason(stop_reason: &str) -> ModelFinishReason {
@@ -1758,6 +2283,7 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     use super::{ANTHROPIC_INTERLEAVED_THINKING_BETA, AnthropicProvider, AnthropicProviderConfig};
+    use crate::execution::{ExecutionScope, scope_execution};
     use crate::model::{
         ModelBudget, ModelEventSink, ModelGenerationConfig, ModelProvider, ModelRetryPolicy,
         ModelRuntime, ModelRuntimeRequest, ModelStreamEvent, ReasoningConfig, ReasoningEffort,
@@ -1768,15 +2294,18 @@ mod tests {
         create_fixture_dir, write_document_attachment, write_document_attachment_with_preview,
         write_image_attachment,
     };
-    use crate::providers::testsupport::{spawn_chunked_mock_server, spawn_mock_server};
+    use crate::providers::testsupport::{
+        MockHttpResponse, spawn_chunked_mock_server, spawn_mock_server, spawn_recording_mock_server,
+    };
     use crate::{DebugCaptureLevel, NoopObserver};
     use kheish_core::ModelDriver;
     use kheish_types::capped_default_max_output_tokens;
     use kheish_types::{
-        CAPPED_DEFAULT_MAX_OUTPUT_TOKENS, ConversationKey, InputContentPart, PromptProjection,
-        ProviderInputItem, ProviderPrompt, SummaryBlock, ToolCallRecord, ToolDefinition,
-        ToolResultRecord,
+        CAPPED_DEFAULT_MAX_OUTPUT_TOKENS, ConversationKey, InputContentPart, ModelRefusal,
+        PromptProjection, ProviderInputItem, ProviderPrompt, RefusalFallbackModel,
+        RefusalFallbacks, SummaryBlock, ToolCallRecord, ToolDefinition, ToolResultRecord,
     };
+    use tokio_util::sync::CancellationToken;
 
     struct FixedDebugObserver {
         level: DebugCaptureLevel,
@@ -1957,6 +2486,8 @@ mod tests {
                                 items: None,
                             },
                         },
+                        refusal_fallbacks: None,
+                        retry_max_tokens: None,
                     },
                 },
                 ModelEventSink::new(sender),
@@ -1970,9 +2501,9 @@ mod tests {
         assert_eq!(payload["tool_choice"]["name"], "echo");
         assert_eq!(payload["tool_choice"]["disable_parallel_tool_use"], true);
         assert_eq!(payload["tools"][0]["name"], "echo");
-        let system = payload["system"]
+        let system = payload["system"][0]["text"]
             .as_str()
-            .expect("system should be serialized");
+            .expect("system should be serialized as one text block");
         assert!(system.contains("Return only valid JSON"));
 
         let messages = payload["messages"]
@@ -2026,32 +2557,121 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_model_capability_table_matches_current_generations() {
-        for model in [
-            "claude-fable-5",
-            "claude-mythos-5",
-            "claude-opus-4-7",
-            "claude-opus-4-8",
-            "claude-sonnet-5",
-            "anthropic.claude-opus-4-8",
+    fn every_current_family_gets_its_documented_thinking_shape() -> Result<()> {
+        let generation = ModelGenerationConfig {
+            reasoning: Some(ReasoningConfig {
+                effort: Some(ReasoningEffort::High),
+                ..ReasoningConfig::default()
+            }),
+            temperature: Some(0.5),
+            ..ModelGenerationConfig::default()
+        };
+        let adaptive = json!({ "type": "adaptive" });
+        let budget = json!({ "type": "enabled", "budget_tokens": 8_192 });
+        for (model, thinking, effort) in [
+            ("claude-opus-5-5", &adaptive, Some("high")),
+            ("anthropic.claude-opus-5-5", &adaptive, Some("high")),
+            ("claude-opus-5", &adaptive, Some("high")),
+            ("claude-fable-5-1", &adaptive, Some("high")),
+            ("claude-fable-5", &adaptive, Some("high")),
+            ("claude-mythos-5-1", &adaptive, Some("high")),
+            ("claude-sonnet-5-5", &adaptive, Some("high")),
+            (
+                "us.anthropic.claude-sonnet-5-5-v1:0",
+                &adaptive,
+                Some("high"),
+            ),
+            ("claude-sonnet-5", &adaptive, Some("high")),
+            ("claude-haiku-5-5", &adaptive, Some("high")),
+            ("anthropic.claude-haiku-5-5", &adaptive, Some("high")),
+            ("claude-opus-4-8", &adaptive, Some("high")),
+            ("anthropic.claude-opus-4-8", &adaptive, Some("high")),
+            ("claude-opus-4-7", &adaptive, Some("high")),
+            ("claude-opus-4-6", &budget, None),
+            ("claude-sonnet-4-6", &budget, None),
+            ("claude-sonnet-4-5-20250929", &budget, None),
+            ("claude-haiku-4-5-20251001", &budget, None),
         ] {
-            assert!(
-                super::anthropic_model_uses_adaptive_thinking(model),
-                "{model} should use adaptive thinking"
+            let provider = AnthropicProvider::new(AnthropicProviderConfig::new(model, "key"))?;
+            let body = provider.build_request_body(&minimal_request(generation.clone()))?;
+            // The conversation binding control is checked on its own below.
+            let mut sent = body["thinking"].clone();
+            if let Some(sent) = sent.as_object_mut() {
+                sent.remove("block_binding");
+            }
+            assert_eq!(&sent, thinking, "{model} thinking");
+            assert_eq!(
+                body.get("output_config")
+                    .map(|value| value["effort"].clone()),
+                effort.map(|effort| json!(effort)),
+                "{model} effort"
+            );
+            // Sampling parameters are a 400 wherever thinking is adaptive-only.
+            assert_eq!(
+                body.get("temperature").is_some(),
+                effort.is_none(),
+                "{model} temperature"
             );
         }
-        for model in [
-            "claude-opus-4-6",
-            "claude-opus-4-5",
-            "claude-sonnet-4-6",
-            "claude-sonnet-4-5",
-            "claude-haiku-4-5",
+        Ok(())
+    }
+
+    #[test]
+    fn claude_opus_5_5_is_never_sent_budget_tokens() -> Result<()> {
+        let provider =
+            AnthropicProvider::new(AnthropicProviderConfig::new("claude-opus-5-5", "test-key"))?;
+        for (reasoning, effort) in [
+            (
+                ReasoningConfig {
+                    budget_tokens: Some(4_096),
+                    ..ReasoningConfig::default()
+                },
+                "medium",
+            ),
+            (
+                ReasoningConfig {
+                    effort: Some(ReasoningEffort::Max),
+                    interleaved: true,
+                    ..ReasoningConfig::default()
+                },
+                "max",
+            ),
+            // Thinking cannot be turned off on Claude Opus 5.5: `none` asks for
+            // the least of it.
+            (
+                ReasoningConfig {
+                    effort: Some(ReasoningEffort::None),
+                    ..ReasoningConfig::default()
+                },
+                "low",
+            ),
         ] {
-            assert!(
-                !super::anthropic_model_uses_adaptive_thinking(model),
-                "{model} should keep the legacy request shape"
-            );
+            let request = provider.build_request(&minimal_request(ModelGenerationConfig {
+                reasoning: Some(reasoning),
+                ..ModelGenerationConfig::default()
+            }))?;
+            assert_eq!(request.body["thinking"]["type"], "adaptive");
+            assert_eq!(request.body["output_config"], json!({ "effort": effort }));
+            assert!(!request.body.to_string().contains("budget_tokens"));
+            assert!(!request.betas.contains(&ANTHROPIC_INTERLEAVED_THINKING_BETA));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn opus_4_8_thinks_only_when_asked() -> Result<()> {
+        let provider =
+            AnthropicProvider::new(AnthropicProviderConfig::new("claude-opus-4-8", "test-key"))?;
+        let body = provider.build_request_body(&minimal_request(ModelGenerationConfig {
+            reasoning: Some(ReasoningConfig {
+                effort: Some(ReasoningEffort::None),
+                ..ReasoningConfig::default()
+            }),
+            ..ModelGenerationConfig::default()
+        }))?;
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("output_config").is_none());
+        Ok(())
     }
 
     #[test]
@@ -2640,9 +3260,21 @@ mod tests {
 
     #[test]
     fn anthropic_headers_add_interleaved_thinking_beta_when_requested() {
+        let interleaved = ModelGenerationConfig {
+            reasoning: Some(ReasoningConfig {
+                effort: Some(ReasoningEffort::High),
+                summary: None,
+                budget_tokens: None,
+                interleaved: true,
+            }),
+            ..ModelGenerationConfig::default()
+        };
         let provider =
             AnthropicProvider::new(AnthropicProviderConfig::new("claude-opus-4-6", "test-key"))
                 .expect("provider should build");
+        let request = provider
+            .build_request(&minimal_request(interleaved.clone()))
+            .expect("request should build");
         let headers = provider
             .headers_from_material(
                 &ResolvedAuthMaterial {
@@ -2653,12 +3285,7 @@ mod tests {
                     grant_id: None,
                     lease_id: None,
                 },
-                Some(&ReasoningConfig {
-                    effort: Some(ReasoningEffort::High),
-                    summary: None,
-                    budget_tokens: None,
-                    interleaved: true,
-                }),
+                &request.betas,
             )
             .expect("headers should build");
 
@@ -2668,6 +3295,15 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some(ANTHROPIC_INTERLEAVED_THINKING_BETA)
         );
+
+        // Adaptive thinking interleaves without the beta.
+        let adaptive =
+            AnthropicProvider::new(AnthropicProviderConfig::new("claude-opus-4-8", "test-key"))
+                .expect("provider should build");
+        let request = adaptive
+            .build_request(&minimal_request(interleaved))
+            .expect("request should build");
+        assert!(request.betas.is_empty());
     }
 
     #[test]
@@ -2688,7 +3324,7 @@ mod tests {
                     grant_id: None,
                     lease_id: None,
                 },
-                None,
+                &[],
             )
             .expect("headers should build");
         assert_eq!(
@@ -2764,6 +3400,881 @@ mod tests {
         }
         assert!(saw_tool_call);
         assert!(saw_stop);
+        Ok(())
+    }
+
+    /// A complete Messages SSE stream that answers `text` and ends the turn.
+    fn sse_text_stream(message_id: &str, text: &str) -> String {
+        format!(
+            concat!(
+                "event: message_start\n",
+                "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{id}\",\"model\":\"claude-opus-5-5\",\"usage\":{{\"input_tokens\":5,\"output_tokens\":0}}}}}}\n\n",
+                "event: content_block_start\n",
+                "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n",
+                "event: content_block_delta\n",
+                "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":{text}}}}}\n\n",
+                "event: content_block_stop\n",
+                "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n",
+                "event: message_delta\n",
+                "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\",\"stop_details\":null}},\"usage\":{{\"output_tokens\":3}}}}\n\n",
+                "event: message_stop\n",
+                "data: {{\"type\":\"message_stop\"}}\n\n"
+            ),
+            id = message_id,
+            text = serde_json::to_string(text).expect("text serializes"),
+        )
+    }
+
+    fn runtime_request(session_id: &str, generation: ModelGenerationConfig) -> ModelRuntimeRequest {
+        ModelRuntimeRequest {
+            attempt: 1,
+            kind: kheish_core::ModelRequestKind::MainLoop,
+            session_id: session_id.to_string(),
+            thread_id: None,
+            turn: 1,
+            prompt: ProviderPrompt {
+                instructions: vec!["You verify exposures.".to_string()],
+                force_synthetic_user_prefix: false,
+                items: vec![ProviderInputItem::Message {
+                    id: "u1".to_string(),
+                    role: kheish_types::Role::User,
+                    content: "Say hello".to_string(),
+                    content_parts: Vec::new(),
+                    attachments: Vec::new(),
+                    provider_response_id: None,
+                    provider_context: None,
+                }],
+            },
+            available_tools: Vec::new(),
+            generation,
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_requests_carry_the_execution_scope_session_and_run() -> Result<()> {
+        let (url, recorded) = spawn_recording_mock_server(vec![
+            MockHttpResponse::sse(&sse_text_stream("msg-scope", "hello")),
+            MockHttpResponse::sse(&sse_text_stream("msg-cli", "hello")),
+        ])
+        .await?;
+        let provider = AnthropicProvider::new(AnthropicProviderConfig {
+            base_url: url,
+            ..AnthropicProviderConfig::new("claude-opus-5-5", "test-key")
+        })?;
+        let scope = ExecutionScope {
+            session_id: "fm-mission-1".to_string(),
+            run_id: Some("run-42".to_string()),
+            ..ExecutionScope::default()
+        };
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        scope_execution(
+            scope,
+            CancellationToken::new(),
+            provider.stream(
+                runtime_request("fm-mission-1", ModelGenerationConfig::default()),
+                ModelEventSink::new(sender),
+            ),
+        )
+        .await?;
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        provider
+            .stream(
+                runtime_request("cli-session", ModelGenerationConfig::default()),
+                ModelEventSink::new(sender),
+            )
+            .await?;
+
+        let recorded = recorded.lock().clone();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(
+            recorded[0].header("x-kheish-session-id"),
+            Some("fm-mission-1")
+        );
+        assert_eq!(recorded[0].header("x-kheish-run-id"), Some("run-42"));
+        assert_eq!(recorded[0].header("x-api-key"), Some("test-key"));
+        // The ids travel as headers only: the model never sees them.
+        assert_eq!(recorded[0].json()["model"], "claude-opus-5-5");
+        assert!(!recorded[0].body.contains("run-42"));
+        assert!(!recorded[0].body.contains("fm-mission-1"));
+        assert_eq!(
+            recorded[1].header("x-kheish-session-id"),
+            Some("cli-session")
+        );
+        assert_eq!(recorded[1].header("x-kheish-run-id"), None);
+        Ok(())
+    }
+
+    fn tool(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: format!("The {name} tool."),
+            input_schema: json!({"type": "object", "properties": {}}),
+            allows_parallel: true,
+        }
+    }
+
+    #[test]
+    fn requests_carry_stable_cache_breakpoints_on_system_and_tools() -> Result<()> {
+        let provider =
+            AnthropicProvider::new(AnthropicProviderConfig::new("claude-opus-5-5", "test-key"))?;
+        let mut first = runtime_request("session-cache", ModelGenerationConfig::default());
+        first.available_tools = vec![tool("submit_verdict"), tool("get_exposure")];
+        let mut second = first.clone();
+        // The runtime may list tools in another order on a later turn.
+        second.available_tools.reverse();
+        second.prompt.items.extend([
+            ProviderInputItem::Message {
+                id: "a1".to_string(),
+                role: kheish_types::Role::Assistant,
+                content: "Hello.".to_string(),
+                content_parts: Vec::new(),
+                attachments: Vec::new(),
+                provider_response_id: Some("msg-1".to_string()),
+                provider_context: None,
+            },
+            ProviderInputItem::Message {
+                id: "u2".to_string(),
+                role: kheish_types::Role::User,
+                content: "Verify the exposure.".to_string(),
+                content_parts: Vec::new(),
+                attachments: Vec::new(),
+                provider_response_id: None,
+                provider_context: None,
+            },
+        ]);
+        let first = provider.build_request_body(&first)?;
+        let second = provider.build_request_body(&second)?;
+
+        let breakpoint = json!({ "type": "ephemeral" });
+        assert_eq!(
+            first["system"],
+            json!([{
+                "type": "text",
+                "text": "You verify exposures.",
+                "cache_control": breakpoint,
+            }])
+        );
+        let tools = first["tools"].as_array().expect("tools");
+        assert_eq!(tools[0]["name"], "get_exposure");
+        assert!(tools[0].get("cache_control").is_none());
+        assert_eq!(tools[1]["name"], "submit_verdict");
+        assert_eq!(tools[1]["cache_control"], breakpoint);
+        // Automatic caching of the conversation tail.
+        assert_eq!(first["cache_control"], breakpoint);
+        // The cached prefix renders the same bytes on the next turn.
+        assert_eq!(first["system"], second["system"]);
+        assert_eq!(first["tools"], second["tools"]);
+        assert_eq!(first["messages"][0], second["messages"][0]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn usage_merges_cache_counts_across_events_and_prices_them() -> Result<()> {
+        let stream = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-cache\",\"model\":\"claude-opus-5-5\",\"usage\":{\"input_tokens\":1000,\"cache_creation_input_tokens\":20000,\"cache_read_input_tokens\":500000,\"output_tokens\":1}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"done\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2000}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let (url, _recorded) =
+            spawn_recording_mock_server(vec![MockHttpResponse::sse(stream)]).await?;
+        let provider = AnthropicProvider::new(AnthropicProviderConfig {
+            base_url: url,
+            ..AnthropicProviderConfig::new("claude-opus-5-5", "test-key")
+        })?;
+        let runtime = ModelRuntime::new(
+            provider,
+            ModelRetryPolicy {
+                max_attempts: 1,
+                ..ModelRetryPolicy::default()
+            },
+            ModelBudget {
+                max_total_output_tokens: Some(1_000_000),
+                max_total_cost_usd: Some(1_000.0),
+            },
+            Arc::new(NoopObserver),
+        );
+        let turn = runtime
+            .next_turn(default_model_request("session-cache"))
+            .await?;
+        let usage = turn.usage.expect("usage");
+        assert_eq!(usage.input_tokens, 1_000);
+        assert_eq!(usage.cache_creation_input_tokens, 20_000);
+        assert_eq!(usage.cache_read_input_tokens, 500_000);
+        assert_eq!(usage.output_tokens, 2_000);
+        assert_eq!(usage.prompt_tokens(), 521_000);
+        // Claude Opus 5.5: $4 input, $5 cache write, $0.20 cache read, $20 output.
+        let expected = 1_000.0 * 4.0 / 1e6
+            + 20_000.0 * 5.0 / 1e6
+            + 500_000.0 * 0.20 / 1e6
+            + 2_000.0 * 20.0 / 1e6;
+        assert!(
+            (usage.cost_usd - expected).abs() < 1e-9,
+            "{}",
+            usage.cost_usd
+        );
+        let consumed = runtime.budget_snapshot().consumed;
+        assert_eq!(consumed.cache_read_input_tokens, 500_000);
+        Ok(())
+    }
+
+    /// A streamed answer that interleaves thinking, text and a tool use the
+    /// way Claude Opus 5.5 does under the default `display: "omitted"`:
+    /// thinking blocks with empty text and a signature.
+    const INTERLEAVED_THINKING_STREAM: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-a1\",\"model\":\"claude-opus-5-5\",\"usage\":{\"input_tokens\":40,\"output_tokens\":1}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"EqQBCkYIBxgCKkBsig-one==\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Checking the host. \"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Scan the port first.\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"EqQBCkYIBxgCKkBsig-two==\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_scan\",\"name\":\"mcp__fregate__scan_target\",\"input\":{}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":3,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"target\\\":\\\"example.com\\\"}\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":3}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_details\":null},\"usage\":{\"output_tokens\":90}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+
+    /// The answer above as the API expects it back.
+    fn interleaved_answer_content() -> Value {
+        json!([
+            {"type": "thinking", "thinking": "", "signature": "EqQBCkYIBxgCKkBsig-one=="},
+            {"type": "text", "text": "Checking the host. "},
+            {"type": "thinking", "thinking": "Scan the port first.", "signature": "EqQBCkYIBxgCKkBsig-two=="},
+            {"type": "tool_use", "id": "toolu_scan", "name": "mcp__fregate__scan_target", "input": {"target": "example.com"}},
+        ])
+    }
+
+    fn user_item(id: &str, content: &str) -> ProviderInputItem {
+        ProviderInputItem::Message {
+            id: id.to_string(),
+            role: kheish_types::Role::User,
+            content: content.to_string(),
+            content_parts: Vec::new(),
+            attachments: Vec::new(),
+            provider_response_id: None,
+            provider_context: None,
+        }
+    }
+
+    /// Runs the interleaved answer through the runtime and returns the
+    /// conversation items the engine would store for it.
+    async fn interleaved_answer_items() -> Result<Vec<ProviderInputItem>> {
+        let (url, _recorded) =
+            spawn_recording_mock_server(vec![MockHttpResponse::sse(INTERLEAVED_THINKING_STREAM)])
+                .await?;
+        let provider = AnthropicProvider::new(AnthropicProviderConfig {
+            base_url: url,
+            ..AnthropicProviderConfig::new("claude-opus-5-5", "test-key")
+        })?;
+        let runtime = ModelRuntime::new(
+            provider,
+            ModelRetryPolicy {
+                max_attempts: 1,
+                ..ModelRetryPolicy::default()
+            },
+            ModelBudget::default(),
+            Arc::new(NoopObserver),
+        );
+        let turn = runtime
+            .next_turn(default_model_request("fm-mission"))
+            .await?;
+        let message = turn.assistant_message;
+        let mut items = vec![ProviderInputItem::Message {
+            id: message.id.clone(),
+            role: message.role.clone(),
+            content: message.content.clone(),
+            content_parts: Vec::new(),
+            attachments: Vec::new(),
+            provider_response_id: message.provider_response_id.clone(),
+            provider_context: message.provider_context.clone(),
+        }];
+        for call in turn.tool_calls {
+            items.push(ProviderInputItem::ToolCall {
+                assistant_message_id: Some(message.id.clone()),
+                call,
+            });
+        }
+        Ok(items)
+    }
+
+    fn opus_5_5_request(items: Vec<ProviderInputItem>) -> ModelRuntimeRequest {
+        let mut request = runtime_request("fm-mission", ModelGenerationConfig::default());
+        request.prompt.items = items;
+        request
+    }
+
+    #[tokio::test]
+    async fn thinking_blocks_replay_byte_for_byte_in_their_original_order() -> Result<()> {
+        let mut items = vec![user_item("u1", "Verify the exposure on example.com.")];
+        items.extend(interleaved_answer_items().await?);
+        items.push(ProviderInputItem::ToolResult {
+            result: ToolResultRecord {
+                call_id: "toolu_scan".to_string(),
+                output: json!({"open_ports": [443]}),
+                is_error: false,
+                tool_name: Some("mcp__fregate__scan_target".to_string()),
+                offset: None,
+                timestamp_ms: None,
+                context_updates: Vec::new(),
+                hook_contexts: Vec::new(),
+            },
+        });
+        let provider =
+            AnthropicProvider::new(AnthropicProviderConfig::new("claude-opus-5-5", "test-key"))?;
+        let body = provider.build_request_body(&opus_5_5_request(items))?;
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(messages[1]["role"], "assistant");
+        // Both thinking blocks, the empty-text one included, keep their
+        // signatures and their place between the text and the tool use.
+        assert_eq!(messages[1]["content"], interleaved_answer_content());
+        assert_eq!(messages[2]["content"][0]["type"], "tool_result");
+        assert_eq!(messages[2]["content"][0]["tool_use_id"], "toolu_scan");
+        Ok(())
+    }
+
+    #[test]
+    fn preserved_thinking_models_send_drop_block_under_the_binding_beta() -> Result<()> {
+        for model in [
+            "claude-opus-5-5",
+            "claude-fable-5-1",
+            "claude-mythos-5-1",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "anthropic.claude-opus-5-5",
+        ] {
+            let provider = AnthropicProvider::new(AnthropicProviderConfig::new(model, "key"))?;
+            // With and without a reasoning config: the field is always set.
+            for generation in [
+                ModelGenerationConfig::default(),
+                ModelGenerationConfig {
+                    reasoning: Some(ReasoningConfig {
+                        effort: Some(ReasoningEffort::High),
+                        summary: Some(ReasoningSummary::Auto),
+                        ..ReasoningConfig::default()
+                    }),
+                    ..ModelGenerationConfig::default()
+                },
+            ] {
+                let request = provider.build_request(&minimal_request(generation))?;
+                assert_eq!(request.body["thinking"]["type"], "adaptive", "{model}");
+                assert_eq!(
+                    request.body["thinking"]["block_binding"],
+                    json!({ "prefix_mismatch_behavior": "drop_block" }),
+                    "{model}"
+                );
+                assert!(
+                    request
+                        .betas
+                        .contains(&"thinking-binding-controls-2026-08-01"),
+                    "{model}"
+                );
+            }
+        }
+        for model in ["claude-opus-5", "claude-opus-4-8", "claude-sonnet-5"] {
+            let provider = AnthropicProvider::new(AnthropicProviderConfig::new(model, "key"))?;
+            let request = provider.build_request(&minimal_request(ModelGenerationConfig {
+                reasoning: Some(ReasoningConfig {
+                    effort: Some(ReasoningEffort::High),
+                    ..ReasoningConfig::default()
+                }),
+                ..ModelGenerationConfig::default()
+            }))?;
+            assert!(
+                request.body["thinking"].get("block_binding").is_none(),
+                "{model}"
+            );
+            assert!(request.betas.is_empty(), "{model}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn orphaned_tool_call_recovery_keeps_the_prefix_and_sends_drop_block() -> Result<()> {
+        // The request that produced the answer, before the daemon died with
+        // the tool call in flight.
+        let before = vec![user_item("u1", "Verify the exposure on example.com.")];
+        // After the restart, the next run's prompt: the answer and its tool
+        // call, no result, then the continuation input.
+        let mut after = before.clone();
+        after.extend(interleaved_answer_items().await?);
+        after.push(user_item("u2", "The run was interrupted; continue."));
+
+        let (url, recorded) = spawn_recording_mock_server(vec![
+            MockHttpResponse::sse(&sse_text_stream("msg-before", "ok")),
+            MockHttpResponse::sse(&sse_text_stream("msg-after", "ok")),
+        ])
+        .await?;
+        let provider = AnthropicProvider::new(AnthropicProviderConfig {
+            base_url: url,
+            ..AnthropicProviderConfig::new("claude-opus-5-5", "test-key")
+        })?;
+        for items in [before, after] {
+            let (sender, _receiver) = mpsc::unbounded_channel();
+            provider
+                .stream(opus_5_5_request(items), ModelEventSink::new(sender))
+                .await?;
+        }
+        let recorded = recorded.lock().clone();
+        let before = recorded[0].json();
+        let after = recorded[1].json();
+
+        // The prefix the thinking blocks were minted under is unchanged...
+        assert_eq!(before["system"], after["system"]);
+        assert_eq!(before["tools"], after["tools"]);
+        assert_eq!(before["messages"][0], after["messages"][0]);
+        // ...the answer replays verbatim...
+        assert_eq!(
+            after["messages"][1]["content"],
+            interleaved_answer_content()
+        );
+        // ...the missing result is appended after it as an error...
+        let repaired = &after["messages"][2]["content"][0];
+        assert_eq!(repaired["type"], "tool_result");
+        assert_eq!(repaired["tool_use_id"], "toolu_scan");
+        assert_eq!(repaired["is_error"], true);
+        assert!(
+            repaired["content"][0]["text"]
+                .as_str()
+                .expect("text")
+                .contains("tool result missing")
+        );
+        assert_eq!(
+            after["messages"][3]["content"][0]["text"],
+            "The run was interrupted; continue."
+        );
+        // ...and the request opts into drop_block under the binding beta.
+        assert_eq!(
+            after["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+            "drop_block"
+        );
+        assert!(
+            recorded[1]
+                .header("anthropic-beta")
+                .expect("beta header")
+                .split(',')
+                .any(|beta| beta == "thinking-binding-controls-2026-08-01")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compacted_history_replays_post_boundary_thinking_with_drop_block() -> Result<()> {
+        // After a compaction the window starts with the summary; the turns
+        // kept after the boundary replay their thinking.
+        let mut items = vec![ProviderInputItem::Summary {
+            summary: SummaryBlock {
+                title: "compaction".to_string(),
+                content: "<summary>The agent scanned example.com.</summary>".to_string(),
+            },
+        }];
+        items.extend(interleaved_answer_items().await?);
+        let provider =
+            AnthropicProvider::new(AnthropicProviderConfig::new("claude-opus-5-5", "test-key"))?;
+        let request = provider.build_request(&opus_5_5_request(items))?;
+        let messages = request.body["messages"].as_array().expect("messages");
+        assert_eq!(messages[0]["role"], "user");
+        assert!(
+            messages[0]["content"][0]["text"]
+                .as_str()
+                .expect("summary text")
+                .contains("The agent scanned example.com.")
+        );
+        assert_eq!(messages[1]["content"], interleaved_answer_content());
+        assert_eq!(
+            request.body["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+            "drop_block"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn input_transformations_are_kept_with_the_answer() -> Result<()> {
+        let stream = sse_text_stream("msg-dropped", "ok").replace(
+            "\"usage\":{\"input_tokens\":5",
+            "\"input_transformations\":[{\"type\":\"thinking_dropped\",\"path\":\"messages.1.content.0\",\"reason\":\"prefix_binding_mismatch\"}],\"usage\":{\"input_tokens\":5",
+        );
+        let (url, _recorded) =
+            spawn_recording_mock_server(vec![MockHttpResponse::sse(&stream)]).await?;
+        let provider = AnthropicProvider::new(AnthropicProviderConfig {
+            base_url: url,
+            ..AnthropicProviderConfig::new("claude-opus-5-5", "test-key")
+        })?;
+        let runtime = ModelRuntime::new(
+            provider,
+            ModelRetryPolicy {
+                max_attempts: 1,
+                ..ModelRetryPolicy::default()
+            },
+            ModelBudget::default(),
+            Arc::new(NoopObserver),
+        );
+        let turn = runtime
+            .next_turn(default_model_request("fm-mission"))
+            .await?;
+        let context = turn
+            .assistant_message
+            .provider_context
+            .expect("the transformation is recorded with the answer");
+        assert_eq!(
+            context["anthropic"]["input_transformations"][0]["reason"],
+            "prefix_binding_mismatch"
+        );
+        Ok(())
+    }
+
+    /// Claude Opus 5.5 starts an answer and a tool call, declines mid-stream,
+    /// and Claude Opus 5 answers: the response shape the refusals and
+    /// fallback page documents for a streamed mid-output fallback.
+    const MID_STREAM_FALLBACK_STREAM: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-fb\",\"model\":\"claude-opus-5-5\",\"usage\":{\"input_tokens\":900,\"output_tokens\":1}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-declined\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Looking at the service. \"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_declined\",\"name\":\"mcp__fregate__scan_target\",\"input\":{}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"target\\\":\\\"a\\\"}\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"fallback\",\"from\":{\"model\":\"claude-opus-5-5\"},\"to\":{\"model\":\"claude-opus-5\"},\"trigger\":{\"type\":\"refusal\",\"category\":\"cyber\"}}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":3}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":4,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":4,\"delta\":{\"type\":\"text_delta\",\"text\":\"The port is closed.\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":4}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":5,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_served\",\"name\":\"mcp__fregate__submit_verdict\",\"input\":{}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":5,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"verdict\\\":\\\"closed\\\"}\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":5}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_details\":null},\"usage\":{\"input_tokens\":900,\"output_tokens\":120,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"iterations\":[{\"type\":\"message\",\"model\":\"claude-opus-5-5\",\"input_tokens\":900,\"output_tokens\":40,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0},{\"type\":\"fallback_message\",\"model\":\"claude-opus-5\",\"input_tokens\":900,\"output_tokens\":120,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}]}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+
+    fn runtime_for(provider: AnthropicProvider) -> ModelRuntime<AnthropicProvider> {
+        ModelRuntime::new(
+            provider,
+            ModelRetryPolicy {
+                max_attempts: 1,
+                ..ModelRetryPolicy::default()
+            },
+            ModelBudget {
+                max_total_output_tokens: Some(1_000_000),
+                max_total_cost_usd: Some(1_000.0),
+            },
+            Arc::new(NoopObserver),
+        )
+    }
+
+    #[test]
+    fn requests_name_refusal_fallbacks_from_the_run_or_the_route() -> Result<()> {
+        let route_default = AnthropicProviderConfig {
+            refusal_fallbacks: Some(RefusalFallbacks::default_routing()),
+            ..AnthropicProviderConfig::new("claude-opus-5-5", "key")
+        };
+        let provider = AnthropicProvider::new(route_default.clone())?;
+        let request = provider.build_request(&minimal_request(ModelGenerationConfig::default()))?;
+        assert_eq!(request.body["fallbacks"], "default");
+        assert!(request.betas.contains(&"server-side-fallback-2026-07-01"));
+
+        // The run's list overrides the route's routing.
+        let request = provider.build_request(&minimal_request(ModelGenerationConfig {
+            refusal_fallbacks: Some(RefusalFallbacks::Models(vec![
+                RefusalFallbackModel {
+                    model: "claude-opus-5".to_string(),
+                    max_tokens: Some(8_000),
+                },
+                RefusalFallbackModel {
+                    model: "claude-opus-4-8".to_string(),
+                    max_tokens: None,
+                },
+            ])),
+            ..ModelGenerationConfig::default()
+        }))?;
+        assert_eq!(
+            request.body["fallbacks"],
+            json!([
+                {"model": "claude-opus-5", "max_tokens": 8_000},
+                {"model": "claude-opus-4-8"}
+            ])
+        );
+
+        // Claude Sonnet 5.5 takes only the default routing; Claude Haiku 5.5
+        // and Claude Opus 4.8 no server-side fallback at all.
+        let list = ModelGenerationConfig {
+            refusal_fallbacks: Some(RefusalFallbacks::Models(vec![RefusalFallbackModel {
+                model: "claude-sonnet-5".to_string(),
+                max_tokens: None,
+            }])),
+            ..ModelGenerationConfig::default()
+        };
+        for model in ["claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-4-8"] {
+            let provider = AnthropicProvider::new(AnthropicProviderConfig::new(model, "key"))?;
+            let request = provider.build_request(&minimal_request(list.clone()))?;
+            assert!(request.body.get("fallbacks").is_none(), "{model}");
+            assert!(!request.betas.contains(&"server-side-fallback-2026-07-01"));
+        }
+        let provider =
+            AnthropicProvider::new(AnthropicProviderConfig::new("claude-sonnet-5-5", "key"))?;
+        let request = provider.build_request(&minimal_request(ModelGenerationConfig {
+            refusal_fallbacks: Some(RefusalFallbacks::default_routing()),
+            ..ModelGenerationConfig::default()
+        }))?;
+        assert_eq!(request.body["fallbacks"], "default");
+
+        // A list that names the requested model, repeats one, or is too long.
+        for models in [
+            vec!["claude-opus-5-5"],
+            vec!["claude-opus-5", "claude-opus-5"],
+            vec!["a-1", "a-2", "a-3", "a-4"],
+        ] {
+            let error = AnthropicProvider::new(route_default.clone())?
+                .build_request(&minimal_request(ModelGenerationConfig {
+                    refusal_fallbacks: Some(RefusalFallbacks::Models(
+                        models
+                            .iter()
+                            .map(|model| RefusalFallbackModel {
+                                model: model.to_string(),
+                                max_tokens: None,
+                            })
+                            .collect(),
+                    )),
+                    ..ModelGenerationConfig::default()
+                }))
+                .err()
+                .expect("an invalid list is refused before the request");
+            assert!(!error.retryable);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_mid_stream_fallback_withdraws_the_declined_attempt_and_prices_each() -> Result<()> {
+        let (url, recorded) =
+            spawn_recording_mock_server(vec![MockHttpResponse::sse(MID_STREAM_FALLBACK_STREAM)])
+                .await?;
+        let provider = AnthropicProvider::new(AnthropicProviderConfig {
+            base_url: url,
+            refusal_fallbacks: Some(RefusalFallbacks::default_routing()),
+            ..AnthropicProviderConfig::new("claude-opus-5-5", "test-key")
+        })?;
+        let turn = runtime_for(provider)
+            .next_turn(default_model_request("fm-mission"))
+            .await?;
+        let request = recorded.lock()[0].clone();
+        assert_eq!(request.json()["fallbacks"], "default");
+        assert!(
+            request
+                .header("anthropic-beta")
+                .expect("betas")
+                .contains("server-side-fallback-2026-07-01")
+        );
+
+        // Only the serving model's tool call runs.
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].id, "toolu_served");
+        // The declined attempt's text stays in the answer.
+        assert_eq!(
+            turn.assistant_message.content,
+            "Looking at the service. The port is closed."
+        );
+        // The replay keeps the text before the marker, the marker where it
+        // appeared, and everything after it.
+        let blocks = turn
+            .assistant_message
+            .provider_context
+            .as_ref()
+            .expect("context")["anthropic"]["content_blocks"]
+            .clone();
+        assert_eq!(
+            blocks,
+            json!([
+                {"type": "text", "text": "Looking at the service. "},
+                {"type": "fallback", "from": {"model": "claude-opus-5-5"}, "to": {"model": "claude-opus-5"}, "trigger": {"type": "refusal", "category": "cyber"}},
+                {"type": "text", "text": "The port is closed."},
+                {"type": "tool_use", "id": "toolu_served"},
+            ])
+        );
+        // Each attempt is priced at its own model's rates.
+        let usage = turn.usage.expect("usage");
+        assert_eq!(usage.iterations.len(), 2);
+        assert_eq!(usage.iterations[0].kind, "message");
+        assert_eq!(
+            usage.iterations[0].model.as_deref(),
+            Some("claude-opus-5-5")
+        );
+        assert_eq!(usage.iterations[1].kind, "fallback_message");
+        assert_eq!(usage.iterations[1].model.as_deref(), Some("claude-opus-5"));
+        let opus_5_5 = 900.0 * 4.0 / 1e6 + 40.0 * 20.0 / 1e6;
+        let opus_5 = 900.0 * 5.0 / 1e6 + 120.0 * 25.0 / 1e6;
+        assert!((usage.iterations[0].cost_usd - opus_5_5).abs() < 1e-12);
+        assert!((usage.iterations[1].cost_usd - opus_5).abs() < 1e-12);
+        assert!((usage.cost_usd - (opus_5_5 + opus_5)).abs() < 1e-12);
+        assert_eq!(usage.billed().output_tokens, 160);
+
+        // The stored turn replays as the API expects it back.
+        let message = turn.assistant_message;
+        let mut items = vec![user_item("u1", "Verify the exposure.")];
+        items.push(ProviderInputItem::Message {
+            id: message.id.clone(),
+            role: message.role.clone(),
+            content: message.content.clone(),
+            content_parts: Vec::new(),
+            attachments: Vec::new(),
+            provider_response_id: message.provider_response_id.clone(),
+            provider_context: message.provider_context.clone(),
+        });
+        for call in turn.tool_calls {
+            items.push(ProviderInputItem::ToolCall {
+                assistant_message_id: Some(message.id.clone()),
+                call,
+            });
+        }
+        let replay =
+            AnthropicProvider::new(AnthropicProviderConfig::new("claude-opus-5-5", "test-key"))?
+                .build_request_body(&opus_5_5_request(items))?;
+        assert_eq!(
+            replay["messages"][1]["content"],
+            json!([
+                {"type": "text", "text": "Looking at the service. "},
+                {"type": "fallback", "from": {"model": "claude-opus-5-5"}, "to": {"model": "claude-opus-5"}, "trigger": {"type": "refusal", "category": "cyber"}},
+                {"type": "text", "text": "The port is closed."},
+                {"type": "tool_use", "id": "toolu_served", "name": "mcp__fregate__submit_verdict", "input": {"verdict": "closed"}},
+            ])
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_final_refusal_reports_its_category() -> Result<()> {
+        let stream = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-refused\",\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":412,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"fallback\",\"from\":{\"model\":\"claude-opus-5-5\"},\"to\":{\"model\":\"claude-opus-5\"},\"trigger\":{\"type\":\"refusal\",\"category\":\"cyber\"}}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\",\"stop_details\":{\"type\":\"refusal\",\"category\":\"cyber\",\"explanation\":\"This request was declined because it could enable cyber harm.\",\"recommended_model\":null}},\"usage\":{\"output_tokens\":0}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let (url, _recorded) =
+            spawn_recording_mock_server(vec![MockHttpResponse::sse(stream)]).await?;
+        let provider = AnthropicProvider::new(AnthropicProviderConfig {
+            base_url: url,
+            ..AnthropicProviderConfig::new("claude-opus-5-5", "test-key")
+        })?;
+        let turn = runtime_for(provider)
+            .next_turn(default_model_request("fm-mission"))
+            .await?;
+        assert_eq!(turn.finish_reason, crate::model::ModelFinishReason::Blocked);
+        assert_eq!(
+            turn.refusal,
+            Some(ModelRefusal {
+                category: Some("cyber".to_string()),
+                explanation: Some(
+                    "This request was declined because it could enable cyber harm.".to_string()
+                ),
+                model: Some("claude-opus-5".to_string()),
+            })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_answer_cut_off_inside_a_tool_use_is_a_max_tokens_turn() -> Result<()> {
+        let cut = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-cut\",\"model\":\"claude-opus-5-5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_cut\",\"name\":\"write_file\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"content\\\":\\\"the report sta\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\",\"stop_details\":null},\"usage\":{\"output_tokens\":16000}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let (url, _recorded) =
+            spawn_recording_mock_server(vec![MockHttpResponse::sse(cut)]).await?;
+        let provider = AnthropicProvider::new(AnthropicProviderConfig {
+            base_url: url,
+            ..AnthropicProviderConfig::new("claude-opus-5-5", "test-key")
+        })?;
+        let turn = runtime_for(provider)
+            .next_turn(default_model_request("fm-mission"))
+            .await?;
+        assert_eq!(
+            turn.finish_reason,
+            crate::model::ModelFinishReason::MaxTokens
+        );
+        assert!(turn.tool_calls.is_empty());
+
+        // The same cut input on an answer that was not cut off is an error.
+        let broken = cut.replace("\"max_tokens\"", "\"tool_use\"");
+        let (url, _recorded) =
+            spawn_recording_mock_server(vec![MockHttpResponse::sse(&broken)]).await?;
+        let provider = AnthropicProvider::new(AnthropicProviderConfig {
+            base_url: url,
+            ..AnthropicProviderConfig::new("claude-opus-5-5", "test-key")
+        })?;
+        let error = runtime_for(provider)
+            .next_turn(default_model_request("fm-mission"))
+            .await
+            .expect_err("a tool use that does not parse fails the attempt");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid Anthropic tool JSON payload")
+        );
         Ok(())
     }
 

@@ -1718,6 +1718,7 @@ mod tests {
                 deliveries: Vec::new(),
                 error: None,
                 error_code: None,
+                refusal: None,
                 limits: None,
             },
             reply_targets: Vec::new(),

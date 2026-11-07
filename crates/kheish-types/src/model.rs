@@ -179,6 +179,9 @@ pub struct ModelMaxOutputTokens {
 /// daemon already routes in normal operation. Unknown models return `None` so
 /// callers can fall back to safer runtime heuristics.
 pub fn model_context_window(model: &str) -> Option<usize> {
+    if let Some(window) = crate::claude::claude_context_window(model) {
+        return Some(window);
+    }
     let canonical = model.to_lowercase();
     if canonical.starts_with("claude-") {
         return Some(200_000);
@@ -204,38 +207,41 @@ pub fn model_context_window(model: &str) -> Option<usize> {
 /// Returns native output token defaults and upper bounds for a model identifier.
 pub fn model_max_output_tokens(model: &str) -> ModelMaxOutputTokens {
     let canonical = model.to_lowercase();
-    let (default, upper_limit) = if canonical.contains("opus-4-6") {
-        (64_000, 128_000)
-    } else if canonical.contains("sonnet-4-6") {
-        (32_000, 128_000)
-    } else if canonical.contains("opus-4-5")
-        || canonical.contains("sonnet-4")
-        || canonical.contains("haiku-4")
-    {
-        (32_000, 64_000)
-    } else if canonical.contains("opus-4-1") || canonical.contains("opus-4") {
-        (32_000, 32_000)
-    } else if canonical.contains("claude-3-opus") {
-        (4_096, 4_096)
-    } else if canonical.contains("claude-3-sonnet")
-        || canonical.contains("3-5-sonnet")
-        || canonical.contains("3-5-haiku")
-    {
-        (8_192, 8_192)
-    } else if canonical.contains("claude-3-haiku") {
-        (4_096, 4_096)
-    } else if canonical.contains("3-7-sonnet") {
-        (32_000, 64_000)
-    } else if canonical.starts_with("gemini-2.5-") {
-        (65_536, 65_536)
-    } else if canonical.starts_with("gemini-3") || canonical.contains("image-preview") {
-        (32_768, 32_768)
-    } else {
-        (
-            CAPPED_DEFAULT_MAX_OUTPUT_TOKENS,
-            ESCALATED_MAX_OUTPUT_TOKENS,
-        )
-    };
+    let (default, upper_limit) =
+        if let Some(limits) = crate::claude::claude_max_output_tokens(model) {
+            limits
+        } else if canonical.contains("opus-4-6") {
+            (64_000, 128_000)
+        } else if canonical.contains("sonnet-4-6") {
+            (32_000, 128_000)
+        } else if canonical.contains("opus-4-5")
+            || canonical.contains("sonnet-4")
+            || canonical.contains("haiku-4")
+        {
+            (32_000, 64_000)
+        } else if canonical.contains("opus-4-1") || canonical.contains("opus-4") {
+            (32_000, 32_000)
+        } else if canonical.contains("claude-3-opus") {
+            (4_096, 4_096)
+        } else if canonical.contains("claude-3-sonnet")
+            || canonical.contains("3-5-sonnet")
+            || canonical.contains("3-5-haiku")
+        {
+            (8_192, 8_192)
+        } else if canonical.contains("claude-3-haiku") {
+            (4_096, 4_096)
+        } else if canonical.contains("3-7-sonnet") {
+            (32_000, 64_000)
+        } else if canonical.starts_with("gemini-2.5-") {
+            (65_536, 65_536)
+        } else if canonical.starts_with("gemini-3") || canonical.contains("image-preview") {
+            (32_768, 32_768)
+        } else {
+            (
+                CAPPED_DEFAULT_MAX_OUTPUT_TOKENS,
+                ESCALATED_MAX_OUTPUT_TOKENS,
+            )
+        };
     ModelMaxOutputTokens {
         default,
         upper_limit: upper_limit.max(default),
@@ -250,11 +256,90 @@ pub fn capped_default_max_output_tokens(model: &str) -> u32 {
 }
 
 /// Captures token and cost usage for one model turn or stream snapshot.
+///
+/// `input_tokens` counts the prompt tokens billed at the full input rate. A
+/// provider with prompt caching reports the prompt tokens it wrote to its cache
+/// in `cache_creation_input_tokens` and those it read from it in
+/// `cache_read_input_tokens`, apart from `input_tokens`; the whole prompt is
+/// [`ModelUsage::prompt_tokens`]. `cost_usd` prices each count at its own rate.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Prompt tokens written to the provider's prompt cache.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_creation_input_tokens: u64,
+    /// Prompt tokens read from the provider's prompt cache.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_read_input_tokens: u64,
+    /// The cost of the turn: every attempt's when `iterations` lists them.
     pub cost_usd: f64,
+    /// Every attempt the provider made to serve the turn, each with its own
+    /// model and cost, when a refusal fallback ran: the declined attempts and
+    /// the one that answered. The token counts above describe the answering
+    /// attempt only, as the provider reports them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub iterations: Vec<ModelUsageIteration>,
+}
+
+/// One attempt of a turn served through a refusal fallback.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelUsageIteration {
+    /// `message` for an attempt that declined, `fallback_message` for the
+    /// fallback attempt that answered (or declined last).
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// The model that ran the attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_creation_input_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_read_input_tokens: u64,
+    /// The attempt's cost, at its own model's prices.
+    pub cost_usd: f64,
+}
+
+impl ModelUsage {
+    /// Returns every prompt token of the request, cached or not: the measure of
+    /// how much context the request carried.
+    pub fn prompt_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cache_creation_input_tokens)
+            .saturating_add(self.cache_read_input_tokens)
+    }
+
+    /// Returns the prompt and output tokens of the request.
+    pub fn total_tokens(&self) -> u64 {
+        self.prompt_tokens().saturating_add(self.output_tokens)
+    }
+
+    /// Returns the counts billed for the turn: the sum over every attempt
+    /// when the provider lists them, the turn's own counts otherwise.
+    pub fn billed(&self) -> ModelUsage {
+        if self.iterations.is_empty() {
+            let mut billed = self.clone();
+            billed.iterations.clear();
+            return billed;
+        }
+        let mut billed = ModelUsage {
+            cost_usd: self.cost_usd,
+            ..ModelUsage::default()
+        };
+        for iteration in &self.iterations {
+            billed.input_tokens += iteration.input_tokens;
+            billed.output_tokens += iteration.output_tokens;
+            billed.cache_creation_input_tokens += iteration.cache_creation_input_tokens;
+            billed.cache_read_input_tokens += iteration.cache_read_input_tokens;
+        }
+        billed
+    }
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// Provider-reported usage attached to one persisted assistant message.
@@ -704,6 +789,9 @@ pub enum ReasoningEffort {
     Medium,
     High,
     Xhigh,
+    /// The deepest rung of providers whose ladder goes past `xhigh`
+    /// (Anthropic's `max`). Providers without it reject it explicitly.
+    Max,
 }
 
 impl ReasoningEffort {
@@ -715,6 +803,7 @@ impl ReasoningEffort {
             Self::Medium => "medium",
             Self::High => "high",
             Self::Xhigh => "xhigh",
+            Self::Max => "max",
         }
     }
 }
@@ -783,6 +872,41 @@ fn default_true() -> bool {
     true
 }
 
+/// The provider's recommended fallback routing by refusal category.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalFallbackRouting {
+    Default,
+}
+
+/// One model a declined request is retried on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefusalFallbackModel {
+    pub model: String,
+    /// Bounds this attempt's own output, apart from the request's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+}
+
+/// The models a provider retries a request on, within the same call, when
+/// its safety classifiers decline it: `"default"` for the provider's
+/// recommended routing by refusal category, or a list of models tried in
+/// order. Anthropic routes only; other drivers reject it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RefusalFallbacks {
+    Routing(RefusalFallbackRouting),
+    Models(Vec<RefusalFallbackModel>),
+}
+
+impl RefusalFallbacks {
+    /// The provider's recommended routing (`"default"`).
+    pub fn default_routing() -> Self {
+        Self::Routing(RefusalFallbackRouting::Default)
+    }
+}
+
 /// Groups provider-neutral generation options for one model turn.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ModelGenerationConfig {
@@ -790,12 +914,19 @@ pub struct ModelGenerationConfig {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_model: Option<String>,
+    /// Models the provider retries a declined request on (Anthropic).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal_fallbacks: Option<RefusalFallbacks>,
     #[serde(default)]
     pub tool_choice: ToolChoice,
     #[serde(default = "default_true")]
     pub allow_parallel_tool_calls: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+    /// The output cap of the one retry a turn cut off at `max_output_tokens`
+    /// gets. Unset, it is twice the cut-off cap, within the model's limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(default, skip_serializing_if = "reasoning_option_is_empty")]
@@ -805,6 +936,30 @@ pub struct ModelGenerationConfig {
 }
 
 impl ModelGenerationConfig {
+    /// Returns the output cap a request with this generation runs with.
+    pub fn effective_max_output_tokens(&self) -> u32 {
+        self.max_output_tokens
+            .unwrap_or_else(|| match self.model.as_deref() {
+                Some(model) => capped_default_max_output_tokens(model),
+                None => CAPPED_DEFAULT_MAX_OUTPUT_TOKENS,
+            })
+    }
+
+    /// Returns the output cap of the one retry a turn cut off at `cut_off_cap`
+    /// gets: `retry_max_tokens` when set, else twice the cut-off cap within the
+    /// model's documented upper limit. Never below the cut-off cap.
+    pub fn output_limit_retry_cap(&self, cut_off_cap: u32) -> u32 {
+        let retry = self.retry_max_tokens.unwrap_or_else(|| {
+            let upper_limit = self
+                .model
+                .as_deref()
+                .map(|model| model_max_output_tokens(model).upper_limit)
+                .unwrap_or(ESCALATED_MAX_OUTPUT_TOKENS);
+            cut_off_cap.saturating_mul(2).min(upper_limit)
+        });
+        retry.max(cut_off_cap)
+    }
+
     /// Merges an explicit generation override onto a default/base generation.
     ///
     /// Fields that still equal the type default are treated as unspecified so
@@ -818,6 +973,9 @@ impl ModelGenerationConfig {
             (Some(base), Some(override_generation)) => Some(Self {
                 model: override_generation.model.or(base.model),
                 fallback_model: override_generation.fallback_model.or(base.fallback_model),
+                refusal_fallbacks: override_generation
+                    .refusal_fallbacks
+                    .or(base.refusal_fallbacks),
                 tool_choice: if override_generation.tool_choice == default_generation.tool_choice {
                     base.tool_choice
                 } else {
@@ -833,6 +991,9 @@ impl ModelGenerationConfig {
                 max_output_tokens: override_generation
                     .max_output_tokens
                     .or(base.max_output_tokens),
+                retry_max_tokens: override_generation
+                    .retry_max_tokens
+                    .or(base.retry_max_tokens),
                 temperature: override_generation.temperature.or(base.temperature),
                 reasoning: merge_reasoning_override(base.reasoning, override_generation.reasoning),
                 response_format: if override_generation.response_format
@@ -878,9 +1039,11 @@ impl Default for ModelGenerationConfig {
         Self {
             model: None,
             fallback_model: None,
+            refusal_fallbacks: None,
             tool_choice: ToolChoice::Auto,
             allow_parallel_tool_calls: true,
             max_output_tokens: None,
+            retry_max_tokens: None,
             temperature: None,
             reasoning: None,
             response_format: ResponseFormat::Text,
@@ -955,9 +1118,120 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ModelGenerationConfig, ReasoningConfig, ReasoningEffort, ReasoningSummary,
-        StructuredFieldSchema, extract_json_text, model_context_window, model_max_output_tokens,
+        ModelGenerationConfig, ModelUsage, ModelUsageIteration, ReasoningConfig, ReasoningEffort,
+        ReasoningSummary, RefusalFallbackModel, RefusalFallbacks, StructuredFieldSchema,
+        extract_json_text, model_context_window, model_max_output_tokens,
     };
+
+    #[test]
+    fn refusal_fallbacks_take_the_default_routing_or_a_model_list() {
+        let routing: RefusalFallbacks = serde_json::from_value(json!("default")).expect("default");
+        assert_eq!(routing, RefusalFallbacks::default_routing());
+        let models: RefusalFallbacks = serde_json::from_value(json!([
+            {"model": "claude-opus-4-8"},
+            {"model": "claude-opus-5", "max_tokens": 8000}
+        ]))
+        .expect("models");
+        assert_eq!(
+            models,
+            RefusalFallbacks::Models(vec![
+                RefusalFallbackModel {
+                    model: "claude-opus-4-8".to_string(),
+                    max_tokens: None,
+                },
+                RefusalFallbackModel {
+                    model: "claude-opus-5".to_string(),
+                    max_tokens: Some(8_000),
+                },
+            ])
+        );
+        assert_eq!(
+            serde_json::to_value(&routing).expect("serializes"),
+            json!("default")
+        );
+        assert!(serde_json::from_value::<RefusalFallbacks>(json!("sometimes")).is_err());
+        assert!(
+            serde_json::from_value::<RefusalFallbacks>(json!([{"model": "m", "speed": "fast"}]))
+                .is_err()
+        );
+
+        let merged = ModelGenerationConfig::merge_override(
+            Some(ModelGenerationConfig {
+                refusal_fallbacks: Some(RefusalFallbacks::default_routing()),
+                ..ModelGenerationConfig::default()
+            }),
+            Some(ModelGenerationConfig::default()),
+        )
+        .expect("merged");
+        assert_eq!(
+            merged.refusal_fallbacks,
+            Some(RefusalFallbacks::default_routing())
+        );
+    }
+
+    #[test]
+    fn the_output_limit_retry_cap_defaults_to_twice_the_cut_off_cap() {
+        let opus = ModelGenerationConfig {
+            model: Some("claude-opus-5-5".to_string()),
+            max_output_tokens: Some(16_000),
+            ..ModelGenerationConfig::default()
+        };
+        assert_eq!(opus.effective_max_output_tokens(), 16_000);
+        assert_eq!(opus.output_limit_retry_cap(16_000), 32_000);
+        // Within the model's limit.
+        assert_eq!(opus.output_limit_retry_cap(100_000), 128_000);
+        // The run's own cap wins, but never below the cut-off cap.
+        let pinned = ModelGenerationConfig {
+            retry_max_tokens: Some(48_000),
+            ..opus.clone()
+        };
+        assert_eq!(pinned.output_limit_retry_cap(16_000), 48_000);
+        assert_eq!(pinned.output_limit_retry_cap(64_000), 64_000);
+        // No model, no cap: the capped default, then the escalated ceiling.
+        let bare = ModelGenerationConfig::default();
+        assert_eq!(bare.effective_max_output_tokens(), 8_000);
+        assert_eq!(bare.output_limit_retry_cap(8_000), 16_000);
+        assert_eq!(bare.output_limit_retry_cap(40_000), 64_000);
+        let merged = ModelGenerationConfig::merge_override(
+            Some(ModelGenerationConfig {
+                retry_max_tokens: Some(32_000),
+                ..ModelGenerationConfig::default()
+            }),
+            Some(ModelGenerationConfig::default()),
+        )
+        .expect("merged");
+        assert_eq!(merged.retry_max_tokens, Some(32_000));
+    }
+
+    #[test]
+    fn billed_usage_sums_every_attempt() {
+        let usage = ModelUsage {
+            input_tokens: 412,
+            output_tokens: 264,
+            cost_usd: 0.5,
+            iterations: vec![
+                ModelUsageIteration {
+                    kind: "message".to_string(),
+                    model: Some("claude-fable-5".to_string()),
+                    input_tokens: 535,
+                    ..ModelUsageIteration::default()
+                },
+                ModelUsageIteration {
+                    kind: "fallback_message".to_string(),
+                    model: Some("claude-opus-4-8".to_string()),
+                    input_tokens: 412,
+                    output_tokens: 264,
+                    ..ModelUsageIteration::default()
+                },
+            ],
+            ..ModelUsage::default()
+        };
+        let billed = usage.billed();
+        assert_eq!(billed.input_tokens, 947);
+        assert_eq!(billed.output_tokens, 264);
+        assert!((billed.cost_usd - 0.5).abs() < 1e-12);
+        assert!(billed.iterations.is_empty());
+    }
 
     fn order_schema() -> StructuredFieldSchema {
         StructuredFieldSchema::from_json_schema(&json!({

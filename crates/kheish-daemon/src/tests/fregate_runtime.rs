@@ -3,6 +3,7 @@
 //! provider slots, MCP execution context, HTTP hook transport, and purges.
 
 use super::*;
+use kheish_types::RunErrorCode;
 
 /// Records the tool names advertised on every model request, then replays
 /// the scripted turns.
@@ -1306,7 +1307,11 @@ async fn run_limits_cap_turns_and_wall_clock_with_distinct_error_codes() -> Resu
     let updates = collect_run_updates(&client, &base, &run.run_id).await?;
     let settled = updates.last().cloned().expect("terminal update");
     assert_eq!(settled.status, DaemonRunStatus::Failed);
-    assert_eq!(settled.error_code.as_deref(), Some("max_turns_exceeded"));
+    assert_eq!(settled.error_code, Some(RunErrorCode::MaxTurnsExceeded));
+    assert_eq!(
+        settled.error.as_deref(),
+        Some("max_turns_exceeded: agent loop exceeded max_turns=2")
+    );
     assert!(
         updates
             .iter()
@@ -1321,7 +1326,16 @@ async fn run_limits_cap_turns_and_wall_clock_with_distinct_error_codes() -> Resu
         .error_for_status()?
         .json::<RunView>()
         .await?;
-    assert_eq!(fetched.error_code.as_deref(), Some("max_turns_exceeded"));
+    assert_eq!(fetched.error_code, Some(RunErrorCode::MaxTurnsExceeded));
+    assert_eq!(
+        terminal_run_event(&client, &base, &run.run_id).await?,
+        RunEvent::Failed {
+            error: "max_turns_exceeded: agent loop exceeded max_turns=2".to_string(),
+            code: Some(RunErrorCode::MaxTurnsExceeded),
+            refusal: None,
+        },
+        "the persisted failed event carries the code"
+    );
     assert_eq!(
         fetched.limits.as_ref().and_then(|limits| limits.max_turns),
         Some(2)
@@ -1357,10 +1371,21 @@ async fn run_limits_cap_turns_and_wall_clock_with_distinct_error_codes() -> Resu
     let updates = collect_run_updates(&client, &base, &slow.run_id).await?;
     let settled = updates.last().cloned().expect("terminal update");
     assert_eq!(settled.status, DaemonRunStatus::Cancelled);
-    assert_eq!(settled.error_code.as_deref(), Some("deadline_exceeded"));
+    assert_eq!(settled.error_code, Some(RunErrorCode::DeadlineExceeded));
     assert!(
         started.elapsed() < Duration::from_secs(4),
         "the deadline cut the run short"
+    );
+    assert_eq!(
+        settled.error.as_deref(),
+        Some("deadline_exceeded: run exceeded max_duration_ms=400")
+    );
+    assert_eq!(
+        terminal_run_event(&client, &base, &slow.run_id).await?,
+        RunEvent::Cancelled {
+            code: Some(RunErrorCode::DeadlineExceeded),
+        },
+        "the persisted cancelled event carries the code"
     );
     let limits = settled.limits.clone().expect("limits are kept");
     assert_eq!(limits.max_duration_ms, Some(400));
@@ -1396,11 +1421,27 @@ async fn run_limits_cap_turns_and_wall_clock_with_distinct_error_codes() -> Resu
     );
     let settled = updates.last().cloned().expect("terminal update");
     assert_eq!(settled.status, DaemonRunStatus::Cancelled);
-    assert_eq!(settled.error_code.as_deref(), Some("deadline_exceeded"));
+    assert_eq!(settled.error_code, Some(RunErrorCode::DeadlineExceeded));
 
     let _ = shutdown.send(());
     wait_for_daemon_shutdown(&client, &base).await?;
     Ok(())
+}
+
+/// Returns the last persisted event of a settled run.
+async fn terminal_run_event(client: &Client, base: &str, run_id: &str) -> Result<RunEvent> {
+    let events = client
+        .get(format!("{base}/v1/runs/{run_id}/events"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<RunEventEntry>>()
+        .await?;
+    Ok(events
+        .last()
+        .expect("a settled run has events")
+        .event
+        .clone())
 }
 
 async fn publish_fact(

@@ -1,8 +1,8 @@
 //! Run lifecycle methods implemented on [`DaemonState`].
 
 use super::*;
+use crate::RunLimits;
 use crate::problems::DaemonProblem;
-use crate::{RUN_ERROR_DEADLINE_EXCEEDED, RunLimits};
 use sha2::{Digest, Sha256};
 
 const RUN_SUMMARY_CANDIDATE_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
@@ -502,6 +502,7 @@ where
                     deliveries: Vec::new(),
                     error: None,
                     error_code: None,
+                    refusal: None,
                     limits: None,
                 },
                 reply_targets: Vec::new(),
@@ -1009,6 +1010,7 @@ where
                 deliveries: Vec::new(),
                 error: None,
                 error_code: None,
+                refusal: None,
                 limits,
             },
             reply_targets,
@@ -1311,6 +1313,7 @@ where
                     deliveries: Vec::new(),
                     error: None,
                     error_code: None,
+                    refusal: None,
                     limits: None,
                 },
                 reply_targets,
@@ -2244,7 +2247,12 @@ where
                 } else {
                     self.pause_goal_after_permanent_continuation_error(&record.view, &error)
                         .await;
-                    self.fail_run(run_id, error.to_string()).await
+                    let terminal = error
+                        .chain()
+                        .find_map(|source| source.downcast_ref::<kheish_types::RunTerminalError>())
+                        .cloned();
+                    self.fail_run_with(run_id, error.to_string(), terminal)
+                        .await
                 }
             }
         };
@@ -2632,7 +2640,22 @@ where
     }
 
     pub(super) async fn fail_run(self: &Arc<Self>, run_id: &str, error: String) -> Result<()> {
-        let Some(record) = self.run_service.mark_failed(run_id, &error).await? else {
+        self.fail_run_with(run_id, error, None).await
+    }
+
+    /// Fails a run, with the code and details of a classified run ending
+    /// (a model condition or a run limit) when the run's error carries one.
+    pub(super) async fn fail_run_with(
+        self: &Arc<Self>,
+        run_id: &str,
+        error: String,
+        terminal: Option<kheish_types::RunTerminalError>,
+    ) -> Result<()> {
+        let Some(record) = self
+            .run_service
+            .mark_failed(run_id, &error, terminal.as_ref())
+            .await?
+        else {
             return Ok(());
         };
         let session_id = record.view.session_id.clone();
@@ -2649,6 +2672,8 @@ where
             &record.view,
             RunEvent::Failed {
                 error: error.clone(),
+                code: record.view.error_code,
+                refusal: record.view.refusal.clone(),
             },
         )?;
         self.sync_project_tasks_for_run_or_warn(&record.view, "fail_run")
@@ -3094,13 +3119,13 @@ where
         self.cancel_run_with_error_code(run_id, error, None).await
     }
 
-    /// Cancels one run with an operator-facing error and a machine-readable
-    /// `error_code`.
+    /// Cancels one run with an operator-facing error and, for a classified
+    /// ending, its machine-readable `error_code`.
     async fn cancel_run_with_error_code(
         self: &Arc<Self>,
         run_id: &str,
         error: Option<String>,
-        error_code: Option<&str>,
+        error_code: Option<kheish_types::RunErrorCode>,
     ) -> Result<RunView> {
         if let Some(view) = self
             .complete_or_decline_waiting_parent_clarification(
@@ -3150,8 +3175,12 @@ where
             "daemon run cancelled"
         );
         self.persist_run_memory_record(&record).await;
-        self.run_service
-            .append_run_event_once(&record.view, RunEvent::Cancelled)?;
+        self.run_service.append_run_event_once(
+            &record.view,
+            RunEvent::Cancelled {
+                code: record.view.error_code,
+            },
+        )?;
         self.sync_project_tasks_for_run_or_warn(&record.view, "cancel_run")
             .await;
         self.publish_run(&record.view);
@@ -4235,13 +4264,10 @@ where
         max_duration_ms: u64,
     ) -> Result<()> {
         info!(run_id = %run_id, max_duration_ms, "run exceeded its max_duration_ms deadline");
-        self.cancel_run_with_error_code(
-            run_id,
-            Some(format!("run exceeded max_duration_ms={max_duration_ms}")),
-            Some(RUN_ERROR_DEADLINE_EXCEEDED),
-        )
-        .await
-        .map(|_| ())
+        let terminal = kheish_types::RunTerminalError::deadline_exceeded(max_duration_ms);
+        self.cancel_run_with_error_code(run_id, Some(terminal.to_string()), Some(terminal.code))
+            .await
+            .map(|_| ())
     }
 
     /// Re-arms the deadline timers of runs that survived a daemon restart
@@ -4528,5 +4554,78 @@ mod goal_continuation_failure_tests {
         assert!(!is_permanent_provider_continuation_failure_message(
             "transport error: connection reset"
         ));
+    }
+}
+
+#[cfg(test)]
+mod submit_run_fingerprint_tests {
+    use serde_json::json;
+
+    use super::{RunLimits, SubmitInputRequest, submit_run_request_fingerprint};
+
+    fn request(generation: serde_json::Value) -> SubmitInputRequest {
+        serde_json::from_value(json!({"content": "scan example.com", "generation": generation}))
+            .expect("submit input request parses")
+    }
+
+    fn fingerprint(generation: serde_json::Value, limits: Option<&RunLimits>) -> String {
+        submit_run_request_fingerprint(&request(generation), limits).expect("fingerprint")
+    }
+
+    #[test]
+    fn fingerprint_covers_the_generation_options_and_the_run_limits() {
+        let base = fingerprint(json!({"max_output_tokens": 4096}), None);
+        assert_eq!(
+            base,
+            fingerprint(json!({"max_output_tokens": 4096}), None),
+            "the same body has the same fingerprint"
+        );
+        let variants = [
+            fingerprint(
+                json!({"max_output_tokens": 4096, "retry_max_tokens": 16384}),
+                None,
+            ),
+            fingerprint(
+                json!({"max_output_tokens": 4096, "refusal_fallbacks": "default"}),
+                None,
+            ),
+            fingerprint(
+                json!({
+                    "max_output_tokens": 4096,
+                    "refusal_fallbacks": [{"model": "claude-opus-4-7", "max_tokens": 8192}]
+                }),
+                None,
+            ),
+            fingerprint(
+                json!({"max_output_tokens": 4096, "reasoning": {"effort": "max"}}),
+                None,
+            ),
+            fingerprint(
+                json!({"max_output_tokens": 4096}),
+                Some(&RunLimits {
+                    max_turns: Some(8),
+                    ..RunLimits::default()
+                }),
+            ),
+            fingerprint(
+                json!({"max_output_tokens": 4096}),
+                Some(&RunLimits {
+                    max_duration_ms: Some(600_000),
+                    ..RunLimits::default()
+                }),
+            ),
+        ];
+        for (index, variant) in variants.iter().enumerate() {
+            assert_ne!(
+                &base, variant,
+                "variant {index} must change the fingerprint"
+            );
+            for other in &variants[index + 1..] {
+                assert_ne!(
+                    variant, other,
+                    "variant {index} must differ from the others"
+                );
+            }
+        }
     }
 }

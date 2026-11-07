@@ -546,3 +546,21 @@ standby on `127.0.0.1:4105`. The driver is a Python script that records every ob
   - `daemon_http_runs_reject_non_image_edit_assets` is a load flake already listed in `REMEDIATION.md`; it passes alone.
 - kheish-mcp passes 59 of 60. `mcp_tool_schema_import_preserves_closed_nested_shapes` fails identically on `844f080`.
 - Clippy (stable, the 7 touched crates, `--lib --bins --tests`) reports no warning on any line these commits changed.
+
+### After merging `feat/fregate-runtime-provider`
+
+Rerun on 2026-11-07 against the merged build (`cargo build --workspace --locked`), same rig. The driver itself also
+ran under `env -i` with a private `HOME`. Every K1 to K9 observation matches the tables above except the two K5 rows:
+run limits now use the same `RunErrorCode` as the model conditions, so `error` starts with the code and the
+persisted terminal run event carries it.
+
+| Change | Observed |
+|---|---|
+| K5 max_turns | `failed`, `error_code: max_turns_exceeded`, `error: max_turns_exceeded: agent loop exceeded max_turns=1`, `limits: {"max_turns":1}`. Last run event: `{"type":"failed","error":"max_turns_exceeded: …","code":"max_turns_exceeded"}`. |
+| K5 max_duration_ms | `cancelled` after 1.53 s, `error_code: deadline_exceeded`, `error: deadline_exceeded: run exceeded max_duration_ms=1500`. Last run event: `{"type":"cancelled","code":"deadline_exceeded"}`. |
+
+The provider check (`scripts/fregate-provider-check/run.sh`, daemon on `:4101`) passed 13 of 13 on the same build.
+
+Tests on the merged tree: kheish-types 63, kheish-core 70, kheish-runtime 340, kheish-coding-tools 26 and
+kheish-auth 44 pass; kheish-daemon passes 1435 of 1436 and its binary tests 242 of 242; kheish-mcp passes 59 of 60.
+The two failures are the pre-existing ones above, with the same assertion as on `844f080`.

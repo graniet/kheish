@@ -149,7 +149,10 @@ Fields:
 - `generation.tool_choice`
 - `generation.allow_parallel_tool_calls`
 - `generation.max_output_tokens`
+- `generation.retry_max_tokens`: the output cap of the one retry a turn cut off at `max_output_tokens` gets (see [Output limit](#output-limit)). Unset, it is twice the cut-off cap, within the model's documented maximum output.
 - `generation.temperature`
+- `generation.reasoning`: `effort` (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`), `summary`, `budget_tokens`, `interleaved`; how each driver maps them is in [Model providers and routes](./model-providers#thinking-and-effort). OpenAI routes reject `max` and `budget_tokens`.
+- `generation.refusal_fallbacks`: Anthropic routes only, `"default"` or a list of `{ "model", "max_tokens" }` (one to three); overrides the route's `anthropic_refusal_fallbacks`. Other drivers reject it. See [Refusal fallback](./model-providers#refusal-fallback).
 - `generation.response_format`
 
 Route precedence is:
@@ -492,9 +495,9 @@ Attachment inputs use the same daemon-owned asset model documented in [Assets AP
 
 `POST /v1/sessions/{session_id}/runs` (`SubmitRunRequest`) accepts every `SubmitInputRequest` field plus:
 
-- `idempotency_key`: deduplicates the submission per session, durably across restarts. The same key with a different body, limits included, returns `409 idempotency_conflict`.
-- `max_turns` (integer, at least 1): the run's turn cap. It only lowers the daemon ceiling (`KHEISH_AGENT_MAX_TURNS`), never raises it. A run that uses every turn fails with `error_code: "max_turns_exceeded"`.
-- `max_duration_ms` (integer, at least 1): the run's wall-clock budget, counted from its first start (`started_at_ms`) and including time spent waiting for approvals or user answers. When it runs out the daemon cancels the run, whether it is executing or waiting, with `status: "cancelled"` and `error_code: "deadline_exceeded"`. The deadline is fixed on first start as `limits.deadline_at_ms` and survives daemon restarts: a waiting run whose deadline passed while the daemon was down is cancelled at boot.
+- `idempotency_key`: deduplicates the submission per session, durably across restarts. The same key with a different body returns `409 idempotency_conflict`; the comparison covers every field, all `generation` options (`retry_max_tokens`, `refusal_fallbacks` and `reasoning` among them) and the limits below.
+- `max_turns` (integer, at least 1): the run's turn cap. It only lowers the daemon ceiling (`KHEISH_AGENT_MAX_TURNS`), never raises it. A run that uses every turn fails with `error_code: "max_turns_exceeded"` ([Run error codes](#run-error-codes)).
+- `max_duration_ms` (integer, at least 1): the run's wall-clock budget, counted from its first start (`started_at_ms`) and including time spent waiting for approvals or user answers. When it runs out the daemon cancels the run, whether it is executing or waiting, with `status: "cancelled"` and `error_code: "deadline_exceeded"` ([Run error codes](#run-error-codes)). The deadline is fixed on first start as `limits.deadline_at_ms` and survives daemon restarts: a waiting run whose deadline passed while the daemon was down is cancelled at boot.
 
 ```json
 {
@@ -780,8 +783,9 @@ input runs are interrupted instead of replaying stale user/provider state.
 - `outputs`
 - `deliveries`
 - `error`
-- `error_code`, a machine-readable reason when the daemon classifies the terminal error: `max_turns_exceeded` (status `failed`) or `deadline_exceeded` (status `cancelled`). Omitted otherwise; `error` keeps the human-readable text.
-- `limits`, the caller-set run limits (`max_turns`, `max_duration_ms`, `deadline_at_ms`), omitted when the run has none
+- `error_code`: the machine-readable code of a classified run ending (see [Run error codes](#run-error-codes)); omitted otherwise, with `error` keeping the human-readable text
+- `refusal`: for `error_code: "model_refusal"`, the refusal's `category`, `explanation` and `model`
+- `limits`: the caller-set run limits (`max_turns`, `max_duration_ms`, `deadline_at_ms`), omitted when the run has none
 
 `RunView.request` is a compact `RunRequestSummary`:
 
@@ -795,6 +799,60 @@ input runs are interrupted instead of replaying stale user/provider state.
 - `question_count`
 
 Use `GET /v1/runs/{run_id}` as the source of truth for the route and model actually used by one execution.
+
+### Run error codes
+
+Some run endings have a cause an embedder must act on. The daemon classifies them with one
+machine-readable `error_code`, set on the run when it reaches its terminal status. Decide on the
+code, never on the `error` text. The code travels the same way whatever set it:
+
+- `RunView.error_code` (and `RunView.refusal`) from `GET /v1/runs/{run_id}`, the run lists, and the
+  terminal `run_updated` event;
+- the persisted terminal run event from `GET /v1/runs/{run_id}/events`: `failed` carries `code` and
+  `refusal`, `cancelled` carries `code`.
+
+| `error_code` | Status | Meaning |
+|---|---|---|
+| `model_refusal` | `failed` | The model declined the request and no refusal fallback served it. `refusal.category` is the policy area (`cyber`, `bio`, ...), absent when the refusal maps to no named category. |
+| `output_limit_exceeded` | `failed` | The model's answer was cut off at the output limit, then again when asked once more with `generation.retry_max_tokens` (see [Output limit](#output-limit)). |
+| `max_turns_exceeded` | `failed` | The run used every turn its `max_turns` (or the daemon ceiling `KHEISH_AGENT_MAX_TURNS`) allowed. |
+| `deadline_exceeded` | `cancelled` | The run outlived its `max_duration_ms`, while executing or while waiting for an approval or an answer. |
+
+A classified run's `error` reads `<error_code>: <detail>`, for example
+`max_turns_exceeded: agent loop exceeded max_turns=12` or
+`deadline_exceeded: run exceeded max_duration_ms=600000`. Other failures and operator cancels have
+no `error_code`.
+
+```json
+{
+  "run_id": "run-12",
+  "status": "failed",
+  "error": "model_refusal: the model declined the request by claude-opus-5 (refusal category: cyber)",
+  "error_code": "model_refusal",
+  "refusal": {"category": "cyber", "explanation": "This request was declined because it could enable cyber harm.", "model": "claude-opus-5"}
+}
+```
+
+The matching persisted event:
+
+```json
+{"type": "failed", "error": "model_refusal: the model declined the request by claude-opus-5 (refusal category: cyber)", "code": "model_refusal", "refusal": {"category": "cyber", "explanation": "This request was declined because it could enable cyber harm.", "model": "claude-opus-5"}}
+```
+
+and for a run past its deadline:
+
+```json
+{"type": "cancelled", "code": "deadline_exceeded"}
+```
+
+### Output limit
+
+A model turn that stops at its output limit (`max_tokens` on Anthropic, `length` or `max_output_tokens`
+elsewhere) is discarded, whatever it holds: its partial text never enters the session history and
+its tool calls never run, including one whose input the limit cut. The same turn is asked again once,
+on the same history, with `max_output_tokens` raised to `generation.retry_max_tokens`. A second
+cut-off on that turn ends the run `failed` with `error_code: "output_limit_exceeded"`; each later turn
+gets its own retry. The discarded turn's tokens still count in the runtime's model budget counters.
 
 ## Output delivery inspection
 
@@ -841,7 +899,8 @@ Common event payload shapes:
 - `user_question_resolved` includes the exact structured answer payload that resumed a normal waiting run.
 - `parent_clarification_resolved` includes the requester child agent/session ids, the request id, decline flag, and exact structured resolution delivered to the child.
 - `output` includes the appended `DaemonOutputRecord` and the run projection.
-- `failed` includes the error string and the run projection.
+- `failed` includes the error string, the run projection, and for a classified ending its `code` (with `refusal` for `model_refusal`).
+- `cancelled` includes `code` when the cancel is a classified ending (`deadline_exceeded`); operator cancels have none.
 
 ### Run external actions
 

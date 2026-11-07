@@ -385,7 +385,7 @@ impl GoalService {
                 let Some(usage) = message.api_usage else {
                     continue;
                 };
-                let tokens = usage.input_tokens.saturating_add(usage.output_tokens);
+                let tokens = usage.total_tokens();
                 max_message_usage_tokens = max_message_usage_tokens.max(tokens);
             }
             let tokens_key = format!("run:{}:tokens", run.run_id);
@@ -511,6 +511,7 @@ mod tests {
             deliveries: Vec::new(),
             error: None,
             error_code: None,
+            refusal: None,
             limits: None,
         }
     }
@@ -542,6 +543,7 @@ mod tests {
                                     input_tokens,
                                     output_tokens,
                                     cost_usd: 0.0,
+                                    ..ModelUsage::default()
                                 }),
                                 offset: Some(timestamp_ms),
                                 timestamp_ms: Some(timestamp_ms),

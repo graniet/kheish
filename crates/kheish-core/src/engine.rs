@@ -14,11 +14,11 @@ use kheish_types::{
     PendingToolDecision, PendingUserQuestion, PermissionDecision, PostCompactRestoration,
     PreservedSegment, PromptMessageSnapshot, PromptProjection, PromptSnapshot, PromptTrace,
     ProviderErrorKind, ProviderInputItem, ProviderPrompt, Role, RunMetaSnapshot, RunPolicySnapshot,
-    RunSnapshot, RunStatus, RunTrace, SessionCheckpoint, SessionEvent, SummaryBlock,
-    SystemPromptSection, SystemPromptSectionSnapshot, ToolCallRecord, ToolCallSnapshot, ToolChoice,
-    ToolDefinition, ToolExecutionTrace, ToolResultRecord, ToolResultSnapshot, TurnSnapshot,
-    TurnTrace, UserQuestionRequest, UserQuestionResolution, model_context_window,
-    model_max_output_tokens,
+    RunSnapshot, RunStatus, RunTerminalError, RunTrace, SessionCheckpoint, SessionEvent,
+    SummaryBlock, SystemPromptSection, SystemPromptSectionSnapshot, ToolCallRecord,
+    ToolCallSnapshot, ToolChoice, ToolDefinition, ToolExecutionTrace, ToolResultRecord,
+    ToolResultSnapshot, TurnSnapshot, TurnTrace, UserQuestionRequest, UserQuestionResolution,
+    model_context_window, model_max_output_tokens,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -40,7 +40,6 @@ use state::{AutocompactTracking, ExecutedBatchOutcome, PendingQuestionExecution,
 mod state;
 
 const MAX_COMPACTION_PTL_RETRIES: usize = 3;
-const MAX_OUTPUT_TOKENS_RECOVERY_LIMIT: u8 = 3;
 const PROMPT_VISIBLE_TOOL_OUTPUT_TOKEN_LIMIT: usize = 10_000;
 const PROMPT_VISIBLE_TOOL_OUTPUT_PREVIEW_CHARS: usize = 32_000;
 
@@ -765,48 +764,70 @@ impl AgentEngine {
             let mut reactive_compacted = false;
             let mut aggressively_snipped = false;
             let mut fallback_model_applied = false;
+            // The output cap of a turn that was cut off, once it is asked again.
+            let mut cut_off_cap: Option<u32> = None;
             let model_turn = loop {
-                match model.next_turn(request.clone()).await {
-                    Ok(model_turn) => break model_turn,
-                    Err(error) if Self::is_prompt_too_long_error(&error) => {
-                        if !aggressively_snipped {
-                            let snip_start_offset = self.next_offset;
-                            if let Some(rebuilt) =
-                                self.aggressive_snip_workspace(turn, &request.generation)
-                            {
-                                trace.compaction_boundaries.extend(
-                                    self.collect_compaction_boundaries_since(snip_start_offset),
-                                );
-                                request.prompt = rebuilt.prompt.clone();
-                                request.provider_prompt = rebuilt.provider_prompt.clone();
-                                aggressively_snipped = true;
-                                continue;
+                let model_turn = loop {
+                    match model.next_turn(request.clone()).await {
+                        Ok(model_turn) => break model_turn,
+                        Err(error) if Self::is_prompt_too_long_error(&error) => {
+                            if !aggressively_snipped {
+                                let snip_start_offset = self.next_offset;
+                                if let Some(rebuilt) =
+                                    self.aggressive_snip_workspace(turn, &request.generation)
+                                {
+                                    trace.compaction_boundaries.extend(
+                                        self.collect_compaction_boundaries_since(snip_start_offset),
+                                    );
+                                    request.prompt = rebuilt.prompt.clone();
+                                    request.provider_prompt = rebuilt.provider_prompt.clone();
+                                    aggressively_snipped = true;
+                                    continue;
+                                }
                             }
-                        }
-                        if !reactive_compacted {
-                            let reactive_start_offset = self.next_offset;
-                            if let Some(checkpoint) = self
-                                .force_reactive_compaction(turn, model, restoration)
-                                .await?
-                            {
-                                trace.checkpoints.push(CheckpointTrace {
-                                    compacted_until_offset: checkpoint.compacted_until_offset,
-                                    journal_digest: checkpoint.journal_digest.clone(),
-                                    summary_chars: checkpoint.summary_text.len(),
-                                });
-                                snapshot_checkpoints.push(checkpoint);
-                                trace.compaction_boundaries.extend(
-                                    self.collect_compaction_boundaries_since(reactive_start_offset),
-                                );
-                                run_meta.autocompact = self.snapshot_autocompact_tracking();
-                                let rebuilt = self.build_prompt_workspace();
-                                request.prompt = rebuilt.prompt.clone();
-                                request.provider_prompt = rebuilt.provider_prompt.clone();
-                                reactive_compacted = true;
-                                continue;
+                            if !reactive_compacted {
+                                let reactive_start_offset = self.next_offset;
+                                if let Some(checkpoint) = self
+                                    .force_reactive_compaction(turn, model, restoration)
+                                    .await?
+                                {
+                                    trace.checkpoints.push(CheckpointTrace {
+                                        compacted_until_offset: checkpoint.compacted_until_offset,
+                                        journal_digest: checkpoint.journal_digest.clone(),
+                                        summary_chars: checkpoint.summary_text.len(),
+                                    });
+                                    snapshot_checkpoints.push(checkpoint);
+                                    trace.compaction_boundaries.extend(
+                                        self.collect_compaction_boundaries_since(
+                                            reactive_start_offset,
+                                        ),
+                                    );
+                                    run_meta.autocompact = self.snapshot_autocompact_tracking();
+                                    let rebuilt = self.build_prompt_workspace();
+                                    request.prompt = rebuilt.prompt.clone();
+                                    request.provider_prompt = rebuilt.provider_prompt.clone();
+                                    reactive_compacted = true;
+                                    continue;
+                                }
                             }
+                            if !fallback_model_applied {
+                                if let Some(fallback_generation) = Self::fallback_model_generation(
+                                    &generation,
+                                    &request_generation,
+                                ) {
+                                    pending_generation = fallback_generation.clone();
+                                    request.generation = fallback_generation;
+                                    fallback_model_applied = true;
+                                    continue;
+                                }
+                            }
+                            return Err(error);
                         }
-                        if !fallback_model_applied {
+                        Err(error)
+                            if !fallback_model_applied
+                                && (Self::is_rate_limit_error(&error)
+                                    || Self::is_provider_unavailable_error(&error)) =>
+                        {
                             if let Some(fallback_generation) =
                                 Self::fallback_model_generation(&generation, &request_generation)
                             {
@@ -815,27 +836,41 @@ impl AgentEngine {
                                 fallback_model_applied = true;
                                 continue;
                             }
+                            return Err(error);
                         }
-                        return Err(error);
+                        Err(error) => return Err(error),
                     }
-                    Err(error)
-                        if !fallback_model_applied
-                            && (Self::is_rate_limit_error(&error)
-                                || Self::is_provider_unavailable_error(&error)) =>
-                    {
-                        if let Some(fallback_generation) =
-                            Self::fallback_model_generation(&generation, &request_generation)
-                        {
-                            pending_generation = fallback_generation.clone();
-                            request.generation = fallback_generation;
-                            fallback_model_applied = true;
-                            continue;
-                        }
-                        return Err(error);
+                };
+                if matches!(model_turn.finish_reason, ModelFinishReason::MaxTokens) {
+                    // The answer was cut off at the output limit. Whatever it
+                    // holds (a partial text, a tool call whose input was cut)
+                    // is discarded: it never enters the history, and its tool
+                    // calls never run. The same turn is asked once more with
+                    // the run's larger cap; a second cut-off ends the run.
+                    let cap = request.generation.effective_max_output_tokens();
+                    if let Some(first_cap) = cut_off_cap {
+                        return Err(anyhow::Error::new(RunTerminalError::output_limit_exceeded(
+                            first_cap, cap,
+                        )));
                     }
-                    Err(error) => return Err(error),
+                    cut_off_cap = Some(cap);
+                    request.generation.max_output_tokens =
+                        Some(request.generation.output_limit_retry_cap(cap));
+                    run_meta.max_output_tokens_recovery_count =
+                        run_meta.max_output_tokens_recovery_count.saturating_add(1);
+                    continue;
                 }
+                break model_turn;
             };
+            if matches!(model_turn.finish_reason, ModelFinishReason::Blocked) {
+                // A final refusal: no fallback served the request. The
+                // declined turn (empty, or a partial answer the provider
+                // withdrew) never enters the history, and the run ends with
+                // a code that carries the refusal's category.
+                return Err(anyhow::Error::new(RunTerminalError::refusal(
+                    model_turn.refusal.clone().unwrap_or_default(),
+                )));
+            }
             let final_message_id = model_turn.assistant_message.id.clone();
             let assistant_message_digest = Self::digest_of(&model_turn.assistant_message)?;
             let stop_reason = model_turn.finish_reason.as_str().to_string();
@@ -1027,25 +1062,6 @@ impl AgentEngine {
                 continue;
             }
 
-            if tool_executions.is_empty()
-                && matches!(model_turn.finish_reason, ModelFinishReason::MaxTokens)
-            {
-                if Self::should_escalate_max_output_tokens(&generation, &request_generation) {
-                    pending_generation =
-                        Self::max_tokens_recovery_generation(&generation, &request_generation);
-                    continue;
-                }
-                if run_meta.max_output_tokens_recovery_count >= MAX_OUTPUT_TOKENS_RECOVERY_LIMIT {
-                    bail!("model output exceeded max tokens after recovery");
-                }
-                self.append_max_tokens_recovery_message(turn);
-                run_meta.max_output_tokens_recovery_count =
-                    run_meta.max_output_tokens_recovery_count.saturating_add(1);
-                pending_generation =
-                    Self::max_tokens_recovery_generation(&generation, &request_generation);
-                continue;
-            }
-
             if tool_executions.is_empty() {
                 let unsatisfied = self.unsatisfied_completion_requirements(&run_meta)?;
                 if !unsatisfied.is_empty() {
@@ -1108,7 +1124,7 @@ impl AgentEngine {
         if max_turns == 0 {
             bail!("agent loop exhausted the usize turn counter");
         }
-        bail!("{MAX_TURNS_EXCEEDED_ERROR_PREFIX}{max_turns}");
+        Err(kheish_types::RunTerminalError::max_turns_exceeded(max_turns).into())
     }
 
     /// Decides every model tool call of one turn.
@@ -1721,41 +1737,6 @@ impl AgentEngine {
                  Continue from where you left off. If you still need the action, retry with safer input or a narrower scope instead of stopping."
             ),
         ));
-    }
-
-    fn append_max_tokens_recovery_message(&mut self, turn: usize) {
-        self.append_message(MessageRecord::new(
-            format!("user-max-tokens-recovery-{turn}"),
-            Role::User,
-            Self::max_tokens_recovery_message(),
-        ));
-    }
-
-    fn max_tokens_recovery_message() -> String {
-        "Output token limit hit. Resume directly — no apology, no recap of what you were doing. Pick up mid-thought if that is where the cut happened. Break remaining work into smaller pieces.".to_string()
-    }
-
-    fn should_escalate_max_output_tokens(
-        base: &ModelGenerationConfig,
-        current: &ModelGenerationConfig,
-    ) -> bool {
-        base.max_output_tokens.is_none()
-            && current
-                .max_output_tokens
-                .unwrap_or_default()
-                .lt(&kheish_types::ESCALATED_MAX_OUTPUT_TOKENS)
-    }
-
-    fn max_tokens_recovery_generation(
-        base: &ModelGenerationConfig,
-        current: &ModelGenerationConfig,
-    ) -> ModelGenerationConfig {
-        if Self::should_escalate_max_output_tokens(base, current) {
-            let mut generation = current.clone();
-            generation.max_output_tokens = Some(kheish_types::ESCALATED_MAX_OUTPUT_TOKENS);
-            return generation;
-        }
-        base.clone()
     }
 
     /// Parses and validates the run's final answer against its contract.
@@ -3376,6 +3357,8 @@ impl AgentEngine {
             temperature: Some(0.0),
             reasoning: None,
             response_format: kheish_types::ResponseFormat::Text,
+            refusal_fallbacks: None,
+            retry_max_tokens: None,
         }
     }
 
@@ -3624,11 +3607,6 @@ impl AgentEngine {
         Ok(digest_text(&message.content))
     }
 }
-
-/// Error-message prefix of a run that used every turn it was allowed.
-///
-/// Daemons match on it to report a machine-readable `max_turns_exceeded`.
-pub const MAX_TURNS_EXCEEDED_ERROR_PREFIX: &str = "agent loop exceeded max_turns=";
 
 /// Returns the turn cap of one run: the engine ceiling (`0` = unbounded),
 /// lowered by the run's own cap when it sets a smaller one.
@@ -4017,6 +3995,7 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new(
@@ -4032,6 +4011,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new(
@@ -4042,6 +4022,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             },
         ]));
 
@@ -4116,6 +4097,7 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new(
@@ -4126,6 +4108,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             },
         ]);
 
@@ -4178,12 +4161,14 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new("assistant-final", Role::Assistant, "Done."),
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             },
         ]);
 
@@ -4254,6 +4239,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: ModelFinishReason::Completed,
             usage: None,
+            refusal: None,
         }]);
 
         let input = InputEnvelope::text(
@@ -4305,6 +4291,7 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new(
@@ -4321,6 +4308,7 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new(
@@ -4337,6 +4325,7 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new(
@@ -4347,6 +4336,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             },
         ]);
 
@@ -4395,6 +4385,7 @@ mod tests {
             }],
             finish_reason: ModelFinishReason::ToolCalls,
             usage: None,
+            refusal: None,
         };
         let model = ScriptedModel::new((1..=4).map(tool_turn).collect());
         let mut input = InputEnvelope::text("daemon", "api", "session-run-turns", "user-1", "go");
@@ -4404,10 +4395,10 @@ mod tests {
             .run_input_with_permissions(input, &model, &EchoToolExecutor, &SelectivePermissionGate)
             .await
             .expect_err("the run must stop at its own cap");
-        assert_eq!(
-            error.to_string(),
-            format!("{MAX_TURNS_EXCEEDED_ERROR_PREFIX}2")
-        );
+        let terminal = kheish_types::RunTerminalError::find(error.as_ref())
+            .expect("turn exhaustion is a typed run ending");
+        assert_eq!(terminal.code, kheish_types::RunErrorCode::MaxTurnsExceeded);
+        assert_eq!(terminal.message, "agent loop exceeded max_turns=2");
         assert_eq!(model.requests().len(), 2, "exactly two model turns ran");
         Ok(())
     }
@@ -4446,6 +4437,7 @@ mod tests {
                 ],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new(
@@ -4456,6 +4448,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             },
         ]);
         // Every visible call asks for approval, so only the visible call may
@@ -4584,6 +4577,7 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new(
@@ -4594,6 +4588,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             },
         ]);
 
@@ -4670,6 +4665,7 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new(
@@ -4680,6 +4676,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             },
         ]);
         let permissions = RecordingPermissionGate::new();
@@ -4757,6 +4754,7 @@ mod tests {
             }],
             finish_reason: ModelFinishReason::ToolCalls,
             usage: None,
+            refusal: None,
         }]);
         let permissions = RecordingPermissionGate::new();
 
@@ -4821,6 +4819,7 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new(
@@ -4831,6 +4830,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             },
         ]);
 
@@ -4885,6 +4885,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new(
@@ -4904,6 +4905,7 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new(
@@ -4914,6 +4916,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             },
         ]);
 
@@ -4996,6 +4999,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: ModelFinishReason::Completed,
             usage: None,
+            refusal: None,
         }
     }
 
@@ -5109,6 +5113,7 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
             text_turn(
                 "assistant-json",
@@ -5210,6 +5215,7 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new(
@@ -5220,6 +5226,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             },
         ]);
 
@@ -5283,6 +5290,7 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
             ModelTurn {
                 assistant_message: MessageRecord::new("assistant-write-2", Role::Assistant, ""),
@@ -5298,6 +5306,7 @@ mod tests {
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
         ]);
 
@@ -5331,96 +5340,248 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn max_tokens_recovery_escalates_then_continues() -> Result<()> {
-        let conversation = ConversationKey {
-            session_id: "session-3c".to_string(),
-            thread_id: None,
-        };
+    async fn a_refusal_ends_the_run_with_its_category_and_keeps_the_turn_out() -> Result<()> {
         let mut engine = AgentEngine::new(
-            conversation,
+            ConversationKey {
+                session_id: "session-refusal".to_string(),
+                thread_id: None,
+            },
             LoopPolicy {
-                max_turns: 5,
-                keep_last_messages: 3,
+                max_turns: 3,
                 ..LoopPolicy::default()
             },
         );
+        let refusal = kheish_types::ModelRefusal {
+            category: Some("cyber".to_string()),
+            explanation: Some("declined".to_string()),
+            model: Some("claude-opus-5".to_string()),
+        };
+        let model = ScriptedModel::new(vec![ModelTurn {
+            assistant_message: MessageRecord::new("assistant-refused", Role::Assistant, "partial"),
+            tool_calls: vec![ToolCallRecord {
+                id: "call-refused".to_string(),
+                name: "write_file".to_string(),
+                input: json!({"path": "x", "content": "y"}),
+                assistant_message_id: None,
+                assistant_provider_response_id: None,
+            }],
+            finish_reason: ModelFinishReason::Blocked,
+            usage: None,
+            refusal: Some(refusal.clone()),
+        }]);
+        let input = InputEnvelope::text("daemon", "api", "session-refusal", "user-1", "Scan it.");
 
+        let error = engine
+            .run_input(input, &model, &EchoToolExecutor)
+            .await
+            .expect_err("a final refusal ends the run");
+        let terminal = kheish_types::RunTerminalError::find(error.as_ref())
+            .expect("the run error carries its code");
+        assert_eq!(terminal.code, kheish_types::RunErrorCode::ModelRefusal);
+        assert_eq!(terminal.refusal, Some(refusal));
+        assert!(error.to_string().starts_with("model_refusal:"));
+        // Neither the declined answer nor its tool call enters the history.
+        assert!(!engine.journal().iter().any(|entry| matches!(
+            &entry.event,
+            SessionEvent::MessageAppended { message } if message.role == Role::Assistant
+        )));
+        assert!(
+            !engine
+                .journal()
+                .iter()
+                .any(|entry| matches!(&entry.event, SessionEvent::ToolCallStarted { .. }))
+        );
+        Ok(())
+    }
+
+    fn cut_off_turn(id: &str) -> ModelTurn {
+        ModelTurn {
+            assistant_message: MessageRecord::new(id, Role::Assistant, "The report starts with"),
+            tool_calls: vec![ToolCallRecord {
+                id: format!("call-{id}"),
+                name: "write_file".to_string(),
+                input: json!({"path": "reports/summary.txt"}),
+                assistant_message_id: None,
+                assistant_provider_response_id: None,
+            }],
+            finish_reason: ModelFinishReason::MaxTokens,
+            usage: None,
+            refusal: None,
+        }
+    }
+
+    fn sixteen_k_run() -> ModelGenerationConfig {
+        ModelGenerationConfig {
+            model: Some("claude-opus-5-5".to_string()),
+            max_output_tokens: Some(16_000),
+            retry_max_tokens: Some(32_000),
+            ..ModelGenerationConfig::default()
+        }
+    }
+
+    fn assistant_ids(engine: &AgentEngine) -> Vec<String> {
+        engine
+            .journal()
+            .iter()
+            .filter_map(|entry| match &entry.event {
+                SessionEvent::MessageAppended { message } if message.role == Role::Assistant => {
+                    Some(message.id.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_cut_off_turn_is_discarded_and_asked_again_with_the_retry_cap() -> Result<()> {
+        let mut engine = AgentEngine::new(
+            ConversationKey {
+                session_id: "session-cut-off".to_string(),
+                thread_id: None,
+            },
+            LoopPolicy {
+                max_turns: 5,
+                ..LoopPolicy::default()
+            },
+        );
         let model = ScriptedModel::new(vec![
-            ModelTurn {
-                assistant_message: MessageRecord::new("assistant-max-1", Role::Assistant, ""),
-                tool_calls: Vec::new(),
-                finish_reason: ModelFinishReason::MaxTokens,
-                usage: None,
+            cut_off_turn("assistant-cut"),
+            text_turn("assistant-done", "The report is done."),
+        ]);
+        let input = InputEnvelope::text("daemon", "api", "session-cut-off", "user-1", "Report.");
+
+        let outcome = engine
+            .run_input_with_generation(
+                input,
+                sixteen_k_run(),
+                &model,
+                &EchoToolExecutor,
+                &AllowAllPermissions,
+            )
+            .await?;
+
+        assert_eq!(outcome.status, RunStatus::Completed);
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].generation.max_output_tokens, Some(16_000));
+        assert_eq!(requests[1].generation.max_output_tokens, Some(32_000));
+        // The retry sends exactly the history the cut-off turn was asked on.
+        assert_eq!(requests[0].provider_prompt, requests[1].provider_prompt);
+        // The cut-off answer and its tool call never enter the history.
+        assert_eq!(assistant_ids(&engine), vec!["assistant-done".to_string()]);
+        assert!(!engine.journal().iter().any(|entry| matches!(
+            &entry.event,
+            SessionEvent::ToolCallStarted { .. } | SessionEvent::ToolCallFinished { .. }
+        )));
+        assert_eq!(
+            outcome.snapshot.run_meta.max_output_tokens_recovery_count,
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_second_cut_off_ends_the_run_with_output_limit_exceeded() -> Result<()> {
+        let mut engine = AgentEngine::new(
+            ConversationKey {
+                session_id: "session-cut-twice".to_string(),
+                thread_id: None,
             },
-            ModelTurn {
-                assistant_message: MessageRecord::new("assistant-max-2", Role::Assistant, ""),
-                tool_calls: Vec::new(),
-                finish_reason: ModelFinishReason::MaxTokens,
-                usage: None,
+            LoopPolicy {
+                max_turns: 5,
+                ..LoopPolicy::default()
             },
+        );
+        let model = ScriptedModel::new(vec![
+            cut_off_turn("assistant-cut-1"),
+            cut_off_turn("assistant-cut-2"),
+            text_turn("assistant-never", "unused"),
+        ]);
+        let input = InputEnvelope::text("daemon", "api", "session-cut-twice", "user-1", "Report.");
+
+        let error = engine
+            .run_input_with_generation(
+                input,
+                sixteen_k_run(),
+                &model,
+                &EchoToolExecutor,
+                &AllowAllPermissions,
+            )
+            .await
+            .expect_err("a second cut-off ends the run");
+
+        let terminal = kheish_types::RunTerminalError::find(error.as_ref())
+            .expect("the run error carries its code");
+        assert_eq!(
+            terminal.code,
+            kheish_types::RunErrorCode::OutputLimitExceeded
+        );
+        assert!(terminal.message.contains("16000") && terminal.message.contains("32000"));
+        assert_eq!(model.requests().len(), 2);
+        assert!(assistant_ids(&engine).is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn each_turn_gets_its_own_output_limit_retry() -> Result<()> {
+        let mut engine = AgentEngine::new(
+            ConversationKey {
+                session_id: "session-cut-per-turn".to_string(),
+                thread_id: None,
+            },
+            LoopPolicy {
+                max_turns: 5,
+                ..LoopPolicy::default()
+            },
+        );
+        let model = ScriptedModel::new(vec![
+            cut_off_turn("assistant-cut-1"),
             ModelTurn {
                 assistant_message: MessageRecord::new(
-                    "assistant-write-after-max",
+                    "assistant-tool",
                     Role::Assistant,
-                    "Writing the report now.",
+                    "Writing.",
                 ),
                 tool_calls: vec![ToolCallRecord {
-                    id: "call-write-after-max".to_string(),
+                    id: "call-write".to_string(),
                     name: "write_file".to_string(),
-                    input: json!({
-                        "path": "reports/summary.txt",
-                        "content": "report body after recovery",
-                    }),
+                    input: json!({"path": "reports/summary.txt", "content": "body"}),
                     assistant_message_id: None,
                     assistant_provider_response_id: None,
                 }],
                 finish_reason: ModelFinishReason::ToolCalls,
                 usage: None,
+                refusal: None,
             },
-            ModelTurn {
-                assistant_message: MessageRecord::new(
-                    "assistant-max-done",
-                    Role::Assistant,
-                    "Done.",
-                ),
-                tool_calls: Vec::new(),
-                finish_reason: ModelFinishReason::Completed,
-                usage: None,
-            },
+            cut_off_turn("assistant-cut-2"),
+            text_turn("assistant-done", "Done."),
         ]);
+        let input = InputEnvelope::text("daemon", "api", "session-cut-per-turn", "user-1", "Go.");
 
-        let mut input = InputEnvelope::text(
-            "daemon",
-            "api",
-            "session-3c",
-            "user-1",
-            "Write the report file in the workspace.",
-        );
-        input.metadata = kheish_types::metadata_with_completion_requirements(
-            serde_json::Value::Null,
-            &[CompletionRequirement::WorkspaceFile {
-                path: Some("reports/summary.txt".to_string()),
-            }],
-        )?;
-
-        let outcome = engine.run_input(input, &model, &EchoToolExecutor).await?;
+        let outcome = engine
+            .run_input_with_generation(
+                input,
+                sixteen_k_run(),
+                &model,
+                &EchoToolExecutor,
+                &AllowAllPermissions,
+            )
+            .await?;
 
         assert_eq!(outcome.status, RunStatus::Completed);
-        let requests = model.requests();
-        assert_eq!(requests.len(), 4);
-        assert_eq!(requests[0].generation.max_output_tokens, None);
+        let caps = model
+            .requests()
+            .iter()
+            .map(|request| request.generation.max_output_tokens)
+            .collect::<Vec<_>>();
         assert_eq!(
-            requests[1].generation.max_output_tokens,
-            Some(kheish_types::ESCALATED_MAX_OUTPUT_TOKENS)
+            caps,
+            vec![Some(16_000), Some(32_000), Some(16_000), Some(32_000)]
         );
-        assert_eq!(requests[2].generation.max_output_tokens, None);
-        assert!(engine.journal().iter().any(|entry| matches!(
-            &entry.event,
-            SessionEvent::MessageAppended { message }
-                if message.role == Role::User
-                    && message.content.contains("Output token limit hit.")
-        )));
-
+        assert_eq!(
+            assistant_ids(&engine),
+            vec!["assistant-tool".to_string(), "assistant-done".to_string()]
+        );
         Ok(())
     }
 
@@ -5534,6 +5695,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             }),
             Err(anyhow!("prompt is too long: 205000 > 200000")),
             Ok(ModelTurn {
@@ -5545,6 +5707,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             }),
         ]);
 
@@ -5600,6 +5763,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             }),
         ]);
 
@@ -5751,6 +5915,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: ModelFinishReason::Completed,
             usage: None,
+            refusal: None,
         })]);
         let checkpoint = engine
             .compact_if_needed(1, &compaction_model)
@@ -5850,6 +6015,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: ModelFinishReason::Completed,
             usage: None,
+            refusal: None,
         })]);
         let restoration = PostCompactRestoration {
             modified_files: vec![kheish_types::FileSnapshot {
@@ -6110,6 +6276,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: ModelFinishReason::Completed,
             usage: None,
+            refusal: None,
         }]);
         let checkpoint = engine
             .compact_if_needed(1, &model)
@@ -6185,6 +6352,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: ModelFinishReason::Completed,
             usage: None,
+            refusal: None,
         }]);
         engine
             .compact_if_needed(1, &model)
@@ -6478,6 +6646,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             }),
         ]);
 

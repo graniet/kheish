@@ -3141,6 +3141,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: ModelFinishReason::Completed,
                 usage: None,
+                refusal: None,
             })
         }
     }

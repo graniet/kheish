@@ -285,6 +285,8 @@ impl crate::GenerationArgs {
             temperature: self.temperature,
             reasoning: self.reasoning_config(),
             response_format,
+            refusal_fallbacks: None,
+            retry_max_tokens: None,
         }))
     }
 
@@ -326,6 +328,7 @@ impl From<crate::ReasoningEffortArg> for kheish_runtime::ReasoningEffort {
             crate::ReasoningEffortArg::Medium => Self::Medium,
             crate::ReasoningEffortArg::High => Self::High,
             crate::ReasoningEffortArg::Xhigh => Self::Xhigh,
+            crate::ReasoningEffortArg::Max => Self::Max,
         }
     }
 }
